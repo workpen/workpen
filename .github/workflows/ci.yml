@@ -48,7 +48,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          toolchain: "1.85"
+          toolchain: "1.95"
           components: rustfmt, clippy
       - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
         with:
@@ -61,12 +61,12 @@ jobs:
         if: >-
           github.event_name != 'pull_request' ||
           !startsWith(github.head_ref, 'release-please')
-        run: cargo clippy --locked --workspace --all-targets --features gc -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --features gc,nono -- -D warnings
       - name: Rustdoc
         if: >-
           github.event_name != 'pull_request' ||
           !startsWith(github.head_ref, 'release-please')
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace --features gc
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace --features gc,nono
       - name: Release-please check
         if: >-
           github.event_name == 'pull_request' &&
@@ -115,7 +115,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
-          toolchain: "1.85"
+          toolchain: "1.95"
       - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
         if: >-
           github.event_name != 'pull_request' ||
@@ -134,13 +134,13 @@ jobs:
           set -euo pipefail
           out="${CARGO_TARGET_DIR}/junit"
           mkdir -p "$out"
-          cargo nextest run --locked --workspace --features gc --profile ci
+          cargo nextest run --locked --workspace --features gc,nono --profile ci
           cp target/nextest/ci/junit.xml "${out}/default.xml"
       - name: Doc tests
         if: >-
           github.event_name != 'pull_request' ||
           !startsWith(github.head_ref, 'release-please')
-        run: cargo test --locked --workspace --features gc --doc
+        run: cargo test --locked --workspace --features gc,nono --doc
       - name: Release-please check
         if: >-
           github.event_name == 'pull_request' &&

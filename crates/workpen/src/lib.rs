@@ -5,6 +5,8 @@ mod deny;
 mod gc;
 mod guard;
 mod why;
+#[cfg(feature = "nono")]
+mod wrap;
 
 pub use deny::{
     DenyPolicy, DestDeny, DestDenyError, DestDenyKind, classify_dest, default_secret_denies,
@@ -18,6 +20,11 @@ pub use gc::{
 };
 pub use guard::{PathGuard, PathGuardDeny, PathGuardError, PathGuardKind, check_dests};
 pub use why::{Why, explain};
+#[cfg(feature = "nono")]
+pub use wrap::{
+    KernelAccess, KernelApply, KernelError, KernelGrant, KernelPolicy, kernel_supported,
+    process_jail,
+};
 
 /// Crate version from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

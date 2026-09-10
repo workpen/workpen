@@ -15,4 +15,4 @@ name = "workpen"
 path = "src/main.rs"
 
 [dependencies]
-workpen = { path = "../workpen", features = ["gc"] }
+workpen = { path = "../workpen", features = ["gc", "nono"] }

@@ -6,9 +6,9 @@ help: ## Show this help
 
 check: ## fmt, clippy, test, deny, stealth, trigger lock
 	cargo fmt --check
-	RUSTFLAGS="-D warnings" cargo clippy --locked --workspace --all-targets --features gc -- -D warnings
-	RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace --features gc
-	RUSTFLAGS="-D warnings" cargo test --locked --workspace --features gc
+	RUSTFLAGS="-D warnings" cargo clippy --locked --workspace --all-targets --features gc,nono -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace --features gc,nono
+	RUSTFLAGS="-D warnings" cargo test --locked --workspace --features gc,nono
 	cargo deny check
 	python3 scripts/test_workflow_triggers.py
 	bash scripts/assert-stealth.sh workpen/workpen
