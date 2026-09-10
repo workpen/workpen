@@ -38,6 +38,12 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertNotIn("tool: actionlint@", text)
         self.assertIn("rhysd/actionlint@", text)
 
+    def test_gitleaks_is_not_an_install_action_tool(self) -> None:
+        # Same class as actionlint: gitleaks is Go, not crates.io.
+        text = (WORKFLOWS / "security.yml").read_text(encoding="utf-8")
+        self.assertNotIn("tool: gitleaks@", text)
+        self.assertIn("gitleaks/gitleaks/releases/download/", text)
+
     def test_release_please_is_main_only(self) -> None:
         text = (WORKFLOWS / "release-please.yml").read_text(encoding="utf-8")
         on_block = _on_block(text)
