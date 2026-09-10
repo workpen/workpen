@@ -115,18 +115,15 @@ impl KernelPolicy {
 }
 
 fn system_read_dirs() -> Vec<&'static Path> {
-    let mut dirs: Vec<&Path> = vec![
+    vec![
         Path::new("/usr"),
         Path::new("/bin"),
         Path::new("/lib"),
         Path::new("/lib64"),
         Path::new("/sbin"),
-    ];
-    #[cfg(target_os = "macos")]
-    {
-        dirs.extend([Path::new("/System"), Path::new("/Library")]);
-    }
-    dirs
+        Path::new("/System"),
+        Path::new("/Library"),
+    ]
 }
 
 fn add_rw(grants: &mut Vec<KernelGrant>, path: &Path) -> Result<(), KernelError> {
