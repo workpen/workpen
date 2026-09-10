@@ -231,11 +231,30 @@ fn match_star(pat: &[u8], text: &[u8]) -> bool {
 }
 
 fn hardlink_sibling_denied(canon: &Path, policy: &DenyPolicy) -> bool {
+    #[cfg(unix)]
+    {
+        hardlink_sibling_denied_unix(canon, policy)
+    }
+    #[cfg(windows)]
+    {
+        hardlink_sibling_denied_windows(canon, policy)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (canon, policy);
+        false
+    }
+}
+
+#[cfg(unix)]
+fn hardlink_sibling_denied_unix(canon: &Path, policy: &DenyPolicy) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
     let meta = match std::fs::metadata(canon) {
         Ok(m) => m,
         Err(_) => return false,
     };
-    let nlink = link_count(&meta);
+    let nlink = meta.nlink();
     if nlink <= 1 {
         return false;
     }
@@ -254,7 +273,7 @@ fn hardlink_sibling_denied(canon: &Path, policy: &DenyPolicy) -> bool {
             Ok(m) => m,
             Err(_) => continue,
         };
-        if !same_file_id(&meta, &sibling_meta) {
+        if sibling_meta.dev() != meta.dev() || sibling_meta.ino() != meta.ino() {
             continue;
         }
         same += 1;
@@ -265,46 +284,95 @@ fn hardlink_sibling_denied(canon: &Path, policy: &DenyPolicy) -> bool {
     same < nlink
 }
 
-#[cfg(unix)]
-fn link_count(meta: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    meta.nlink()
-}
-
+/// `MetadataExt::file_index` is unstable (`windows_by_handle`). List names
+/// with FindFirstFileNameW instead.
 #[cfg(windows)]
-fn link_count(meta: &std::fs::Metadata) -> u64 {
-    use std::os::windows::fs::MetadataExt;
-    u64::from(meta.number_of_links())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn link_count(_meta: &std::fs::Metadata) -> u64 {
-    1
-}
-
-#[cfg(unix)]
-fn same_file_id(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    a.dev() == b.dev() && a.ino() == b.ino()
-}
-
-#[cfg(windows)]
-fn same_file_id(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    match (
-        a.volume_serial_number(),
-        a.file_index(),
-        b.volume_serial_number(),
-        b.file_index(),
-    ) {
-        (Some(va), Some(ia), Some(vb), Some(ib)) => va == vb && ia == ib,
-        _ => false,
+fn hardlink_sibling_denied_windows(canon: &Path, policy: &DenyPolicy) -> bool {
+    match win_hardlink_names(canon) {
+        Ok(names) if names.len() <= 1 => false,
+        Ok(names) => names.iter().any(|n| {
+            let s = n.to_string_lossy().replace('\\', "/");
+            path_is_denied_glob(policy.globs(), &s)
+        }),
+        Err(_) => true,
     }
 }
 
-#[cfg(not(any(unix, windows)))]
-fn same_file_id(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
-    false
+#[cfg(windows)]
+fn win_hardlink_names(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    type Handle = *mut core::ffi::c_void;
+    type Dword = u32;
+    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+    const ERROR_MORE_DATA: Dword = 234;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn FindFirstFileNameW(
+            lp_file_name: *const u16,
+            dw_flags: Dword,
+            string_length: *mut Dword,
+            link_name: *mut u16,
+        ) -> Handle;
+        fn FindNextFileNameW(
+            h_find_stream: Handle,
+            string_length: *mut Dword,
+            link_name: *mut u16,
+        ) -> i32;
+        fn FindClose(h_find_file: Handle) -> i32;
+        fn GetLastError() -> Dword;
+    }
+
+    fn wide_to_os(buf: &[u16], claimed: usize) -> std::ffi::OsString {
+        let end = buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(claimed.min(buf.len()));
+        std::ffi::OsString::from_wide(&buf[..end])
+    }
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut len: Dword = 256;
+    let mut buf = vec![0u16; 256];
+    let handle = loop {
+        // SAFETY: `wide` is a NUL-terminated path; `buf` is at least `len` units.
+        let h = unsafe { FindFirstFileNameW(wide.as_ptr(), 0, &mut len, buf.as_mut_ptr()) };
+        if h != INVALID_HANDLE_VALUE {
+            break h;
+        }
+        let err = unsafe { GetLastError() };
+        if err == ERROR_MORE_DATA {
+            buf.resize(len as usize, 0);
+            continue;
+        }
+        return Err(std::io::Error::from_raw_os_error(err as i32));
+    };
+
+    let mut names = vec![wide_to_os(&buf, len as usize)];
+    loop {
+        len = buf.len() as Dword;
+        // SAFETY: `handle` came from FindFirstFileNameW; `buf` matches `len`.
+        let ok = unsafe { FindNextFileNameW(handle, &mut len, buf.as_mut_ptr()) };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_MORE_DATA {
+                buf.resize(len as usize, 0);
+                continue;
+            }
+            break;
+        }
+        names.push(wide_to_os(&buf, len as usize));
+    }
+    // SAFETY: `handle` is an open FindFirst handle.
+    unsafe {
+        FindClose(handle);
+    }
+    Ok(names)
 }
 
 fn peel_shell_meta(s: &str) -> &str {
