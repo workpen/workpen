@@ -1,0 +1,52 @@
+name: FOSSA
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.*"
+      - "crates/**"
+      - ".github/workflows/fossa.yml"
+  pull_request:
+    paths:
+      - "Cargo.*"
+      - "crates/**"
+      - ".github/workflows/fossa.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: fossa-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  license-scan:
+    name: License Scan
+    if: >-
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      !github.event.repository.private &&
+      (github.event_name != 'pull_request' ||
+       !startsWith(github.head_ref, 'release-please'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check FOSSA API key
+        id: check-key
+        run: |
+          if [ -z "$FOSSA_API_KEY" ]; then
+            echo "FOSSA_API_KEY not configured, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
+      - name: Skip without key
+        if: steps.check-key.outputs.skip == 'true'
+        run: echo "FOSSA skipped"

@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/workpen", "crates/workpen-cli"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/workpen/workpen"
+
+[workspace.metadata.dist]
+pr-run-mode = "skip"

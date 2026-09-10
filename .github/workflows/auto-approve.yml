@@ -1,0 +1,69 @@
+name: Auto-approve
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-approve-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  auto-approve:
+    name: Auto-approve
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # enable auto-merge on the PR
+      contents: write
+      # hmarr/auto-approve-action creates the review
+      pull-requests: write
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (
+        (
+          github.event.pull_request.user.login != 'github-actions[bot]' &&
+          github.actor == 'SebTardif'
+        ) ||
+        startsWith(github.head_ref, 'release-please') ||
+        contains(github.event.pull_request.labels.*.name, 'autorelease: pending')
+      )
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - name: Auto-approve PR
+        uses: hmarr/auto-approve-action@f0939ea97e9205ef24d872e76833fa908a770363 # v4
+      - name: Enable auto-merge
+        if: >-
+          !github.event.pull_request.draft &&
+          !startsWith(github.head_ref, 'release-please') &&
+          !contains(github.event.pull_request.labels.*.name, 'autorelease: pending') &&
+          github.event.pull_request.title != 'chore: amend constitution' &&
+          !startsWith(github.event.pull_request.title, 'release:') &&
+          !startsWith(github.event.pull_request.title, 'chore(release)') &&
+          !startsWith(github.event.pull_request.title, 'publish')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          paths=$(gh pr diff --name-only "$PR" --repo "$REPO")
+          if echo "$paths" | grep -qx 'CONSTITUTION.md' \
+            || echo "$paths" | grep -qx 'scripts/assert-stealth.sh'; then
+            echo "Skip auto-merge: constitution or stealth script in diff"
+            exit 0
+          fi
+          gh pr merge --auto --squash "$PR" --repo "$REPO" \
+            || echo "Could not enable auto-merge. The PR was approved."
+      - name: Skip auto-merge for draft PRs
+        if: github.event.pull_request.draft
+        env:
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          echo "Draft PR ${PR}: auto-merge deferred until ready for review."

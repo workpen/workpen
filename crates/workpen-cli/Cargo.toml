@@ -1,0 +1,18 @@
+[package]
+name = "workpen-cli"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reserved."
+publish = false
+keywords = []
+categories = []
+
+[[bin]]
+name = "workpen"
+path = "src/main.rs"
+
+[dependencies]
+workpen = { path = "../workpen" }

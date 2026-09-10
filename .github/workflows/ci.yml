@@ -1,0 +1,172 @@
+name: CI
+
+on:
+  pull_request:
+  merge_group: {}
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  stealth:
+    name: Stealth
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Assert stealth surfaces
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/assert-stealth.sh workpen/workpen
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TARGET_DIR: target/ci-lint
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.85"
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
+        with:
+          tool: cargo-deny@0.20.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'workflow_dispatch' }}
+      - run: cargo fmt --check
+      - name: Full clippy
+        if: >-
+          github.event_name != 'pull_request' ||
+          !startsWith(github.head_ref, 'release-please')
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Rustdoc
+        if: >-
+          github.event_name != 'pull_request' ||
+          !startsWith(github.head_ref, 'release-please')
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace
+      - name: Release-please check
+        if: >-
+          github.event_name == 'pull_request' &&
+          startsWith(github.head_ref, 'release-please')
+        run: cargo check --locked --workspace --all-targets
+      - run: cargo deny check
+      - run: python3 scripts/test_workflow_triggers.py
+
+  workflows:
+    name: Workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
+        with:
+          tool: actionlint@1.7.7,zizmor@1.16.0
+      - run: actionlint
+      - run: zizmor --min-severity=high .github/workflows
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # test-summary/action publishes a check run
+      checks: write
+    env:
+      CARGO_TARGET_DIR: target/ci-test
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.85"
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
+        if: >-
+          github.event_name != 'pull_request' ||
+          !startsWith(github.head_ref, 'release-please')
+        with:
+          tool: cargo-nextest@0.9.140
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'workflow_dispatch' }}
+      - name: Unit and integration tests
+        if: >-
+          github.event_name != 'pull_request' ||
+          !startsWith(github.head_ref, 'release-please')
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="${CARGO_TARGET_DIR}/junit"
+          mkdir -p "$out"
+          cargo nextest run --locked --workspace --profile ci
+          cp target/nextest/ci/junit.xml "${out}/default.xml"
+      - name: Doc tests
+        if: >-
+          github.event_name != 'pull_request' ||
+          !startsWith(github.head_ref, 'release-please')
+        run: cargo test --locked --workspace --doc
+      - name: Release-please check
+        if: >-
+          github.event_name == 'pull_request' &&
+          startsWith(github.head_ref, 'release-please')
+        run: cargo check --locked --workspace --all-targets
+      - name: Test summary
+        if: >-
+          always() &&
+          (github.event_name != 'pull_request' ||
+           !startsWith(github.head_ref, 'release-please'))
+        uses: test-summary/action@37b508cfee6d4d080eedd00b5bb240a6a784a6a5 # v2.6
+        with:
+          paths: target/ci-test/junit/*.xml
+          show: all
+
+  test-gate:
+    name: Test
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - name: All OS tests passed
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+        run: test "$TEST_RESULT" = "success"
