@@ -5,8 +5,8 @@ use std::path::Path;
 
 use workpen::{
     DenyPolicy, DestDeny, DestDenyError, DestDenyKind, classify_dest, default_secret_denies,
-    dest_deny_message, is_env_template_basename, is_path_denied, path_is_denied_glob,
-    reject_command_secret_path_tokens,
+    deny_patch_dests, dest_deny_message, is_env_template_basename, is_path_denied,
+    path_is_denied_glob, reject_command_secret_path_tokens,
 };
 
 #[test]
@@ -278,4 +278,15 @@ fn classify_dest_does_not_treat_dotdot_as_dest_deny() {
         None,
         "out-of-tree is PathGuard, not dest-deny"
     );
+}
+
+#[test]
+fn deny_patch_dests_secret_denied_clean_allowed() {
+    let policy = DenyPolicy::default();
+    let err = deny_patch_dests(&[Path::new(".env")], &policy).expect_err("secret dest denied");
+    match err {
+        DestDenyError::Denied(denied) => assert_eq!(denied.kind, DestDenyKind::DenyGlob),
+        other => panic!("expected Denied, got {other}"),
+    }
+    deny_patch_dests(&[Path::new("src/lib.rs")], &policy).expect("clean dest allowed");
 }

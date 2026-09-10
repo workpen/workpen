@@ -1,4 +1,4 @@
-//! Dest-deny predicate. Stubs typecheck; classify and argv scan land in PR 2.
+//! Dest-deny predicate. Glob match, hardlink sibling, patch dests, argv tokens.
 
 use std::path::{Path, PathBuf};
 
@@ -87,8 +87,21 @@ impl std::fmt::Display for DestDeny {
 
 /// Classify one dest. Glob vs hardlink only. Does not jail `..`.
 pub fn classify_dest(path: &Path, policy: &DenyPolicy) -> Option<DestDenyKind> {
-    let _ = (path, policy);
-    unimplemented!("dest-deny classify lands after the corpus")
+    if path_is_denied_glob(policy.globs(), &path_as_glob(path)) {
+        return Some(DestDenyKind::DenyGlob);
+    }
+
+    let canon = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    if path_is_denied_glob(policy.globs(), &path_as_glob(&canon)) {
+        return Some(DestDenyKind::DenyGlob);
+    }
+    if hardlink_sibling_denied(&canon, policy) {
+        return Some(DestDenyKind::HardlinkSibling);
+    }
+    None
 }
 
 pub fn is_path_denied(path: &Path, policy: &DenyPolicy) -> bool {
@@ -131,8 +144,12 @@ pub fn reject_command_secret_path_tokens(
     command: &str,
     policy: &DenyPolicy,
 ) -> Result<(), DestDenyError> {
-    let _ = (command, policy);
-    unimplemented!("argv dest-deny scan lands after the corpus")
+    for (display, candidate) in command_path_tokens(command) {
+        if candidate_is_denied(&candidate, policy) {
+            return Err(DestDenyError::CommandToken { token: display });
+        }
+    }
+    Ok(())
 }
 
 /// Committed dotenv templates, not live env files.
@@ -147,13 +164,279 @@ pub fn is_env_template_basename(name: &str) -> bool {
 }
 
 pub fn path_matches_deny_glob(pattern: &str, path: &str) -> bool {
-    let _ = (pattern, path);
-    unimplemented!("glob matcher lands after the corpus")
+    let pattern = normalize_glob_text(pattern);
+    let path = normalize_glob_text(path);
+    let pat: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match_glob_segments(&pat, &segs)
 }
 
 pub fn path_is_denied_glob(globs: &[String], path: &str) -> bool {
-    let _ = (globs, path);
-    unimplemented!("glob matcher lands after the corpus")
+    if is_env_template_basename(path) {
+        return false;
+    }
+    globs.iter().any(|g| path_matches_deny_glob(g, path))
+}
+
+fn path_as_glob(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn normalize_glob_text(s: &str) -> String {
+    s.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn match_glob_segments(pat: &[&str], path: &[&str]) -> bool {
+    match (pat.split_first(), path.split_first()) {
+        (None, None) => true,
+        (None, Some(_)) => false,
+        (Some((&"**", rest)), _) => {
+            if rest.is_empty() {
+                return true;
+            }
+            for i in 0..=path.len() {
+                if match_glob_segments(rest, &path[i..]) {
+                    return true;
+                }
+            }
+            false
+        }
+        (Some((p, prest)), Some((h, hrest))) => {
+            glob_segment(p, h) && match_glob_segments(prest, hrest)
+        }
+        (Some(_), None) => false,
+    }
+}
+
+fn glob_segment(pat: &str, text: &str) -> bool {
+    match_star(pat.as_bytes(), text.as_bytes())
+}
+
+fn match_star(pat: &[u8], text: &[u8]) -> bool {
+    match pat.split_first() {
+        None => text.is_empty(),
+        Some((&b'*', rest)) => {
+            for i in 0..=text.len() {
+                if match_star(rest, &text[i..]) {
+                    return true;
+                }
+            }
+            false
+        }
+        Some((p, prest)) => match text.split_first() {
+            Some((t, trest)) if p == t => match_star(prest, trest),
+            _ => false,
+        },
+    }
+}
+
+fn hardlink_sibling_denied(canon: &Path, policy: &DenyPolicy) -> bool {
+    let meta = match std::fs::metadata(canon) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let nlink = link_count(&meta);
+    if nlink <= 1 {
+        return false;
+    }
+    let parent = match canon.parent() {
+        Some(p) => p,
+        None => return true,
+    };
+    let entries = match std::fs::read_dir(parent) {
+        Ok(rd) => rd,
+        Err(_) => return true,
+    };
+    let mut same = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let sibling_meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !same_file_id(&meta, &sibling_meta) {
+            continue;
+        }
+        same += 1;
+        if path_is_denied_glob(policy.globs(), &path_as_glob(&path)) {
+            return true;
+        }
+    }
+    same < nlink
+}
+
+#[cfg(unix)]
+fn link_count(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink()
+}
+
+#[cfg(windows)]
+fn link_count(meta: &std::fs::Metadata) -> u64 {
+    use std::os::windows::fs::MetadataExt;
+    u64::from(meta.number_of_links())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn link_count(_meta: &std::fs::Metadata) -> u64 {
+    1
+}
+
+#[cfg(unix)]
+fn same_file_id(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(windows)]
+fn same_file_id(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    match (
+        a.volume_serial_number(),
+        a.file_index(),
+        b.volume_serial_number(),
+        b.file_index(),
+    ) {
+        (Some(va), Some(ia), Some(vb), Some(ib)) => va == vb && ia == ib,
+        _ => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_id(_a: &std::fs::Metadata, _b: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn peel_shell_meta(s: &str) -> &str {
+    s.trim_matches(|c: char| matches!(c, ';' | '|' | '&' | ')' | '(' | '<' | '>' | '`' | ','))
+}
+
+fn candidate_is_denied(candidate: &str, policy: &DenyPolicy) -> bool {
+    let peeled = peel_shell_meta(candidate);
+    if peeled.is_empty() || peeled.starts_with('-') {
+        return false;
+    }
+    if path_is_denied_glob(policy.globs(), peeled) {
+        return true;
+    }
+    if let Some((_, after)) = peeled.rsplit_once(':') {
+        let after = peel_shell_meta(after);
+        if !after.is_empty()
+            && !after.starts_with('-')
+            && path_is_denied_glob(policy.globs(), after)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn command_path_tokens(command: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    collect_function_calls(command, &mut out);
+    collect_quoted_and_words(command, &mut out);
+    out
+}
+
+fn collect_function_calls(s: &str, out: &mut Vec<(String, String)>) {
+    let mut pos = 0;
+    while let Some((end, display, path)) = next_function_call(s, pos) {
+        out.push((display, path));
+        pos = end;
+    }
+}
+
+fn next_function_call(s: &str, from: usize) -> Option<(usize, String, String)> {
+    let bytes = s.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        if is_ident_start(bytes[i]) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_ident_cont(bytes[i]) {
+                i += 1;
+            }
+            let ident_end = i;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'(' {
+                i += 1;
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if i < bytes.len() && (bytes[i] == b'\'' || bytes[i] == b'"') {
+                    let q = bytes[i];
+                    i += 1;
+                    let path_start = i;
+                    while i < bytes.len() && bytes[i] != q {
+                        i += 1;
+                    }
+                    if i < bytes.len() && bytes[i] == q {
+                        let path = s[path_start..i].to_string();
+                        i += 1;
+                        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                            i += 1;
+                        }
+                        if i < bytes.len() && bytes[i] == b')' {
+                            i += 1;
+                            let display = s[start..i].to_string();
+                            return Some((i, display, path));
+                        }
+                    }
+                }
+            }
+            i = ident_end.max(start + 1);
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
+
+fn is_ident_cont(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn collect_quoted_and_words(s: &str, out: &mut Vec<(String, String)>) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\'' || bytes[i] == b'"' {
+            let q = bytes[i];
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != q {
+                i += 1;
+            }
+            let inner = &s[start..i];
+            if i < bytes.len() {
+                i += 1;
+            }
+            collect_function_calls(inner, out);
+            collect_quoted_and_words(inner, out);
+            out.push((inner.to_string(), inner.to_string()));
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let raw = &s[start..i];
+        let peeled = peel_shell_meta(raw);
+        out.push((raw.to_string(), peeled.to_string()));
+        if let Some((_, after)) = peeled.rsplit_once(':') {
+            out.push((raw.to_string(), after.to_string()));
+        }
+    }
 }
 
 /// v1 list is byte-identical to Bline `default_secret_denies()`.
