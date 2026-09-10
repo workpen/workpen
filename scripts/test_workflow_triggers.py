@@ -31,6 +31,13 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertNotIn("push:", on_block)
         self.assertNotIn("tags:", on_block)
 
+    def test_actionlint_is_not_an_install_action_tool(self) -> None:
+        # actionlint is a Go binary, not a crates.io crate. install-action
+        # falls back to cargo-binstall and fails with "actionlint is not found".
+        text = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+        self.assertNotIn("tool: actionlint@", text)
+        self.assertIn("rhysd/actionlint@", text)
+
     def test_release_please_is_main_only(self) -> None:
         text = (WORKFLOWS / "release-please.yml").read_text(encoding="utf-8")
         on_block = _on_block(text)
