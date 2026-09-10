@@ -1,12 +1,23 @@
 //! Userspace containment stack. Not ready.
 
 mod deny;
+#[cfg(feature = "gc")]
+mod gc;
+mod guard;
+mod why;
 
 pub use deny::{
     DenyPolicy, DestDeny, DestDenyError, DestDenyKind, classify_dest, default_secret_denies,
     deny_patch_dests, dest_deny_message, is_env_template_basename, is_path_denied,
     path_is_denied_glob, path_matches_deny_glob, reject_command_secret_path_tokens,
 };
+#[cfg(feature = "gc")]
+pub use gc::{
+    GcDecision, GcError, GcKeepReason, GcPolicy, GcReport, Worktree, decide, gc_leftovers,
+    list_worktrees,
+};
+pub use guard::{PathGuard, PathGuardDeny, PathGuardError, PathGuardKind, check_dests};
+pub use why::{Why, explain};
 
 /// Crate version from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

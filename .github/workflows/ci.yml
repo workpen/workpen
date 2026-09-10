@@ -61,12 +61,12 @@ jobs:
         if: >-
           github.event_name != 'pull_request' ||
           !startsWith(github.head_ref, 'release-please')
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --features gc -- -D warnings
       - name: Rustdoc
         if: >-
           github.event_name != 'pull_request' ||
           !startsWith(github.head_ref, 'release-please')
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace --features gc
       - name: Release-please check
         if: >-
           github.event_name == 'pull_request' &&
@@ -134,13 +134,13 @@ jobs:
           set -euo pipefail
           out="${CARGO_TARGET_DIR}/junit"
           mkdir -p "$out"
-          cargo nextest run --locked --workspace --profile ci
+          cargo nextest run --locked --workspace --features gc --profile ci
           cp target/nextest/ci/junit.xml "${out}/default.xml"
       - name: Doc tests
         if: >-
           github.event_name != 'pull_request' ||
           !startsWith(github.head_ref, 'release-please')
-        run: cargo test --locked --workspace --doc
+        run: cargo test --locked --workspace --features gc --doc
       - name: Release-please check
         if: >-
           github.event_name == 'pull_request' &&
