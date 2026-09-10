@@ -44,6 +44,13 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertNotIn("tool: gitleaks@", text)
         self.assertIn("gitleaks/gitleaks/releases/download/", text)
 
+    def test_release_please_uses_simple_for_virtual_workspace(self) -> None:
+        text = (ROOT / "release-please-config.json").read_text(encoding="utf-8")
+        self.assertIn('"release-type": "simple"', text)
+        self.assertNotIn('"release-type": "rust"', text)
+        self.assertIn("crates/workpen/Cargo.toml", text)
+        self.assertIn("crates/workpen-cli/Cargo.toml", text)
+
     def test_release_please_is_main_only(self) -> None:
         text = (WORKFLOWS / "release-please.yml").read_text(encoding="utf-8")
         on_block = _on_block(text)
