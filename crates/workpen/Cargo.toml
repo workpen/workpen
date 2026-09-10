@@ -17,6 +17,8 @@ nono = ["dep:nono"]
 
 [dependencies]
 thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
 nono = { version = "0.76", optional = true, default-features = false }
 
 [dev-dependencies]

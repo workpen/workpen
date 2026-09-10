@@ -50,7 +50,14 @@ pub enum KernelError {
 /// Whether this OS can apply a kernel jail.
 #[must_use]
 pub fn kernel_supported() -> bool {
-    nono::Sandbox::is_supported()
+    #[cfg(unix)]
+    {
+        nono::Sandbox::is_supported()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// Build a process-jail policy. Does not apply it.
@@ -86,19 +93,19 @@ impl KernelPolicy {
         if !kernel_supported() {
             return Ok(KernelApply::UserspaceOnly);
         }
-        let caps = self.to_capability_set()?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
+            let caps = self.to_capability_set()?;
             nono::Sandbox::apply_auto(&caps).map_err(|e| KernelError::Apply(e.to_string()))?;
             Ok(KernelApply::Applied)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let _ = caps;
             Ok(KernelApply::UserspaceOnly)
         }
     }
 
+    #[cfg(unix)]
     fn to_capability_set(&self) -> Result<nono::CapabilitySet, KernelError> {
         let mut caps = nono::CapabilitySet::new();
         for grant in &self.grants {
