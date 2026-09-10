@@ -93,7 +93,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2
-        with:
-          tool: gitleaks@8.24.3
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          ver=8.24.3
+          dest="${HOME}/.local/bin"
+          mkdir -p "$dest"
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${ver}/gitleaks_${ver}_linux_x64.tar.gz" \
+            | tar xz -C "$dest" gitleaks
+          echo "$dest" >> "$GITHUB_PATH"
       - run: gitleaks detect --source . --exit-code 1
