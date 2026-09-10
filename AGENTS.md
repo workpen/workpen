@@ -1,6 +1,6 @@
 # Agents
 
-Rust workspace. MSRV 1.85. Edition 2024.
+Rust workspace. MSRV 1.95. Edition 2024.
 
 ```bash
 make check

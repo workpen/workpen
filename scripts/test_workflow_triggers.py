@@ -81,6 +81,24 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertIn("crates-io-auth-action", text)
         self.assertNotIn("CARGO_REGISTRY_TOKEN: ${{ secrets.", text)
 
+    def test_msrv_is_1_95(self) -> None:
+        toolchain = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
+        self.assertIn('channel = "1.95"', toolchain)
+        ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn('toolchain: "1.95"', ci)
+        self.assertNotIn('toolchain: "1.85"', ci)
+        publish = (WORKFLOWS / "publish-crates.yml").read_text(encoding="utf-8")
+        self.assertIn('toolchain: "1.95"', publish)
+        cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
+        self.assertIn('rust-version = "1.95"', cargo)
+
+    def test_ci_enables_gc_and_nono_features(self) -> None:
+        ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("--features gc,nono", ci)
+        self.assertNotIn("--features gc --", ci)
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn("--features gc,nono", makefile)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -69,6 +69,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     if let Err(e) = workpen::check_dests(&guard, &[Path::new(&root)]) {
         return Err(e.to_string());
     }
+    workpen::process_jail(&root, &extras)
+        .and_then(|policy| policy.apply())
+        .map_err(|e| e.to_string())?;
     let status = Command::new(&cmd[0])
         .args(&cmd[1..])
         .current_dir(&root)

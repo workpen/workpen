@@ -13,10 +13,11 @@ categories = []
 [features]
 default = []
 gc = []
-nono = []
+nono = ["dep:nono"]
 
 [dependencies]
 thiserror = "2"
+nono = { version = "0.76", optional = true, default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
@@ -24,3 +25,7 @@ tempfile = "3"
 [[test]]
 name = "gc_corpus"
 required-features = ["gc"]
+
+[[test]]
+name = "nono_corpus"
+required-features = ["nono"]

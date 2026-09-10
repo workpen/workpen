@@ -187,10 +187,10 @@ fn chain_has_symlink(path: &Path) -> bool {
     let mut cur = PathBuf::new();
     for component in path.components() {
         cur.push(component);
-        if let Ok(meta) = std::fs::symlink_metadata(&cur) {
-            if meta.file_type().is_symlink() {
-                return true;
-            }
+        if let Ok(meta) = std::fs::symlink_metadata(&cur)
+            && meta.file_type().is_symlink()
+        {
+            return true;
         }
     }
     false
