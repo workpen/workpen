@@ -75,6 +75,7 @@ pub enum GcError {
 }
 
 /// Parse a duration token (`7d`, `24h`, `60m`, `30s`). Number must be `> 0`.
+/// Does not peel quotes. Hosts strip `'7d'` / `"7d"` first.
 pub fn parse_max_age(raw: &str) -> Result<Duration, GcError> {
     let s = raw.trim();
     if s.chars().count() < 2 {
@@ -123,7 +124,35 @@ pub fn classify_for_age_gc(
     classify_worktree(path, false)
 }
 
+/// Remove one registered worktree after the unique-work check.
+/// `force` does not skip dirty, unique, unreadable, or missing-git Keep.
+/// Porcelain `locked` is always Keep.
+pub fn remove_explicit(
+    path: &Path,
+    saved_ref_prefix: &str,
+    force: bool,
+) -> Result<GcDecision, GcError> {
+    let _ = force;
+    if worktree_is_locked(path) {
+        return Ok(GcDecision::Keep {
+            reason: KeepReason::Locked,
+        });
+    }
+    match classify_worktree(path, false) {
+        keep @ GcDecision::Keep { .. } => Ok(keep),
+        GcDecision::Reclaim { .. } => {
+            let saved = save_unique_commits(path, saved_ref_prefix);
+            let repo = path.parent().unwrap_or(path);
+            remove_worktree(repo, path)?;
+            Ok(GcDecision::Reclaim { saved_refs: saved })
+        }
+    }
+}
+
 /// Classify keep vs reclaim (age already applied by the caller when relevant).
+///
+/// `Reclaim.saved_refs` is empty here. Unique commits are saved in
+/// [`run_gc`] and [`remove_explicit`].
 pub fn classify_worktree(path: &Path, untracked: bool) -> GcDecision {
     if untracked {
         return GcDecision::Keep {
@@ -382,7 +411,8 @@ fn lsof_process_cwds() -> Vec<PathBuf> {
         .collect()
 }
 
-fn worktree_last_used(path: &Path) -> Option<SystemTime> {
+/// Newest of HEAD committer time, index mtime, and a bounded tree walk.
+pub fn worktree_last_used(path: &Path) -> Option<SystemTime> {
     let mut latest = head_commit_time(path);
     if let Some(t) = index_mtime(path) {
         latest = Some(latest.map_or(t, |n| n.max(t)));
@@ -575,8 +605,17 @@ fn remove_worktree(repo: &Path, tree: &Path) -> Result<(), GcError> {
     }
 }
 
+fn worktree_is_locked(path: &Path) -> bool {
+    registered_worktrees(path)
+        .ok()
+        .into_iter()
+        .flatten()
+        .any(|w| paths_eq(&w.path, path) && w.locked)
+}
+
 fn git(cwd: &Path, args: &[&str]) -> Result<String, GcError> {
     let out = Command::new("git")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .args(args)
         .current_dir(cwd)
         .output()

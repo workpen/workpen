@@ -14,7 +14,7 @@ static CWD_LOCK: Mutex<()> = Mutex::new(());
 use tempfile::TempDir;
 use workpen::{
     GcConfig, GcDecision, GcError, KeepReason, classify_for_age_gc, classify_worktree,
-    parse_max_age, run_gc,
+    parse_max_age, remove_explicit, run_gc, worktree_last_used,
 };
 
 const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# cache\n";
@@ -565,4 +565,40 @@ fn recent_index_keeps_tree_when_head_and_files_are_old() {
         } => {}
         other => panic!("fresh index must keep the tree, got {other:?}"),
     }
+}
+
+#[test]
+fn remove_explicit_refuses_dirty() {
+    let (_dir, repo) = init_repo();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "rm-dirty");
+    fs::write(wt.join("README"), b"changed").expect("dirty");
+    match remove_explicit(&wt, "refs/workpen/reclaimed", true) {
+        Ok(GcDecision::Keep {
+            reason: KeepReason::DirtyWork,
+        }) => {}
+        other => panic!("force must not skip unique work, got {other:?}"),
+    }
+    assert!(wt.exists(), "dirty tree must stay");
+}
+
+#[test]
+fn remove_explicit_reclaims_clean() {
+    let (_dir, repo) = init_repo();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "rm-clean");
+    match remove_explicit(&wt, "refs/workpen/reclaimed", false) {
+        Ok(GcDecision::Reclaim { .. }) => {}
+        other => panic!("expected reclaim, got {other:?}"),
+    }
+    assert!(!wt.exists(), "clean tree should be removed");
+}
+
+#[test]
+fn worktree_last_used_is_public() {
+    let (_dir, repo) = init_repo();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "last-used");
+    let used = worktree_last_used(&wt).expect("last used");
+    assert!(used <= SystemTime::now() + Duration::from_secs(2));
 }
