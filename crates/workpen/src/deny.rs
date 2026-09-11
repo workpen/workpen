@@ -120,6 +120,9 @@ pub enum CheckDestError {
     Nul,
     #[error("refuse special file ({kind}): {path}")]
     SpecialFile { path: String, kind: &'static str },
+    /// Read helper only. [`check_dest`] still allows directories.
+    #[error("refuse directory read: {path}")]
+    Directory { path: String },
     #[error("open failed: {0}")]
     Io(String),
 }
@@ -168,7 +171,7 @@ pub fn dest_deny_message(path: &Path, display: &str, policy: &DenyPolicy) -> Opt
 /// `guard: None` dest-denies raw and, if the path exists, dest-denies the
 /// cwd-joined canonicalize. Does not treat cwd as a workspace root.
 /// Rejects NUL and existing fifo / socket / device. Does not peel.
-/// Does not open; see [`open_verified_read`] for check plus post-open.
+/// Does not refuse directories (write dests). See [`open_verified_read`].
 pub fn check_dest(
     path: &str,
     policy: &DenyPolicy,
@@ -216,16 +219,36 @@ pub fn check_dest(
     Ok(resolved)
 }
 
-/// `check_dest`, open for read, then [`verify_post_open`].
+/// `check_dest`, refuse directories, open for read, then [`verify_post_open`].
 pub fn open_verified_read(
     path: &str,
     policy: &DenyPolicy,
     guard: Option<&PathGuard>,
 ) -> Result<File, CheckDestError> {
     let resolved = check_dest(path, policy, guard)?;
+    refuse_directory(&resolved)?;
     let file = File::open(&resolved).map_err(|e| CheckDestError::Io(e.to_string()))?;
+    if file.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+        return Err(directory_read_error(&resolved));
+    }
     verify_post_open(&resolved, &file, policy)?;
     Ok(file)
+}
+
+fn refuse_directory(path: &Path) -> Result<(), CheckDestError> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if meta.is_dir() {
+        return Err(directory_read_error(path));
+    }
+    Ok(())
+}
+
+fn directory_read_error(path: &Path) -> CheckDestError {
+    CheckDestError::Directory {
+        path: path.display().to_string(),
+    }
 }
 
 fn reject_special_file(path: &Path) -> Result<(), CheckDestError> {

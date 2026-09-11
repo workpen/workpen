@@ -636,6 +636,20 @@ fn check_dest_refuses_fifo() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn check_dest_refuses_device() {
+    let path = Path::new("/dev/null");
+    if !path.exists() {
+        return;
+    }
+    let policy = DenyPolicy::default();
+    match check_dest("/dev/null", &policy, None) {
+        Err(CheckDestError::SpecialFile { kind, .. }) => assert_eq!(kind, "device"),
+        other => panic!("device must be SpecialFile, got {other:?}"),
+    }
+}
+
 #[test]
 fn open_verified_read_allows_plain_file() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -644,6 +658,20 @@ fn open_verified_read_allows_plain_file() {
     let policy = DenyPolicy::default();
     let got = open_verified_read(&file.to_string_lossy(), &policy, None).expect("open");
     drop(got);
+}
+
+#[test]
+fn open_verified_read_refuses_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).expect("src");
+    let policy = DenyPolicy::default();
+    let path = src.to_string_lossy();
+    check_dest(&path, &policy, None).expect("check_dest still allows directories");
+    match open_verified_read(&path, &policy, None) {
+        Err(CheckDestError::Directory { .. }) => {}
+        other => panic!("directory must be CheckDestError::Directory, got {other:?}"),
+    }
 }
 
 #[cfg(unix)]
