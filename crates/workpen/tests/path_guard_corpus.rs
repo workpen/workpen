@@ -18,8 +18,9 @@ fn workspace() -> TempDir {
 
 #[test]
 fn path_guard_kind_is_escape_or_symlink_vault_only() {
-    let kinds = [PathGuardKind::Escape, PathGuardKind::SymlinkVault];
-    assert_eq!(kinds.len(), 2);
+    match PathGuardKind::Escape {
+        PathGuardKind::Escape | PathGuardKind::SymlinkVault => {}
+    }
 }
 
 #[test]
@@ -325,11 +326,8 @@ fn resolve_extra_root_allows_explicit_dir() {
 #[test]
 fn resolve_extra_root_rejects_implicit_host_temp() {
     let dir = workspace();
-    let tmp = std::env::temp_dir();
-    let via = tmp.join("workpen-implicit-temp").join("..");
-    if !via.exists() {
-        return;
-    }
+    let marker = TempDir::new().expect("implicit-temp marker");
+    let via = marker.path().join("..");
     match resolve_extra_root(dir.path(), &via.to_string_lossy()) {
         Err(ExtraRootError::EscapedToRoot { .. }) => {}
         other => panic!("implicit host temp must be refused, got {other:?}"),

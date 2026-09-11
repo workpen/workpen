@@ -166,19 +166,48 @@ fn parse_max_age_does_not_peel_quotes() {
     );
 }
 
+struct RestoreHomeEnv {
+    home: Option<std::ffi::OsString>,
+    profile: Option<std::ffi::OsString>,
+}
+
+impl RestoreHomeEnv {
+    fn set_to(path: &Path) -> Self {
+        let home = std::env::var_os("HOME");
+        let profile = std::env::var_os("USERPROFILE");
+        // Safety: serialized by CWD_LOCK (Repo holds it); restored on drop.
+        unsafe {
+            std::env::set_var("HOME", path);
+            std::env::set_var("USERPROFILE", path);
+        }
+        Self { home, profile }
+    }
+}
+
+impl Drop for RestoreHomeEnv {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.profile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+}
+
 #[test]
 fn refuse_home_as_workspace() {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    let Some(home) = home else {
-        return;
-    };
-    let home = PathBuf::from(home);
-    if !home.join(".git").exists() && !home.join(".git").is_file() {
-        return;
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let _restore = RestoreHomeEnv::set_to(&repo);
+    match run_gc(&repo, &GcConfig::new(&repo, Duration::from_secs(1))) {
+        Err(GcError::Home(_)) => {}
+        other => panic!("expected Home, got {other:?}"),
     }
-    let err = run_gc(&home, &GcConfig::new(&home, Duration::from_secs(1)))
-        .expect_err("home is not a gc workspace");
-    assert!(err.to_string().contains("home"));
 }
 
 #[test]
@@ -471,6 +500,70 @@ fn gitignored_untagged_node_modules_is_reclaimable() {
 }
 
 #[test]
+fn tracked_dirty_under_cache_dir_is_kept() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"target\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore target"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "dirty-target");
+    let target = wt.join("target");
+    fs::create_dir_all(&target).expect("target");
+    let tracked = target.join("tracked.txt");
+    fs::write(&tracked, b"tracked").expect("tracked");
+    git(&wt, &["add", "-f", "target/tracked.txt"]);
+    git(&wt, &["commit", "-m", "force-add tracked under target"]);
+    fs::write(&tracked, b"dirty tracked").expect("modify");
+    let porcelain = git_out(&wt, &["status", "--porcelain=v1", "-uall", "--ignored"]);
+    assert!(
+        porcelain.lines().any(|line| {
+            let xy = line.get(..2).unwrap_or("");
+            xy != "??" && xy != "!!" && porcelain_rel(line).starts_with("target/")
+        }),
+        "fixture porcelain must be tracked dirty under target/, got {porcelain:?}"
+    );
+    match classify_worktree(&wt, false) {
+        GcDecision::Keep {
+            reason: KeepReason::DirtyWork,
+        } => {}
+        other => panic!("tracked dirty under target/ must Keep DirtyWork, got {other:?}"),
+    }
+    let now = SystemTime::now() + Duration::from_secs(10);
+    match classify_for_age_gc(&wt, false, Duration::from_secs(0), now) {
+        GcDecision::Keep {
+            reason: KeepReason::DirtyWork,
+        } => {}
+        other => {
+            panic!("old leftover with dirty tracked target/ must Keep DirtyWork, got {other:?}")
+        }
+    }
+    let rows = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now)).expect("gc");
+    let row = rows
+        .iter()
+        .find(|(p, _)| p.file_name() == wt.file_name())
+        .expect("dirty-target row");
+    match &row.1 {
+        GcDecision::Keep {
+            reason: KeepReason::DirtyWork,
+        } => {}
+        other => panic!("run_gc must keep leftover with dirty tracked target/, got {other:?}"),
+    }
+    assert!(
+        wt.exists(),
+        "worktree with dirty tracked file under target/ must stay"
+    );
+    assert_eq!(fs::read(&tracked).expect("read"), b"dirty tracked");
+}
+
+fn porcelain_rel(line: &str) -> &str {
+    let rest = line.get(3..).unwrap_or(line).trim();
+    rest.split_once(" -> ")
+        .map(|(_, dest)| dest)
+        .unwrap_or(rest)
+}
+
+#[test]
 fn unique_dangling_commit_is_saved_under_prefix() {
     let fx = init_repo();
     let repo = fx.repo.clone();
@@ -544,8 +637,8 @@ fn registry_unreadable_is_error() {
         dir.path(),
         &GcConfig::new(dir.path(), Duration::from_secs(1)),
     ) {
-        Err(GcError::RegistryUnreadable(_)) | Err(GcError::Git { .. }) => {}
-        other => panic!("expected registry error, got {other:?}"),
+        Err(GcError::RegistryUnreadable(_)) => {}
+        other => panic!("expected RegistryUnreadable, got {other:?}"),
     }
 }
 
