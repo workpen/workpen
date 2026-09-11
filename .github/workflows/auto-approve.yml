@@ -37,7 +37,16 @@ jobs:
         with:
           egress-policy: audit
       - name: Auto-approve PR
+        if: >-
+          !startsWith(github.head_ref, 'release-please') &&
+          !contains(github.event.pull_request.labels.*.name, 'autorelease: pending')
         uses: hmarr/auto-approve-action@f0939ea97e9205ef24d872e76833fa908a770363 # v4
+      - name: Skip self-approve on release-please
+        if: >-
+          startsWith(github.head_ref, 'release-please') ||
+          contains(github.event.pull_request.labels.*.name, 'autorelease: pending')
+        run: |
+          echo "Skip hmarr on release-please (bot cannot approve its own PR)"
       - name: Enable auto-merge
         if: >-
           !github.event.pull_request.draft &&
