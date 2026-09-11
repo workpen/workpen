@@ -241,6 +241,48 @@ fn check_path_entry_rejects_parent_symlink_escape() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn check_path_entry_rejects_parent_junction_escape() {
+    let dir = workspace();
+    let outside = TempDir::new().expect("outside");
+    fs::write(outside.path().join("leaf.txt"), b"x").expect("leaf");
+    let junction = dir.path().join("out");
+    let status = std::process::Command::new("cmd")
+        .args([
+            "/C",
+            "mklink",
+            "/J",
+            &junction.to_string_lossy(),
+            &outside.path().to_string_lossy(),
+        ])
+        .status();
+    let Ok(status) = status else {
+        return;
+    };
+    if !status.success() {
+        return;
+    }
+    let guard = PathGuard::new(dir.path(), AbsolutePathPolicy::AllowIfContained).expect("guard");
+    match guard.check_path_entry("out/leaf.txt") {
+        Err(PathGuardError::Denied(deny)) => {
+            assert!(
+                matches!(
+                    deny.kind,
+                    PathGuardKind::Escape | PathGuardKind::SymlinkVault
+                ),
+                "junction parent must be Denied, got {:?}",
+                deny.kind
+            );
+        }
+        other => panic!("junction parent escape must be denied, got {other:?}"),
+    }
+    assert!(
+        !dir.path().join("leaf.txt").exists(),
+        "must not write a leaf into the workspace"
+    );
+}
+
 #[test]
 fn resolve_extra_root_rejects_empty_missing_and_file() {
     let dir = workspace();

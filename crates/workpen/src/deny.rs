@@ -116,6 +116,12 @@ pub enum CheckDestError {
     DestDeny(#[from] DestDenyError),
     #[error(transparent)]
     PathGuard(#[from] PathGuardError),
+    #[error("path contains a NUL byte")]
+    Nul,
+    #[error("refuse special file ({kind}): {path}")]
+    SpecialFile { path: String, kind: &'static str },
+    #[error("open failed: {0}")]
+    Io(String),
 }
 
 impl std::fmt::Display for DestDeny {
@@ -161,12 +167,16 @@ pub fn dest_deny_message(path: &Path, display: &str, policy: &DenyPolicy) -> Opt
 ///
 /// `guard: None` dest-denies raw and, if the path exists, dest-denies the
 /// cwd-joined canonicalize. Does not treat cwd as a workspace root.
-/// Does not peel, does not reject NUL, does not verify after open.
+/// Rejects NUL and existing fifo / socket / device. Does not peel.
+/// Does not open; see [`open_verified_read`] for check plus post-open.
 pub fn check_dest(
     path: &str,
     policy: &DenyPolicy,
     guard: Option<&PathGuard>,
 ) -> Result<PathBuf, CheckDestError> {
+    if path.contains('\0') {
+        return Err(CheckDestError::Nul);
+    }
     let raw = Path::new(path);
     if let Some(kind) = classify_dest(raw, policy) {
         return Err(CheckDestError::DestDeny(DestDenyError::Denied(DestDeny {
@@ -202,7 +212,48 @@ pub fn check_dest(
             display: path.to_owned(),
         })));
     }
+    reject_special_file(&resolved)?;
     Ok(resolved)
+}
+
+/// `check_dest`, open for read, then [`verify_post_open`].
+pub fn open_verified_read(
+    path: &str,
+    policy: &DenyPolicy,
+    guard: Option<&PathGuard>,
+) -> Result<File, CheckDestError> {
+    let resolved = check_dest(path, policy, guard)?;
+    let file = File::open(&resolved).map_err(|e| CheckDestError::Io(e.to_string()))?;
+    verify_post_open(&resolved, &file, policy)?;
+    Ok(file)
+}
+
+fn reject_special_file(path: &Path) -> Result<(), CheckDestError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let Ok(meta) = std::fs::metadata(path) else {
+            return Ok(());
+        };
+        let ft = meta.file_type();
+        let kind = if ft.is_fifo() {
+            Some("fifo")
+        } else if ft.is_socket() {
+            Some("socket")
+        } else if ft.is_char_device() || ft.is_block_device() {
+            Some("device")
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            return Err(CheckDestError::SpecialFile {
+                path: path.display().to_string(),
+                kind,
+            });
+        }
+    }
+    let _ = path;
+    Ok(())
 }
 
 /// Unix inode/dev; Windows file index + volume serial.
@@ -347,11 +398,12 @@ pub fn path_matches_deny_glob(pattern: &str, path: &str) -> bool {
 
 pub fn path_is_denied_glob(globs: &[String], path: &str) -> bool {
     let template = is_env_template_basename(path);
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
     globs.iter().any(|g| {
         if template && is_default_env_star_glob(g) {
             return false;
         }
-        path_matches_deny_glob(g, path)
+        path_matches_deny_glob(g, path) || path_matches_deny_glob(g, base)
     })
 }
 
