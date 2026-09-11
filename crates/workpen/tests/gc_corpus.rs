@@ -500,6 +500,70 @@ fn gitignored_untagged_node_modules_is_reclaimable() {
 }
 
 #[test]
+fn tracked_dirty_under_cache_dir_is_kept() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"target\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore target"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "dirty-target");
+    let target = wt.join("target");
+    fs::create_dir_all(&target).expect("target");
+    let tracked = target.join("tracked.txt");
+    fs::write(&tracked, b"tracked").expect("tracked");
+    git(&wt, &["add", "-f", "target/tracked.txt"]);
+    git(&wt, &["commit", "-m", "force-add tracked under target"]);
+    fs::write(&tracked, b"dirty tracked").expect("modify");
+    let porcelain = git_out(&wt, &["status", "--porcelain=v1", "-uall", "--ignored"]);
+    assert!(
+        porcelain.lines().any(|line| {
+            let xy = line.get(..2).unwrap_or("");
+            xy != "??" && xy != "!!" && porcelain_rel(line).starts_with("target/")
+        }),
+        "fixture porcelain must be tracked dirty under target/, got {porcelain:?}"
+    );
+    match classify_worktree(&wt, false) {
+        GcDecision::Keep {
+            reason: KeepReason::DirtyWork,
+        } => {}
+        other => panic!("tracked dirty under target/ must Keep DirtyWork, got {other:?}"),
+    }
+    let now = SystemTime::now() + Duration::from_secs(10);
+    match classify_for_age_gc(&wt, false, Duration::from_secs(0), now) {
+        GcDecision::Keep {
+            reason: KeepReason::DirtyWork,
+        } => {}
+        other => {
+            panic!("old leftover with dirty tracked target/ must Keep DirtyWork, got {other:?}")
+        }
+    }
+    let rows = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now)).expect("gc");
+    let row = rows
+        .iter()
+        .find(|(p, _)| p.file_name() == wt.file_name())
+        .expect("dirty-target row");
+    match &row.1 {
+        GcDecision::Keep {
+            reason: KeepReason::DirtyWork,
+        } => {}
+        other => panic!("run_gc must keep leftover with dirty tracked target/, got {other:?}"),
+    }
+    assert!(
+        wt.exists(),
+        "worktree with dirty tracked file under target/ must stay"
+    );
+    assert_eq!(fs::read(&tracked).expect("read"), b"dirty tracked");
+}
+
+fn porcelain_rel(line: &str) -> &str {
+    let rest = line.get(3..).unwrap_or(line).trim();
+    rest.split_once(" -> ")
+        .map(|(_, dest)| dest)
+        .unwrap_or(rest)
+}
+
+#[test]
 fn unique_dangling_commit_is_saved_under_prefix() {
     let fx = init_repo();
     let repo = fx.repo.clone();

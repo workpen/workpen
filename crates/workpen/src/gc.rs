@@ -566,6 +566,7 @@ fn is_under_known_cache(root: &Path, file: &Path) -> bool {
 
 /// Unique-work is `git status --porcelain=v1 -uall --ignored`. Git CLI, not gix.
 /// Porcelain `??` / `!!` under a first-component cache dir name is not unique work.
+/// Other XY statuses under those names are DirtyWork (tracked dirty cache paths).
 fn unique_work_reason(path: &Path) -> Option<KeepReason> {
     let out = match git(
         path,
@@ -587,10 +588,10 @@ fn unique_work_reason(path: &Path) -> Option<KeepReason> {
             continue;
         }
         let rel = porcelain_path(line);
-        if is_under_known_cache(path, &path.join(&rel)) {
-            continue;
-        }
         if line.starts_with("??") || line.starts_with("!!") {
+            if is_under_known_cache(path, &path.join(&rel)) {
+                continue;
+            }
             has_unique = true;
         } else {
             return Some(KeepReason::DirtyWork);
