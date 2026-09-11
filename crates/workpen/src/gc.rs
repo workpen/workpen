@@ -435,7 +435,7 @@ fn other_process_cwds() -> Result<Vec<PathBuf>, ()> {
     }
     #[cfg(unix)]
     {
-        return lsof_process_cwds();
+        lsof_process_cwds()
     }
     #[cfg(not(unix))]
     {
