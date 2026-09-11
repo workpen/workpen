@@ -113,14 +113,13 @@ pub fn classify_dest(path: &Path, policy: &DenyPolicy) -> Option<DestDenyKind> {
         return Some(DestDenyKind::DenyGlob);
     }
 
-    let canon = match std::fs::canonicalize(path) {
-        Ok(p) => p,
-        Err(_) => return None,
-    };
-    if path_is_denied_glob(policy.globs(), &path_as_glob(&canon)) {
+    let canon = std::fs::canonicalize(path).ok();
+    if let Some(canon) = &canon
+        && path_is_denied_glob(policy.globs(), &path_as_glob(canon))
+    {
         return Some(DestDenyKind::DenyGlob);
     }
-    if hardlink_sibling_denied(&canon, policy) {
+    if hardlink_sibling_denied(path, canon.as_deref(), policy) {
         return Some(DestDenyKind::HardlinkSibling);
     }
     None
@@ -222,8 +221,8 @@ fn verify_post_open_unix(path: &Path, fd: &File, policy: &DenyPolicy) -> Result<
         });
     }
     if fd_meta.nlink() > 1 {
-        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if hardlink_sibling_denied(&canon, policy) {
+        let canon = std::fs::canonicalize(path).ok();
+        if hardlink_sibling_denied(path, canon.as_deref(), policy) {
             return Err(DestDenyError::LateHardlink {
                 path: path.display().to_string(),
             });
@@ -250,8 +249,8 @@ fn verify_post_open_windows(
         });
     }
     if fd_info.nlink > 1 {
-        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if hardlink_sibling_denied(&canon, policy) {
+        let canon = std::fs::canonicalize(path).ok();
+        if hardlink_sibling_denied(path, canon.as_deref(), policy) {
             return Err(DestDenyError::LateHardlink {
                 path: path.display().to_string(),
             });
@@ -371,27 +370,30 @@ fn match_star(pat: &[u8], text: &[u8]) -> bool {
     }
 }
 
-fn hardlink_sibling_denied(canon: &Path, policy: &DenyPolicy) -> bool {
+fn hardlink_sibling_denied(path: &Path, canon: Option<&Path>, policy: &DenyPolicy) -> bool {
     #[cfg(unix)]
     {
-        hardlink_sibling_denied_unix(canon, policy)
+        hardlink_sibling_denied_unix(path, canon, policy)
     }
     #[cfg(windows)]
     {
-        hardlink_sibling_denied_windows(canon, policy)
+        hardlink_sibling_denied_windows(path, canon, policy)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (canon, policy);
+        let _ = (path, canon, policy);
         false
     }
 }
 
 #[cfg(unix)]
-fn hardlink_sibling_denied_unix(canon: &Path, policy: &DenyPolicy) -> bool {
+fn hardlink_sibling_denied_unix(path: &Path, canon: Option<&Path>, policy: &DenyPolicy) -> bool {
     use std::os::unix::fs::MetadataExt;
 
-    let meta = match std::fs::metadata(canon) {
+    let meta = match canon
+        .map(std::fs::metadata)
+        .unwrap_or_else(|| std::fs::symlink_metadata(path))
+    {
         Ok(m) => m,
         Err(_) => return false,
     };
@@ -403,43 +405,64 @@ fn hardlink_sibling_denied_unix(canon: &Path, policy: &DenyPolicy) -> bool {
     if nlink <= 1 {
         return false;
     }
-    let parent = match canon.parent() {
-        Some(p) => p,
-        None => return true,
-    };
-    let entries = match std::fs::read_dir(parent) {
-        Ok(rd) => rd,
-        Err(_) => return true,
-    };
-    let mut same = 0u64;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let sibling_meta = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
+    let mut parents = Vec::new();
+    push_scan_parent(&mut parents, path.parent());
+    if let Some(c) = canon {
+        push_scan_parent(&mut parents, c.parent());
+    }
+    if parents.is_empty() {
+        return true;
+    }
+    let mut found = 0u64;
+    for parent in &parents {
+        let entries = match std::fs::read_dir(parent) {
+            Ok(rd) => rd,
+            Err(_) => return true,
         };
-        if sibling_meta.dev() != meta.dev() || sibling_meta.ino() != meta.ino() {
-            continue;
-        }
-        same += 1;
-        if path_is_denied_glob(policy.globs(), &path_as_glob(&path)) {
-            return true;
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            let sibling_meta = match std::fs::symlink_metadata(&entry_path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if sibling_meta.dev() != meta.dev() || sibling_meta.ino() != meta.ino() {
+                continue;
+            }
+            if path_is_denied_glob(policy.globs(), &path_as_glob(&entry_path)) {
+                return true;
+            }
+            found += 1;
         }
     }
-    same < nlink
+    found < nlink
+}
+
+#[cfg(unix)]
+fn push_scan_parent(parents: &mut Vec<PathBuf>, parent: Option<&Path>) {
+    let parent = match parent {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        Some(_) => PathBuf::from("."),
+        None => return,
+    };
+    let key = std::fs::canonicalize(&parent).unwrap_or(parent);
+    if !parents.iter().any(|p| p == &key) {
+        parents.push(key);
+    }
 }
 
 /// `MetadataExt::file_index` is unstable (`windows_by_handle`). List names
 /// with FindFirstFileNameW instead.
 #[cfg(windows)]
-fn hardlink_sibling_denied_windows(canon: &Path, policy: &DenyPolicy) -> bool {
-    if std::fs::metadata(canon)
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
-    {
+fn hardlink_sibling_denied_windows(path: &Path, canon: Option<&Path>, policy: &DenyPolicy) -> bool {
+    let probe = canon.unwrap_or(path);
+    let meta = match std::fs::metadata(probe) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if meta.is_dir() {
         return false;
     }
-    match win_hardlink_names(canon) {
+    match win_hardlink_names(probe) {
         Ok(names) if names.len() <= 1 => false,
         Ok(names) => names.iter().any(|n| {
             let s = n.to_string_lossy().replace('\\', "/");
@@ -816,4 +839,29 @@ pub fn default_secret_denies() -> Vec<String> {
         "**/auth.json".into(),
         "**/auth-*.json".into(),
     ]
+}
+
+#[cfg(test)]
+mod classify_hardlink_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn hardlink_denied_when_canon_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env = dir.path().join(".env");
+        std::fs::write(&env, "API_KEY=secret\n").expect("write .env");
+        let sibling = dir.path().join("notes.txt");
+        std::fs::hard_link(&env, &sibling).expect("hardlink");
+        let policy = DenyPolicy::default();
+        assert!(
+            hardlink_sibling_denied(&sibling, None, &policy),
+            "nlink > 1 must dest-deny when canonicalize is unavailable"
+        );
+        assert!(!hardlink_sibling_denied(
+            Path::new("no-such-workpen-hardlink-xyz"),
+            None,
+            &policy
+        ));
+    }
 }
