@@ -850,3 +850,82 @@ fn git_ignores_process_git_dir() {
     }
     used.expect("process GIT_DIR must not hide last-used");
 }
+
+#[cfg(unix)]
+fn with_git_wrapper<T>(script: &str, f: impl FnOnce() -> T) -> T {
+    use std::os::unix::fs::PermissionsExt;
+    let real = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("which git");
+    assert!(real.status.success(), "need git on PATH");
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_owned();
+    let wrap_dir = tempfile::TempDir::new().expect("wrap");
+    let wrap = wrap_dir.path().join("git");
+    fs::write(&wrap, script.replace("__GIT__", &real)).expect("wrapper");
+    fs::set_permissions(&wrap, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let old = std::env::var_os("PATH");
+    let mut path = wrap_dir.path().display().to_string();
+    path.push(':');
+    path.push_str(&std::env::var("PATH").unwrap_or_default());
+    // Safety: serialized by CWD_LOCK; restored below.
+    unsafe { std::env::set_var("PATH", &path) };
+    let got = f();
+    match old {
+        Some(v) => unsafe { std::env::set_var("PATH", v) },
+        None => unsafe { std::env::remove_var("PATH") },
+    }
+    got
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_explicit_reflog_failure_keeps_tree() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "reflog-fail");
+    let got = with_git_wrapper(
+        "#!/bin/sh\ncase \" $* \" in\n*\" reflog \"*) echo reflog failed >&2; exit 1 ;;\nesac\nexec __GIT__ \"$@\"\n",
+        || remove_explicit(&wt, "refs/workpen/reclaimed", false),
+    );
+    match got {
+        Ok(GcDecision::Keep {
+            reason: KeepReason::StatusUnreadable,
+        }) => {}
+        other => panic!("reflog failure must keep StatusUnreadable, got {other:?}"),
+    }
+    assert!(wt.exists(), "must not delete when unique-commit save fails");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_gc_reflog_failure_keeps_and_continues() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let leftover = repo.join(".workpen-worktrees");
+    let fail = add_leftover_worktree(&repo, &leftover, "reflog-fail");
+    let ok = add_leftover_worktree(&repo, &leftover, "reflog-ok");
+    let now = SystemTime::now() + Duration::from_secs(10);
+    let cfg = cfg(&repo, Duration::from_secs(0), now);
+    let got = with_git_wrapper(
+        "#!/bin/sh\ncase \" $* \" in\n*\" reflog \"*)\n  case \"$PWD/\" in\n  */reflog-fail/*|*/reflog-fail/) echo reflog failed >&2; exit 1 ;;\n  esac\n  ;;\nesac\nexec __GIT__ \"$@\"\n",
+        || run_gc(&repo, &cfg),
+    );
+    let rows = got.expect("age-gc continues after save miss");
+    let fail_row = rows
+        .iter()
+        .find(|(p, _)| p.file_name() == fail.file_name())
+        .expect("reflog-fail row");
+    assert_eq!(keep_reason(&fail_row.1), KeepReason::StatusUnreadable);
+    assert!(fail.exists(), "save miss must not delete reflog-fail");
+    let ok_row = rows
+        .iter()
+        .find(|(p, _)| p.file_name() == ok.file_name())
+        .expect("reflog-ok row");
+    match &ok_row.1 {
+        GcDecision::Reclaim { .. } => {}
+        other => panic!("sibling must still reclaim, got {other:?}"),
+    }
+    assert!(!ok.exists(), "other trees must still reclaim");
+}

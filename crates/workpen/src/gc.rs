@@ -160,7 +160,14 @@ pub fn remove_explicit(
     match classify_worktree(path, false) {
         keep @ GcDecision::Keep { .. } => Ok(keep),
         GcDecision::Reclaim { .. } => {
-            let saved = save_unique_commits(path, saved_ref_prefix);
+            let saved = match save_unique_commits(path, saved_ref_prefix) {
+                Ok(saved) => saved,
+                Err(_) => {
+                    return Ok(GcDecision::Keep {
+                        reason: KeepReason::StatusUnreadable,
+                    });
+                }
+            };
             if entry.is_some() {
                 remove_worktree(&repo, path, locked && force)?;
             } else {
@@ -240,9 +247,17 @@ pub fn run_gc(cwd: &Path, cfg: &GcConfig) -> Result<Vec<(PathBuf, GcDecision)>, 
         if let GcDecision::Reclaim { .. } = &decision
             && !cfg.dry_run
         {
-            let saved = save_unique_commits(&wt.path, &cfg.saved_ref_prefix);
-            remove_worktree(cwd, &wt.path, false)?;
-            decision = GcDecision::Reclaim { saved_refs: saved };
+            match save_unique_commits(&wt.path, &cfg.saved_ref_prefix) {
+                Ok(saved) => {
+                    remove_worktree(cwd, &wt.path, false)?;
+                    decision = GcDecision::Reclaim { saved_refs: saved };
+                }
+                Err(_) => {
+                    decision = GcDecision::Keep {
+                        reason: KeepReason::StatusUnreadable,
+                    };
+                }
+            }
         }
         rows.push((wt.path.clone(), decision));
     }
@@ -255,7 +270,13 @@ pub fn run_gc(cwd: &Path, cfg: &GcConfig) -> Result<Vec<(PathBuf, GcDecision)>, 
         ));
     }
     if !cfg.dry_run {
-        let _ = git(cwd, &["worktree", "prune"]);
+        git(cwd, &["worktree", "prune"]).map_err(|e| match e {
+            GcError::Git { detail, .. } => GcError::Git {
+                op: "worktree prune".into(),
+                detail,
+            },
+            other => other,
+        })?;
     }
     Ok(rows)
 }
@@ -567,10 +588,14 @@ fn porcelain_path(line: &str) -> PathBuf {
     }
 }
 
-fn save_unique_commits(path: &Path, prefix: &str) -> Vec<String> {
-    let Ok(reflog) = git(path, &["reflog", "--format=%H"]) else {
-        return Vec::new();
-    };
+fn save_unique_commits(path: &Path, prefix: &str) -> Result<Vec<String>, GcError> {
+    let reflog = git(path, &["reflog", "--format=%H"]).map_err(|e| match e {
+        GcError::Git { detail, .. } => GcError::Git {
+            op: "reflog".into(),
+            detail,
+        },
+        other => other,
+    })?;
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -584,20 +609,25 @@ fn save_unique_commits(path: &Path, prefix: &str) -> Vec<String> {
         if sha.len() < 7 || !seen.insert(sha.to_owned()) {
             continue;
         }
-        if !commit_is_dangling(path, sha) {
+        if !commit_is_dangling(path, sha)? {
             continue;
         }
         let refname = format!("{prefix}/{name}/{sha}");
-        if git(path, &["update-ref", &refname, sha]).is_ok() {
-            saved.push(refname);
-        }
+        git(path, &["update-ref", &refname, sha]).map_err(|e| match e {
+            GcError::Git { detail, .. } => GcError::Git {
+                op: "update-ref".into(),
+                detail,
+            },
+            other => other,
+        })?;
+        saved.push(refname);
     }
-    saved
+    Ok(saved)
 }
 
-fn commit_is_dangling(path: &Path, sha: &str) -> bool {
-    let contains = git(path, &["branch", "-a", "--contains", sha]).unwrap_or_default();
-    !contains.lines().any(|l| !l.trim().is_empty())
+fn commit_is_dangling(path: &Path, sha: &str) -> Result<bool, GcError> {
+    let contains = git(path, &["branch", "-a", "--contains", sha])?;
+    Ok(!contains.lines().any(|l| !l.trim().is_empty()))
 }
 
 fn sanitize_ref_component(raw: &str) -> String {
@@ -724,6 +754,15 @@ mod parse_tests {
     #[test]
     fn parse_max_age_rejects_bare_number() {
         assert!(parse_max_age("7").is_err());
+    }
+
+    #[test]
+    fn commit_is_dangling_git_failure_is_not_dangling() {
+        let dir = tempfile::tempdir().expect("tmp");
+        match commit_is_dangling(dir.path(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+            Ok(false) | Err(_) => {}
+            Ok(true) => panic!("git failure must not treat commit as dangling"),
+        }
     }
 
     #[test]
