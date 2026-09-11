@@ -463,6 +463,7 @@ fn linux_process_cwds() -> Result<Vec<PathBuf>, ()> {
     Ok(out)
 }
 
+#[cfg(unix)]
 fn lsof_process_cwds() -> Result<Vec<PathBuf>, ()> {
     let out = Command::new("lsof")
         .args(["-a", "-d", "cwd", "-Fn"])
