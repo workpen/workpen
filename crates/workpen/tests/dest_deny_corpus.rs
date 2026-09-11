@@ -296,7 +296,8 @@ fn deny_patch_dests_secret_denied_clean_allowed() {
 fn check_dest_raw_env_is_dest_deny_before_guard() {
     let policy = DenyPolicy::default();
     let dir = tempfile::tempdir().expect("tempdir");
-    let guard = PathGuard::new(dir.path()).expect("guard");
+    let guard =
+        PathGuard::new(dir.path(), workpen::AbsolutePathPolicy::AllowIfContained).expect("guard");
     let err = check_dest(".env", &policy, Some(&guard)).expect_err("raw .env");
     match err {
         CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
@@ -341,7 +342,8 @@ fn check_dest_guard_escape_is_path_guard() {
     let outside = tempfile::tempdir().expect("outside");
     let file = outside.path().join("notes.txt");
     std::fs::write(&file, "ok\n").expect("write");
-    let guard = PathGuard::new(dir.path()).expect("guard");
+    let guard =
+        PathGuard::new(dir.path(), workpen::AbsolutePathPolicy::AllowIfContained).expect("guard");
     let policy = DenyPolicy::default();
     let err =
         check_dest(&file.to_string_lossy(), &policy, Some(&guard)).expect_err("outside workspace");
@@ -359,7 +361,8 @@ fn check_dest_resolved_symlink_to_env_is_dest_deny() {
     std::fs::write(&env, "SECRET=1\n").expect("write .env");
     let alias = dir.path().join("config");
     std::os::unix::fs::symlink(&env, &alias).expect("symlink");
-    let guard = PathGuard::new(dir.path()).expect("guard");
+    let guard =
+        PathGuard::new(dir.path(), workpen::AbsolutePathPolicy::AllowIfContained).expect("guard");
     let policy = DenyPolicy::default();
     let err =
         check_dest(&alias.to_string_lossy(), &policy, Some(&guard)).expect_err("symlink to .env");

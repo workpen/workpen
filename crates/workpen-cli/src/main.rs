@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use workpen::{
     DenyPolicy, GcConfig, GcDecision, PathGuard, explain, parse_max_age,
-    reject_command_secret_path_tokens, run_gc,
+    reject_command_secret_path_tokens, resolve_extra_root, run_gc,
 };
 
 fn main() -> ExitCode {
@@ -38,6 +38,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
 
 fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
+    let extras = resolve_extras(&root, &extras)?;
     let path = rest
         .first()
         .ok_or_else(|| "usage: workpen why [--root DIR] [--extra-root DIR] PATH".to_string())?;
@@ -53,6 +54,7 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
 
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
+    let extras = resolve_extras(&root, &extras)?;
     let cmd = if rest.first().map(String::as_str) == Some("--") {
         &rest[1..]
     } else {
@@ -137,6 +139,13 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn resolve_extras(root: &Path, extras: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    extras
+        .iter()
+        .map(|extra| resolve_extra_root(root, &extra.to_string_lossy()).map_err(|e| e.to_string()))
+        .collect()
 }
 
 fn parse_roots(args: &[String]) -> Result<(PathBuf, Vec<PathBuf>, Vec<String>), String> {

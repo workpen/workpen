@@ -16,6 +16,7 @@ gc = []
 nono = ["dep:nono"]
 
 [dependencies]
+dunce = "1"
 thiserror = "2"
 
 [target.'cfg(unix)'.dependencies]

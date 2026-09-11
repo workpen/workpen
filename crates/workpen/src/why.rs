@@ -33,7 +33,12 @@ pub fn explain(path: &Path, policy: &DenyPolicy, guard: Option<&PathGuard>) -> W
     if let Some(guard) = guard {
         match guard.check(path) {
             Err(PathGuardError::Denied(deny)) => return Why::PathGuard(deny),
-            Err(PathGuardError::Root(_)) => {
+            Err(
+                PathGuardError::Root(_)
+                | PathGuardError::EmptyPath
+                | PathGuardError::AbsolutePath(_)
+                | PathGuardError::Canonicalize { .. },
+            ) => {
                 return Why::PathGuard(PathGuardDeny {
                     kind: crate::PathGuardKind::Escape,
                     path: path.to_path_buf(),
