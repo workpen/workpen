@@ -28,6 +28,17 @@ impl DenyPolicy {
         }
     }
 
+    /// Intern a host-held glob list. Does not copy the strings.
+    /// There is still no process-wide deny slot.
+    pub fn from_arc(globs: Arc<Vec<String>>) -> Self {
+        Self { globs }
+    }
+
+    /// Same allocation as [`DenyPolicy::from_arc`] / clone.
+    pub fn globs_arc(&self) -> Arc<Vec<String>> {
+        Arc::clone(&self.globs)
+    }
+
     /// `default_secret_denies()` plus extras. Extras never replace defaults.
     pub fn with_extra(extra: impl IntoIterator<Item = String>) -> Self {
         let mut globs = default_secret_denies();
