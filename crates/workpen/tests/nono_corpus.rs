@@ -1,8 +1,10 @@
 //! Process-jail corpus. Feature `nono`. Never grant filesystem root.
-//! Does not call `KernelPolicy::apply` (irreversible).
+//! Does not call `KernelPolicy::apply` (irreversible). `apply_pre_exec`
+//! is allowed: it only installs a child hook.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use tempfile::TempDir;
 use workpen::{KernelAccess, KernelApply, KernelError, kernel_supported, process_jail};
@@ -159,4 +161,82 @@ fn kernel_supported_matches_unix_backends() {
     assert!(kernel_supported());
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     assert!(!kernel_supported());
+}
+
+#[cfg(unix)]
+#[test]
+fn extra_system_read_dirs_are_granted_when_present() {
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    for candidate in ["/dev", "/etc", "/opt/homebrew", "/usr/local"] {
+        let path = Path::new(candidate);
+        if !path.is_dir() {
+            continue;
+        }
+        if path.parent().is_some() && !path.parent().unwrap().as_os_str().is_empty() {
+            let grant = policy
+                .grants()
+                .iter()
+                .find(|g| g.path == path)
+                .unwrap_or_else(|| panic!("missing presented system Read grant: {candidate}"));
+            assert_eq!(
+                grant.access,
+                KernelAccess::Read,
+                "presented system grant must be Read: {candidate}"
+            );
+        }
+        let Ok(resolved) = fs::canonicalize(path) else {
+            continue;
+        };
+        if resolved.parent().is_none()
+            || resolved.parent().is_some_and(|p| p.as_os_str().is_empty())
+        {
+            continue;
+        }
+        let grant = policy
+            .grants()
+            .iter()
+            .find(|g| g.path == resolved)
+            .unwrap_or_else(|| panic!("missing canonical system Read grant: {candidate}"));
+        assert_eq!(
+            grant.access,
+            KernelAccess::Read,
+            "canonical system grant must be Read: {candidate}"
+        );
+    }
+}
+
+#[test]
+fn apply_pre_exec_does_not_jail_the_parent() {
+    let dir = workspace();
+    let outside = TempDir::new().expect("outside");
+    let marker = outside.path().join("parent-still-free");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("true");
+    let applied = policy.apply_pre_exec(&mut cmd).expect("pre_exec");
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    assert_eq!(applied, KernelApply::Applied);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    assert_eq!(applied, KernelApply::UserspaceOnly);
+    fs::write(&marker, "free").expect("parent must still write outside the workspace");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn apply_pre_exec_child_can_echo() {
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("/bin/echo");
+    cmd.arg("ok");
+    assert_eq!(
+        policy.apply_pre_exec(&mut cmd).expect("pre_exec"),
+        KernelApply::Applied
+    );
+    let out = cmd.output().expect("spawn child");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
 }

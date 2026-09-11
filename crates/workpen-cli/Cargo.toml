@@ -16,3 +16,6 @@ path = "src/main.rs"
 
 [dependencies]
 workpen = { path = "../workpen", features = ["gc", "nono"] }
+
+[dev-dependencies]
+tempfile = "3"

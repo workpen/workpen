@@ -2679,6 +2679,7 @@ dependencies = [
 name = "workpen-cli"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
  "workpen",
 ]
 
