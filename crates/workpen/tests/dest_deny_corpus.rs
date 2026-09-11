@@ -535,6 +535,37 @@ fn missing_path_is_not_a_hardlink_hit() {
     assert!(classify_dest(Path::new("no-such-workpen-hardlink-xyz"), &policy).is_none());
 }
 
+#[cfg(unix)]
+#[test]
+fn hardlink_stat_permission_denied_is_fail_closed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = dir.path().join(".env");
+    std::fs::write(&env, "API_KEY=secret\n").expect("write .env");
+    let sibling = dir.path().join("notes.txt");
+    std::fs::hard_link(&env, &sibling).expect("hardlink");
+    let policy = DenyPolicy::default();
+
+    struct RestoreMode<'a>(&'a Path);
+    impl Drop for RestoreMode<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _restore = RestoreMode(dir.path());
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o000))
+        .expect("chmod 000");
+
+    // Parent mode 000 makes sibling metadata PermissionDenied, not NotFound.
+    match classify_dest(&sibling, &policy) {
+        Some(DestDenyKind::HardlinkSibling) => {}
+        other => panic!(
+            "hardlink stat that is not NotFound must fail closed as HardlinkSibling, got {other:?}"
+        ),
+    }
+}
+
 #[test]
 fn cross_dir_hardlink_of_env_is_denied() {
     let dir = tempfile::tempdir().expect("tempdir");
