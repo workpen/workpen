@@ -312,10 +312,17 @@ pub fn path_matches_deny_glob(pattern: &str, path: &str) -> bool {
 }
 
 pub fn path_is_denied_glob(globs: &[String], path: &str) -> bool {
-    if is_env_template_basename(path) {
-        return false;
-    }
-    globs.iter().any(|g| path_matches_deny_glob(g, path))
+    let template = is_env_template_basename(path);
+    globs.iter().any(|g| {
+        if template && is_default_env_star_glob(g) {
+            return false;
+        }
+        path_matches_deny_glob(g, path)
+    })
+}
+
+fn is_default_env_star_glob(pattern: &str) -> bool {
+    normalize_glob_text(pattern) == "**/.env.*"
 }
 
 fn path_as_glob(path: &Path) -> String {

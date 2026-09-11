@@ -95,6 +95,25 @@ fn env_template_basename_carve_out() {
 }
 
 #[test]
+fn extra_glob_can_dest_deny_env_template() {
+    let policy = DenyPolicy::with_extra(["**/.env.example".into()]);
+    assert!(
+        is_path_denied(Path::new(".env.example"), &policy),
+        "extra glob must dest-deny .env.example"
+    );
+    assert!(
+        is_path_denied(Path::new("proj/.env.example"), &policy),
+        "extra glob must dest-deny nested .env.example"
+    );
+    let defaults = DenyPolicy::default();
+    assert!(!is_path_denied(Path::new(".env.example"), &defaults));
+    assert!(!is_path_denied(Path::new(".env.sample"), &defaults));
+    assert!(!is_path_denied(Path::new(".env.template"), &defaults));
+    assert!(!is_path_denied(Path::new(".ENV.example"), &defaults));
+    assert!(is_path_denied(Path::new(".env.local"), &defaults));
+}
+
+#[test]
 fn is_path_denied_env_ssh_source_and_pairing_names() {
     let policy = DenyPolicy::default();
     assert!(is_path_denied(Path::new(".env"), &policy));
