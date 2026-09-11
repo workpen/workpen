@@ -166,19 +166,48 @@ fn parse_max_age_does_not_peel_quotes() {
     );
 }
 
+struct RestoreHomeEnv {
+    home: Option<std::ffi::OsString>,
+    profile: Option<std::ffi::OsString>,
+}
+
+impl RestoreHomeEnv {
+    fn set_to(path: &Path) -> Self {
+        let home = std::env::var_os("HOME");
+        let profile = std::env::var_os("USERPROFILE");
+        // Safety: serialized by CWD_LOCK (Repo holds it); restored on drop.
+        unsafe {
+            std::env::set_var("HOME", path);
+            std::env::set_var("USERPROFILE", path);
+        }
+        Self { home, profile }
+    }
+}
+
+impl Drop for RestoreHomeEnv {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.profile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+}
+
 #[test]
 fn refuse_home_as_workspace() {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    let Some(home) = home else {
-        return;
-    };
-    let home = PathBuf::from(home);
-    if !home.join(".git").exists() && !home.join(".git").is_file() {
-        return;
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let _restore = RestoreHomeEnv::set_to(&repo);
+    match run_gc(&repo, &GcConfig::new(&repo, Duration::from_secs(1))) {
+        Err(GcError::Home(_)) => {}
+        other => panic!("expected Home, got {other:?}"),
     }
-    let err = run_gc(&home, &GcConfig::new(&home, Duration::from_secs(1)))
-        .expect_err("home is not a gc workspace");
-    assert!(err.to_string().contains("home"));
 }
 
 #[test]
@@ -544,8 +573,8 @@ fn registry_unreadable_is_error() {
         dir.path(),
         &GcConfig::new(dir.path(), Duration::from_secs(1)),
     ) {
-        Err(GcError::RegistryUnreadable(_)) | Err(GcError::Git { .. }) => {}
-        other => panic!("expected registry error, got {other:?}"),
+        Err(GcError::RegistryUnreadable(_)) => {}
+        other => panic!("expected RegistryUnreadable, got {other:?}"),
     }
 }
 
