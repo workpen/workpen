@@ -237,6 +237,30 @@ fn argv_cat_env_and_plain_echo() {
 }
 
 #[test]
+fn argv_denies_hardlink_and_symlink_tokens() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = dir.path().join(".env");
+    std::fs::write(&env, "API_KEY=secret\n").expect("write .env");
+    let sibling = dir.path().join("notes.txt");
+    std::fs::hard_link(&env, &sibling).expect("hardlink");
+    let policy = DenyPolicy::default();
+    let cmd = format!("cat {}", sibling.display());
+    reject_command_secret_path_tokens(&cmd, &policy)
+        .expect_err("argv must dest-deny hardlink sibling token");
+    #[cfg(unix)]
+    {
+        let alias = dir.path().join("config");
+        std::os::unix::fs::symlink(&env, &alias).expect("symlink");
+        let cmd = format!("cat {}", alias.display());
+        reject_command_secret_path_tokens(&cmd, &policy)
+            .expect_err("argv must dest-deny symlink token to .env");
+    }
+    reject_command_secret_path_tokens("ls -la", &policy).expect("flags still pass");
+    reject_command_secret_path_tokens("echo hello", &policy).expect("plain words still pass");
+    reject_command_secret_path_tokens("cat .env.example", &policy).expect("template still allowed");
+}
+
+#[test]
 fn argv_shell_meta_bash_c_interpreter_function_call_and_git_colon() {
     let policy = DenyPolicy::default();
     reject_command_secret_path_tokens("cat .env;", &policy).expect_err("trailing semicolon");

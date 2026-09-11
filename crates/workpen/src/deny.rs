@@ -688,14 +688,12 @@ fn candidate_is_denied(candidate: &str, policy: &DenyPolicy) -> bool {
     if peeled.is_empty() || peeled.starts_with('-') {
         return false;
     }
-    if path_is_denied_glob(policy.globs(), peeled) {
+    if is_path_denied(Path::new(peeled), policy) {
         return true;
     }
     if let Some((_, after)) = peeled.rsplit_once(':') {
         let after = peel_shell_meta(after);
-        if !after.is_empty()
-            && !after.starts_with('-')
-            && path_is_denied_glob(policy.globs(), after)
+        if !after.is_empty() && !after.starts_with('-') && is_path_denied(Path::new(after), policy)
         {
             return true;
         }
