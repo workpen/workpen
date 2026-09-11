@@ -34,7 +34,10 @@ pub use gc::{
     GcConfig, GcDecision, GcError, KeepReason, classify_for_age_gc, classify_worktree,
     parse_max_age, run_gc,
 };
-pub use guard::{PathGuard, PathGuardDeny, PathGuardError, PathGuardKind, check_dests};
+pub use guard::{
+    AbsolutePathPolicy, ExtraRootError, PathGuard, PathGuardBuilder, PathGuardDeny, PathGuardError,
+    PathGuardKind, check_dests, resolve_extra_root,
+};
 pub use why::{Why, explain};
 #[cfg(feature = "nono")]
 pub use wrap::{

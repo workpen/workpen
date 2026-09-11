@@ -1,12 +1,26 @@
 //! Workspace PathGuard. Separate from dest-deny. Does not classify secrets.
 
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
-/// Allowed roots. Workspace plus optional extra roots.
+/// Policy for absolute dests. Extra roots apply to absolute inputs only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbsolutePathPolicy {
+    /// Reject every absolute path (builder default).
+    Reject,
+    /// Allow absolute paths that stay inside the primary workspace.
+    AllowIfContained,
+    /// Allow absolute paths inside the workspace or these extra roots.
+    AllowAdditionalRoots(Vec<PathBuf>),
+}
+
+/// Allowed roots plus an absolute-path policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathGuard {
+    root: PathBuf,
     workspace: PathBuf,
     roots: Vec<PathBuf>,
+    policy: AbsolutePathPolicy,
 }
 
 /// Why PathGuard rejected a path. Hosts branch on this; do not parse messages.
@@ -49,33 +63,98 @@ impl std::fmt::Display for PathGuardDeny {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PathGuardError {
+    #[error("path must not be empty")]
+    EmptyPath,
+    #[error("absolute paths are not allowed: {0}")]
+    AbsolutePath(String),
     #[error("{0}")]
     Denied(PathGuardDeny),
     #[error("path guard root is not usable: {0}")]
     Root(String),
+    #[error("failed to canonicalize path: {path}: {source}")]
+    Canonicalize {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Extra-root resolution. Separate from PathGuardError so hosts can match variants.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExtraRootError {
+    #[error("extra write dir must not be empty")]
+    Empty,
+    #[error("extra write dir does not exist: {path}")]
+    Missing { path: String },
+    #[error("extra write dir is not a directory: {path}")]
+    NotDirectory { path: String },
+    #[error("failed to canonicalize extra write dir {path}: {detail}")]
+    Canonicalize { path: String, detail: String },
+    #[error(
+        "extra write dir {requested} escaped after canonicalize to {resolved} (not an explicit extra)"
+    )]
+    EscapedToRoot { requested: String, resolved: String },
+}
+
+/// Builder default policy is [`AbsolutePathPolicy::Reject`].
+pub struct PathGuardBuilder {
+    root: PathBuf,
+    policy: AbsolutePathPolicy,
 }
 
 impl PathGuard {
-    pub fn new(workspace: impl AsRef<Path>) -> Result<Self, PathGuardError> {
-        Self::with_extra_roots(workspace, std::iter::empty::<PathBuf>())
+    pub fn new(
+        workspace: impl AsRef<Path>,
+        policy: AbsolutePathPolicy,
+    ) -> Result<Self, PathGuardError> {
+        let root = workspace.as_ref().to_path_buf();
+        let workspace = canonicalize_root(&root)?;
+        let extra = match &policy {
+            AbsolutePathPolicy::AllowAdditionalRoots(extra) => extra.as_slice(),
+            AbsolutePathPolicy::Reject | AbsolutePathPolicy::AllowIfContained => &[],
+        };
+        let mut roots = vec![workspace.clone()];
+        for extra in extra {
+            let extra = canonicalize_root(extra)?;
+            if !roots.iter().any(|r| r == &extra) {
+                roots.push(extra);
+            }
+        }
+        Ok(Self {
+            root,
+            workspace,
+            roots,
+            policy,
+        })
+    }
+
+    pub fn builder(root: impl Into<PathBuf>) -> PathGuardBuilder {
+        PathGuardBuilder {
+            root: root.into(),
+            policy: AbsolutePathPolicy::Reject,
+        }
     }
 
     pub fn with_extra_roots(
         workspace: impl AsRef<Path>,
         extra: impl IntoIterator<Item = impl AsRef<Path>>,
     ) -> Result<Self, PathGuardError> {
-        let workspace = canonicalize_root(workspace.as_ref())?;
-        let mut roots = vec![workspace.clone()];
-        for extra in extra {
-            let root = canonicalize_root(extra.as_ref())?;
-            if !roots.iter().any(|r| r == &root) {
-                roots.push(root);
-            }
-        }
-        Ok(Self { workspace, roots })
+        let extra = extra
+            .into_iter()
+            .map(|p| p.as_ref().to_path_buf())
+            .collect::<Vec<_>>();
+        Self::new(workspace, AbsolutePathPolicy::AllowAdditionalRoots(extra))
     }
 
     pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn canon_root(&self) -> &Path {
         &self.workspace
     }
 
@@ -88,23 +167,106 @@ impl PathGuard {
         match self.check(path) {
             Ok(_) => None,
             Err(PathGuardError::Denied(d)) => Some(d.kind),
-            Err(PathGuardError::Root(_)) => Some(PathGuardKind::Escape),
+            Err(_) => Some(PathGuardKind::Escape),
         }
     }
 
     pub fn check(&self, path: &Path) -> Result<PathBuf, PathGuardError> {
-        let start = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.workspace.join(path)
-        };
-        walk_guarded(&start, &self.roots).map_err(|kind| {
-            PathGuardError::Denied(PathGuardDeny {
-                kind,
-                path: path.to_path_buf(),
-                display: path.display().to_string(),
-            })
+        self.check_path(&path.to_string_lossy())
+    }
+
+    /// Content ops. Follows the final component.
+    pub fn check_path(&self, path: &str) -> Result<PathBuf, PathGuardError> {
+        self.check_inner(path, Follow::Final)
+    }
+
+    /// Unlink / rename. Follows the parent only; appends the leaf.
+    pub fn check_path_entry(&self, path: &str) -> Result<PathBuf, PathGuardError> {
+        self.check_inner(path, Follow::Parent)
+    }
+
+    fn check_inner(&self, path: &str, follow: Follow) -> Result<PathBuf, PathGuardError> {
+        if is_blank_path(path) {
+            return Err(PathGuardError::EmptyPath);
+        }
+        let raw = Path::new(path);
+        if raw.is_absolute() {
+            let roots = self.absolute_roots(path)?;
+            return self.resolve(path, raw, &roots, follow);
+        }
+        if relative_escapes_primary(raw) {
+            return Err(self.denied(path, PathGuardKind::Escape));
+        }
+        let joined = self.workspace.join(raw);
+        self.resolve(path, &joined, std::slice::from_ref(&self.workspace), follow)
+    }
+
+    fn absolute_roots(&self, path: &str) -> Result<Vec<PathBuf>, PathGuardError> {
+        match &self.policy {
+            AbsolutePathPolicy::Reject => Err(PathGuardError::AbsolutePath(path.to_owned())),
+            AbsolutePathPolicy::AllowIfContained => Ok(vec![self.workspace.clone()]),
+            AbsolutePathPolicy::AllowAdditionalRoots(_) => Ok(self.roots.clone()),
+        }
+    }
+
+    fn resolve(
+        &self,
+        display: &str,
+        start: &Path,
+        roots: &[PathBuf],
+        follow: Follow,
+    ) -> Result<PathBuf, PathGuardError> {
+        match follow {
+            Follow::Final => walk_guarded(start, roots).map_err(|kind| self.denied(display, kind)),
+            Follow::Parent => {
+                let leaf = start.file_name().map(PathBuf::from);
+                let parent = start.parent().unwrap_or(Path::new("."));
+                let parent = if parent.as_os_str().is_empty() {
+                    self.workspace.clone()
+                } else {
+                    walk_guarded(parent, roots).map_err(|kind| self.denied(display, kind))?
+                };
+                Ok(match leaf {
+                    Some(name) => parent.join(name),
+                    None => parent,
+                })
+            }
+        }
+    }
+
+    fn denied(&self, display: &str, kind: PathGuardKind) -> PathGuardError {
+        PathGuardError::Denied(PathGuardDeny {
+            kind,
+            path: PathBuf::from(display),
+            display: display.to_owned(),
         })
+    }
+}
+
+impl PathGuardBuilder {
+    pub fn allow_root(mut self, extra: impl Into<PathBuf>) -> Self {
+        let extra = extra.into();
+        self.policy = match self.policy {
+            AbsolutePathPolicy::AllowAdditionalRoots(mut roots) => {
+                if !roots.iter().any(|r| r == &extra) {
+                    roots.push(extra);
+                }
+                AbsolutePathPolicy::AllowAdditionalRoots(roots)
+            }
+            AbsolutePathPolicy::Reject | AbsolutePathPolicy::AllowIfContained => {
+                AbsolutePathPolicy::AllowAdditionalRoots(vec![extra])
+            }
+        };
+        self
+    }
+
+    pub fn absolute_policy(mut self, policy: AbsolutePathPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub fn build(self) -> Result<PathGuard, PathGuardError> {
+        PathGuard::new(self.root, self.policy)
     }
 }
 
@@ -116,14 +278,85 @@ pub fn check_dests(guard: &PathGuard, dests: &[impl AsRef<Path>]) -> Result<(), 
     Ok(())
 }
 
+/// Resolve one extra write dir against `cwd`. Fail closed on missing,
+/// not-a-dir, canonicalize failure, or implicit escape to `/` or host temp
+/// unless the caller named that root explicitly.
+pub fn resolve_extra_root(cwd: &Path, extra: &str) -> Result<PathBuf, ExtraRootError> {
+    let extra = extra.trim();
+    if extra.is_empty() {
+        return Err(ExtraRootError::Empty);
+    }
+    let raw = PathBuf::from(extra);
+    let abs = if raw.is_absolute() {
+        raw
+    } else {
+        cwd.join(raw)
+    };
+    if !abs.exists() {
+        return Err(ExtraRootError::Missing {
+            path: abs.display().to_string(),
+        });
+    }
+    if !abs.is_dir() {
+        return Err(ExtraRootError::NotDirectory {
+            path: abs.display().to_string(),
+        });
+    }
+    let canon = dunce::canonicalize(&abs).map_err(|e| ExtraRootError::Canonicalize {
+        path: abs.display().to_string(),
+        detail: e.to_string(),
+    })?;
+    if is_filesystem_root(&canon) && !requested_is_explicit_root(extra) {
+        return Err(ExtraRootError::EscapedToRoot {
+            requested: extra.to_owned(),
+            resolved: canon.display().to_string(),
+        });
+    }
+    if is_host_temp_root(&canon) && !requested_is_explicit_temp(extra) {
+        return Err(ExtraRootError::EscapedToRoot {
+            requested: extra.to_owned(),
+            resolved: canon.display().to_string(),
+        });
+    }
+    Ok(canon)
+}
+
+#[derive(Clone, Copy)]
+enum Follow {
+    Final,
+    Parent,
+}
+
+fn is_blank_path(s: &str) -> bool {
+    s.chars().all(|c| {
+        c.is_whitespace() || matches!(c, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}')
+    })
+}
+
+fn relative_escapes_primary(path: &Path) -> bool {
+    let mut depth: i32 = 0;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir => {
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+        }
+    }
+    false
+}
+
 fn canonicalize_root(path: &Path) -> Result<PathBuf, PathGuardError> {
-    std::fs::canonicalize(path)
-        .map_err(|e| PathGuardError::Root(format!("{} ({e})", path.display())))
+    dunce::canonicalize(path).map_err(|e| PathGuardError::Root(format!("{} ({e})", path.display())))
 }
 
 fn walk_guarded(start: &Path, roots: &[PathBuf]) -> Result<PathBuf, PathGuardKind> {
     let lexical = normalize_lexical(start);
-    if let Ok(canon) = std::fs::canonicalize(&lexical) {
+    if let Ok(canon) = dunce::canonicalize(&lexical) {
         if inside_any_root(&canon, roots) {
             return Ok(canon);
         }
@@ -141,7 +374,7 @@ fn walk_guarded(start: &Path, roots: &[PathBuf]) -> Result<PathBuf, PathGuardKin
             Err(PathGuardKind::Escape)
         };
     }
-    let prefix_canon = std::fs::canonicalize(&prefix).map_err(|_| PathGuardKind::Escape)?;
+    let prefix_canon = dunce::canonicalize(&prefix).map_err(|_| PathGuardKind::Escape)?;
     let rest = lexical.strip_prefix(&prefix).unwrap_or(Path::new(""));
     let resolved = prefix_canon.join(rest);
     if inside_any_root(&resolved, roots) {
@@ -200,4 +433,42 @@ fn inside_any_root(path: &Path, roots: &[PathBuf]) -> bool {
     roots
         .iter()
         .any(|root| path == root || path.starts_with(root))
+}
+
+fn is_filesystem_root(path: &Path) -> bool {
+    path.parent().is_none_or(|p| p.as_os_str().is_empty())
+}
+
+fn requested_is_explicit_root(requested: &str) -> bool {
+    let t = requested.trim();
+    t == "/" || t == "\\" || (t.len() == 3 && t.as_bytes()[1] == b':' && t.ends_with(['\\', '/']))
+}
+
+fn is_host_temp_root(path: &Path) -> bool {
+    if is_well_known_temp_name(path) {
+        return true;
+    }
+    let tmp = std::env::temp_dir();
+    if path == tmp {
+        return true;
+    }
+    dunce::canonicalize(&tmp).is_ok_and(|canon| path == canon)
+}
+
+fn is_well_known_temp_name(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    let s = s.trim_end_matches(['/', '\\']);
+    s.eq_ignore_ascii_case("/tmp")
+        || s.eq_ignore_ascii_case("/private/tmp")
+        || s.eq_ignore_ascii_case("/var/tmp")
+        || s.eq_ignore_ascii_case("/private/var/tmp")
+}
+
+fn requested_is_explicit_temp(requested: &str) -> bool {
+    let t = requested.trim().trim_end_matches(['/', '\\']);
+    if t.is_empty() {
+        return false;
+    }
+    let p = Path::new(t);
+    p.is_absolute() && (is_well_known_temp_name(p) || is_host_temp_root(p))
 }
