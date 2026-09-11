@@ -226,6 +226,40 @@ fn unique_untracked_is_kept() {
 }
 
 #[test]
+fn ignored_env_in_old_worktree_is_kept() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b".env\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore env"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "ignored-env");
+    let env = wt.join(".env");
+    fs::write(&env, b"SECRET=1\n").expect("env");
+    let now = SystemTime::now() + Duration::from_secs(10);
+    match classify_for_age_gc(&wt, false, Duration::from_secs(0), now) {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked | KeepReason::DirtyWork,
+        } => {}
+        other => panic!("gitignored .env must keep the tree, got {other:?}"),
+    }
+    let rows = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now)).expect("gc");
+    let row = rows
+        .iter()
+        .find(|(p, _)| p.file_name() == wt.file_name())
+        .expect("ignored-env row");
+    match &row.1 {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked | KeepReason::DirtyWork,
+        } => {}
+        other => panic!("run_gc must keep leftover with .env, got {other:?}"),
+    }
+    assert!(wt.exists(), "worktree with gitignored .env must stay");
+    assert!(env.exists(), "gitignored .env must not be deleted");
+    assert_eq!(fs::read(&env).expect("read env"), b"SECRET=1\n");
+}
+
+#[test]
 fn live_cwd_is_kept() {
     let fx = init_repo();
     let repo = fx.repo.clone();

@@ -1,6 +1,7 @@
 //! Fail-closed leftover worktree age GC. Feature-gated (`gc`).
 //!
-//! Unique-work is `git status --porcelain`. Last-used is `git log -1
+//! Unique-work is `git status --porcelain=v1 -uall --ignored` (with
+//! `status.showUntrackedFiles=all`). Last-used is `git log -1
 //! --format=%ct`, the index mtime, and a bounded tree walk. Both clocks
 //! are git CLI. There is no `gix` path in v1.
 
@@ -550,9 +551,19 @@ fn is_under_known_cache(root: &Path, file: &Path) -> bool {
     is_known_cache_dir(&root.join(first))
 }
 
-/// Unique-work is `git status --porcelain`. Git CLI, not gix.
+/// Unique-work is `git status --porcelain=v1 -uall --ignored`. Git CLI, not gix.
 fn unique_work_reason(path: &Path) -> Option<KeepReason> {
-    let out = match git(path, &["status", "--porcelain"]) {
+    let out = match git(
+        path,
+        &[
+            "-c",
+            "status.showUntrackedFiles=all",
+            "status",
+            "--porcelain=v1",
+            "-uall",
+            "--ignored",
+        ],
+    ) {
         Ok(s) => s,
         Err(_) => return Some(KeepReason::StatusUnreadable),
     };
@@ -565,7 +576,7 @@ fn unique_work_reason(path: &Path) -> Option<KeepReason> {
         if is_under_known_cache(path, &path.join(&rel)) {
             continue;
         }
-        if line.starts_with("??") {
+        if line.starts_with("??") || line.starts_with("!!") {
             has_unique = true;
         } else {
             return Some(KeepReason::DirtyWork);
