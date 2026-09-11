@@ -396,33 +396,49 @@ fn path_is_same_or_parent(root: &Path, inner: &Path) -> bool {
 }
 
 fn worktree_has_live_cwd(path: &Path) -> bool {
-    if let Ok(cwd) = std::env::current_dir()
-        && path_is_same_or_parent(path, &cwd)
+    let current = std::env::current_dir().ok();
+    let other = other_process_cwds();
+    worktree_has_live_cwd_from(
+        path,
+        current.as_deref(),
+        match &other {
+            Ok(cwds) => Ok(cwds.as_slice()),
+            Err(()) => Err(()),
+        },
+    )
+}
+
+/// Fail-closed: unknown other-process cwds count as live.
+fn worktree_has_live_cwd_from(
+    path: &Path,
+    current: Option<&Path>,
+    other: Result<&[PathBuf], ()>,
+) -> bool {
+    if let Some(cwd) = current
+        && path_is_same_or_parent(path, cwd)
     {
         return true;
     }
-    live_process_cwds()
-        .into_iter()
-        .any(|cwd| path_is_same_or_parent(path, &cwd))
+    match other {
+        Err(()) => true,
+        Ok(cwds) => cwds.iter().any(|cwd| path_is_same_or_parent(path, cwd)),
+    }
 }
 
-fn live_process_cwds() -> Vec<PathBuf> {
-    let mut out = Vec::new();
+/// Other-process cwds. `Err` when every available probe failed.
+fn other_process_cwds() -> Result<Vec<PathBuf>, ()> {
     #[cfg(target_os = "linux")]
     {
-        out.extend(linux_process_cwds());
+        if let Ok(cwds) = linux_process_cwds() {
+            return Ok(cwds);
+        }
     }
-    if out.is_empty() {
-        out.extend(lsof_process_cwds());
-    }
-    out
+    lsof_process_cwds()
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process_cwds() -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
+fn linux_process_cwds() -> Result<Vec<PathBuf>, ()> {
+    let rd = std::fs::read_dir("/proc").map_err(|_| ())?;
     let mut out = Vec::new();
     for entry in rd.flatten() {
         let name = entry.file_name();
@@ -437,25 +453,23 @@ fn linux_process_cwds() -> Vec<PathBuf> {
             out.push(cwd);
         }
     }
-    out
+    Ok(out)
 }
 
-fn lsof_process_cwds() -> Vec<PathBuf> {
-    let Ok(out) = Command::new("lsof")
+fn lsof_process_cwds() -> Result<Vec<PathBuf>, ()> {
+    let out = Command::new("lsof")
         .args(["-a", "-d", "cwd", "-Fn"])
         .output()
-    else {
-        return Vec::new();
-    };
+        .map_err(|_| ())?;
     if !out.status.success() {
-        return Vec::new();
+        return Err(());
     }
-    String::from_utf8_lossy(&out.stdout)
+    Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| line.strip_prefix('n'))
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
-        .collect()
+        .collect())
 }
 
 /// Newest of HEAD committer time (`git log -1 --format=%ct`), index
@@ -774,6 +788,20 @@ mod parse_tests {
             Ok(false) | Err(_) => {}
             Ok(true) => panic!("git failure must not treat commit as dangling"),
         }
+    }
+
+    #[test]
+    fn probe_failure_is_live_when_current_dir_is_elsewhere() {
+        let tree = tempfile::tempdir().expect("tree");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        assert!(
+            worktree_has_live_cwd_from(tree.path(), Some(elsewhere.path()), Err(())),
+            "probe failure must keep the tree"
+        );
+        assert!(
+            !worktree_has_live_cwd_from(tree.path(), Some(elsewhere.path()), Ok(&[])),
+            "successful empty scan is not live"
+        );
     }
 
     #[test]
