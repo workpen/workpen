@@ -132,12 +132,31 @@ fn parse_max_age_rejects_zero_and_bad_unit() {
 #[test]
 fn parse_max_age_does_not_peel_quotes() {
     match parse_max_age("'7d'") {
-        Err(GcError::InvalidDuration(_)) => {}
+        Err(GcError::InvalidDuration(msg)) => {
+            assert!(
+                msg.contains("use s, m, h, d"),
+                "quoted 7d must hint units, got {msg}"
+            );
+        }
         other => panic!("quoted 7d must stay InvalidDuration, got {other:?}"),
     }
     match parse_max_age("\"7d\"") {
-        Err(GcError::InvalidDuration(_)) => {}
+        Err(GcError::InvalidDuration(msg)) => {
+            assert!(
+                msg.contains("use s, m, h, d"),
+                "double-quoted 7d must hint units, got {msg}"
+            );
+        }
         other => panic!("double-quoted 7d must stay InvalidDuration, got {other:?}"),
+    }
+    match parse_max_age("7days") {
+        Err(GcError::InvalidDuration(msg)) => {
+            assert!(
+                msg.contains("use s, m, h, d"),
+                "7days must hint units, got {msg}"
+            );
+        }
+        other => panic!("7days must stay InvalidDuration, got {other:?}"),
     }
     assert_eq!(
         parse_max_age("7d").expect("bare 7d"),

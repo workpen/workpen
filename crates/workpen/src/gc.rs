@@ -92,7 +92,7 @@ pub fn parse_max_age(raw: &str) -> Result<Duration, GcError> {
     let n: u64 = num
         .trim()
         .parse()
-        .map_err(|_| GcError::InvalidDuration(s.to_owned()))?;
+        .map_err(|_| GcError::InvalidDuration(format!("{s} (use s, m, h, d)")))?;
     if n == 0 {
         return Err(GcError::InvalidDuration(format!(
             "duration must be greater than zero: {s}"
