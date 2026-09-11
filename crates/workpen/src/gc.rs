@@ -561,6 +561,43 @@ fn is_age_cache_dir_name(name: &str) -> bool {
 }
 
 /// First path component matches [`CACHE_DIR_NAMES`] by name. No `CACHEDIR.TAG`.
+/// Porcelain often lists only `!! target/`, not `!! target/.env`.
+fn cache_tree_has_denied_name(root: &Path, rel: &Path) -> bool {
+    let policy = DenyPolicy::default();
+    if is_path_denied(rel, &policy) {
+        return true;
+    }
+    let Some(std::path::Component::Normal(name)) = rel.components().next() else {
+        return false;
+    };
+    let start = root.join(name);
+    let mut remaining = LAST_USED_WALK_LIMIT;
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(start);
+    while remaining > 0 {
+        let Some(dir) = queue.pop_front() else {
+            break;
+        };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
+            let p = entry.path();
+            if is_path_denied(&p, &policy) {
+                return true;
+            }
+            if p.is_dir() {
+                queue.push_back(p);
+            }
+        }
+    }
+    false
+}
+
 fn is_under_known_cache(root: &Path, file: &Path) -> bool {
     let Ok(rel) = file.strip_prefix(root) else {
         return false;
@@ -573,8 +610,9 @@ fn is_under_known_cache(root: &Path, file: &Path) -> bool {
 
 /// Unique-work is `git status --porcelain=v1 -uall --ignored`. Git CLI, not gix.
 /// Porcelain `??` / `!!` under a first-component cache dir name is not unique
-/// work unless the relative path dest-denies (e.g. `target/.env`).
-/// Other XY statuses under those names are DirtyWork (tracked dirty cache paths).
+/// work unless a dest-deny name exists in that tree (git often lists only
+/// `!! target/`, not `!! target/.env`). Other XY statuses under those names
+/// are DirtyWork (tracked dirty cache paths).
 fn unique_work_reason(path: &Path) -> Option<KeepReason> {
     let out = match git(
         path,
@@ -597,9 +635,10 @@ fn unique_work_reason(path: &Path) -> Option<KeepReason> {
         }
         let rel = porcelain_path(line);
         if line.starts_with("??") || line.starts_with("!!") {
-            if is_under_known_cache(path, &path.join(&rel))
-                && !is_path_denied(&rel, &DenyPolicy::default())
-            {
+            if is_under_known_cache(path, &path.join(&rel)) {
+                if cache_tree_has_denied_name(path, &rel) {
+                    has_unique = true;
+                }
                 continue;
             }
             has_unique = true;

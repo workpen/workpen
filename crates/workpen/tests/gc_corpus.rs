@@ -582,14 +582,6 @@ fn gitignored_env_under_cache_dir_is_kept() {
         fs::create_dir_all(&dir).expect("cache dir");
         let env = dir.join(".env");
         fs::write(&env, b"SECRET=1\n").expect("env");
-        let porcelain = git_out(&wt, &["status", "--porcelain=v1", "-uall", "--ignored"]);
-        assert!(
-            porcelain.lines().any(|line| {
-                (line.starts_with("??") || line.starts_with("!!"))
-                    && porcelain_rel(line).contains(".env")
-            }),
-            "fixture porcelain must list ignored {cache}/.env, got {porcelain:?}"
-        );
         match classify_worktree(&wt, false) {
             GcDecision::Keep {
                 reason: KeepReason::UniqueUntracked | KeepReason::DirtyWork,
