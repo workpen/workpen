@@ -283,7 +283,6 @@ pub fn run_gc(cwd: &Path, cfg: &GcConfig) -> Result<Vec<(PathBuf, GcDecision)>, 
 }
 
 const CACHE_DIR_NAMES: &[&str] = &["target", "node_modules", ".venv", "dist", "__pycache__"];
-const CACHEDIR_TAG_SIG: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 const LAST_USED_WALK_LIMIT: usize = 4096;
 
 struct Registered {
@@ -461,15 +460,16 @@ fn lsof_process_cwds() -> Result<Vec<PathBuf>, ()> {
         .args(["-a", "-d", "cwd", "-Fn"])
         .output()
         .map_err(|_| ())?;
-    if !out.status.success() {
-        return Err(());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
+    let paths: Vec<PathBuf> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| line.strip_prefix('n'))
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
-        .collect())
+        .collect();
+    if !out.status.success() && paths.is_empty() {
+        return Err(());
+    }
+    Ok(paths)
 }
 
 /// Newest of HEAD committer time (`git log -1 --format=%ct`), index
@@ -544,28 +544,19 @@ fn is_age_cache_dir_name(name: &str) -> bool {
     CACHE_DIR_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
 }
 
-fn is_known_cache_dir(dir: &Path) -> bool {
-    let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    if !CACHE_DIR_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n)) {
-        return false;
-    }
-    let tag = dir.join("CACHEDIR.TAG");
-    std::fs::read_to_string(tag)
-        .map(|s| s.contains(CACHEDIR_TAG_SIG))
-        .unwrap_or(false)
-}
-
+/// First path component matches [`CACHE_DIR_NAMES`] by name. No `CACHEDIR.TAG`.
 fn is_under_known_cache(root: &Path, file: &Path) -> bool {
     let Ok(rel) = file.strip_prefix(root) else {
         return false;
     };
-    let Some(first) = rel.components().next() else {
+    let Some(std::path::Component::Normal(name)) = rel.components().next() else {
         return false;
     };
-    is_known_cache_dir(&root.join(first))
+    is_age_cache_dir_name(&name.to_string_lossy())
 }
 
 /// Unique-work is `git status --porcelain=v1 -uall --ignored`. Git CLI, not gix.
+/// Porcelain `??` / `!!` under a first-component cache dir name is not unique work.
 fn unique_work_reason(path: &Path) -> Option<KeepReason> {
     let out = match git(
         path,

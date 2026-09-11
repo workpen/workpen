@@ -425,6 +425,50 @@ fn cache_only_target_is_reclaimable() {
 }
 
 #[test]
+fn gitignored_untagged_node_modules_is_reclaimable() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"node_modules\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore node_modules"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "untagged-nm");
+    let nm = wt.join("node_modules");
+    fs::create_dir_all(&nm).expect("node_modules");
+    fs::write(nm.join("foo"), b"pkg").expect("foo");
+    assert!(
+        !nm.join("CACHEDIR.TAG").exists(),
+        "fixture must not have CACHEDIR.TAG"
+    );
+    match classify_worktree(&wt, false) {
+        GcDecision::Reclaim { .. } => {}
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => panic!("untagged gitignored node_modules must not keep UniqueUntracked"),
+        other => panic!("expected reclaim untagged node_modules, got {other:?}"),
+    }
+    let now = SystemTime::now() + Duration::from_secs(10);
+    match classify_for_age_gc(&wt, false, Duration::from_secs(0), now) {
+        GcDecision::Reclaim { .. } => {}
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => panic!("old leftover with only untagged node_modules must not keep UniqueUntracked"),
+        other => panic!("expected Reclaim for old untagged node_modules leftover, got {other:?}"),
+    }
+    let rows = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now)).expect("gc");
+    assert!(
+        rows.iter().any(|(p, d)| {
+            p.file_name() == wt.file_name() && matches!(d, GcDecision::Reclaim { .. })
+        }),
+        "old leftover with only untagged node_modules should reclaim: {rows:?}"
+    );
+    assert!(
+        !wt.exists(),
+        "worktree with only untagged node_modules should be gone"
+    );
+}
+
+#[test]
 fn unique_dangling_commit_is_saved_under_prefix() {
     let fx = init_repo();
     let repo = fx.repo.clone();
