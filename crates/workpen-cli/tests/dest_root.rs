@@ -85,6 +85,35 @@ fn run_dest_denies_hardlink_sibling_under_root_before_spawn() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn run_refuses_dev_null_special_file_before_spawn() {
+    let ws = TempDir::new().expect("workspace");
+    let cwd = TempDir::new().expect("other cwd");
+    if !std::path::Path::new("/dev/null").exists() {
+        return;
+    }
+    let out = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "/bin/cat", "/dev/null"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "run cat /dev/null must fail closed, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = combined(&out);
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        lower.contains("special") || lower.contains("device") || lower.contains("refuse"),
+        "run must name the special-file dest deny: {text}"
+    );
+}
+
 #[test]
 fn why_plain_file_under_root_is_allowed() {
     let (ws, cwd) = workspace_with_env_hardlink();

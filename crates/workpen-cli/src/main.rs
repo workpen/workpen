@@ -90,9 +90,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
             continue;
         }
         let dest = dest_under_root(&root, token);
-        if let Err(CheckDestError::DestDeny(e)) =
-            workpen::check_dest(&dest.to_string_lossy(), &policy, None)
-        {
+        if let Err(e) = workpen::check_dest(&dest.to_string_lossy(), &policy, None) {
             return Err(e.to_string());
         }
     }
