@@ -44,6 +44,18 @@ fn unknown_gc_flag_names_max_age() {
         err.contains("--max-age"),
         "stderr must name --max-age: {err}"
     );
+    assert!(
+        err.contains("--dry-run"),
+        "stderr must name --dry-run: {err}"
+    );
+    assert!(
+        err.contains("--leftover"),
+        "stderr must name --leftover: {err}"
+    );
+    assert!(
+        !err.contains("--help"),
+        "unknown gc flag must not advertise --help: {err}"
+    );
 }
 
 #[test]

@@ -134,7 +134,7 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
             }
             other => {
                 return Err(format!(
-                    "unknown gc flag: {other} (use --max-age, --dry-run, --leftover, or --help)"
+                    "unknown gc flag: {other} (use --max-age, --dry-run, or --leftover)"
                 ));
             }
         }
