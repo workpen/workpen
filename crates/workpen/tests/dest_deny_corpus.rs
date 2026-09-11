@@ -433,6 +433,57 @@ fn existing_directory_is_not_a_hardlink_sibling() {
 }
 
 #[test]
+fn missing_path_is_not_a_hardlink_hit() {
+    let policy = DenyPolicy::default();
+    assert!(classify_dest(Path::new("no-such-workpen-hardlink-xyz"), &policy).is_none());
+}
+
+#[test]
+fn cross_dir_hardlink_of_env_is_denied() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = dir.path().join(".env");
+    std::fs::write(&env, "API_KEY=secret\n").expect("write .env");
+    let src = dir.path().join("src");
+    std::fs::create_dir(&src).expect("src");
+    let alias = src.join("config.rs");
+    std::fs::hard_link(&env, &alias).expect("cross-dir hardlink");
+    let policy = DenyPolicy::default();
+    match classify_dest(&alias, &policy) {
+        Some(DestDenyKind::HardlinkSibling) => {}
+        other => panic!("cross-dir hardlink of .env must be HardlinkSibling, got {other:?}"),
+    }
+    let innocent = dir.path().join("readme.md");
+    std::fs::write(&innocent, "ok\n").expect("readme");
+    let copy = dir.path().join("readme-copy.md");
+    std::fs::hard_link(&innocent, &copy).expect("same-dir innocent hardlink");
+    assert!(
+        !is_path_denied(&copy, &policy),
+        "same-dir hardlink of a non-secret file must still be allowed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_post_open_detects_symlink_swap_after_check() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("victim.txt");
+    let outside = dir.path().join("outside-secret.txt");
+    std::fs::write(&path, "safe").expect("victim");
+    std::fs::write(&outside, "leaked").expect("outside");
+    std::fs::remove_file(&path).expect("remove");
+    std::os::unix::fs::symlink(&outside, &path).expect("swap");
+    let fd = std::fs::File::open(&path).expect("open follows symlink");
+    let policy = DenyPolicy::default();
+    let err = verify_post_open(&path, &fd, &policy).expect_err("symlink swap");
+    let msg = err.to_string();
+    assert!(msg.contains("TOCTOU"), "{msg}");
+    assert!(
+        !msg.to_ascii_lowercase().contains("unlink extra names"),
+        "{msg}"
+    );
+}
+
+#[test]
 fn glob_named_directory_is_still_deny_glob() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ssh = dir.path().join(".ssh");
