@@ -1,4 +1,8 @@
-//! Combined dest-deny + PathGuard explanation for `workpen why`.
+//! Combined dest-deny + PathGuard explanation.
+//!
+//! Dest-deny runs on the path as given. Hosts that have a workspace
+//! root should join first, or call [`crate::check_dest`]. The CLI
+//! `why` command uses `check_dest` under `--root`.
 
 use std::path::Path;
 
