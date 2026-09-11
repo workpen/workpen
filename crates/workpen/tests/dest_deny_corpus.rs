@@ -418,3 +418,28 @@ fn verify_post_open_late_hardlink_wording_is_distinct() {
         .to_ascii_lowercase();
     assert!(!pre.contains("unlink extra names"), "{pre}");
 }
+
+#[test]
+fn existing_directory_is_not_a_hardlink_sibling() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("lib")).expect("src/lib");
+    let policy = DenyPolicy::default();
+    assert!(
+        !is_path_denied(&src, &policy),
+        "directory nlink must not dest-deny src/"
+    );
+    assert_eq!(classify_dest(&src, &policy), None);
+}
+
+#[test]
+fn glob_named_directory_is_still_deny_glob() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ssh = dir.path().join(".ssh");
+    std::fs::create_dir_all(ssh.join("config.d")).expect(".ssh");
+    let policy = DenyPolicy::default();
+    match classify_dest(&ssh, &policy) {
+        Some(DestDenyKind::DenyGlob) => {}
+        other => panic!("basename glob must still dest-deny .ssh/, got {other:?}"),
+    }
+}
