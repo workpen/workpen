@@ -22,13 +22,69 @@ jobs:
       # release-please opens the version PR and later tags
       contents: write
       pull-requests: write
+    outputs:
+      pr: ${{ steps.rp.outputs.pr }}
+      release_created: ${{ steps.rp.outputs.release_created }}
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
         with:
           egress-policy: audit
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: rp
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  sync-release-pr-versions:
+    name: Sync release PR lock
+    needs: release-please
+    if: >-
+      always() && !failure() && !cancelled() &&
+      needs.release-please.outputs.pr != '' &&
+      needs.release-please.outputs.release_created != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
+        with:
+          egress-policy: audit
+      - name: Resolve release-please head
+        id: branch
+        env:
+          PR_JSON: ${{ needs.release-please.outputs.pr }}
+        run: |
+          set -euo pipefail
+          name=$(printf '%s\n' "$PR_JSON" | jq -r '.headBranchName')
+          test -n "$name" && test "$name" != "null"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.branch.outputs.name }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: "1.95"
+      - name: Refresh Cargo.lock workspace versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          bash scripts/sync-cargo-lock-workspace-versions.sh
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          if git diff --cached --quiet; then
+            echo "OK: Cargo.lock already matches crate versions"
+            exit 0
+          fi
+          git commit -s -m "chore: sync Cargo.lock workspace versions"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git"
+          git push origin "HEAD:${BRANCH}"
+

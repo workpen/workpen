@@ -60,10 +60,33 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertNotIn("pull_request:", on_block)
         self.assertNotRegex(text, r"cargo (test|nextest|clippy|fuzz)")
 
+    def test_release_please_syncs_cargo_lock(self) -> None:
+        text = (WORKFLOWS / "release-please.yml").read_text(encoding="utf-8")
+        self.assertIn("sync-release-pr-versions:", text)
+        self.assertIn("scripts/sync-cargo-lock-workspace-versions.sh", text)
+        self.assertNotIn("cargo generate-lockfile", text)
+        script = (ROOT / "scripts" / "sync-cargo-lock-workspace-versions.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("cargo check -p workpen", script)
+        self.assertIn("cargo metadata --locked", script)
+        self.assertNotIn("generate-lockfile", script)
+
     def test_auto_merge_skips_release_please_head(self) -> None:
         text = (WORKFLOWS / "auto-approve.yml").read_text(encoding="utf-8")
         self.assertIn("!startsWith(github.head_ref, 'release-please')", text)
         self.assertIn("autorelease: pending", text)
+
+    def test_auto_approve_skips_hmarr_on_release_please(self) -> None:
+        text = (WORKFLOWS / "auto-approve.yml").read_text(encoding="utf-8")
+        self.assertIn("Skip self-approve on release-please", text)
+        self.assertIn("bot cannot approve its own PR", text)
+        approve_idx = text.index("name: Auto-approve PR")
+        skip_idx = text.index("name: Skip self-approve on release-please")
+        self.assertLess(approve_idx, skip_idx)
+        approve_block = text[approve_idx:skip_idx]
+        self.assertIn("!startsWith(github.head_ref, 'release-please')", approve_block)
+        self.assertIn("hmarr/auto-approve-action@", approve_block)
 
     def test_cheap_pr_status_checks_do_not_cancel(self) -> None:
         for name in ("pr-title.yml", "dco.yml"):
