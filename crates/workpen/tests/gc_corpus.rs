@@ -67,6 +67,8 @@ fn init_repo() -> Repo {
     git(&repo, &["config", "user.email", "dev@example.com"]);
     git(&repo, &["config", "user.name", "dev"]);
     git(&repo, &["config", "commit.gpgsign", "false"]);
+    git(&repo, &["config", "core.autocrlf", "false"]);
+    git(&repo, &["config", "core.eol", "lf"]);
     fs::write(repo.join("README"), b"x").expect("readme");
     git(&repo, &["add", "README"]);
     git(&repo, &["commit", "-m", "init"]);
