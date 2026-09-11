@@ -42,8 +42,8 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     let path = rest
         .first()
         .ok_or_else(|| "usage: workpen why [--root DIR] [--extra-root DIR] PATH".to_string())?;
-    let guard = PathGuard::with_extra_roots(&root, &extras).ok();
-    let why = explain(Path::new(path), &DenyPolicy::default(), guard.as_ref());
+    let guard = PathGuard::with_extra_roots(&root, &extras).map_err(|e| e.to_string())?;
+    let why = explain(Path::new(path), &DenyPolicy::default(), Some(&guard));
     println!("{}", why.message());
     Ok(if matches!(why, workpen::Why::Allowed) {
         ExitCode::SUCCESS
