@@ -471,3 +471,98 @@ fn age_uses_tree_mtime_not_root_only() {
         other => panic!("nested file mtime must keep the tree young, got {other:?}"),
     }
 }
+
+fn git_path(wt: &Path, name: &str) -> PathBuf {
+    let raw = git_out(wt, &["rev-parse", "--git-path", name]);
+    let p = PathBuf::from(raw.trim());
+    if p.is_absolute() { p } else { wt.join(p) }
+}
+
+#[test]
+fn unreadable_git_status_is_kept() {
+    let (_dir, repo) = init_repo();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "status-fail");
+    fs::write(git_path(&wt, "index"), [0u8, 0, 0]).expect("corrupt index");
+    match classify_worktree(&wt, false) {
+        GcDecision::Keep {
+            reason: KeepReason::StatusUnreadable,
+        } => {}
+        other => panic!("expected StatusUnreadable, got {other:?}"),
+    }
+    let now = SystemTime::now() + Duration::from_secs(10);
+    let _ = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now));
+    assert!(wt.exists(), "unreadable status must not be reclaimed");
+}
+
+#[test]
+fn missing_git_pointer_is_kept() {
+    let (_dir, repo) = init_repo();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "missing-git");
+    let git_ptr = wt.join(".git");
+    if git_ptr.is_file() {
+        fs::remove_file(&git_ptr).expect("remove .git file");
+    } else {
+        fs::remove_dir_all(&git_ptr).expect("remove .git dir");
+    }
+    match classify_worktree(&wt, false) {
+        GcDecision::Keep {
+            reason: KeepReason::NotAGitDir,
+        } => {}
+        other => panic!("expected NotAGitDir, got {other:?}"),
+    }
+    let now = SystemTime::now() + Duration::from_secs(10);
+    let _ = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now));
+    assert!(wt.exists(), "missing git dir must not be reclaimed");
+}
+
+#[cfg(unix)]
+#[test]
+fn recent_index_keeps_tree_when_head_and_files_are_old() {
+    let (_dir, repo) = init_repo();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "index-age");
+    let amend = Command::new("git")
+        .args([
+            "commit",
+            "--amend",
+            "--no-edit",
+            "--date=2000-01-01T00:00:00",
+        ])
+        .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00")
+        .current_dir(&wt)
+        .status()
+        .expect("amend");
+    if !amend.success() {
+        return;
+    }
+    let index = git_path(&wt, "index");
+    let stamp = |p: &Path| {
+        Command::new("touch")
+            .args(["-t", "200001010000", p.to_str().expect("utf8")])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !stamp(&wt) || !stamp(&wt.join("README")) {
+        return;
+    }
+    let now = SystemTime::now();
+    if let Ok(f) = fs::File::open(&index) {
+        let _ = f.set_modified(now);
+    } else if !Command::new("touch")
+        .arg(index.to_str().expect("utf8"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    match classify_for_age_gc(&wt, false, Duration::from_secs(60 * 60), now) {
+        GcDecision::Keep {
+            reason: KeepReason::TooNew,
+        } => {}
+        other => panic!("fresh index must keep the tree, got {other:?}"),
+    }
+}

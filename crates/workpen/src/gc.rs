@@ -240,6 +240,9 @@ fn repo_root(cwd: &Path) -> Result<PathBuf, GcError> {
 }
 
 fn is_git_repo(cwd: &Path) -> bool {
+    if !cwd.join(".git").exists() {
+        return false;
+    }
     git(cwd, &["rev-parse", "--is-inside-work-tree"])
         .map(|s| s.trim() == "true")
         .unwrap_or(false)
