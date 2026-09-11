@@ -6,8 +6,8 @@ use std::path::Path;
 use workpen::{
     CheckDestError, DenyPolicy, DestDeny, DestDenyError, DestDenyKind, PathGuard, check_dest,
     classify_dest, default_secret_denies, deny_patch_dests, deny_patch_dests_with_display,
-    dest_deny_message, is_env_template_basename, is_path_denied, path_is_denied_glob,
-    reject_command_secret_path_tokens, verify_post_open,
+    dest_deny_message, is_env_template_basename, is_path_denied, open_verified_read,
+    path_is_denied_glob, reject_command_secret_path_tokens, verify_post_open,
 };
 
 #[test]
@@ -237,6 +237,19 @@ fn argv_cat_env_and_plain_echo() {
 }
 
 #[test]
+fn argv_denies_pairing_and_auth_tokens() {
+    let policy = DenyPolicy::default();
+    reject_command_secret_path_tokens("cat gateway/pairing.json", &policy)
+        .expect_err("relative pairing");
+    reject_command_secret_path_tokens("cat /tmp/bline/gateway/pairing.json", &policy)
+        .expect_err("absolute pairing");
+    reject_command_secret_path_tokens("cat auth.json", &policy).expect_err("auth.json");
+    reject_command_secret_path_tokens("cat auth-work.json", &policy).expect_err("auth-*.json");
+    reject_command_secret_path_tokens("cat pairing.json", &policy)
+        .expect("bare pairing.json is not **/gateway/pairing.json");
+}
+
+#[test]
 fn argv_denies_hardlink_and_symlink_tokens() {
     let dir = tempfile::tempdir().expect("tempdir");
     let env = dir.path().join(".env");
@@ -289,6 +302,18 @@ fn path_is_denied_table() {
     assert!(path_is_denied_glob(&deny, "keys/server.pem"));
     assert!(path_is_denied_glob(&deny, "app/secrets/token.txt"));
     assert!(path_is_denied_glob(&deny, "home/.ssh/id_ed25519"));
+    assert!(path_is_denied_glob(&deny, "home/.ssh/id_dsa"));
+    assert!(path_is_denied_glob(&deny, "home/.ssh/id_eddsa"));
+    assert!(path_is_denied_glob(&deny, "ID_RSA"));
+    assert!(path_is_denied_glob(&deny, "home/.pypirc"));
+    assert!(path_is_denied_glob(&deny, "home/.docker/config.json"));
+    assert!(path_is_denied_glob(&deny, "kubeconfig"));
+    assert!(path_is_denied_glob(&deny, "app/secrets.json"));
+    assert!(path_is_denied_glob(&deny, "app/service-account.json"));
+    assert!(path_is_denied_glob(&deny, "app/service-account-foo.json"));
+    assert!(path_is_denied_glob(&deny, "token.json"));
+    assert!(path_is_denied_glob(&deny, "secring.gpg"));
+    assert!(path_is_denied_glob(&deny, "home/.ssh/config"));
     assert!(path_is_denied_glob(&deny, "home/.npmrc"));
     assert!(path_is_denied_glob(&deny, "home/.kube/config"));
     assert!(path_is_denied_glob(
@@ -562,4 +587,58 @@ fn glob_named_directory_is_still_deny_glob() {
         Some(DestDenyKind::DenyGlob) => {}
         other => panic!("basename glob must still dest-deny .ssh/, got {other:?}"),
     }
+}
+
+#[test]
+fn check_dest_rejects_nul_byte() {
+    let policy = DenyPolicy::default();
+    match check_dest("foo\0bar", &policy, None) {
+        Err(CheckDestError::Nul) => {}
+        other => panic!("NUL must be CheckDestError::Nul, got {other:?}"),
+    }
+}
+
+#[test]
+fn extra_glob_id_rsa_matches_basename() {
+    let policy = DenyPolicy::with_extra(["id_rsa".into()]);
+    let path = Path::new("/tmp/id_rsa");
+    assert!(
+        is_path_denied(path, &policy),
+        "extra glob id_rsa (no **/) must match /tmp/id_rsa basename"
+    );
+    match check_dest("/tmp/id_rsa", &policy, None) {
+        Err(CheckDestError::DestDeny(DestDenyError::Denied(d))) => {
+            assert_eq!(d.kind, DestDenyKind::DenyGlob);
+        }
+        other => panic!("expected dest-deny, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_dest_refuses_fifo() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fifo = dir.path().join("pipe");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    if !status.success() {
+        return;
+    }
+    let policy = DenyPolicy::default();
+    match check_dest(&fifo.to_string_lossy(), &policy, None) {
+        Err(CheckDestError::SpecialFile { kind, .. }) => assert_eq!(kind, "fifo"),
+        other => panic!("fifo must be SpecialFile, got {other:?}"),
+    }
+}
+
+#[test]
+fn open_verified_read_allows_plain_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("notes.txt");
+    std::fs::write(&file, "ok\n").expect("write");
+    let policy = DenyPolicy::default();
+    let got = open_verified_read(&file.to_string_lossy(), &policy, None).expect("open");
+    drop(got);
 }
