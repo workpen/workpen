@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
+use crate::deny::{DenyPolicy, is_path_denied};
+
 /// Host knobs. Bline passes leftover_dir = ".bline-worktrees",
 /// saved_ref_prefix = "refs/bline/reclaimed".
 #[derive(Debug, Clone)]
@@ -565,7 +567,8 @@ fn is_under_known_cache(root: &Path, file: &Path) -> bool {
 }
 
 /// Unique-work is `git status --porcelain=v1 -uall --ignored`. Git CLI, not gix.
-/// Porcelain `??` / `!!` under a first-component cache dir name is not unique work.
+/// Porcelain `??` / `!!` under a first-component cache dir name is not unique
+/// work unless the relative path dest-denies (e.g. `target/.env`).
 /// Other XY statuses under those names are DirtyWork (tracked dirty cache paths).
 fn unique_work_reason(path: &Path) -> Option<KeepReason> {
     let out = match git(
@@ -589,7 +592,9 @@ fn unique_work_reason(path: &Path) -> Option<KeepReason> {
         }
         let rel = porcelain_path(line);
         if line.starts_with("??") || line.starts_with("!!") {
-            if is_under_known_cache(path, &path.join(&rel)) {
+            if is_under_known_cache(path, &path.join(&rel))
+                && !is_path_denied(&rel, &DenyPolicy::default())
+            {
                 continue;
             }
             has_unique = true;
