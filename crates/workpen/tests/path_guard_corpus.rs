@@ -293,3 +293,41 @@ fn resolve_extra_root_rejects_implicit_host_temp() {
         other => panic!("implicit host temp must be refused, got {other:?}"),
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn resolve_extra_root_rejects_symlink_to_filesystem_root() {
+    let dir = workspace();
+    let link = dir.path().join("to-root");
+    std::os::unix::fs::symlink("/", &link).expect("symlink to /");
+    match resolve_extra_root(dir.path(), "to-root") {
+        Err(ExtraRootError::EscapedToRoot { requested, .. }) => {
+            assert!(requested.contains("to-root"), "{requested}");
+        }
+        other => panic!("symlink to / must be EscapedToRoot, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_extra_root_rejects_symlink_to_tmp() {
+    let dir = workspace();
+    let link = dir.path().join("to-tmp");
+    std::os::unix::fs::symlink("/tmp", &link).expect("symlink to /tmp");
+    match resolve_extra_root(dir.path(), "to-tmp") {
+        Err(ExtraRootError::EscapedToRoot { .. }) => {}
+        other => panic!("symlink to /tmp must be EscapedToRoot, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_extra_root_allows_explicit_tmp() {
+    let dir = workspace();
+    let got = resolve_extra_root(dir.path(), "/tmp").expect("explicit /tmp");
+    assert!(
+        got == Path::new("/tmp") || got == Path::new("/private/tmp"),
+        "explicit /tmp resolved to {}",
+        got.display()
+    );
+}
