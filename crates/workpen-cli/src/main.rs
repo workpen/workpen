@@ -69,14 +69,12 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     if let Err(e) = workpen::check_dests(&guard, &[Path::new(&root)]) {
         return Err(e.to_string());
     }
+    let mut child = Command::new(&cmd[0]);
+    child.args(&cmd[1..]).current_dir(&root);
     workpen::process_jail(&root, &extras)
-        .and_then(|policy| policy.apply())
+        .and_then(|policy| policy.apply_pre_exec(&mut child))
         .map_err(|e| e.to_string())?;
-    let status = Command::new(&cmd[0])
-        .args(&cmd[1..])
-        .current_dir(&root)
-        .status()
-        .map_err(|e| e.to_string())?;
+    let status = child.status().map_err(|e| e.to_string())?;
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 

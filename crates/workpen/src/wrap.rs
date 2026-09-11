@@ -3,9 +3,11 @@
 //! Never grant filesystem root (`/` or a Windows drive root). Inspect
 //! [`KernelPolicy::grants`]; do not parse nono internals. Do not call
 //! [`KernelPolicy::apply`] from unit tests (`Sandbox::apply_auto` is
-//! irreversible).
+//! irreversible). [`KernelPolicy::apply_pre_exec`] is safe in tests: it
+//! only installs a child hook.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Access granted for one path. Hosts branch on this; do not parse messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +33,7 @@ pub struct KernelPolicy {
 /// Result of applying the jail. Hosts branch on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelApply {
-    /// Landlock or Seatbelt is now active in this process.
+    /// Kernel jail is active in this process, or hooked for the child.
     Applied,
     /// Platform has no kernel backend (Windows). Userspace dest-deny + PathGuard only.
     UserspaceOnly,
@@ -89,13 +91,15 @@ impl KernelPolicy {
     }
 
     /// Apply Landlock/Seatbelt for this process. Irreversible. Not for tests.
+    ///
+    /// Uses `SignalMode::AllowAll` so a jailed parent can still signal children.
     pub fn apply(&self) -> Result<KernelApply, KernelError> {
         if !kernel_supported() {
             return Ok(KernelApply::UserspaceOnly);
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let caps = self.to_capability_set()?;
+            let caps = self.to_capability_set(nono::SignalMode::AllowAll)?;
             nono::Sandbox::apply_auto(&caps).map_err(|e| KernelError::Apply(e.to_string()))?;
             Ok(KernelApply::Applied)
         }
@@ -105,8 +109,43 @@ impl KernelPolicy {
         }
     }
 
+    /// Install Landlock/Seatbelt in the child `pre_exec` hook.
+    ///
+    /// Builds the capability set in the parent (allocation is not safe after
+    /// fork). Uses `SignalMode::Isolated` so the child cannot signal the parent.
+    /// Does not jail this process.
+    pub fn apply_pre_exec(&self, cmd: &mut Command) -> Result<KernelApply, KernelError> {
+        if !kernel_supported() {
+            let _ = cmd;
+            return Ok(KernelApply::UserspaceOnly);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let caps = self.to_capability_set(nono::SignalMode::Isolated)?;
+            // Safety: the set is built in the parent; the hook only applies
+            // it and maps failure to io::Error. apply_auto may allocate.
+            unsafe {
+                use std::os::unix::process::CommandExt;
+                cmd.pre_exec(move || {
+                    nono::Sandbox::apply_auto(&caps)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    Ok(())
+                });
+            }
+            Ok(KernelApply::Applied)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = cmd;
+            Ok(KernelApply::UserspaceOnly)
+        }
+    }
+
     #[cfg(unix)]
-    fn to_capability_set(&self) -> Result<nono::CapabilitySet, KernelError> {
+    fn to_capability_set(
+        &self,
+        signal: nono::SignalMode,
+    ) -> Result<nono::CapabilitySet, KernelError> {
         let mut caps = nono::CapabilitySet::new();
         for grant in &self.grants {
             let mode = match grant.access {
@@ -117,7 +156,7 @@ impl KernelPolicy {
                 .allow_path(&grant.path, mode)
                 .map_err(|e| KernelError::Apply(e.to_string()))?;
         }
-        Ok(caps.block_network())
+        Ok(caps.block_network().set_signal_mode(signal))
     }
 }
 
@@ -130,6 +169,10 @@ fn system_read_dirs() -> Vec<&'static Path> {
         Path::new("/sbin"),
         Path::new("/System"),
         Path::new("/Library"),
+        Path::new("/dev"),
+        Path::new("/etc"),
+        Path::new("/opt/homebrew"),
+        Path::new("/usr/local"),
     ]
 }
 
@@ -146,13 +189,17 @@ fn add_read_if_dir(grants: &mut Vec<KernelGrant>, path: &Path) {
     if !meta.is_dir() {
         return;
     }
-    let Ok(resolved) = std::fs::canonicalize(path) else {
-        return;
-    };
-    if is_fs_root(&resolved) {
+    let resolved = std::fs::canonicalize(path).ok();
+    if resolved.as_ref().is_some_and(|p| is_fs_root(p)) {
         return;
     }
-    push_grant(grants, resolved, KernelAccess::Read);
+    // Grant the path as given so symlink lookups (`/etc` -> `/private/etc`) work.
+    if !is_fs_root(path) {
+        push_grant(grants, path.to_path_buf(), KernelAccess::Read);
+    }
+    if let Some(resolved) = resolved {
+        push_grant(grants, resolved, KernelAccess::Read);
+    }
 }
 
 fn push_grant(grants: &mut Vec<KernelGrant>, path: PathBuf, access: KernelAccess) {
