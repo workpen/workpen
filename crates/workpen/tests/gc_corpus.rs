@@ -130,6 +130,22 @@ fn parse_max_age_rejects_zero_and_bad_unit() {
 }
 
 #[test]
+fn parse_max_age_does_not_peel_quotes() {
+    match parse_max_age("'7d'") {
+        Err(GcError::InvalidDuration(_)) => {}
+        other => panic!("quoted 7d must stay InvalidDuration, got {other:?}"),
+    }
+    match parse_max_age("\"7d\"") {
+        Err(GcError::InvalidDuration(_)) => {}
+        other => panic!("double-quoted 7d must stay InvalidDuration, got {other:?}"),
+    }
+    assert_eq!(
+        parse_max_age("7d").expect("bare 7d"),
+        Duration::from_secs(7 * 86400)
+    );
+}
+
+#[test]
 fn refuse_home_as_workspace() {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     let Some(home) = home else {
@@ -705,6 +721,76 @@ fn remove_explicit_untracked_leftover_rm() {
         other => panic!("untracked leftover must rm after unique-work, got {other:?}"),
     }
     assert!(!wt.exists(), "untracked leftover should be removed");
+}
+
+#[test]
+fn remove_explicit_other_repo_cwd_uses_path_registry() {
+    let fx = init_repo();
+    let repo_a = fx.repo.clone();
+    let repo_b = repo_a.parent().expect("temp parent").join("other");
+    fs::create_dir(&repo_b).expect("other");
+    git(&repo_b, &["init", "-b", "main"]);
+    git(&repo_b, &["config", "user.email", "dev@example.com"]);
+    git(&repo_b, &["config", "user.name", "dev"]);
+    git(&repo_b, &["config", "commit.gpgsign", "false"]);
+    fs::write(repo_b.join("README"), b"b").expect("readme b");
+    git(&repo_b, &["add", "README"]);
+    git(&repo_b, &["commit", "-m", "init-b"]);
+    let wt = add_sibling_worktree(&repo_a, "from-a");
+    let prev = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&repo_b).expect("chdir B");
+    let got = remove_explicit(&wt, "refs/workpen/reclaimed", false);
+    let _ = std::env::set_current_dir(&prev);
+    match got {
+        Ok(GcDecision::Reclaim { .. }) => {}
+        other => panic!("cwd B must still reclaim A's worktree, got {other:?}"),
+    }
+    assert!(!wt.exists(), "A's registered tree must be removed");
+    assert!(repo_a.join("README").exists(), "repo A must stay");
+    assert!(repo_b.join("README").exists(), "repo B must stay");
+}
+
+#[test]
+fn classify_worktree_reclaim_has_empty_saved_refs() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "classify-save");
+    fs::write(wt.join("README"), b"unique commit").expect("edit");
+    git(&wt, &["add", "README"]);
+    git(&wt, &["commit", "-m", "unique"]);
+    let sha = git_out(&wt, &["rev-parse", "HEAD"]).trim().to_owned();
+    git(&wt, &["reset", "--hard", "HEAD~1"]);
+    match classify_worktree(&wt, false) {
+        GcDecision::Reclaim { saved_refs } => {
+            assert!(
+                saved_refs.is_empty(),
+                "classify must not save refs, got {saved_refs:?}"
+            );
+        }
+        other => panic!("unique dangling must classify Reclaim, got {other:?}"),
+    }
+    let listed = git_out(&repo, &["show-ref"]);
+    assert!(
+        !listed.contains("refs/workpen/reclaimed"),
+        "classify must not write reclaimed refs: {listed}"
+    );
+    match remove_explicit(&wt, "refs/workpen/reclaimed", false) {
+        Ok(GcDecision::Reclaim { saved_refs }) => {
+            assert!(
+                saved_refs
+                    .iter()
+                    .any(|r| r.contains("refs/workpen/reclaimed") && r.contains(&sha)),
+                "remove_explicit must save, got {saved_refs:?}"
+            );
+        }
+        other => panic!("remove_explicit must reclaim, got {other:?}"),
+    }
+    let listed = git_out(&repo, &["show-ref"]);
+    assert!(
+        listed.contains("refs/workpen/reclaimed"),
+        "remove_explicit must write reclaimed refs: {listed}"
+    );
 }
 
 #[cfg(unix)]

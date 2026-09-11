@@ -313,6 +313,9 @@ fn path_is_denied_table() {
     assert!(path_is_denied_glob(&deny, "app/service-account-foo.json"));
     assert!(path_is_denied_glob(&deny, "token.json"));
     assert!(path_is_denied_glob(&deny, "secring.gpg"));
+    assert!(path_is_denied_glob(&deny, "credentials.json"));
+    assert!(path_is_denied_glob(&deny, "home/.aws/credentials"));
+    assert!(path_is_denied_glob(&deny, "home/.netrc"));
     assert!(path_is_denied_glob(&deny, "home/.ssh/config"));
     assert!(path_is_denied_glob(&deny, "home/.npmrc"));
     assert!(path_is_denied_glob(&deny, "home/.kube/config"));
@@ -641,4 +644,34 @@ fn open_verified_read_allows_plain_file() {
     let policy = DenyPolicy::default();
     let got = open_verified_read(&file.to_string_lossy(), &policy, None).expect("open");
     drop(got);
+}
+
+#[cfg(unix)]
+#[test]
+fn check_dest_refuses_unix_socket() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sock = dir.path().join("s.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+    let policy = DenyPolicy::default();
+    match check_dest(&sock.to_string_lossy(), &policy, None) {
+        Err(CheckDestError::SpecialFile { kind, .. }) => assert_eq!(kind, "socket"),
+        other => panic!("socket must be SpecialFile, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn open_verified_read_symlink_to_env_is_dest_deny() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = dir.path().join(".env");
+    std::fs::write(&env, "SECRET=1\n").expect("write .env");
+    let alias = dir.path().join("readme.txt");
+    std::os::unix::fs::symlink(&env, &alias).expect("symlink");
+    let policy = DenyPolicy::default();
+    match open_verified_read(&alias.to_string_lossy(), &policy, None) {
+        Err(CheckDestError::DestDeny(DestDenyError::Denied(d))) => {
+            assert_eq!(d.kind, DestDenyKind::DenyGlob);
+        }
+        other => panic!("symlink to .env must dest-deny, got {other:?}"),
+    }
 }
