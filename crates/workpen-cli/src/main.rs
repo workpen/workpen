@@ -5,7 +5,7 @@ use std::process::{Command, ExitCode};
 use std::time::SystemTime;
 
 use workpen::{
-    DenyPolicy, GcConfig, GcDecision, PathGuard, explain, parse_max_age,
+    CheckDestError, DenyPolicy, GcConfig, GcDecision, PathGuard, parse_max_age,
     reject_command_secret_path_tokens, resolve_extra_root, run_gc,
 };
 
@@ -32,7 +32,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
         "why" => cmd_why(&args[1..]),
         "run" => cmd_run(&args[1..]),
         "gc" => cmd_gc(&args[1..]),
-        other => Err(format!("unknown command: {other}")),
+        other => Err(format!("unknown command: {other} (use why, run, or gc)")),
     }
 }
 
@@ -42,14 +42,27 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     let path = rest
         .first()
         .ok_or_else(|| "usage: workpen why [--root DIR] [--extra-root DIR] PATH".to_string())?;
-    let guard = PathGuard::with_extra_roots(&root, &extras).ok();
-    let why = explain(Path::new(path), &DenyPolicy::default(), guard.as_ref());
-    println!("{}", why.message());
-    Ok(if matches!(why, workpen::Why::Allowed) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
-    })
+    let guard = PathGuard::with_extra_roots(&root, &extras).map_err(|e| e.to_string())?;
+    let dest = why_dest(&root, path);
+    match workpen::check_dest(
+        &dest.to_string_lossy(),
+        &DenyPolicy::default(),
+        Some(&guard),
+    ) {
+        Ok(_) => {
+            println!("allowed");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(CheckDestError::DestDeny(e)) => {
+            println!("{e}");
+            Ok(ExitCode::from(1))
+        }
+        Err(CheckDestError::PathGuard(e)) => {
+            println!("{e}");
+            Ok(ExitCode::from(1))
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
@@ -72,12 +85,23 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     if let Err(e) = workpen::check_dests(&guard, &[Path::new(&root)]) {
         return Err(e.to_string());
     }
+    for token in cmd {
+        if token.starts_with('-') {
+            continue;
+        }
+        let dest = dest_under_root(&root, token);
+        if let Err(e) = workpen::check_dest(&dest.to_string_lossy(), &policy, None) {
+            return Err(e.to_string());
+        }
+    }
     let mut child = Command::new(&cmd[0]);
     child.args(&cmd[1..]).current_dir(&root);
     workpen::process_jail(&root, &extras)
         .and_then(|policy| policy.apply_pre_exec(&mut child))
         .map_err(|e| e.to_string())?;
-    let status = child.status().map_err(|e| e.to_string())?;
+    let status = child
+        .status()
+        .map_err(|e| format!("failed to spawn {}: {e}", cmd[0]))?;
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
@@ -108,7 +132,11 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
                 dry_run = true;
                 i += 1;
             }
-            other => return Err(format!("unknown gc flag: {other}")),
+            other => {
+                return Err(format!(
+                    "unknown gc flag: {other} (use --max-age, --dry-run, or --leftover)"
+                ));
+            }
         }
     }
     let max_age = max_age.ok_or_else(|| {
@@ -139,6 +167,25 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Join a relative dest to `--root`. Absolute dests stay as given.
+fn dest_under_root(root: &Path, path: &str) -> PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root.join(p)
+    }
+}
+
+/// Blank `why` PATH stays blank so PathGuard reports empty, not the workspace.
+fn why_dest(root: &Path, path: &str) -> PathBuf {
+    if path.trim().is_empty() {
+        PathBuf::from(path)
+    } else {
+        dest_under_root(root, path)
+    }
 }
 
 fn resolve_extras(root: &Path, extras: &[PathBuf]) -> Result<Vec<PathBuf>, String> {

@@ -67,6 +67,8 @@ fn init_repo() -> Repo {
     git(&repo, &["config", "user.email", "dev@example.com"]);
     git(&repo, &["config", "user.name", "dev"]);
     git(&repo, &["config", "commit.gpgsign", "false"]);
+    git(&repo, &["config", "core.autocrlf", "false"]);
+    git(&repo, &["config", "core.eol", "lf"]);
     fs::write(repo.join("README"), b"x").expect("readme");
     git(&repo, &["add", "README"]);
     git(&repo, &["commit", "-m", "init"]);
@@ -132,12 +134,31 @@ fn parse_max_age_rejects_zero_and_bad_unit() {
 #[test]
 fn parse_max_age_does_not_peel_quotes() {
     match parse_max_age("'7d'") {
-        Err(GcError::InvalidDuration(_)) => {}
+        Err(GcError::InvalidDuration(msg)) => {
+            assert!(
+                msg.contains("use s, m, h, d"),
+                "quoted 7d must hint units, got {msg}"
+            );
+        }
         other => panic!("quoted 7d must stay InvalidDuration, got {other:?}"),
     }
     match parse_max_age("\"7d\"") {
-        Err(GcError::InvalidDuration(_)) => {}
+        Err(GcError::InvalidDuration(msg)) => {
+            assert!(
+                msg.contains("use s, m, h, d"),
+                "double-quoted 7d must hint units, got {msg}"
+            );
+        }
         other => panic!("double-quoted 7d must stay InvalidDuration, got {other:?}"),
+    }
+    match parse_max_age("7days") {
+        Err(GcError::InvalidDuration(msg)) => {
+            assert!(
+                msg.contains("use s, m, h, d"),
+                "7days must hint units, got {msg}"
+            );
+        }
+        other => panic!("7days must stay InvalidDuration, got {other:?}"),
     }
     assert_eq!(
         parse_max_age("7d").expect("bare 7d"),
@@ -204,6 +225,40 @@ fn unique_untracked_is_kept() {
         } => {}
         other => panic!("expected UniqueUntracked, got {other:?}"),
     }
+}
+
+#[test]
+fn ignored_env_in_old_worktree_is_kept() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b".env\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore env"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "ignored-env");
+    let env = wt.join(".env");
+    fs::write(&env, b"SECRET=1\n").expect("env");
+    let now = SystemTime::now() + Duration::from_secs(10);
+    match classify_for_age_gc(&wt, false, Duration::from_secs(0), now) {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked | KeepReason::DirtyWork,
+        } => {}
+        other => panic!("gitignored .env must keep the tree, got {other:?}"),
+    }
+    let rows = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now)).expect("gc");
+    let row = rows
+        .iter()
+        .find(|(p, _)| p.file_name() == wt.file_name())
+        .expect("ignored-env row");
+    match &row.1 {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked | KeepReason::DirtyWork,
+        } => {}
+        other => panic!("run_gc must keep leftover with .env, got {other:?}"),
+    }
+    assert!(wt.exists(), "worktree with gitignored .env must stay");
+    assert!(env.exists(), "gitignored .env must not be deleted");
+    assert_eq!(fs::read(&env).expect("read env"), b"SECRET=1\n");
 }
 
 #[test]
@@ -369,6 +424,50 @@ fn cache_only_target_is_reclaimable() {
         GcDecision::Reclaim { .. } => {}
         other => panic!("expected reclaim cache-only, got {other:?}"),
     }
+}
+
+#[test]
+fn gitignored_untagged_node_modules_is_reclaimable() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"node_modules\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore node_modules"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "untagged-nm");
+    let nm = wt.join("node_modules");
+    fs::create_dir_all(&nm).expect("node_modules");
+    fs::write(nm.join("foo"), b"pkg").expect("foo");
+    assert!(
+        !nm.join("CACHEDIR.TAG").exists(),
+        "fixture must not have CACHEDIR.TAG"
+    );
+    match classify_worktree(&wt, false) {
+        GcDecision::Reclaim { .. } => {}
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => panic!("untagged gitignored node_modules must not keep UniqueUntracked"),
+        other => panic!("expected reclaim untagged node_modules, got {other:?}"),
+    }
+    let now = SystemTime::now() + Duration::from_secs(10);
+    match classify_for_age_gc(&wt, false, Duration::from_secs(0), now) {
+        GcDecision::Reclaim { .. } => {}
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => panic!("old leftover with only untagged node_modules must not keep UniqueUntracked"),
+        other => panic!("expected Reclaim for old untagged node_modules leftover, got {other:?}"),
+    }
+    let rows = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now)).expect("gc");
+    assert!(
+        rows.iter().any(|(p, d)| {
+            p.file_name() == wt.file_name() && matches!(d, GcDecision::Reclaim { .. })
+        }),
+        "old leftover with only untagged node_modules should reclaim: {rows:?}"
+    );
+    assert!(
+        !wt.exists(),
+        "worktree with only untagged node_modules should be gone"
+    );
 }
 
 #[test]
@@ -849,4 +948,83 @@ fn git_ignores_process_git_dir() {
         None => unsafe { std::env::remove_var("GIT_DIR") },
     }
     used.expect("process GIT_DIR must not hide last-used");
+}
+
+#[cfg(unix)]
+fn with_git_wrapper<T>(script: &str, f: impl FnOnce() -> T) -> T {
+    use std::os::unix::fs::PermissionsExt;
+    let real = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("which git");
+    assert!(real.status.success(), "need git on PATH");
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_owned();
+    let wrap_dir = tempfile::TempDir::new().expect("wrap");
+    let wrap = wrap_dir.path().join("git");
+    fs::write(&wrap, script.replace("__GIT__", &real)).expect("wrapper");
+    fs::set_permissions(&wrap, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let old = std::env::var_os("PATH");
+    let mut path = wrap_dir.path().display().to_string();
+    path.push(':');
+    path.push_str(&std::env::var("PATH").unwrap_or_default());
+    // Safety: serialized by CWD_LOCK; restored below.
+    unsafe { std::env::set_var("PATH", &path) };
+    let got = f();
+    match old {
+        Some(v) => unsafe { std::env::set_var("PATH", v) },
+        None => unsafe { std::env::remove_var("PATH") },
+    }
+    got
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_explicit_reflog_failure_keeps_tree() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "reflog-fail");
+    let got = with_git_wrapper(
+        "#!/bin/sh\ncase \" $* \" in\n*\" reflog \"*) echo reflog failed >&2; exit 1 ;;\nesac\nexec __GIT__ \"$@\"\n",
+        || remove_explicit(&wt, "refs/workpen/reclaimed", false),
+    );
+    match got {
+        Ok(GcDecision::Keep {
+            reason: KeepReason::StatusUnreadable,
+        }) => {}
+        other => panic!("reflog failure must keep StatusUnreadable, got {other:?}"),
+    }
+    assert!(wt.exists(), "must not delete when unique-commit save fails");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_gc_reflog_failure_keeps_and_continues() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let leftover = repo.join(".workpen-worktrees");
+    let fail = add_leftover_worktree(&repo, &leftover, "reflog-fail");
+    let ok = add_leftover_worktree(&repo, &leftover, "reflog-ok");
+    let now = SystemTime::now() + Duration::from_secs(10);
+    let cfg = cfg(&repo, Duration::from_secs(0), now);
+    let got = with_git_wrapper(
+        "#!/bin/sh\ncase \" $* \" in\n*\" reflog \"*)\n  case \"$PWD/\" in\n  */reflog-fail/*|*/reflog-fail/) echo reflog failed >&2; exit 1 ;;\n  esac\n  ;;\nesac\nexec __GIT__ \"$@\"\n",
+        || run_gc(&repo, &cfg),
+    );
+    let rows = got.expect("age-gc continues after save miss");
+    let fail_row = rows
+        .iter()
+        .find(|(p, _)| p.file_name() == fail.file_name())
+        .expect("reflog-fail row");
+    assert_eq!(keep_reason(&fail_row.1), KeepReason::StatusUnreadable);
+    assert!(fail.exists(), "save miss must not delete reflog-fail");
+    let ok_row = rows
+        .iter()
+        .find(|(p, _)| p.file_name() == ok.file_name())
+        .expect("reflog-ok row");
+    match &ok_row.1 {
+        GcDecision::Reclaim { .. } => {}
+        other => panic!("sibling must still reclaim, got {other:?}"),
+    }
+    assert!(!ok.exists(), "other trees must still reclaim");
 }

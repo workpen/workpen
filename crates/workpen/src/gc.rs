@@ -1,6 +1,7 @@
 //! Fail-closed leftover worktree age GC. Feature-gated (`gc`).
 //!
-//! Unique-work is `git status --porcelain`. Last-used is `git log -1
+//! Unique-work is `git status --porcelain=v1 -uall --ignored` (with
+//! `status.showUntrackedFiles=all`). Last-used is `git log -1
 //! --format=%ct`, the index mtime, and a bounded tree walk. Both clocks
 //! are git CLI. There is no `gix` path in v1.
 
@@ -92,7 +93,7 @@ pub fn parse_max_age(raw: &str) -> Result<Duration, GcError> {
     let n: u64 = num
         .trim()
         .parse()
-        .map_err(|_| GcError::InvalidDuration(s.to_owned()))?;
+        .map_err(|_| GcError::InvalidDuration(format!("{s} (use s, m, h, d)")))?;
     if n == 0 {
         return Err(GcError::InvalidDuration(format!(
             "duration must be greater than zero: {s}"
@@ -160,7 +161,14 @@ pub fn remove_explicit(
     match classify_worktree(path, false) {
         keep @ GcDecision::Keep { .. } => Ok(keep),
         GcDecision::Reclaim { .. } => {
-            let saved = save_unique_commits(path, saved_ref_prefix);
+            let saved = match save_unique_commits(path, saved_ref_prefix) {
+                Ok(saved) => saved,
+                Err(_) => {
+                    return Ok(GcDecision::Keep {
+                        reason: KeepReason::StatusUnreadable,
+                    });
+                }
+            };
             if entry.is_some() {
                 remove_worktree(&repo, path, locked && force)?;
             } else {
@@ -240,9 +248,17 @@ pub fn run_gc(cwd: &Path, cfg: &GcConfig) -> Result<Vec<(PathBuf, GcDecision)>, 
         if let GcDecision::Reclaim { .. } = &decision
             && !cfg.dry_run
         {
-            let saved = save_unique_commits(&wt.path, &cfg.saved_ref_prefix);
-            remove_worktree(cwd, &wt.path, false)?;
-            decision = GcDecision::Reclaim { saved_refs: saved };
+            match save_unique_commits(&wt.path, &cfg.saved_ref_prefix) {
+                Ok(saved) => {
+                    remove_worktree(cwd, &wt.path, false)?;
+                    decision = GcDecision::Reclaim { saved_refs: saved };
+                }
+                Err(_) => {
+                    decision = GcDecision::Keep {
+                        reason: KeepReason::StatusUnreadable,
+                    };
+                }
+            }
         }
         rows.push((wt.path.clone(), decision));
     }
@@ -255,13 +271,18 @@ pub fn run_gc(cwd: &Path, cfg: &GcConfig) -> Result<Vec<(PathBuf, GcDecision)>, 
         ));
     }
     if !cfg.dry_run {
-        let _ = git(cwd, &["worktree", "prune"]);
+        git(cwd, &["worktree", "prune"]).map_err(|e| match e {
+            GcError::Git { detail, .. } => GcError::Git {
+                op: "worktree prune".into(),
+                detail,
+            },
+            other => other,
+        })?;
     }
     Ok(rows)
 }
 
 const CACHE_DIR_NAMES: &[&str] = &["target", "node_modules", ".venv", "dist", "__pycache__"];
-const CACHEDIR_TAG_SIG: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 const LAST_USED_WALK_LIMIT: usize = 4096;
 
 struct Registered {
@@ -374,33 +395,57 @@ fn path_is_same_or_parent(root: &Path, inner: &Path) -> bool {
 }
 
 fn worktree_has_live_cwd(path: &Path) -> bool {
-    if let Ok(cwd) = std::env::current_dir()
-        && path_is_same_or_parent(path, &cwd)
+    let current = std::env::current_dir().ok();
+    let other = other_process_cwds();
+    worktree_has_live_cwd_from(
+        path,
+        current.as_deref(),
+        match &other {
+            Ok(cwds) => Ok(cwds.as_slice()),
+            Err(()) => Err(()),
+        },
+    )
+}
+
+/// Fail-closed: unknown other-process cwds count as live.
+fn worktree_has_live_cwd_from(
+    path: &Path,
+    current: Option<&Path>,
+    other: Result<&[PathBuf], ()>,
+) -> bool {
+    if let Some(cwd) = current
+        && path_is_same_or_parent(path, cwd)
     {
         return true;
     }
-    live_process_cwds()
-        .into_iter()
-        .any(|cwd| path_is_same_or_parent(path, &cwd))
+    match other {
+        Err(()) => true,
+        Ok(cwds) => cwds.iter().any(|cwd| path_is_same_or_parent(path, cwd)),
+    }
 }
 
-fn live_process_cwds() -> Vec<PathBuf> {
-    let mut out = Vec::new();
+/// Other-process cwds. `Err` when an expected probe failed.
+/// Windows has no `/proc` and no `lsof`; that is not a probe failure.
+fn other_process_cwds() -> Result<Vec<PathBuf>, ()> {
     #[cfg(target_os = "linux")]
     {
-        out.extend(linux_process_cwds());
+        if let Ok(cwds) = linux_process_cwds() {
+            return Ok(cwds);
+        }
     }
-    if out.is_empty() {
-        out.extend(lsof_process_cwds());
+    #[cfg(unix)]
+    {
+        lsof_process_cwds()
     }
-    out
+    #[cfg(not(unix))]
+    {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process_cwds() -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
+fn linux_process_cwds() -> Result<Vec<PathBuf>, ()> {
+    let rd = std::fs::read_dir("/proc").map_err(|_| ())?;
     let mut out = Vec::new();
     for entry in rd.flatten() {
         let name = entry.file_name();
@@ -415,25 +460,25 @@ fn linux_process_cwds() -> Vec<PathBuf> {
             out.push(cwd);
         }
     }
-    out
+    Ok(out)
 }
 
-fn lsof_process_cwds() -> Vec<PathBuf> {
-    let Ok(out) = Command::new("lsof")
+#[cfg(unix)]
+fn lsof_process_cwds() -> Result<Vec<PathBuf>, ()> {
+    let out = Command::new("lsof")
         .args(["-a", "-d", "cwd", "-Fn"])
         .output()
-    else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&out.stdout)
+        .map_err(|_| ())?;
+    let paths: Vec<PathBuf> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| line.strip_prefix('n'))
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
-        .collect()
+        .collect();
+    if !out.status.success() && paths.is_empty() {
+        return Err(());
+    }
+    Ok(paths)
 }
 
 /// Newest of HEAD committer time (`git log -1 --format=%ct`), index
@@ -508,30 +553,31 @@ fn is_age_cache_dir_name(name: &str) -> bool {
     CACHE_DIR_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
 }
 
-fn is_known_cache_dir(dir: &Path) -> bool {
-    let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    if !CACHE_DIR_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n)) {
-        return false;
-    }
-    let tag = dir.join("CACHEDIR.TAG");
-    std::fs::read_to_string(tag)
-        .map(|s| s.contains(CACHEDIR_TAG_SIG))
-        .unwrap_or(false)
-}
-
+/// First path component matches [`CACHE_DIR_NAMES`] by name. No `CACHEDIR.TAG`.
 fn is_under_known_cache(root: &Path, file: &Path) -> bool {
     let Ok(rel) = file.strip_prefix(root) else {
         return false;
     };
-    let Some(first) = rel.components().next() else {
+    let Some(std::path::Component::Normal(name)) = rel.components().next() else {
         return false;
     };
-    is_known_cache_dir(&root.join(first))
+    is_age_cache_dir_name(&name.to_string_lossy())
 }
 
-/// Unique-work is `git status --porcelain`. Git CLI, not gix.
+/// Unique-work is `git status --porcelain=v1 -uall --ignored`. Git CLI, not gix.
+/// Porcelain `??` / `!!` under a first-component cache dir name is not unique work.
 fn unique_work_reason(path: &Path) -> Option<KeepReason> {
-    let out = match git(path, &["status", "--porcelain"]) {
+    let out = match git(
+        path,
+        &[
+            "-c",
+            "status.showUntrackedFiles=all",
+            "status",
+            "--porcelain=v1",
+            "-uall",
+            "--ignored",
+        ],
+    ) {
         Ok(s) => s,
         Err(_) => return Some(KeepReason::StatusUnreadable),
     };
@@ -544,7 +590,7 @@ fn unique_work_reason(path: &Path) -> Option<KeepReason> {
         if is_under_known_cache(path, &path.join(&rel)) {
             continue;
         }
-        if line.starts_with("??") {
+        if line.starts_with("??") || line.starts_with("!!") {
             has_unique = true;
         } else {
             return Some(KeepReason::DirtyWork);
@@ -567,10 +613,14 @@ fn porcelain_path(line: &str) -> PathBuf {
     }
 }
 
-fn save_unique_commits(path: &Path, prefix: &str) -> Vec<String> {
-    let Ok(reflog) = git(path, &["reflog", "--format=%H"]) else {
-        return Vec::new();
-    };
+fn save_unique_commits(path: &Path, prefix: &str) -> Result<Vec<String>, GcError> {
+    let reflog = git(path, &["reflog", "--format=%H"]).map_err(|e| match e {
+        GcError::Git { detail, .. } => GcError::Git {
+            op: "reflog".into(),
+            detail,
+        },
+        other => other,
+    })?;
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -584,20 +634,25 @@ fn save_unique_commits(path: &Path, prefix: &str) -> Vec<String> {
         if sha.len() < 7 || !seen.insert(sha.to_owned()) {
             continue;
         }
-        if !commit_is_dangling(path, sha) {
+        if !commit_is_dangling(path, sha)? {
             continue;
         }
         let refname = format!("{prefix}/{name}/{sha}");
-        if git(path, &["update-ref", &refname, sha]).is_ok() {
-            saved.push(refname);
-        }
+        git(path, &["update-ref", &refname, sha]).map_err(|e| match e {
+            GcError::Git { detail, .. } => GcError::Git {
+                op: "update-ref".into(),
+                detail,
+            },
+            other => other,
+        })?;
+        saved.push(refname);
     }
-    saved
+    Ok(saved)
 }
 
-fn commit_is_dangling(path: &Path, sha: &str) -> bool {
-    let contains = git(path, &["branch", "-a", "--contains", sha]).unwrap_or_default();
-    !contains.lines().any(|l| !l.trim().is_empty())
+fn commit_is_dangling(path: &Path, sha: &str) -> Result<bool, GcError> {
+    let contains = git(path, &["branch", "-a", "--contains", sha])?;
+    Ok(!contains.lines().any(|l| !l.trim().is_empty()))
 }
 
 fn sanitize_ref_component(raw: &str) -> String {
@@ -724,6 +779,29 @@ mod parse_tests {
     #[test]
     fn parse_max_age_rejects_bare_number() {
         assert!(parse_max_age("7").is_err());
+    }
+
+    #[test]
+    fn commit_is_dangling_git_failure_is_not_dangling() {
+        let dir = tempfile::tempdir().expect("tmp");
+        match commit_is_dangling(dir.path(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+            Ok(false) | Err(_) => {}
+            Ok(true) => panic!("git failure must not treat commit as dangling"),
+        }
+    }
+
+    #[test]
+    fn probe_failure_is_live_when_current_dir_is_elsewhere() {
+        let tree = tempfile::tempdir().expect("tree");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        assert!(
+            worktree_has_live_cwd_from(tree.path(), Some(elsewhere.path()), Err(())),
+            "probe failure must keep the tree"
+        );
+        assert!(
+            !worktree_has_live_cwd_from(tree.path(), Some(elsewhere.path()), Ok(&[])),
+            "successful empty scan is not live"
+        );
     }
 
     #[test]
