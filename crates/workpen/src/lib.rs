@@ -1,4 +1,19 @@
 //! Userspace containment stack. Not ready.
+//!
+//! Hosts call dest-deny with an explicit [`DenyPolicy`]. There is no
+//! process-wide deny slot; a session wrapper can hold the policy:
+//!
+//! ```
+//! use std::path::Path;
+//! use workpen::{DenyPolicy, dest_deny_message, is_path_denied};
+//!
+//! let policy = DenyPolicy::default();
+//! assert!(is_path_denied(Path::new(".env"), &policy));
+//! assert!(dest_deny_message(Path::new(".env"), ".env", &policy).is_some());
+//! ```
+//!
+//! Leftover worktree GC is behind `feature = "gc"`. Hosts pass
+//! `leftover_dir` and `saved_ref_prefix` on `GcConfig`.
 
 mod deny;
 #[cfg(feature = "gc")]
@@ -16,8 +31,8 @@ pub use deny::{
 };
 #[cfg(feature = "gc")]
 pub use gc::{
-    GcDecision, GcError, GcKeepReason, GcPolicy, GcReport, Worktree, decide, gc_leftovers,
-    list_worktrees,
+    GcConfig, GcDecision, GcError, KeepReason, classify_for_age_gc, classify_worktree,
+    parse_max_age, run_gc,
 };
 pub use guard::{PathGuard, PathGuardDeny, PathGuardError, PathGuardKind, check_dests};
 pub use why::{Why, explain};

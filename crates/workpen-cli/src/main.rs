@@ -2,10 +2,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use workpen::{
-    DenyPolicy, GcPolicy, PathGuard, explain, gc_leftovers, reject_command_secret_path_tokens,
+    DenyPolicy, GcConfig, GcDecision, PathGuard, explain, parse_max_age,
+    reject_command_secret_path_tokens, run_gc,
 };
 
 fn main() -> ExitCode {
@@ -81,28 +82,59 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
 fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
     let (root, _extras, rest) = parse_roots(args)?;
     let mut max_age = None;
+    let mut leftover = None;
+    let mut dry_run = false;
     let mut i = 0;
     while i < rest.len() {
-        if rest[i] == "--max-age" {
-            let raw = rest
-                .get(i + 1)
-                .ok_or_else(|| "usage: workpen gc [--root DIR] --max-age DUR".to_string())?;
-            max_age = Some(parse_duration(raw)?);
-            i += 2;
-            continue;
+        match rest[i].as_str() {
+            "--max-age" => {
+                let raw = rest.get(i + 1).ok_or_else(|| {
+                    "usage: workpen gc [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]"
+                        .to_string()
+                })?;
+                max_age = Some(parse_max_age(raw).map_err(|e| e.to_string())?);
+                i += 2;
+            }
+            "--leftover" => {
+                leftover = Some(PathBuf::from(rest.get(i + 1).ok_or_else(|| {
+                    "usage: workpen gc [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]"
+                        .to_string()
+                })?));
+                i += 2;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown gc flag: {other}")),
         }
-        return Err(format!("unknown gc flag: {}", rest[i]));
     }
-    let max_age =
-        max_age.ok_or_else(|| "usage: workpen gc [--root DIR] --max-age DUR".to_string())?;
-    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let report = gc_leftovers(&root, &GcPolicy::new(max_age), SystemTime::now(), &cwd)
-        .map_err(|e| e.to_string())?;
-    for path in &report.removed {
-        println!("removed {}", path.display());
+    let max_age = max_age.ok_or_else(|| {
+        "usage: workpen gc [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]".to_string()
+    })?;
+    let mut cfg = GcConfig::new(&root, max_age);
+    cfg.now = SystemTime::now();
+    cfg.dry_run = dry_run;
+    if let Some(dir) = leftover {
+        cfg.leftover_dir = if dir.is_absolute() {
+            dir
+        } else {
+            root.join(dir)
+        };
     }
-    for (path, reason) in &report.kept {
-        println!("kept {} ({reason:?})", path.display());
+    let rows = run_gc(&root, &cfg).map_err(|e| e.to_string())?;
+    for (path, decision) in &rows {
+        match decision {
+            GcDecision::Keep { reason } => {
+                println!("keep {} ({})", path.display(), reason.as_str());
+            }
+            GcDecision::Reclaim { .. } if dry_run => {
+                println!("dry-run: would reclaim {}", path.display());
+            }
+            GcDecision::Reclaim { .. } => {
+                println!("reclaimed {}", path.display());
+            }
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -139,24 +171,4 @@ fn parse_roots(args: &[String]) -> Result<(PathBuf, Vec<PathBuf>, Vec<String>), 
         }
     }
     Ok((root, extras, rest))
-}
-
-fn parse_duration(raw: &str) -> Result<Duration, String> {
-    if let Some(n) = raw.strip_suffix('d') {
-        return Ok(Duration::from_secs(parse_u64(n)? * 86400));
-    }
-    if let Some(n) = raw.strip_suffix('h') {
-        return Ok(Duration::from_secs(parse_u64(n)? * 3600));
-    }
-    if let Some(n) = raw.strip_suffix('m') {
-        return Ok(Duration::from_secs(parse_u64(n)? * 60));
-    }
-    if let Some(n) = raw.strip_suffix('s') {
-        return Ok(Duration::from_secs(parse_u64(n)?));
-    }
-    Ok(Duration::from_secs(parse_u64(raw)?))
-}
-
-fn parse_u64(raw: &str) -> Result<u64, String> {
-    raw.parse().map_err(|_| format!("invalid duration: {raw}"))
 }
