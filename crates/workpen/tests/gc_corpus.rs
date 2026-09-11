@@ -872,6 +872,32 @@ fn recent_index_keeps_tree_when_head_and_files_are_old() {
 }
 
 #[test]
+fn remove_explicit_live_cwd_is_kept() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "rm-live");
+    let prev = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&wt).expect("chdir");
+    let no_force = remove_explicit(&wt, "refs/workpen/reclaimed", false);
+    let forced = remove_explicit(&wt, "refs/workpen/reclaimed", true);
+    let _ = std::env::set_current_dir(&prev);
+    match no_force {
+        Ok(GcDecision::Keep {
+            reason: KeepReason::LiveCwd,
+        }) => {}
+        other => panic!("remove_explicit live cwd must Keep LiveCwd, got {other:?}"),
+    }
+    match forced {
+        Ok(GcDecision::Keep {
+            reason: KeepReason::LiveCwd,
+        }) => {}
+        other => panic!("force must not skip live cwd, got {other:?}"),
+    }
+    assert!(wt.exists(), "live cwd must not be removed");
+}
+
+#[test]
 fn remove_explicit_refuses_dirty() {
     let fx = init_repo();
     let repo = fx.repo.clone();

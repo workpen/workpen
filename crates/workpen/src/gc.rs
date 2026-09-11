@@ -135,7 +135,7 @@ pub fn classify_for_age_gc(
 ///
 /// Discovers `--git-common-dir` from `path` (not `path.parent()`).
 /// `force` unlocks porcelain locked (`git worktree remove --force --force`).
-/// `force` does not skip dirty, unique, unreadable, or missing-git Keep.
+/// `force` does not skip dirty, unique, live-cwd, unreadable, or missing-git Keep.
 /// An unreadable worktree registry is [`GcError::RegistryUnreadable`].
 /// A same-repo checkout missing from the registry is leftover rm
 /// (`remove_dir_all`) after unique-work. A directory with no `.git` is
@@ -158,6 +158,11 @@ pub fn remove_explicit(
     if locked && !force {
         return Ok(GcDecision::Keep {
             reason: KeepReason::Locked,
+        });
+    }
+    if worktree_has_live_cwd(path) {
+        return Ok(GcDecision::Keep {
+            reason: KeepReason::LiveCwd,
         });
     }
     match classify_worktree(path, false) {
