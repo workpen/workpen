@@ -5,8 +5,8 @@ use std::path::Path;
 
 use workpen::{
     CheckDestError, DenyPolicy, DestDeny, DestDenyError, DestDenyKind, PathGuard, check_dest,
-    classify_dest, default_secret_denies, deny_patch_dests, dest_deny_message,
-    is_env_template_basename, is_path_denied, path_is_denied_glob,
+    classify_dest, default_secret_denies, deny_patch_dests, deny_patch_dests_with_display,
+    dest_deny_message, is_env_template_basename, is_path_denied, path_is_denied_glob,
     reject_command_secret_path_tokens, verify_post_open,
 };
 
@@ -333,6 +333,23 @@ fn deny_patch_dests_secret_denied_clean_allowed() {
         other => panic!("expected Denied, got {other}"),
     }
     deny_patch_dests(&[Path::new("src/lib.rs")], &policy).expect("clean dest allowed");
+}
+
+#[test]
+fn deny_patch_dests_with_display_uses_host_string() {
+    let policy = DenyPolicy::default();
+    let err = deny_patch_dests_with_display(&[(Path::new(".env"), "workspace:.env")], &policy)
+        .expect_err("denied");
+    let msg = err.to_string();
+    assert!(msg.contains("workspace:.env"), "{msg}");
+}
+
+#[test]
+fn deny_policy_clone_shares_globs() {
+    let a = DenyPolicy::default();
+    let b = a.clone();
+    assert_eq!(a.globs() as *const [String], b.globs() as *const [String]);
+    assert_eq!(a, b);
 }
 
 #[test]

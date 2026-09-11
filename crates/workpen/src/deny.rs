@@ -2,26 +2,30 @@
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::guard::{PathGuard, PathGuardError};
 
 /// Portable dest-deny policy. Same globs on every OS.
+/// Hosts hold this value. There is no process-wide default slot. Clone is cheap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenyPolicy {
-    globs: Vec<String>,
+    globs: Arc<Vec<String>>,
 }
 
 impl Default for DenyPolicy {
     fn default() -> Self {
         Self {
-            globs: default_secret_denies(),
+            globs: Arc::new(default_secret_denies()),
         }
     }
 }
 
 impl DenyPolicy {
     pub fn new(globs: Vec<String>) -> Self {
-        Self { globs }
+        Self {
+            globs: Arc::new(globs),
+        }
     }
 
     /// `default_secret_denies()` plus extras. Extras never replace defaults.
@@ -32,7 +36,9 @@ impl DenyPolicy {
                 globs.push(g);
             }
         }
-        Self { globs }
+        Self {
+            globs: Arc::new(globs),
+        }
     }
 
     pub fn globs(&self) -> &[String] {
@@ -273,6 +279,23 @@ pub fn deny_patch_dests(
                 kind,
                 path: dest.to_path_buf(),
                 display: dest.display().to_string(),
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// Like [`deny_patch_dests`], with a host-chosen display string per dest.
+pub fn deny_patch_dests_with_display(
+    dests: &[(&Path, &str)],
+    policy: &DenyPolicy,
+) -> Result<(), DestDenyError> {
+    for (dest, display) in dests {
+        if let Some(kind) = classify_dest(dest, policy) {
+            return Err(DestDenyError::Denied(DestDeny {
+                kind,
+                path: dest.to_path_buf(),
+                display: (*display).to_owned(),
             }));
         }
     }
