@@ -9,9 +9,10 @@ mod why;
 mod wrap;
 
 pub use deny::{
-    DenyPolicy, DestDeny, DestDenyError, DestDenyKind, classify_dest, default_secret_denies,
-    deny_patch_dests, dest_deny_message, is_env_template_basename, is_path_denied,
-    path_is_denied_glob, path_matches_deny_glob, reject_command_secret_path_tokens,
+    CheckDestError, DenyPolicy, DestDeny, DestDenyError, DestDenyKind, check_dest, classify_dest,
+    default_secret_denies, deny_patch_dests, dest_deny_message, is_env_template_basename,
+    is_path_denied, path_is_denied_glob, path_matches_deny_glob, reject_command_secret_path_tokens,
+    verify_post_open,
 };
 #[cfg(feature = "gc")]
 pub use gc::{

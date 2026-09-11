@@ -4,9 +4,10 @@
 use std::path::Path;
 
 use workpen::{
-    DenyPolicy, DestDeny, DestDenyError, DestDenyKind, classify_dest, default_secret_denies,
-    deny_patch_dests, dest_deny_message, is_env_template_basename, is_path_denied,
-    path_is_denied_glob, reject_command_secret_path_tokens,
+    CheckDestError, DenyPolicy, DestDeny, DestDenyError, DestDenyKind, PathGuard, check_dest,
+    classify_dest, default_secret_denies, deny_patch_dests, dest_deny_message,
+    is_env_template_basename, is_path_denied, path_is_denied_glob,
+    reject_command_secret_path_tokens, verify_post_open,
 };
 
 #[test]
@@ -289,4 +290,128 @@ fn deny_patch_dests_secret_denied_clean_allowed() {
         other => panic!("expected Denied, got {other}"),
     }
     deny_patch_dests(&[Path::new("src/lib.rs")], &policy).expect("clean dest allowed");
+}
+
+#[test]
+fn check_dest_raw_env_is_dest_deny_before_guard() {
+    let policy = DenyPolicy::default();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let guard = PathGuard::new(dir.path()).expect("guard");
+    let err = check_dest(".env", &policy, Some(&guard)).expect_err("raw .env");
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(d.kind, DestDenyKind::DenyGlob);
+        }
+        other => panic!("expected dest-deny, got {other}"),
+    }
+}
+
+#[test]
+fn check_dest_none_does_not_jail_dotdot() {
+    let policy = DenyPolicy::default();
+    let got = check_dest("../src/lib.rs", &policy, None).expect(".. is PathGuard, not dest-deny");
+    let want = std::env::current_dir().expect("cwd").join("../src/lib.rs");
+    assert_eq!(got, want);
+}
+
+#[test]
+fn check_dest_none_missing_is_cwd_joined() {
+    let policy = DenyPolicy::default();
+    let got = check_dest("no-such-workpen-dest-xyz", &policy, None).expect("missing dest");
+    let want = std::env::current_dir()
+        .expect("cwd")
+        .join("no-such-workpen-dest-xyz");
+    assert_eq!(got, want);
+}
+
+#[test]
+fn check_dest_none_existing_is_canonical() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("readme.md");
+    std::fs::write(&file, "ok\n").expect("write");
+    let policy = DenyPolicy::default();
+    let got = check_dest(&file.to_string_lossy(), &policy, None).expect("clean dest");
+    let want = std::fs::canonicalize(&file).expect("canon");
+    assert_eq!(got, want);
+}
+
+#[test]
+fn check_dest_guard_escape_is_path_guard() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outside = tempfile::tempdir().expect("outside");
+    let file = outside.path().join("notes.txt");
+    std::fs::write(&file, "ok\n").expect("write");
+    let guard = PathGuard::new(dir.path()).expect("guard");
+    let policy = DenyPolicy::default();
+    let err =
+        check_dest(&file.to_string_lossy(), &policy, Some(&guard)).expect_err("outside workspace");
+    match err {
+        CheckDestError::PathGuard(_) => {}
+        other => panic!("expected PathGuard, got {other}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_dest_resolved_symlink_to_env_is_dest_deny() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = dir.path().join(".env");
+    std::fs::write(&env, "SECRET=1\n").expect("write .env");
+    let alias = dir.path().join("config");
+    std::os::unix::fs::symlink(&env, &alias).expect("symlink");
+    let guard = PathGuard::new(dir.path()).expect("guard");
+    let policy = DenyPolicy::default();
+    let err =
+        check_dest(&alias.to_string_lossy(), &policy, Some(&guard)).expect_err("symlink to .env");
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(d.kind, DestDenyKind::DenyGlob);
+        }
+        other => panic!("expected dest-deny, got {other}"),
+    }
+}
+
+#[test]
+fn verify_post_open_same_file_passes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("safe.txt");
+    std::fs::write(&file, "content").expect("write");
+    let fd = std::fs::File::open(&file).expect("open");
+    let policy = DenyPolicy::default();
+    verify_post_open(&file, &fd, &policy).expect("same inode");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn verify_post_open_inode_mismatch_is_toctou() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let a = dir.path().join("a.txt");
+    let b = dir.path().join("b.txt");
+    std::fs::write(&a, "a").expect("write a");
+    std::fs::write(&b, "b").expect("write b");
+    let fd = std::fs::File::open(&a).expect("open a");
+    let policy = DenyPolicy::default();
+    let err = verify_post_open(&b, &fd, &policy).expect_err("mismatch");
+    let msg = err.to_string();
+    assert!(msg.contains("TOCTOU"), "{msg}");
+}
+
+#[test]
+fn verify_post_open_late_hardlink_wording_is_distinct() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = dir.path().join(".env");
+    std::fs::write(&env, "API_KEY=secret\n").expect("write .env");
+    let sibling = dir.path().join("notes.txt");
+    std::fs::hard_link(&env, &sibling).expect("hardlink");
+    let fd = std::fs::File::open(&sibling).expect("open sibling");
+    let policy = DenyPolicy::default();
+    let err = verify_post_open(&sibling, &fd, &policy).expect_err("late hardlink");
+    let msg = err.to_string().to_ascii_lowercase();
+    assert!(msg.contains("hardlink of a denied name"), "{msg}");
+    assert!(msg.contains("unlink extra names"), "{msg}");
+    assert!(!msg.contains("matches deny glob"), "{msg}");
+    let pre = dest_deny_message(&sibling, &sibling.to_string_lossy(), &policy)
+        .expect("pre-open sibling dest-deny")
+        .to_ascii_lowercase();
+    assert!(!pre.contains("unlink extra names"), "{pre}");
 }

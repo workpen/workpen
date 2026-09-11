@@ -1,6 +1,9 @@
 //! Dest-deny predicate. Glob match, hardlink sibling, patch dests, argv tokens.
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
+
+use crate::guard::{PathGuard, PathGuardError};
 
 /// Portable dest-deny policy. Same globs on every OS.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +80,25 @@ pub enum DestDenyError {
     /// Argv token hit. Distinct wording from [`DestDeny::message`].
     #[error("command references path denied by sandbox profile: {token}")]
     CommandToken { token: String },
+    /// Post-open hardlink hit. Distinct wording from [`DestDeny::message`].
+    #[error(
+        "path denied: {path} is a hardlink of a denied name; unlink extra names or do not share the inode"
+    )]
+    LateHardlink { path: String },
+    /// Path identity changed between check and open.
+    #[error("TOCTOU race detected: {path} changed between check and open")]
+    Toctou { path: String },
+    #[error("TOCTOU check failed: {0}")]
+    ToctouStat(String),
+}
+
+/// Host composition error. Dest-deny vs PathGuard; do not parse messages.
+#[derive(Debug, thiserror::Error)]
+pub enum CheckDestError {
+    #[error(transparent)]
+    DestDeny(#[from] DestDenyError),
+    #[error(transparent)]
+    PathGuard(#[from] PathGuardError),
 }
 
 impl std::fmt::Display for DestDeny {
@@ -117,6 +139,125 @@ pub fn dest_deny_message(path: &Path, display: &str, policy: &DenyPolicy) -> Opt
         }
         .message()
     })
+}
+
+/// Dest-deny raw; if `guard` is `Some`, PathGuard; dest-deny resolved.
+///
+/// `guard: None` dest-denies raw and, if the path exists, dest-denies the
+/// cwd-joined canonicalize. Does not treat cwd as a workspace root.
+/// Does not peel, does not reject NUL, does not verify after open.
+pub fn check_dest(
+    path: &str,
+    policy: &DenyPolicy,
+    guard: Option<&PathGuard>,
+) -> Result<PathBuf, CheckDestError> {
+    let raw = Path::new(path);
+    if let Some(kind) = classify_dest(raw, policy) {
+        return Err(CheckDestError::DestDeny(DestDenyError::Denied(DestDeny {
+            kind,
+            path: raw.to_path_buf(),
+            display: path.to_owned(),
+        })));
+    }
+
+    let resolved = match guard {
+        Some(g) => g.check(raw)?,
+        None => {
+            let joined = if raw.is_absolute() {
+                raw.to_path_buf()
+            } else {
+                match std::env::current_dir() {
+                    Ok(cwd) => cwd.join(raw),
+                    Err(_) => raw.to_path_buf(),
+                }
+            };
+            if joined.exists() {
+                std::fs::canonicalize(&joined).unwrap_or(joined)
+            } else {
+                joined
+            }
+        }
+    };
+
+    if let Some(kind) = classify_dest(&resolved, policy) {
+        return Err(CheckDestError::DestDeny(DestDenyError::Denied(DestDeny {
+            kind,
+            path: resolved,
+            display: path.to_owned(),
+        })));
+    }
+    Ok(resolved)
+}
+
+/// Unix inode/dev; Windows file index + volume serial.
+/// Re-runs hardlink dest-deny when nlink / nNumberOfLinks > 1.
+pub fn verify_post_open(path: &Path, fd: &File, policy: &DenyPolicy) -> Result<(), DestDenyError> {
+    #[cfg(unix)]
+    {
+        verify_post_open_unix(path, fd, policy)
+    }
+    #[cfg(windows)]
+    {
+        verify_post_open_windows(path, fd, policy)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, fd, policy);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn verify_post_open_unix(path: &Path, fd: &File, policy: &DenyPolicy) -> Result<(), DestDenyError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let path_meta = std::fs::symlink_metadata(path)
+        .map_err(|e| DestDenyError::ToctouStat(format!("cannot stat {}: {e}", path.display())))?;
+    let fd_meta = fd
+        .metadata()
+        .map_err(|e| DestDenyError::ToctouStat(format!("cannot fstat fd: {e}")))?;
+    if path_meta.ino() != fd_meta.ino() || path_meta.dev() != fd_meta.dev() {
+        return Err(DestDenyError::Toctou {
+            path: path.display().to_string(),
+        });
+    }
+    if fd_meta.nlink() > 1 {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if hardlink_sibling_denied(&canon, policy) {
+            return Err(DestDenyError::LateHardlink {
+                path: path.display().to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_post_open_windows(
+    path: &Path,
+    fd: &File,
+    policy: &DenyPolicy,
+) -> Result<(), DestDenyError> {
+    use std::os::windows::io::AsRawHandle;
+
+    let path_info = win_path_by_handle(path)
+        .map_err(|e| DestDenyError::ToctouStat(format!("cannot stat {}: {e}", path.display())))?;
+    let fd_info = win_handle_info(fd.as_raw_handle())
+        .map_err(|e| DestDenyError::ToctouStat(format!("cannot fstat fd: {e}")))?;
+    if path_info.index != fd_info.index || path_info.volume != fd_info.volume {
+        return Err(DestDenyError::Toctou {
+            path: path.display().to_string(),
+        });
+    }
+    if fd_info.nlink > 1 {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if hardlink_sibling_denied(&canon, policy) {
+            return Err(DestDenyError::LateHardlink {
+                path: path.display().to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Refuse if any host-extracted dest is a secret glob or hardlink sibling.
@@ -373,6 +514,129 @@ fn win_hardlink_names(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
         FindClose(handle);
     }
     Ok(names)
+}
+
+#[cfg(windows)]
+struct WinHandleInfo {
+    volume: u32,
+    index: u64,
+    nlink: u32,
+}
+
+#[cfg(windows)]
+fn win_path_by_handle(path: &Path) -> std::io::Result<WinHandleInfo> {
+    use std::os::windows::ffi::OsStrExt;
+
+    type Handle = *mut core::ffi::c_void;
+    type Dword = u32;
+    const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+    const FILE_READ_ATTRIBUTES: Dword = 0x0080;
+    const FILE_SHARE_READ: Dword = 0x0001;
+    const FILE_SHARE_WRITE: Dword = 0x0002;
+    const FILE_SHARE_DELETE: Dword = 0x0004;
+    const OPEN_EXISTING: Dword = 3;
+    const FILE_FLAG_BACKUP_SEMANTICS: Dword = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: Dword = 0x0020_0000;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileW(
+            lp_file_name: *const u16,
+            dw_desired_access: Dword,
+            dw_share_mode: Dword,
+            lp_security_attributes: *mut core::ffi::c_void,
+            dw_creation_disposition: Dword,
+            dw_flags_and_attributes: Dword,
+            h_template_file: Handle,
+        ) -> Handle;
+        fn CloseHandle(h_object: Handle) -> i32;
+        fn GetLastError() -> Dword;
+    }
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a NUL-terminated path.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            core::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            core::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        let err = unsafe { GetLastError() };
+        return Err(std::io::Error::from_raw_os_error(err as i32));
+    }
+    let info = win_handle_info(handle);
+    unsafe {
+        CloseHandle(handle);
+    }
+    info
+}
+
+#[cfg(windows)]
+fn win_handle_info(handle: *mut core::ffi::c_void) -> std::io::Result<WinHandleInfo> {
+    type Dword = u32;
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        dw_file_attributes: Dword,
+        ft_creation_time_lo: Dword,
+        ft_creation_time_hi: Dword,
+        ft_last_access_time_lo: Dword,
+        ft_last_access_time_hi: Dword,
+        ft_last_write_time_lo: Dword,
+        ft_last_write_time_hi: Dword,
+        dw_volume_serial_number: Dword,
+        n_file_size_high: Dword,
+        n_file_size_low: Dword,
+        n_number_of_links: Dword,
+        n_file_index_high: Dword,
+        n_file_index_low: Dword,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            h_file: *mut core::ffi::c_void,
+            lp_file_information: *mut ByHandleFileInformation,
+        ) -> i32;
+        fn GetLastError() -> Dword;
+    }
+
+    let mut info = ByHandleFileInformation {
+        dw_file_attributes: 0,
+        ft_creation_time_lo: 0,
+        ft_creation_time_hi: 0,
+        ft_last_access_time_lo: 0,
+        ft_last_access_time_hi: 0,
+        ft_last_write_time_lo: 0,
+        ft_last_write_time_hi: 0,
+        dw_volume_serial_number: 0,
+        n_file_size_high: 0,
+        n_file_size_low: 0,
+        n_number_of_links: 0,
+        n_file_index_high: 0,
+        n_file_index_low: 0,
+    };
+    // SAFETY: `handle` is an open file handle; `info` is the Win32 layout.
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        return Err(std::io::Error::from_raw_os_error(err as i32));
+    }
+    Ok(WinHandleInfo {
+        volume: info.dw_volume_serial_number,
+        index: (u64::from(info.n_file_index_high) << 32) | u64::from(info.n_file_index_low),
+        nlink: info.n_number_of_links,
+    })
 }
 
 fn peel_shell_meta(s: &str) -> &str {
