@@ -561,7 +561,7 @@ fn hardlink_stat_permission_denied_is_fail_closed() {
     match classify_dest(&sibling, &policy) {
         Some(DestDenyKind::HardlinkSibling) => {}
         other => panic!(
-            "hardlink stat that is not NotFound must fail closed as HardlinkSibling, got {other:?}"
+            "hardlink stat PermissionDenied must fail closed as HardlinkSibling, got {other:?}"
         ),
     }
 }

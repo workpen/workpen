@@ -511,8 +511,8 @@ fn hardlink_sibling_denied_unix(path: &Path, canon: Option<&Path>, policy: &Deny
         .unwrap_or_else(|| std::fs::symlink_metadata(path))
     {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return true,
+        Err(_) => return false,
     };
     // Directory nlink counts children, not extra names for this inode.
     if meta.file_type().is_dir() {
@@ -574,8 +574,8 @@ fn hardlink_sibling_denied_windows(path: &Path, canon: Option<&Path>, policy: &D
     let probe = canon.unwrap_or(path);
     let meta = match std::fs::metadata(probe) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return true,
+        Err(_) => return false,
     };
     if meta.is_dir() {
         return false;

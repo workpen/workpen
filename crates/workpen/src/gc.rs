@@ -424,7 +424,8 @@ fn worktree_has_live_cwd_from(
     }
 }
 
-/// Other-process cwds. `Err` when every available probe failed.
+/// Other-process cwds. `Err` when an expected probe failed.
+/// Windows has no `/proc` and no `lsof`; that is not a probe failure.
 fn other_process_cwds() -> Result<Vec<PathBuf>, ()> {
     #[cfg(target_os = "linux")]
     {
@@ -432,7 +433,14 @@ fn other_process_cwds() -> Result<Vec<PathBuf>, ()> {
             return Ok(cwds);
         }
     }
-    lsof_process_cwds()
+    #[cfg(unix)]
+    {
+        return lsof_process_cwds();
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(target_os = "linux")]
