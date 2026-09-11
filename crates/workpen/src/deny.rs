@@ -395,6 +395,10 @@ fn hardlink_sibling_denied_unix(canon: &Path, policy: &DenyPolicy) -> bool {
         Ok(m) => m,
         Err(_) => return false,
     };
+    // Directory nlink counts children, not extra names for this inode.
+    if meta.file_type().is_dir() {
+        return false;
+    }
     let nlink = meta.nlink();
     if nlink <= 1 {
         return false;
@@ -429,6 +433,12 @@ fn hardlink_sibling_denied_unix(canon: &Path, policy: &DenyPolicy) -> bool {
 /// with FindFirstFileNameW instead.
 #[cfg(windows)]
 fn hardlink_sibling_denied_windows(canon: &Path, policy: &DenyPolicy) -> bool {
+    if std::fs::metadata(canon)
+        .map(|m| m.is_dir())
+        .unwrap_or(false)
+    {
+        return false;
+    }
     match win_hardlink_names(canon) {
         Ok(names) if names.len() <= 1 => false,
         Ok(names) => names.iter().any(|n| {
