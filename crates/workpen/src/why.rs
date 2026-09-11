@@ -10,6 +10,7 @@ pub enum Why {
     Allowed,
     DestDeny(DestDeny),
     PathGuard(PathGuardDeny),
+    EmptyPath,
 }
 
 impl Why {
@@ -18,6 +19,7 @@ impl Why {
             Why::Allowed => "allowed".into(),
             Why::DestDeny(d) => d.message(),
             Why::PathGuard(d) => d.message(),
+            Why::EmptyPath => PathGuardError::EmptyPath.to_string(),
         }
     }
 }
@@ -33,9 +35,9 @@ pub fn explain(path: &Path, policy: &DenyPolicy, guard: Option<&PathGuard>) -> W
     if let Some(guard) = guard {
         match guard.check(path) {
             Err(PathGuardError::Denied(deny)) => return Why::PathGuard(deny),
+            Err(PathGuardError::EmptyPath) => return Why::EmptyPath,
             Err(
                 PathGuardError::Root(_)
-                | PathGuardError::EmptyPath
                 | PathGuardError::AbsolutePath(_)
                 | PathGuardError::Canonicalize { .. },
             ) => {
@@ -61,6 +63,29 @@ mod tests {
         match explain(std::path::Path::new(".env"), &DenyPolicy::default(), None) {
             Why::DestDeny(d) => assert!(d.message().contains("deny glob")),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn explain_empty_path_is_not_escape() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let extras: [&std::path::Path; 0] = [];
+        let guard = PathGuard::with_extra_roots(dir.path(), extras).expect("guard");
+        for raw in ["", " "] {
+            let why = explain(
+                std::path::Path::new(raw),
+                &DenyPolicy::default(),
+                Some(&guard),
+            );
+            let msg = why.message();
+            assert!(
+                msg.to_ascii_lowercase().contains("empty"),
+                "empty path must mention empty: {msg}"
+            );
+            assert!(
+                !msg.contains("escapes workspace"),
+                "empty path must not claim escape: {msg}"
+            );
         }
     }
 }

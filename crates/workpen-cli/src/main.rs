@@ -32,7 +32,7 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
         "why" => cmd_why(&args[1..]),
         "run" => cmd_run(&args[1..]),
         "gc" => cmd_gc(&args[1..]),
-        other => Err(format!("unknown command: {other}")),
+        other => Err(format!("unknown command: {other} (use why, run, or gc)")),
     }
 }
 
@@ -77,7 +77,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     workpen::process_jail(&root, &extras)
         .and_then(|policy| policy.apply_pre_exec(&mut child))
         .map_err(|e| e.to_string())?;
-    let status = child.status().map_err(|e| e.to_string())?;
+    let status = child
+        .status()
+        .map_err(|e| format!("failed to spawn {}: {e}", cmd[0]))?;
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
@@ -108,7 +110,11 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
                 dry_run = true;
                 i += 1;
             }
-            other => return Err(format!("unknown gc flag: {other}")),
+            other => {
+                return Err(format!(
+                    "unknown gc flag: {other} (use --max-age, --dry-run, --leftover, or --help)"
+                ));
+            }
         }
     }
     let max_age = max_age.ok_or_else(|| {
