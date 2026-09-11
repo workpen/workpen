@@ -276,7 +276,7 @@ fn resolve_extra_root_allows_explicit_dir() {
     let dir = workspace();
     let extra = TempDir::new().expect("extra");
     let got = resolve_extra_root(dir.path(), extra.path().to_str().expect("utf8")).expect("ok");
-    let want = std::fs::canonicalize(extra.path()).expect("canon");
+    let want = dunce::canonicalize(extra.path()).expect("canon");
     assert_eq!(got, want);
 }
 
