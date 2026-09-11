@@ -353,6 +353,15 @@ fn deny_policy_clone_shares_globs() {
 }
 
 #[test]
+fn deny_policy_from_arc_shares_allocation() {
+    use std::sync::Arc;
+    let globs = Arc::new(vec!["**/.env".into(), "**/.env.*".into()]);
+    let policy = DenyPolicy::from_arc(Arc::clone(&globs));
+    assert!(Arc::ptr_eq(&globs, &policy.globs_arc()));
+    assert_eq!(policy.globs(), globs.as_slice());
+}
+
+#[test]
 fn check_dest_raw_env_is_dest_deny_before_guard() {
     let policy = DenyPolicy::default();
     let dir = tempfile::tempdir().expect("tempdir");
