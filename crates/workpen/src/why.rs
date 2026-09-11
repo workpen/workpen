@@ -1,8 +1,9 @@
 //! Combined dest-deny + PathGuard explanation.
 //!
-//! Dest-deny runs on the path as given. Hosts that have a workspace
-//! root should join first, or call [`crate::check_dest`]. The CLI
-//! `why` command uses `check_dest` under `--root`.
+//! Dest-deny runs on the path as given. If `guard` is `Some`, PathGuard
+//! resolves then dest-deny runs on the resolved path (same order as
+//! [`crate::check_dest`]). The CLI `why` command uses `check_dest`
+//! under `--root`.
 
 use std::path::Path;
 
@@ -51,7 +52,15 @@ pub fn explain(path: &Path, policy: &DenyPolicy, guard: Option<&PathGuard>) -> W
                     display: path.display().to_string(),
                 });
             }
-            Ok(_) => {}
+            Ok(resolved) => {
+                if let Some(kind) = classify_dest(&resolved, policy) {
+                    return Why::DestDeny(DestDeny {
+                        kind,
+                        path: resolved,
+                        display: path.display().to_string(),
+                    });
+                }
+            }
         }
     }
     Why::Allowed
@@ -67,6 +76,32 @@ mod tests {
         match explain(std::path::Path::new(".env"), &DenyPolicy::default(), None) {
             Why::DestDeny(d) => assert!(d.message().contains("deny glob")),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn explain_path_guard_resolved_hardlink_is_dest_deny() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let env = dir.path().join(".env");
+        std::fs::write(&env, "SECRET=1\n").expect("env");
+        let notes = dir.path().join("notes.txt");
+        std::fs::hard_link(&env, &notes).expect("hardlink");
+        let extras: [&std::path::Path; 0] = [];
+        let guard = PathGuard::with_extra_roots(dir.path(), extras).expect("guard");
+        let policy = DenyPolicy::default();
+        // Process cwd is not the workspace. Raw "notes.txt" is not dest-deny;
+        // PathGuard joins the workspace and must dest-deny the resolved sibling.
+        match explain(std::path::Path::new("notes.txt"), &policy, Some(&guard)) {
+            Why::DestDeny(d) => {
+                assert_eq!(d.kind, crate::DestDenyKind::HardlinkSibling);
+            }
+            other => panic!("resolved hardlink sibling must DestDeny, got {other:?}"),
+        }
+        match crate::check_dest("notes.txt", &policy, Some(&guard)) {
+            Err(crate::CheckDestError::DestDeny(crate::DestDenyError::Denied(d))) => {
+                assert_eq!(d.kind, crate::DestDenyKind::HardlinkSibling);
+            }
+            other => panic!("check_dest must dest-deny the same shape, got {other:?}"),
         }
     }
 

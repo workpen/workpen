@@ -564,6 +564,61 @@ fn porcelain_rel(line: &str) -> &str {
 }
 
 #[test]
+fn gitignored_env_under_cache_dir_is_kept() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"target\nnode_modules\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore cache dirs"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let now = SystemTime::now() + Duration::from_secs(10);
+    let cases = [
+        ("cache-env-target", "target"),
+        ("cache-env-nm", "node_modules"),
+    ];
+    for (name, cache) in cases {
+        let wt = add_leftover_worktree(&repo, &leftover, name);
+        let dir = wt.join(cache);
+        fs::create_dir_all(&dir).expect("cache dir");
+        let env = dir.join(".env");
+        fs::write(&env, b"SECRET=1\n").expect("env");
+        match classify_worktree(&wt, false) {
+            GcDecision::Keep {
+                reason: KeepReason::UniqueUntracked | KeepReason::DirtyWork,
+            } => {}
+            other => panic!("gitignored {cache}/.env must keep the tree, got {other:?}"),
+        }
+        match classify_for_age_gc(&wt, false, Duration::from_secs(0), now) {
+            GcDecision::Keep {
+                reason: KeepReason::UniqueUntracked | KeepReason::DirtyWork,
+            } => {}
+            other => panic!("old leftover with {cache}/.env must keep, got {other:?}"),
+        }
+    }
+    let rows = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now)).expect("gc");
+    for (name, cache) in cases {
+        let wt = leftover.join(name);
+        let env = wt.join(cache).join(".env");
+        let row = rows
+            .iter()
+            .find(|(p, _)| p.file_name() == wt.file_name())
+            .unwrap_or_else(|| panic!("{name} row"));
+        match &row.1 {
+            GcDecision::Keep {
+                reason: KeepReason::UniqueUntracked | KeepReason::DirtyWork,
+            } => {}
+            other => panic!("run_gc must keep leftover with {cache}/.env, got {other:?}"),
+        }
+        assert!(
+            wt.exists(),
+            "worktree with gitignored {cache}/.env must stay"
+        );
+        assert!(env.exists(), "gitignored {cache}/.env must not be deleted");
+        assert_eq!(fs::read(&env).expect("read env"), b"SECRET=1\n");
+    }
+}
+
+#[test]
 fn unique_dangling_commit_is_saved_under_prefix() {
     let fx = init_repo();
     let repo = fx.repo.clone();
@@ -806,6 +861,32 @@ fn recent_index_keeps_tree_when_head_and_files_are_old() {
         } => {}
         other => panic!("fresh index must keep the tree, got {other:?}"),
     }
+}
+
+#[test]
+fn remove_explicit_live_cwd_is_kept() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "rm-live");
+    let prev = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&wt).expect("chdir");
+    let no_force = remove_explicit(&wt, "refs/workpen/reclaimed", false);
+    let forced = remove_explicit(&wt, "refs/workpen/reclaimed", true);
+    let _ = std::env::set_current_dir(&prev);
+    match no_force {
+        Ok(GcDecision::Keep {
+            reason: KeepReason::LiveCwd,
+        }) => {}
+        other => panic!("remove_explicit live cwd must Keep LiveCwd, got {other:?}"),
+    }
+    match forced {
+        Ok(GcDecision::Keep {
+            reason: KeepReason::LiveCwd,
+        }) => {}
+        other => panic!("force must not skip live cwd, got {other:?}"),
+    }
+    assert!(wt.exists(), "live cwd must not be removed");
 }
 
 #[test]
