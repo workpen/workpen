@@ -21,6 +21,9 @@ const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# cache
 
 fn git(cwd: &Path, args: &[&str]) {
     let out = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .args(args)
         .current_dir(cwd)
         .output()
@@ -34,6 +37,9 @@ fn git(cwd: &Path, args: &[&str]) {
 
 fn git_out(cwd: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .args(args)
         .current_dir(cwd)
         .output()
@@ -46,17 +52,29 @@ fn git_out(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-fn init_repo() -> (TempDir, PathBuf) {
+struct Repo {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    _dir: TempDir,
+    repo: PathBuf,
+}
+
+fn init_repo() -> Repo {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = TempDir::new().expect("repo");
-    git(dir.path(), &["init", "-b", "main"]);
-    git(dir.path(), &["config", "user.email", "dev@example.com"]);
-    git(dir.path(), &["config", "user.name", "dev"]);
-    git(dir.path(), &["config", "commit.gpgsign", "false"]);
-    fs::write(dir.path().join("README"), b"x").expect("readme");
-    git(dir.path(), &["add", "README"]);
-    git(dir.path(), &["commit", "-m", "init"]);
-    let top = dir.path().to_path_buf();
-    (dir, top)
+    let repo = dir.path().join("origin");
+    fs::create_dir(&repo).expect("origin");
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "dev@example.com"]);
+    git(&repo, &["config", "user.name", "dev"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    fs::write(repo.join("README"), b"x").expect("readme");
+    git(&repo, &["add", "README"]);
+    git(&repo, &["commit", "-m", "init"]);
+    Repo {
+        _lock,
+        _dir: dir,
+        repo,
+    }
 }
 
 fn add_leftover_worktree(repo: &Path, leftover_dir: &Path, name: &str) -> PathBuf {
@@ -128,7 +146,8 @@ fn refuse_home_as_workspace() {
 
 #[test]
 fn primary_is_never_a_candidate() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let rows = run_gc(
         &repo,
         &cfg(&repo, Duration::from_secs(0), SystemTime::now()),
@@ -143,7 +162,8 @@ fn primary_is_never_a_candidate() {
 
 #[test]
 fn dirty_worktree_is_kept() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "dirty");
     fs::write(wt.join("README"), b"changed").expect("dirty");
@@ -157,7 +177,8 @@ fn dirty_worktree_is_kept() {
 
 #[test]
 fn unique_untracked_is_kept() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "unique");
     fs::write(wt.join("only-here.txt"), b"unique").expect("untracked");
@@ -171,10 +192,10 @@ fn unique_untracked_is_kept() {
 
 #[test]
 fn live_cwd_is_kept() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "live");
-    let _guard = CWD_LOCK.lock().expect("cwd lock");
     let prev = std::env::current_dir().expect("cwd");
     std::env::set_current_dir(&wt).expect("chdir");
     let rows = run_gc(
@@ -197,7 +218,8 @@ fn live_cwd_is_kept() {
 
 #[test]
 fn locked_worktree_is_kept() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "locked");
     git(&repo, &["worktree", "lock", wt.to_str().expect("utf8")]);
@@ -220,7 +242,8 @@ fn locked_worktree_is_kept() {
 
 #[test]
 fn young_clean_worktree_is_kept() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "young");
     match classify_for_age_gc(&wt, false, Duration::from_secs(60 * 60), SystemTime::now()) {
@@ -233,7 +256,8 @@ fn young_clean_worktree_is_kept() {
 
 #[test]
 fn old_clean_worktree_is_reclaimed() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "oldclean");
     let now = SystemTime::now() + Duration::from_secs(10);
@@ -253,7 +277,8 @@ fn old_clean_worktree_is_reclaimed() {
 
 #[test]
 fn untracked_leftover_is_kept_and_not_removed() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let copy = leftover.join("copy");
     fs::create_dir_all(&copy).expect("copy");
@@ -290,7 +315,8 @@ fn untracked_leftover_is_kept_and_not_removed() {
 
 #[test]
 fn leftover_dir_is_host_configurable() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".bline-worktrees");
     let copy = leftover.join("copy");
     fs::create_dir_all(&copy).expect("copy");
@@ -315,7 +341,8 @@ fn leftover_dir_is_host_configurable() {
 
 #[test]
 fn cache_only_target_is_reclaimable() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "cache-wt");
     let target = wt.join("target");
@@ -330,7 +357,8 @@ fn cache_only_target_is_reclaimable() {
 
 #[test]
 fn unique_dangling_commit_is_saved_under_prefix() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "saved");
     fs::write(wt.join("README"), b"unique commit").expect("edit");
@@ -374,7 +402,8 @@ fn unique_dangling_commit_is_saved_under_prefix() {
 
 #[test]
 fn dry_run_does_not_remove() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "dry");
     let mut gc = cfg(
@@ -429,7 +458,8 @@ fn keep_reason_as_str_is_stable() {
 #[cfg(unix)]
 #[test]
 fn age_uses_tree_mtime_not_root_only() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "mtime");
     let amend = Command::new("git")
@@ -480,7 +510,8 @@ fn git_path(wt: &Path, name: &str) -> PathBuf {
 
 #[test]
 fn unreadable_git_status_is_kept() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "status-fail");
     fs::write(git_path(&wt, "index"), [0u8, 0, 0]).expect("corrupt index");
@@ -497,7 +528,8 @@ fn unreadable_git_status_is_kept() {
 
 #[test]
 fn missing_git_pointer_is_kept() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "missing-git");
     let git_ptr = wt.join(".git");
@@ -520,7 +552,8 @@ fn missing_git_pointer_is_kept() {
 #[cfg(unix)]
 #[test]
 fn recent_index_keeps_tree_when_head_and_files_are_old() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "index-age");
     let amend = Command::new("git")
@@ -569,7 +602,8 @@ fn recent_index_keeps_tree_when_head_and_files_are_old() {
 
 #[test]
 fn remove_explicit_refuses_dirty() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "rm-dirty");
     fs::write(wt.join("README"), b"changed").expect("dirty");
@@ -584,7 +618,8 @@ fn remove_explicit_refuses_dirty() {
 
 #[test]
 fn remove_explicit_reclaims_clean() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "rm-clean");
     match remove_explicit(&wt, "refs/workpen/reclaimed", false) {
@@ -596,9 +631,136 @@ fn remove_explicit_reclaims_clean() {
 
 #[test]
 fn worktree_last_used_is_public() {
-    let (_dir, repo) = init_repo();
+    let fx = init_repo();
+    let repo = fx.repo.clone();
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "last-used");
     let used = worktree_last_used(&wt).expect("last used");
     assert!(used <= SystemTime::now() + Duration::from_secs(2));
+}
+
+fn add_sibling_worktree(repo: &Path, name: &str) -> PathBuf {
+    let dest = repo.parent().expect("temp parent").join(name);
+    git(
+        repo,
+        &["worktree", "add", dest.to_str().expect("utf8"), "-b", name],
+    );
+    dest
+}
+
+#[test]
+fn remove_explicit_sibling_worktree_reclaims() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let wt = add_sibling_worktree(&repo, "sib-rm");
+    assert_ne!(
+        wt.parent().expect("parent"),
+        repo.as_path(),
+        "sibling parent must not be the repo"
+    );
+    match remove_explicit(&wt, "refs/workpen/reclaimed", false) {
+        Ok(GcDecision::Reclaim { .. }) => {}
+        other => panic!("sibling worktree must reclaim, got {other:?}"),
+    }
+    assert!(!wt.exists(), "sibling tree should be removed");
+}
+
+#[test]
+fn remove_explicit_force_removes_locked() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let wt = add_sibling_worktree(&repo, "sib-lock");
+    git(&repo, &["worktree", "lock", wt.to_str().expect("utf8")]);
+    match remove_explicit(&wt, "refs/workpen/reclaimed", false) {
+        Ok(GcDecision::Keep {
+            reason: KeepReason::Locked,
+        }) => {}
+        other => panic!("locked without force must keep, got {other:?}"),
+    }
+    assert!(wt.exists(), "locked tree must stay without force");
+    match remove_explicit(&wt, "refs/workpen/reclaimed", true) {
+        Ok(GcDecision::Reclaim { .. }) => {}
+        other => panic!("force must remove locked, got {other:?}"),
+    }
+    assert!(!wt.exists(), "forced locked tree should be removed");
+}
+
+#[test]
+fn remove_explicit_untracked_leftover_rm() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "orphan-copy");
+    let gitdir = repo.join(".git").join("worktrees").join("orphan-copy");
+    fs::write(
+        wt.join(".git"),
+        format!("gitdir: {}\n", repo.join(".git").display()),
+    )
+    .expect("retarget git");
+    if gitdir.exists() {
+        fs::remove_dir_all(&gitdir).expect("unregister");
+    }
+    match remove_explicit(&wt, "refs/workpen/reclaimed", false) {
+        Ok(GcDecision::Reclaim { .. }) => {}
+        other => panic!("untracked leftover must rm after unique-work, got {other:?}"),
+    }
+    assert!(!wt.exists(), "untracked leftover should be removed");
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_explicit_registry_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let wt = add_sibling_worktree(&repo, "sib-unreadable");
+    let real = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("which git");
+    assert!(real.status.success(), "need git on PATH");
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_owned();
+    let wrap_dir = tempfile::TempDir::new().expect("wrap");
+    let wrap = wrap_dir.path().join("git");
+    fs::write(
+        &wrap,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n*\" worktree list \"*) echo unreadable >&2; exit 1 ;;\nesac\nexec {real} \"$@\"\n"
+        ),
+    )
+    .expect("wrapper");
+    fs::set_permissions(&wrap, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let old = std::env::var_os("PATH");
+    let mut path = wrap_dir.path().display().to_string();
+    path.push(':');
+    path.push_str(&std::env::var("PATH").unwrap_or_default());
+    unsafe { std::env::set_var("PATH", &path) };
+    let got = remove_explicit(&wt, "refs/workpen/reclaimed", false);
+    match old {
+        Some(v) => unsafe { std::env::set_var("PATH", v) },
+        None => unsafe { std::env::remove_var("PATH") },
+    }
+    match got {
+        Err(GcError::RegistryUnreadable(_)) => {}
+        other => panic!("unreadable registry must fail closed, got {other:?}"),
+    }
+    assert!(wt.exists(), "must not delete when registry is unreadable");
+}
+
+#[test]
+fn git_ignores_process_git_dir() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "git-dir-env");
+    let decoy = repo.join("no-such-git-dir");
+    let old = std::env::var_os("GIT_DIR");
+    // Safety: serialized by CWD_LOCK; restored below.
+    unsafe { std::env::set_var("GIT_DIR", &decoy) };
+    let used = worktree_last_used(&wt);
+    match old {
+        Some(v) => unsafe { std::env::set_var("GIT_DIR", v) },
+        None => unsafe { std::env::remove_var("GIT_DIR") },
+    }
+    used.expect("process GIT_DIR must not hide last-used");
 }

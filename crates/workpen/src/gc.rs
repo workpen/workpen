@@ -1,4 +1,8 @@
 //! Fail-closed leftover worktree age GC. Feature-gated (`gc`).
+//!
+//! Unique-work is `git status --porcelain`. Last-used is `git log -1
+//! --format=%ct`, the index mtime, and a bounded tree walk. Both clocks
+//! are git CLI. There is no `gix` path in v1.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -124,16 +128,31 @@ pub fn classify_for_age_gc(
     classify_worktree(path, false)
 }
 
-/// Remove one registered worktree after the unique-work check.
+/// Remove one worktree after the unique-work check.
+///
+/// Discovers `--git-common-dir` from `path` (not `path.parent()`).
+/// `force` unlocks porcelain locked (`git worktree remove --force --force`).
 /// `force` does not skip dirty, unique, unreadable, or missing-git Keep.
-/// Porcelain `locked` is always Keep.
+/// An unreadable worktree registry is [`GcError::RegistryUnreadable`].
+/// A same-repo checkout missing from the registry is leftover rm
+/// (`remove_dir_all`) after unique-work. A directory with no `.git` is
+/// [`KeepReason::NotAGitDir`].
 pub fn remove_explicit(
     path: &Path,
     saved_ref_prefix: &str,
     force: bool,
 ) -> Result<GcDecision, GcError> {
-    let _ = force;
-    if worktree_is_locked(path) {
+    if !path.is_dir() || !is_git_repo(path) {
+        return Ok(GcDecision::Keep {
+            reason: KeepReason::NotAGitDir,
+        });
+    }
+    let common = git_common_dir(path).map_err(registry_unreadable)?;
+    let repo = repo_cwd_from_common_dir(&common);
+    let registered = registered_worktrees(&repo)?;
+    let entry = registered.iter().find(|w| paths_eq(&w.path, path));
+    let locked = entry.is_some_and(|w| w.locked);
+    if locked && !force {
         return Ok(GcDecision::Keep {
             reason: KeepReason::Locked,
         });
@@ -142,8 +161,14 @@ pub fn remove_explicit(
         keep @ GcDecision::Keep { .. } => Ok(keep),
         GcDecision::Reclaim { .. } => {
             let saved = save_unique_commits(path, saved_ref_prefix);
-            let repo = path.parent().unwrap_or(path);
-            remove_worktree(repo, path)?;
+            if entry.is_some() {
+                remove_worktree(&repo, path, locked && force)?;
+            } else {
+                std::fs::remove_dir_all(path).map_err(|e| GcError::Git {
+                    op: "leftover rm".into(),
+                    detail: e.to_string(),
+                })?;
+            }
             Ok(GcDecision::Reclaim { saved_refs: saved })
         }
     }
@@ -216,7 +241,7 @@ pub fn run_gc(cwd: &Path, cfg: &GcConfig) -> Result<Vec<(PathBuf, GcDecision)>, 
             && !cfg.dry_run
         {
             let saved = save_unique_commits(&wt.path, &cfg.saved_ref_prefix);
-            remove_worktree(cwd, &wt.path)?;
+            remove_worktree(cwd, &wt.path, false)?;
             decision = GcDecision::Reclaim { saved_refs: saved };
         }
         rows.push((wt.path.clone(), decision));
@@ -411,7 +436,8 @@ fn lsof_process_cwds() -> Vec<PathBuf> {
         .collect()
 }
 
-/// Newest of HEAD committer time, index mtime, and a bounded tree walk.
+/// Newest of HEAD committer time (`git log -1 --format=%ct`), index
+/// mtime, and a bounded tree walk. Git CLI, not gix.
 pub fn worktree_last_used(path: &Path) -> Option<SystemTime> {
     let mut latest = head_commit_time(path);
     if let Some(t) = index_mtime(path) {
@@ -503,6 +529,7 @@ fn is_under_known_cache(root: &Path, file: &Path) -> bool {
     is_known_cache_dir(&root.join(first))
 }
 
+/// Unique-work is `git status --porcelain`. Git CLI, not gix.
 fn unique_work_reason(path: &Path) -> Option<KeepReason> {
     let out = match git(path, &["status", "--porcelain"]) {
         Ok(s) => s,
@@ -588,7 +615,28 @@ fn sanitize_ref_component(raw: &str) -> String {
     if s.is_empty() { "worktree".into() } else { s }
 }
 
-fn remove_worktree(repo: &Path, tree: &Path) -> Result<(), GcError> {
+fn git_common_dir(path: &Path) -> Result<PathBuf, GcError> {
+    let raw = git(path, &["rev-parse", "--git-common-dir"])?;
+    let p = PathBuf::from(raw.trim());
+    if p.is_absolute() {
+        Ok(p)
+    } else {
+        Ok(path.join(p))
+    }
+}
+
+fn repo_cwd_from_common_dir(common: &Path) -> PathBuf {
+    common.parent().unwrap_or(common).to_path_buf()
+}
+
+fn registry_unreadable(err: GcError) -> GcError {
+    match err {
+        GcError::Git { detail, .. } => GcError::RegistryUnreadable(detail),
+        other => other,
+    }
+}
+
+fn remove_worktree(repo: &Path, tree: &Path, unlock: bool) -> Result<(), GcError> {
     let path_s = tree
         .to_str()
         .ok_or_else(|| GcError::Git {
@@ -596,26 +644,54 @@ fn remove_worktree(repo: &Path, tree: &Path) -> Result<(), GcError> {
             detail: "non-utf8 path".into(),
         })?
         .to_owned();
-    match git(repo, &["worktree", "remove", "--force", &path_s]) {
+    let args: Vec<&str> = if unlock {
+        vec!["worktree", "remove", "--force", "--force", &path_s]
+    } else {
+        vec!["worktree", "remove", "--force", &path_s]
+    };
+    match git(repo, &args) {
         Ok(_) => Ok(()),
         Err(_) => {
-            git(tree, &["worktree", "remove", "--force", &path_s])?;
+            git(tree, &args)?;
             Ok(())
         }
     }
 }
 
-fn worktree_is_locked(path: &Path) -> bool {
-    registered_worktrees(path)
-        .ok()
-        .into_iter()
-        .flatten()
-        .any(|w| paths_eq(&w.path, path) && w.locked)
-}
+/// Host keys restored after `env_clear`. No `GIT_*` except the two we set.
+const GIT_FORWARD_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "USERPROFILE",
+    "COMSPEC",
+    "PATHEXT",
+    "HOMEDRIVE",
+    "HOMEPATH",
+];
 
 fn git(cwd: &Path, args: &[&str]) -> Result<String, GcError> {
-    let out = Command::new("git")
+    let mut cmd = Command::new("git");
+    cmd.env_clear();
+    for key in GIT_FORWARD_ENV {
+        if let Some(v) = std::env::var_os(key) {
+            cmd.env(key, v);
+        }
+    }
+    let out = cmd
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .args(args)
         .current_dir(cwd)
         .output()
@@ -648,5 +724,17 @@ mod parse_tests {
     #[test]
     fn parse_max_age_rejects_bare_number() {
         assert!(parse_max_age("7").is_err());
+    }
+
+    #[test]
+    fn git_forward_env_has_no_git_keys() {
+        for key in GIT_FORWARD_ENV {
+            assert!(
+                !key.starts_with("GIT_"),
+                "forward list must not include {key}"
+            );
+        }
+        assert!(GIT_FORWARD_ENV.contains(&"PATH"));
+        assert!(GIT_FORWARD_ENV.contains(&"HOME") || GIT_FORWARD_ENV.contains(&"USERPROFILE"));
     }
 }
