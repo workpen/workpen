@@ -38,6 +38,9 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
 
 fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
+    if let Some(flag) = rest.iter().find(|t| t.starts_with('-')) {
+        return Err(format!("unknown flag: {flag}"));
+    }
     let extras = resolve_extras(&root, &extras)?;
     let path = rest
         .first()
@@ -67,6 +70,9 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
 
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
+    if let Some(flag) = rest.first().filter(|t| t.starts_with('-') && *t != "--") {
+        return Err(format!("unknown flag: {flag}"));
+    }
     let extras = resolve_extras(&root, &extras)?;
     let cmd = if rest.first().map(String::as_str) == Some("--") {
         &rest[1..]
@@ -106,7 +112,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
 }
 
 fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
-    let (root, _extras, rest) = parse_roots(args)?;
+    let (root, extras, rest) = parse_roots(args)?;
+    if !extras.is_empty() {
+        return Err("gc does not take --extra-root".into());
+    }
     let mut max_age = None;
     let mut leftover = None;
     let mut dry_run = false;
@@ -114,18 +123,12 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
     while i < rest.len() {
         match rest[i].as_str() {
             "--max-age" => {
-                let raw = rest.get(i + 1).ok_or_else(|| {
-                    "usage: workpen gc [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]"
-                        .to_string()
-                })?;
+                let raw = flag_value(&rest, i, "--max-age")?;
                 max_age = Some(parse_max_age(raw).map_err(|e| e.to_string())?);
                 i += 2;
             }
             "--leftover" => {
-                leftover = Some(PathBuf::from(rest.get(i + 1).ok_or_else(|| {
-                    "usage: workpen gc [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]"
-                        .to_string()
-                })?));
+                leftover = Some(PathBuf::from(flag_value(&rest, i, "--leftover")?));
                 i += 2;
             }
             "--dry-run" => {
@@ -139,9 +142,7 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
             }
         }
     }
-    let max_age = max_age.ok_or_else(|| {
-        "usage: workpen gc [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]".to_string()
-    })?;
+    let max_age = max_age.ok_or_else(gc_usage)?;
     let mut cfg = GcConfig::new(&root, max_age);
     cfg.now = SystemTime::now();
     cfg.dry_run = dry_run;
@@ -195,6 +196,22 @@ fn resolve_extras(root: &Path, extras: &[PathBuf]) -> Result<Vec<PathBuf>, Strin
         .collect()
 }
 
+fn gc_usage() -> String {
+    "usage: workpen gc [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]".to_string()
+}
+
+/// Next token after a flag, or error if missing or another `--` flag.
+fn flag_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str, String> {
+    match args.get(i + 1) {
+        Some(v) if !v.starts_with("--") => Ok(v.as_str()),
+        _ => Err(if flag == "--root" || flag == "--extra-root" {
+            format!("missing {flag} value")
+        } else {
+            gc_usage()
+        }),
+    }
+}
+
 fn parse_roots(args: &[String]) -> Result<(PathBuf, Vec<PathBuf>, Vec<String>), String> {
     let mut root = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut extras = Vec::new();
@@ -203,26 +220,20 @@ fn parse_roots(args: &[String]) -> Result<(PathBuf, Vec<PathBuf>, Vec<String>), 
     while i < args.len() {
         match args[i].as_str() {
             "--root" => {
-                root = PathBuf::from(
-                    args.get(i + 1)
-                        .ok_or_else(|| "missing --root value".to_string())?,
-                );
+                root = PathBuf::from(flag_value(args, i, "--root")?);
                 i += 2;
             }
             "--extra-root" => {
-                extras.push(PathBuf::from(
-                    args.get(i + 1)
-                        .ok_or_else(|| "missing --extra-root value".to_string())?,
-                ));
+                extras.push(PathBuf::from(flag_value(args, i, "--extra-root")?));
                 i += 2;
             }
             "--" => {
-                rest.extend(args[i + 1..].iter().cloned());
+                rest.extend(args[i..].iter().cloned());
                 break;
             }
             _ => {
-                rest.extend(args[i..].iter().cloned());
-                break;
+                rest.push(args[i].clone());
+                i += 1;
             }
         }
     }
