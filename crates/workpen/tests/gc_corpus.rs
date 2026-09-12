@@ -13,8 +13,10 @@ static CWD_LOCK: Mutex<()> = Mutex::new(());
 
 use tempfile::TempDir;
 use workpen::{
-    GcConfig, GcDecision, GcError, KeepReason, classify_for_age_gc, classify_worktree,
-    parse_max_age, remove_explicit, run_gc, worktree_last_used,
+    DenyPolicy, GcConfig, GcDecision, GcError, KeepReason, classify_for_age_gc,
+    classify_for_age_gc_with_policy, classify_worktree, classify_worktree_with_policy,
+    parse_max_age, remove_explicit, remove_explicit_with_policy, run_gc, run_gc_with_policy,
+    worktree_last_used,
 };
 
 const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# cache\n";
@@ -618,6 +620,148 @@ fn gitignored_env_under_cache_dir_is_kept() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn unreadable_gitignored_cache_dir_is_kept() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"target\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore target"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "cache-unreadable");
+    let target = wt.join("target");
+    fs::create_dir_all(&target).expect("target");
+    let env = target.join(".env");
+    fs::write(&env, b"SECRET=1\n").expect("env");
+
+    struct RestoreMode<'a>(&'a Path);
+    impl Drop for RestoreMode<'_> {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = RestoreMode(&target);
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    if fs::read_dir(&target).is_ok() {
+        return;
+    }
+
+    match classify_worktree(&wt, false) {
+        GcDecision::Keep {
+            reason:
+                KeepReason::UniqueUntracked | KeepReason::DirtyWork | KeepReason::StatusUnreadable,
+        } => {}
+        other => panic!("unreadable target/ with .env must Keep, got {other:?}"),
+    }
+    let now = SystemTime::now() + Duration::from_secs(10);
+    match classify_for_age_gc(&wt, false, Duration::from_secs(0), now) {
+        GcDecision::Keep {
+            reason:
+                KeepReason::UniqueUntracked | KeepReason::DirtyWork | KeepReason::StatusUnreadable,
+        } => {}
+        other => panic!("old leftover with unreadable target/ must Keep, got {other:?}"),
+    }
+    let rows = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now)).expect("gc");
+    let row = rows
+        .iter()
+        .find(|(p, _)| p.file_name() == wt.file_name())
+        .expect("cache-unreadable row");
+    match &row.1 {
+        GcDecision::Keep { .. } => {}
+        other => panic!("run_gc must keep leftover with unreadable target/, got {other:?}"),
+    }
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("restore for read");
+    assert!(
+        wt.exists(),
+        "worktree with unreadable target/.env must stay"
+    );
+    assert!(env.exists(), "target/.env must remain");
+    assert_eq!(fs::read(&env).expect("read env"), b"SECRET=1\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_cross_dir_hardlinked_rlib_is_reclaimable() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"target\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore target"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "cache-hardlink-rlib");
+    let target = wt.join("target");
+    fs::create_dir_all(target.join("nested")).expect("nested");
+    let a = target.join("a.rlib");
+    let b = target.join("nested").join("b.rlib");
+    fs::write(&a, b"obj").expect("a.rlib");
+    fs::hard_link(&a, &b).expect("hardlink rlib");
+    match classify_worktree(&wt, false) {
+        GcDecision::Reclaim { .. } => {}
+        other => panic!("cross-dir hardlinked rlib under target/ must Reclaim, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_hardlink_of_env_under_target_is_kept() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"target\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore target"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "cache-hardlink-env");
+    let target = wt.join("target");
+    fs::create_dir_all(&target).expect("target");
+    let env = target.join(".env");
+    fs::write(&env, b"SECRET=1\n").expect("env");
+    fs::hard_link(&env, target.join("notes.txt")).expect("hardlink notes");
+    match classify_worktree(&wt, false) {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => {
+            panic!("hardlink of target/.env to notes.txt must Keep UniqueUntracked, got {other:?}")
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_dir_symlink_to_outside_env_is_reclaimable() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"target\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore target"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "cache-symlink-out");
+    let target = wt.join("target");
+    fs::create_dir_all(&target).expect("target");
+    fs::write(target.join("lib.rlib"), b"obj").expect("lib.rlib");
+    let outside = repo.parent().expect("temp parent").join("outside-secrets");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::write(outside.join(".env"), b"SECRET=1\n").expect("outside env");
+    std::os::unix::fs::symlink(&outside, target.join("out")).expect("dir symlink");
+    match classify_worktree(&wt, false) {
+        GcDecision::Reclaim { .. } => {}
+        other => panic!("target/out symlink to outside dir with .env must Reclaim, got {other:?}"),
+    }
+    let real = add_leftover_worktree(&repo, &leftover, "cache-real-env");
+    let real_target = real.join("target");
+    fs::create_dir_all(&real_target).expect("real target");
+    fs::write(real_target.join(".env"), b"SECRET=1\n").expect("real env");
+    match classify_worktree(&real, false) {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => panic!("real target/.env must Keep UniqueUntracked, got {other:?}"),
+    }
+}
+
 #[test]
 fn unique_dangling_commit_is_saved_under_prefix() {
     let fx = init_repo();
@@ -707,7 +851,7 @@ fn keep_reason_as_str_is_stable() {
     assert_eq!(KeepReason::TooNew.as_str(), "newer than --max-age");
     assert_eq!(
         KeepReason::UntrackedWorktree.as_str(),
-        "untracked (use worktree rm)"
+        "untracked leftover (not a registered worktree)"
     );
     assert_eq!(KeepReason::NotAGitDir.as_str(), "not a git worktree");
     assert_eq!(
@@ -860,6 +1004,76 @@ fn recent_index_keeps_tree_when_head_and_files_are_old() {
             reason: KeepReason::TooNew,
         } => {}
         other => panic!("fresh index must keep the tree, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_dir_in_age_walk_is_kept() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "age-unreadable");
+    let hidden = wt.join("hidden");
+    fs::create_dir_all(&hidden).expect("hidden");
+    let recent = hidden.join("just_touched");
+    fs::write(&recent, b"x").expect("just_touched");
+    git(&wt, &["add", "hidden/just_touched"]);
+    git(&wt, &["commit", "-m", "tracked hidden"]);
+
+    let amend = Command::new("git")
+        .args([
+            "commit",
+            "--amend",
+            "--no-edit",
+            "--date=2020-01-01T00:00:00",
+        ])
+        .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00")
+        .current_dir(&wt)
+        .status()
+        .expect("amend");
+    if !amend.success() {
+        return;
+    }
+    let index = git_path(&wt, "index");
+    let stamp = |p: &Path| {
+        Command::new("touch")
+            .args(["-t", "202001010000", p.to_str().expect("utf8")])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !stamp(&wt) || !stamp(&index) || !stamp(&wt.join("README")) || !stamp(&recent) {
+        return;
+    }
+    if !Command::new("touch")
+        .arg(recent.to_str().expect("utf8"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    struct RestoreMode<'a>(&'a Path);
+    impl Drop for RestoreMode<'_> {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = RestoreMode(&hidden);
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    if fs::read_dir(&hidden).is_ok() {
+        return;
+    }
+
+    match classify_for_age_gc(&wt, false, Duration::from_secs(60 * 60), SystemTime::now()) {
+        GcDecision::Keep {
+            reason: KeepReason::TooNew | KeepReason::StatusUnreadable,
+        } => {}
+        other => panic!("unreadable hidden/ with recent tracked file must Keep, got {other:?}"),
     }
 }
 
@@ -1201,4 +1415,245 @@ fn run_gc_reflog_failure_keeps_and_continues() {
         other => panic!("sibling must still reclaim, got {other:?}"),
     }
     assert!(!ok.exists(), "other trees must still reclaim");
+}
+
+fn configure_identity(cwd: &Path) {
+    git(cwd, &["config", "user.email", "dev@example.com"]);
+    git(cwd, &["config", "user.name", "dev"]);
+    git(cwd, &["config", "commit.gpgsign", "false"]);
+    git(cwd, &["config", "core.autocrlf", "false"]);
+    git(cwd, &["config", "core.eol", "lf"]);
+}
+
+#[test]
+fn remove_explicit_separate_git_dir_reclaims_linked() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().expect("tmp");
+    let store = dir.path().join("store.git");
+    let ws = dir.path().join("ws");
+    let linked = dir.path().join("linked");
+    git(
+        dir.path(),
+        &[
+            "init",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            store.to_str().expect("utf8"),
+            ws.to_str().expect("utf8"),
+        ],
+    );
+    configure_identity(&ws);
+    fs::write(ws.join("README"), b"x").expect("readme");
+    git(&ws, &["add", "README"]);
+    git(&ws, &["commit", "-m", "init"]);
+    git(
+        &ws,
+        &[
+            "worktree",
+            "add",
+            linked.to_str().expect("utf8"),
+            "-b",
+            "extra",
+        ],
+    );
+    match remove_explicit(&linked, "refs/workpen/reclaimed", false) {
+        Ok(GcDecision::Reclaim { .. }) => {}
+        other => panic!("separate-git-dir linked must reclaim, got {other:?}"),
+    }
+    assert!(!linked.exists(), "linked worktree must be removed");
+    assert!(ws.join("README").exists(), "main checkout must stay");
+}
+
+#[test]
+fn remove_explicit_bare_repo_worktree_reclaims() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().expect("tmp");
+    let bare = dir.path().join("bare.git");
+    let seed = dir.path().join("seed");
+    let from_bare = dir.path().join("from-bare");
+    git(
+        dir.path(),
+        &["init", "--bare", "-b", "main", bare.to_str().expect("utf8")],
+    );
+    git(
+        dir.path(),
+        &["init", "-b", "main", seed.to_str().expect("utf8")],
+    );
+    configure_identity(&seed);
+    fs::write(seed.join("README"), b"x").expect("readme");
+    git(&seed, &["add", "README"]);
+    git(&seed, &["commit", "-m", "init"]);
+    git(
+        &seed,
+        &["remote", "add", "origin", bare.to_str().expect("utf8")],
+    );
+    git(&seed, &["push", "-u", "origin", "main"]);
+    git(
+        &bare,
+        &["worktree", "add", from_bare.to_str().expect("utf8"), "main"],
+    );
+    match remove_explicit(&from_bare, "refs/workpen/reclaimed", false) {
+        Ok(GcDecision::Reclaim { .. }) => {}
+        other => panic!("bare-repo worktree must reclaim, got {other:?}"),
+    }
+    assert!(!from_bare.exists(), "from-bare worktree must be removed");
+    assert!(bare.exists(), "bare repo must stay");
+}
+
+fn leftover_with_gitignored_cache_file(
+    repo: &Path,
+    name: &str,
+    rel: &str,
+    bytes: &[u8],
+) -> PathBuf {
+    fs::write(repo.join(".gitignore"), b"target\n").expect("gitignore");
+    git(repo, &["add", ".gitignore"]);
+    git(repo, &["commit", "-m", "ignore target"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(repo, &leftover, name);
+    let dest = wt.join(rel);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).expect("cache parent");
+    }
+    fs::write(&dest, bytes).expect("cache file");
+    wt
+}
+
+#[test]
+fn extra_deny_policy_keeps_target_my_secret() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let wt = leftover_with_gitignored_cache_file(
+        &repo,
+        "extra-secret",
+        "target/my-secret",
+        b"host extra\n",
+    );
+    let secret = wt.join("target").join("my-secret");
+    let policy = DenyPolicy::with_extra(["**/my-secret".into()]);
+    match classify_worktree_with_policy(&wt, false, &policy) {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => panic!(
+            "extra **/my-secret plus target/my-secret must Keep UniqueUntracked, got {other:?}"
+        ),
+    }
+    let now = SystemTime::now() + Duration::from_secs(10);
+    match classify_for_age_gc_with_policy(&wt, false, Duration::from_secs(0), now, &policy) {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => panic!("old leftover with extra-policy target/my-secret must Keep, got {other:?}"),
+    }
+    match remove_explicit_with_policy(&wt, "refs/workpen/reclaimed", false, &policy) {
+        Ok(GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        }) => {}
+        other => panic!("remove_explicit_with_policy must keep extra-policy secret, got {other:?}"),
+    }
+    let rows =
+        run_gc_with_policy(&repo, &cfg(&repo, Duration::from_secs(0), now), &policy).expect("gc");
+    let row = rows
+        .iter()
+        .find(|(p, _)| p.file_name() == wt.file_name())
+        .expect("extra-secret row");
+    match &row.1 {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => {
+            panic!("run_gc_with_policy must keep leftover with target/my-secret, got {other:?}")
+        }
+    }
+    assert!(
+        wt.exists(),
+        "worktree with extra-policy target/my-secret must stay"
+    );
+    assert_eq!(fs::read(&secret).expect("read"), b"host extra\n");
+}
+
+#[test]
+fn default_policy_reclaims_target_my_secret() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let wt = leftover_with_gitignored_cache_file(
+        &repo,
+        "default-secret",
+        "target/my-secret",
+        b"not a default dest-deny\n",
+    );
+    match classify_worktree(&wt, false) {
+        GcDecision::Reclaim { .. } => {}
+        other => panic!("default policy must Reclaim extra-only target/my-secret, got {other:?}"),
+    }
+    match classify_worktree_with_policy(&wt, false, &DenyPolicy::default()) {
+        GcDecision::Reclaim { .. } => {}
+        other => {
+            panic!("default with_policy must Reclaim extra-only target/my-secret, got {other:?}")
+        }
+    }
+    let now = SystemTime::now() + Duration::from_secs(10);
+    match classify_for_age_gc(&wt, false, Duration::from_secs(0), now) {
+        GcDecision::Reclaim { .. } => {}
+        other => {
+            panic!("old leftover with default-policy target/my-secret must Reclaim, got {other:?}")
+        }
+    }
+    let rows = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now)).expect("gc");
+    assert!(
+        rows.iter().any(|(p, d)| {
+            p.file_name() == wt.file_name() && matches!(d, GcDecision::Reclaim { .. })
+        }),
+        "CLI default run_gc must reclaim extra-only target/my-secret: {rows:?}"
+    );
+    assert!(
+        !wt.exists(),
+        "default policy must reclaim leftover with only target/my-secret"
+    );
+}
+
+#[test]
+fn default_policy_still_keeps_target_env() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let wt =
+        leftover_with_gitignored_cache_file(&repo, "default-env", "target/.env", b"SECRET=1\n");
+    let env = wt.join("target").join(".env");
+    match classify_worktree_with_policy(&wt, false, &DenyPolicy::default()) {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => panic!("default policy must still Keep target/.env, got {other:?}"),
+    }
+    let now = SystemTime::now() + Duration::from_secs(10);
+    match classify_for_age_gc_with_policy(
+        &wt,
+        false,
+        Duration::from_secs(0),
+        now,
+        &DenyPolicy::default(),
+    ) {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => panic!("old leftover with default-policy target/.env must Keep, got {other:?}"),
+    }
+    let rows = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now)).expect("gc");
+    let row = rows
+        .iter()
+        .find(|(p, _)| p.file_name() == wt.file_name())
+        .expect("default-env row");
+    match &row.1 {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => panic!("run_gc must still keep leftover with target/.env, got {other:?}"),
+    }
+    assert!(
+        wt.exists(),
+        "worktree with default-policy target/.env must stay"
+    );
+    assert_eq!(fs::read(&env).expect("read env"), b"SECRET=1\n");
 }

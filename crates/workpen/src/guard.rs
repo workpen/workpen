@@ -278,6 +278,50 @@ pub fn check_dests(guard: &PathGuard, dests: &[impl AsRef<Path>]) -> Result<(), 
     Ok(())
 }
 
+/// Resolve `--root` against `cwd`. Must exist and be a directory.
+/// A relative `../ws` becomes the absolute workspace, not a PathGuard escape.
+/// Implicit canonicalize to `/` or the host temp root is refused unless asked.
+pub fn resolve_workspace_root(cwd: &Path, root: &str) -> Result<PathBuf, PathGuardError> {
+    let requested = root.trim();
+    if requested.is_empty() {
+        return Err(PathGuardError::Root(
+            "workspace root must not be empty".into(),
+        ));
+    }
+    let raw = PathBuf::from(requested);
+    let abs = if raw.is_absolute() {
+        raw
+    } else {
+        cwd.join(raw)
+    };
+    if !abs.exists() {
+        return Err(PathGuardError::Root(format!(
+            "workspace root does not exist: {}",
+            abs.display()
+        )));
+    }
+    if !abs.is_dir() {
+        return Err(PathGuardError::Root(format!(
+            "workspace root is not a directory: {}",
+            abs.display()
+        )));
+    }
+    let canon = canonicalize_root(&abs)?;
+    if is_filesystem_root(&canon) && !requested_is_explicit_root(requested) {
+        return Err(PathGuardError::Root(format!(
+            "workspace root {requested} escaped after canonicalize to {}",
+            canon.display()
+        )));
+    }
+    if is_host_temp_root(&canon) && !requested_is_explicit_temp(requested) {
+        return Err(PathGuardError::Root(format!(
+            "workspace root {requested} escaped after canonicalize to {}",
+            canon.display()
+        )));
+    }
+    Ok(canon)
+}
+
 /// Resolve one extra write dir against `cwd`. Fail closed on missing,
 /// not-a-dir, canonicalize failure, or implicit escape to `/` or host temp
 /// unless the caller named that root explicitly.

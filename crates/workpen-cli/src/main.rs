@@ -5,8 +5,8 @@ use std::process::{Command, ExitCode};
 use std::time::SystemTime;
 
 use workpen::{
-    CheckDestError, DenyPolicy, GcConfig, GcDecision, PathGuard, parse_max_age,
-    reject_command_secret_path_tokens, resolve_extra_root, run_gc,
+    CheckDestError, DenyPolicy, GcConfig, GcDecision, PathGuard, check_command_argv,
+    dest_under_root, parse_max_age, resolve_extra_root, resolve_workspace_root, run_gc,
 };
 
 fn main() -> ExitCode {
@@ -39,7 +39,9 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
 fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
     if let Some(flag) = rest.iter().find(|t| t.starts_with('-')) {
-        return Err(format!("unknown flag: {flag}"));
+        return Err(format!(
+            "unknown flag: {flag} (use --root DIR or --extra-root DIR)"
+        ));
     }
     let extras = resolve_extras(&root, &extras)?;
     let path = rest
@@ -71,8 +73,12 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
     if let Some(flag) = rest.first().filter(|t| t.starts_with('-') && *t != "--") {
-        return Err(format!("unknown flag: {flag}"));
+        return Err(format!(
+            "unknown flag: {flag} (use --root DIR or --extra-root DIR)"
+        ));
     }
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root = resolve_workspace_root(&cwd, &root.to_string_lossy()).map_err(|e| e.to_string())?;
     let extras = resolve_extras(&root, &extras)?;
     let cmd = if rest.first().map(String::as_str) == Some("--") {
         &rest[1..]
@@ -82,27 +88,14 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     if cmd.is_empty() {
         return Err("usage: workpen run [--root DIR] [--extra-root DIR] [--] CMD...".into());
     }
-    let joined = cmd.join(" ");
     let policy = DenyPolicy::default();
-    if let Err(e) = reject_command_secret_path_tokens(&joined, &policy) {
-        return Err(e.to_string());
-    }
     let guard = PathGuard::with_extra_roots(&root, &extras).map_err(|e| e.to_string())?;
-    if let Err(e) = workpen::check_dests(&guard, &[Path::new(&root)]) {
+    if let Err(e) = check_command_argv(cmd, guard.canon_root(), &policy) {
         return Err(e.to_string());
-    }
-    for token in cmd {
-        if token.starts_with('-') {
-            continue;
-        }
-        let dest = dest_under_root(&root, token);
-        if let Err(e) = workpen::check_dest(&dest.to_string_lossy(), &policy, None) {
-            return Err(e.to_string());
-        }
     }
     let mut child = Command::new(&cmd[0]);
-    child.args(&cmd[1..]).current_dir(&root);
-    workpen::process_jail(&root, &extras)
+    child.args(&cmd[1..]).current_dir(guard.canon_root());
+    workpen::process_jail(guard.canon_root(), &extras)
         .and_then(|policy| policy.apply_pre_exec(&mut child))
         .map_err(|e| e.to_string())?;
     let status = child
@@ -168,16 +161,6 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
         }
     }
     Ok(ExitCode::SUCCESS)
-}
-
-/// Join a relative dest to `--root`. Absolute dests stay as given.
-fn dest_under_root(root: &Path, path: &str) -> PathBuf {
-    let p = Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        root.join(p)
-    }
 }
 
 /// Blank `why` PATH stays blank so PathGuard reports empty, not the workspace.

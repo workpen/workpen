@@ -24,19 +24,22 @@ mod why;
 mod wrap;
 
 pub use deny::{
-    CheckDestError, DenyPolicy, DestDeny, DestDenyError, DestDenyKind, check_dest, classify_dest,
-    default_secret_denies, deny_patch_dests, deny_patch_dests_with_display, dest_deny_message,
-    is_env_template_basename, is_path_denied, open_verified_read, path_is_denied_glob,
-    path_matches_deny_glob, reject_command_secret_path_tokens, verify_post_open,
+    CheckDestError, DenyPolicy, DestDeny, DestDenyError, DestDenyKind, check_command_argv,
+    check_command_dests, check_dest, classify_dest, default_secret_denies, deny_patch_dests,
+    deny_patch_dests_with_display, dest_deny_message, dest_under_root, is_env_template_basename,
+    is_path_denied, open_verified_read, path_is_denied_glob, path_matches_deny_glob,
+    reject_command_secret_path_tokens, verify_post_open,
 };
 #[cfg(feature = "gc")]
 pub use gc::{
-    GcConfig, GcDecision, GcError, KeepReason, classify_for_age_gc, classify_worktree,
-    parse_max_age, remove_explicit, run_gc, worktree_last_used,
+    GcConfig, GcDecision, GcError, KeepReason, classify_for_age_gc,
+    classify_for_age_gc_with_policy, classify_worktree, classify_worktree_with_policy,
+    parse_max_age, remove_explicit, remove_explicit_with_policy, run_gc, run_gc_with_policy,
+    worktree_last_used,
 };
 pub use guard::{
     AbsolutePathPolicy, ExtraRootError, PathGuard, PathGuardBuilder, PathGuardDeny, PathGuardError,
-    PathGuardKind, check_dests, resolve_extra_root,
+    PathGuardKind, check_dests, resolve_extra_root, resolve_workspace_root,
 };
 pub use why::{Why, explain};
 #[cfg(feature = "nono")]

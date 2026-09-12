@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
-use crate::deny::{DenyPolicy, is_path_denied};
+use crate::deny::{DenyPolicy, path_is_denied_glob};
 
 /// Host knobs. Bline passes leftover_dir = ".bline-worktrees",
 /// saved_ref_prefix = "refs/bline/reclaimed".
@@ -54,7 +54,7 @@ impl KeepReason {
             Self::DirtyWork => "unique uncommitted work",
             Self::UniqueUntracked => "unique untracked files",
             Self::TooNew => "newer than --max-age",
-            Self::UntrackedWorktree => "untracked (use worktree rm)",
+            Self::UntrackedWorktree => "untracked leftover (not a registered worktree)",
             Self::NotAGitDir => "not a git worktree",
             Self::StatusUnreadable => "git status unreadable",
             Self::LiveCwd => "live process cwd",
@@ -111,15 +111,34 @@ pub fn parse_max_age(raw: &str) -> Result<Duration, GcError> {
 }
 
 /// Age filter then classify. Untracked trees are never age-gc'd.
+///
+/// Uses [`DenyPolicy::default()`]. Hosts with extras should call
+/// [`classify_for_age_gc_with_policy`].
 pub fn classify_for_age_gc(
     path: &Path,
     untracked: bool,
     max_age: Duration,
     now: SystemTime,
 ) -> GcDecision {
+    classify_for_age_gc_with_policy(path, untracked, max_age, now, &DenyPolicy::default())
+}
+
+/// Like [`classify_for_age_gc`], using `policy` for glob-only cache name checks.
+pub fn classify_for_age_gc_with_policy(
+    path: &Path,
+    untracked: bool,
+    max_age: Duration,
+    now: SystemTime,
+    policy: &DenyPolicy,
+) -> GcDecision {
     if untracked {
         return GcDecision::Keep {
             reason: KeepReason::UntrackedWorktree,
+        };
+    }
+    if newest_tree_mtime(path).is_err() {
+        return GcDecision::Keep {
+            reason: KeepReason::StatusUnreadable,
         };
     }
     let last_used = worktree_last_used(path).unwrap_or(now);
@@ -128,7 +147,7 @@ pub fn classify_for_age_gc(
             reason: KeepReason::TooNew,
         };
     }
-    classify_worktree(path, false)
+    classify_worktree_with_policy(path, false, policy)
 }
 
 /// Remove one worktree after the unique-work check.
@@ -140,10 +159,23 @@ pub fn classify_for_age_gc(
 /// A same-repo checkout missing from the registry is leftover rm
 /// (`remove_dir_all`) after unique-work. A directory with no `.git` is
 /// [`KeepReason::NotAGitDir`].
+///
+/// Uses [`DenyPolicy::default()`]. Hosts with extras should call
+/// [`remove_explicit_with_policy`].
 pub fn remove_explicit(
     path: &Path,
     saved_ref_prefix: &str,
     force: bool,
+) -> Result<GcDecision, GcError> {
+    remove_explicit_with_policy(path, saved_ref_prefix, force, &DenyPolicy::default())
+}
+
+/// Like [`remove_explicit`], using `policy` for glob-only cache name checks.
+pub fn remove_explicit_with_policy(
+    path: &Path,
+    saved_ref_prefix: &str,
+    force: bool,
+    policy: &DenyPolicy,
 ) -> Result<GcDecision, GcError> {
     if !path.is_dir() || !is_git_repo(path) {
         return Ok(GcDecision::Keep {
@@ -165,7 +197,7 @@ pub fn remove_explicit(
             reason: KeepReason::LiveCwd,
         });
     }
-    match classify_worktree(path, false) {
+    match classify_worktree_with_policy(path, false, policy) {
         keep @ GcDecision::Keep { .. } => Ok(keep),
         GcDecision::Reclaim { .. } => {
             let saved = match save_unique_commits(path, saved_ref_prefix) {
@@ -193,7 +225,19 @@ pub fn remove_explicit(
 ///
 /// `Reclaim.saved_refs` is empty here. Unique commits are saved in
 /// [`run_gc`] and [`remove_explicit`].
+///
+/// Uses [`DenyPolicy::default()`]. Hosts with extras should call
+/// [`classify_worktree_with_policy`].
 pub fn classify_worktree(path: &Path, untracked: bool) -> GcDecision {
+    classify_worktree_with_policy(path, untracked, &DenyPolicy::default())
+}
+
+/// Like [`classify_worktree`], using `policy` for glob-only cache name checks.
+pub fn classify_worktree_with_policy(
+    path: &Path,
+    untracked: bool,
+    policy: &DenyPolicy,
+) -> GcDecision {
     if untracked {
         return GcDecision::Keep {
             reason: KeepReason::UntrackedWorktree,
@@ -209,7 +253,7 @@ pub fn classify_worktree(path: &Path, untracked: bool) -> GcDecision {
             reason: KeepReason::NotAGitDir,
         };
     }
-    match unique_work_reason(path) {
+    match unique_work_reason(path, policy) {
         Some(reason) => GcDecision::Keep { reason },
         None => GcDecision::Reclaim {
             saved_refs: Vec::new(),
@@ -220,7 +264,19 @@ pub fn classify_worktree(path: &Path, untracked: bool) -> GcDecision {
 /// List registered worktrees, skip primary checkout, skip locked / live cwd,
 /// classify the rest. Untracked leftovers under `leftover_dir` are reported
 /// as Keep(UntrackedWorktree) and never removed by age gc.
+///
+/// Uses [`DenyPolicy::default()`]. Hosts with extras should call
+/// [`run_gc_with_policy`].
 pub fn run_gc(cwd: &Path, cfg: &GcConfig) -> Result<Vec<(PathBuf, GcDecision)>, GcError> {
+    run_gc_with_policy(cwd, cfg, &DenyPolicy::default())
+}
+
+/// Like [`run_gc`], using `policy` for glob-only cache name checks.
+pub fn run_gc_with_policy(
+    cwd: &Path,
+    cfg: &GcConfig,
+    policy: &DenyPolicy,
+) -> Result<Vec<(PathBuf, GcDecision)>, GcError> {
     refuse_home(cwd)?;
     let registered = registered_worktrees(cwd)?;
     let registered_paths: Vec<PathBuf> = registered.iter().map(|w| w.path.clone()).collect();
@@ -251,7 +307,8 @@ pub fn run_gc(cwd: &Path, cfg: &GcConfig) -> Result<Vec<(PathBuf, GcDecision)>, 
             ));
             continue;
         }
-        let mut decision = classify_for_age_gc(&wt.path, false, cfg.max_age, cfg.now);
+        let mut decision =
+            classify_for_age_gc_with_policy(&wt.path, false, cfg.max_age, cfg.now, policy);
         if let GcDecision::Reclaim { .. } = &decision
             && !cfg.dry_run
         {
@@ -495,7 +552,7 @@ pub fn worktree_last_used(path: &Path) -> Option<SystemTime> {
     if let Some(t) = index_mtime(path) {
         latest = Some(latest.map_or(t, |n| n.max(t)));
     }
-    if let Some(t) = newest_tree_mtime(path) {
+    if let Ok(Some(t)) = newest_tree_mtime(path) {
         latest = Some(latest.map_or(t, |n| n.max(t)));
     }
     latest
@@ -518,21 +575,24 @@ fn index_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(index).and_then(|m| m.modified()).ok()
 }
 
-fn newest_tree_mtime(root: &Path) -> Option<SystemTime> {
+/// Finished walk of file mtimes. `Err` if `read_dir` failed or the
+/// budget ran out with directories still queued. `DirEntry::metadata`
+/// (lstat); do not switch to `fs::metadata`.
+fn newest_tree_mtime(root: &Path) -> Result<Option<SystemTime>, ()> {
     let mut newest: Option<SystemTime> = None;
     let mut remaining = LAST_USED_WALK_LIMIT;
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(root.to_path_buf());
     while remaining > 0 {
         let Some(dir) = queue.pop_front() else {
-            break;
+            return Ok(newest);
         };
         let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
+            return Err(());
         };
         for entry in rd.flatten() {
             if remaining == 0 {
-                break;
+                return Err(());
             }
             remaining -= 1;
             let p = entry.path();
@@ -553,7 +613,10 @@ fn newest_tree_mtime(root: &Path) -> Option<SystemTime> {
             }
         }
     }
-    newest
+    if !queue.is_empty() {
+        return Err(());
+    }
+    Ok(newest)
 }
 
 fn is_age_cache_dir_name(name: &str) -> bool {
@@ -562,9 +625,11 @@ fn is_age_cache_dir_name(name: &str) -> bool {
 
 /// First path component matches [`CACHE_DIR_NAMES`] by name. No `CACHEDIR.TAG`.
 /// Porcelain often lists only `!! target/`, not `!! target/.env`.
-fn cache_tree_has_denied_name(root: &Path, rel: &Path) -> bool {
-    let policy = DenyPolicy::default();
-    if is_path_denied(rel, &policy) {
+/// Cache walk matches deny globs only (full path and basename). It does
+/// not apply dest-deny hardlink / incomplete-nlink fail-closed, and it
+/// does not follow directory symlinks out of the cache tree.
+fn cache_tree_has_denied_name(root: &Path, rel: &Path, policy: &DenyPolicy) -> bool {
+    if cache_path_denied_glob(policy, rel) {
         return true;
     }
     let Some(std::path::Component::Normal(name)) = rel.components().next() else {
@@ -576,26 +641,43 @@ fn cache_tree_has_denied_name(root: &Path, rel: &Path) -> bool {
     queue.push_back(start);
     while remaining > 0 {
         let Some(dir) = queue.pop_front() else {
-            break;
+            return false;
         };
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => return true,
         };
         for entry in rd.flatten() {
             if remaining == 0 {
-                break;
+                return true;
             }
             remaining -= 1;
             let p = entry.path();
-            if is_path_denied(&p, &policy) {
+            if cache_path_denied_glob(policy, &p) {
                 return true;
             }
-            if p.is_dir() {
+            let is_real_dir = match entry.file_type() {
+                Ok(ft) => ft.is_dir(),
+                Err(_) => match std::fs::symlink_metadata(&p) {
+                    Ok(meta) => meta.file_type().is_dir(),
+                    Err(_) => return true,
+                },
+            };
+            if is_real_dir {
                 queue.push_back(p);
             }
         }
     }
-    false
+    !queue.is_empty()
+}
+
+fn cache_path_denied_glob(policy: &DenyPolicy, path: &Path) -> bool {
+    let full = path.to_string_lossy().replace('\\', "/");
+    if path_is_denied_glob(policy.globs(), &full) {
+        return true;
+    }
+    path.file_name()
+        .is_some_and(|base| path_is_denied_glob(policy.globs(), &base.to_string_lossy()))
 }
 
 fn is_under_known_cache(root: &Path, file: &Path) -> bool {
@@ -610,10 +692,10 @@ fn is_under_known_cache(root: &Path, file: &Path) -> bool {
 
 /// Unique-work is `git status --porcelain=v1 -uall --ignored`. Git CLI, not gix.
 /// Porcelain `??` / `!!` under a first-component cache dir name is not unique
-/// work unless a dest-deny name exists in that tree (git often lists only
+/// work unless a deny-glob name exists in that tree (git often lists only
 /// `!! target/`, not `!! target/.env`). Other XY statuses under those names
 /// are DirtyWork (tracked dirty cache paths).
-fn unique_work_reason(path: &Path) -> Option<KeepReason> {
+fn unique_work_reason(path: &Path, policy: &DenyPolicy) -> Option<KeepReason> {
     let out = match git(
         path,
         &[
@@ -636,7 +718,7 @@ fn unique_work_reason(path: &Path) -> Option<KeepReason> {
         let rel = porcelain_path(line);
         if line.starts_with("??") || line.starts_with("!!") {
             if is_under_known_cache(path, &path.join(&rel)) {
-                if cache_tree_has_denied_name(path, &rel) {
+                if cache_tree_has_denied_name(path, &rel, policy) {
                     has_unique = true;
                 }
                 continue;
@@ -644,6 +726,18 @@ fn unique_work_reason(path: &Path) -> Option<KeepReason> {
             has_unique = true;
         } else {
             return Some(KeepReason::DirtyWork);
+        }
+    }
+    // Git omits unreadable ignored dirs from porcelain. Walk them anyway.
+    if !has_unique {
+        for name in CACHE_DIR_NAMES {
+            if !path.join(name).is_dir() {
+                continue;
+            }
+            if cache_tree_has_denied_name(path, Path::new(name), policy) {
+                has_unique = true;
+                break;
+            }
         }
     }
     if has_unique {
@@ -730,8 +824,12 @@ fn git_common_dir(path: &Path) -> Result<PathBuf, GcError> {
     }
 }
 
+/// `$repo/.git` -> `$repo`. Bare or `--separate-git-dir` store -> the git dir.
 fn repo_cwd_from_common_dir(common: &Path) -> PathBuf {
-    common.parent().unwrap_or(common).to_path_buf()
+    match common.file_name() {
+        Some(name) if name == ".git" => common.parent().unwrap_or(common).to_path_buf(),
+        _ => common.to_path_buf(),
+    }
 }
 
 fn registry_unreadable(err: GcError) -> GcError {

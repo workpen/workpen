@@ -400,6 +400,61 @@ pub fn reject_command_secret_path_tokens(
     Ok(())
 }
 
+/// Join a relative dest to `root`. Absolute dests stay as given.
+pub fn dest_under_root(root: &Path, path: &str) -> PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root.join(p)
+    }
+}
+
+/// Dest-deny each raw argv dest under `root`.
+///
+/// Empty and flag-looking tokens are skipped. A `-c` token also
+/// dest-denies paths inside the next argv token via [`check_command_dests`].
+/// Does not dest-deny a flattened join of all argv.
+pub fn check_command_argv(
+    cmd: &[impl AsRef<str>],
+    root: &Path,
+    policy: &DenyPolicy,
+) -> Result<(), CheckDestError> {
+    for (i, token) in cmd.iter().enumerate() {
+        let token = token.as_ref();
+        if !token.is_empty() && !token.starts_with('-') {
+            let dest = dest_under_root(root, token);
+            check_dest(&dest.to_string_lossy(), policy, None)?;
+        }
+        if token == "-c"
+            && let Some(body) = cmd.get(i + 1)
+        {
+            check_command_dests(body.as_ref(), root, policy)?;
+        }
+    }
+    Ok(())
+}
+
+/// Join extracted command dests under `root` and dest-deny each.
+///
+/// Absolute dests stay as given. Empty and flag-looking peeled tokens
+/// are skipped. Does not peel `--flag=.env`.
+pub fn check_command_dests(
+    command: &str,
+    root: &Path,
+    policy: &DenyPolicy,
+) -> Result<(), CheckDestError> {
+    for (_display, candidate) in command_path_tokens(command) {
+        let peeled = peel_shell_meta(&candidate);
+        if peeled.is_empty() || peeled.starts_with('-') {
+            continue;
+        }
+        let dest = dest_under_root(root, peeled);
+        check_dest(&dest.to_string_lossy(), policy, None)?;
+    }
+    Ok(())
+}
+
 /// Committed dotenv templates, not live env files.
 pub fn is_env_template_basename(name: &str) -> bool {
     let base = name
