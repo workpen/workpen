@@ -11,6 +11,18 @@ use workpen::{
     verify_post_open,
 };
 
+/// `matches deny glob **/.env` must not pass when wording only names `**/.env.*`.
+fn names_deny_glob_token(msg: &str, glob: &str) -> bool {
+    let needle = format!("matches deny glob {glob}");
+    let Some(at) = msg.find(&needle) else {
+        return false;
+    };
+    match msg[at + needle.len()..].chars().next() {
+        None | Some(')') | Some(':') | Some(' ') | Some(',') => true,
+        Some(c) => !c.is_ascii_alphanumeric() && c != '.' && c != '*' && c != '/',
+    }
+}
+
 #[test]
 fn default_secret_denies_matches_bline_v1_list() {
     let got = default_secret_denies();
@@ -187,17 +199,29 @@ fn dest_deny_message_reports_hardlink_not_glob_for_sibling() {
     assert!(!msg.contains("unlink extra names"), "{msg}");
     assert!(!msg.contains("matches deny glob"), "{msg}");
     assert!(
-        msg.contains(".env"),
-        "hardlink dest-deny must name the denied sibling: {msg}"
+        msg.contains("denied name .env"),
+        "hardlink dest-deny must say denied name .env, not a glob prefix: {msg}"
     );
     let glob_msg = dest_deny_message(&env, &env.to_string_lossy(), &policy)
         .expect(".env is a deny glob")
         .to_ascii_lowercase();
     assert!(glob_msg.contains("matches deny glob"), "{glob_msg}");
     assert!(
-        glob_msg.contains("**/.env"),
-        "glob dest-deny must name the matching glob: {glob_msg}"
+        names_deny_glob_token(&glob_msg, "**/.env"),
+        "glob dest-deny must name **/.env as a token, not a **/.env.* prefix: {glob_msg}"
     );
+}
+
+#[test]
+fn names_deny_glob_token_is_not_star_prefix() {
+    assert!(names_deny_glob_token(
+        "path denied by sandbox profile (matches deny glob **/.env): .env",
+        "**/.env"
+    ));
+    assert!(!names_deny_glob_token(
+        "path denied by sandbox profile (matches deny glob **/.env.*): .env.local",
+        "**/.env"
+    ));
 }
 
 #[test]

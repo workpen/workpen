@@ -104,6 +104,16 @@ fn keep_reason(decision: &GcDecision) -> KeepReason {
     }
 }
 
+#[cfg(unix)]
+fn process_euid_is_root() -> bool {
+    Command::new("/usr/bin/id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .is_some_and(|s| s.trim() == "0")
+}
+
 #[test]
 fn parse_max_age_tokens() {
     assert_eq!(
@@ -646,7 +656,10 @@ fn unreadable_gitignored_cache_dir_is_kept() {
     let _restore = RestoreMode(&target);
     fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).expect("chmod 000");
     if fs::read_dir(&target).is_ok() {
-        return;
+        if process_euid_is_root() {
+            return;
+        }
+        panic!("chmod 000 must make the dir unreadable");
     }
 
     match classify_worktree(&wt, false) {
@@ -1066,7 +1079,10 @@ fn unreadable_dir_in_age_walk_is_kept() {
     let _restore = RestoreMode(&hidden);
     fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).expect("chmod 000");
     if fs::read_dir(&hidden).is_ok() {
-        return;
+        if process_euid_is_root() {
+            return;
+        }
+        panic!("chmod 000 must make the dir unreadable");
     }
 
     match classify_for_age_gc(&wt, false, Duration::from_secs(60 * 60), SystemTime::now()) {
