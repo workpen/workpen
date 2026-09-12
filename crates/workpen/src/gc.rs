@@ -111,11 +111,25 @@ pub fn parse_max_age(raw: &str) -> Result<Duration, GcError> {
 }
 
 /// Age filter then classify. Untracked trees are never age-gc'd.
+///
+/// Uses [`DenyPolicy::default()`]. Hosts with extras should call
+/// [`classify_for_age_gc_with_policy`].
 pub fn classify_for_age_gc(
     path: &Path,
     untracked: bool,
     max_age: Duration,
     now: SystemTime,
+) -> GcDecision {
+    classify_for_age_gc_with_policy(path, untracked, max_age, now, &DenyPolicy::default())
+}
+
+/// Like [`classify_for_age_gc`], using `policy` for glob-only cache name checks.
+pub fn classify_for_age_gc_with_policy(
+    path: &Path,
+    untracked: bool,
+    max_age: Duration,
+    now: SystemTime,
+    policy: &DenyPolicy,
 ) -> GcDecision {
     if untracked {
         return GcDecision::Keep {
@@ -133,7 +147,7 @@ pub fn classify_for_age_gc(
             reason: KeepReason::TooNew,
         };
     }
-    classify_worktree(path, false)
+    classify_worktree_with_policy(path, false, policy)
 }
 
 /// Remove one worktree after the unique-work check.
@@ -145,10 +159,23 @@ pub fn classify_for_age_gc(
 /// A same-repo checkout missing from the registry is leftover rm
 /// (`remove_dir_all`) after unique-work. A directory with no `.git` is
 /// [`KeepReason::NotAGitDir`].
+///
+/// Uses [`DenyPolicy::default()`]. Hosts with extras should call
+/// [`remove_explicit_with_policy`].
 pub fn remove_explicit(
     path: &Path,
     saved_ref_prefix: &str,
     force: bool,
+) -> Result<GcDecision, GcError> {
+    remove_explicit_with_policy(path, saved_ref_prefix, force, &DenyPolicy::default())
+}
+
+/// Like [`remove_explicit`], using `policy` for glob-only cache name checks.
+pub fn remove_explicit_with_policy(
+    path: &Path,
+    saved_ref_prefix: &str,
+    force: bool,
+    policy: &DenyPolicy,
 ) -> Result<GcDecision, GcError> {
     if !path.is_dir() || !is_git_repo(path) {
         return Ok(GcDecision::Keep {
@@ -170,7 +197,7 @@ pub fn remove_explicit(
             reason: KeepReason::LiveCwd,
         });
     }
-    match classify_worktree(path, false) {
+    match classify_worktree_with_policy(path, false, policy) {
         keep @ GcDecision::Keep { .. } => Ok(keep),
         GcDecision::Reclaim { .. } => {
             let saved = match save_unique_commits(path, saved_ref_prefix) {
@@ -198,7 +225,19 @@ pub fn remove_explicit(
 ///
 /// `Reclaim.saved_refs` is empty here. Unique commits are saved in
 /// [`run_gc`] and [`remove_explicit`].
+///
+/// Uses [`DenyPolicy::default()`]. Hosts with extras should call
+/// [`classify_worktree_with_policy`].
 pub fn classify_worktree(path: &Path, untracked: bool) -> GcDecision {
+    classify_worktree_with_policy(path, untracked, &DenyPolicy::default())
+}
+
+/// Like [`classify_worktree`], using `policy` for glob-only cache name checks.
+pub fn classify_worktree_with_policy(
+    path: &Path,
+    untracked: bool,
+    policy: &DenyPolicy,
+) -> GcDecision {
     if untracked {
         return GcDecision::Keep {
             reason: KeepReason::UntrackedWorktree,
@@ -214,7 +253,7 @@ pub fn classify_worktree(path: &Path, untracked: bool) -> GcDecision {
             reason: KeepReason::NotAGitDir,
         };
     }
-    match unique_work_reason(path) {
+    match unique_work_reason(path, policy) {
         Some(reason) => GcDecision::Keep { reason },
         None => GcDecision::Reclaim {
             saved_refs: Vec::new(),
@@ -225,7 +264,19 @@ pub fn classify_worktree(path: &Path, untracked: bool) -> GcDecision {
 /// List registered worktrees, skip primary checkout, skip locked / live cwd,
 /// classify the rest. Untracked leftovers under `leftover_dir` are reported
 /// as Keep(UntrackedWorktree) and never removed by age gc.
+///
+/// Uses [`DenyPolicy::default()`]. Hosts with extras should call
+/// [`run_gc_with_policy`].
 pub fn run_gc(cwd: &Path, cfg: &GcConfig) -> Result<Vec<(PathBuf, GcDecision)>, GcError> {
+    run_gc_with_policy(cwd, cfg, &DenyPolicy::default())
+}
+
+/// Like [`run_gc`], using `policy` for glob-only cache name checks.
+pub fn run_gc_with_policy(
+    cwd: &Path,
+    cfg: &GcConfig,
+    policy: &DenyPolicy,
+) -> Result<Vec<(PathBuf, GcDecision)>, GcError> {
     refuse_home(cwd)?;
     let registered = registered_worktrees(cwd)?;
     let registered_paths: Vec<PathBuf> = registered.iter().map(|w| w.path.clone()).collect();
@@ -256,7 +307,8 @@ pub fn run_gc(cwd: &Path, cfg: &GcConfig) -> Result<Vec<(PathBuf, GcDecision)>, 
             ));
             continue;
         }
-        let mut decision = classify_for_age_gc(&wt.path, false, cfg.max_age, cfg.now);
+        let mut decision =
+            classify_for_age_gc_with_policy(&wt.path, false, cfg.max_age, cfg.now, policy);
         if let GcDecision::Reclaim { .. } = &decision
             && !cfg.dry_run
         {
@@ -576,9 +628,8 @@ fn is_age_cache_dir_name(name: &str) -> bool {
 /// Cache walk matches deny globs only (full path and basename). It does
 /// not apply dest-deny hardlink / incomplete-nlink fail-closed, and it
 /// does not follow directory symlinks out of the cache tree.
-fn cache_tree_has_denied_name(root: &Path, rel: &Path) -> bool {
-    let policy = DenyPolicy::default();
-    if cache_path_denied_glob(&policy, rel) {
+fn cache_tree_has_denied_name(root: &Path, rel: &Path, policy: &DenyPolicy) -> bool {
+    if cache_path_denied_glob(policy, rel) {
         return true;
     }
     let Some(std::path::Component::Normal(name)) = rel.components().next() else {
@@ -602,7 +653,7 @@ fn cache_tree_has_denied_name(root: &Path, rel: &Path) -> bool {
             }
             remaining -= 1;
             let p = entry.path();
-            if cache_path_denied_glob(&policy, &p) {
+            if cache_path_denied_glob(policy, &p) {
                 return true;
             }
             let is_real_dir = match entry.file_type() {
@@ -644,7 +695,7 @@ fn is_under_known_cache(root: &Path, file: &Path) -> bool {
 /// work unless a deny-glob name exists in that tree (git often lists only
 /// `!! target/`, not `!! target/.env`). Other XY statuses under those names
 /// are DirtyWork (tracked dirty cache paths).
-fn unique_work_reason(path: &Path) -> Option<KeepReason> {
+fn unique_work_reason(path: &Path, policy: &DenyPolicy) -> Option<KeepReason> {
     let out = match git(
         path,
         &[
@@ -667,7 +718,7 @@ fn unique_work_reason(path: &Path) -> Option<KeepReason> {
         let rel = porcelain_path(line);
         if line.starts_with("??") || line.starts_with("!!") {
             if is_under_known_cache(path, &path.join(&rel)) {
-                if cache_tree_has_denied_name(path, &rel) {
+                if cache_tree_has_denied_name(path, &rel, policy) {
                     has_unique = true;
                 }
                 continue;
@@ -683,7 +734,7 @@ fn unique_work_reason(path: &Path) -> Option<KeepReason> {
             if !path.join(name).is_dir() {
                 continue;
             }
-            if cache_tree_has_denied_name(path, Path::new(name)) {
+            if cache_tree_has_denied_name(path, Path::new(name), policy) {
                 has_unique = true;
                 break;
             }

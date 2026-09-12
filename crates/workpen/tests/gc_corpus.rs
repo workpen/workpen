@@ -13,8 +13,10 @@ static CWD_LOCK: Mutex<()> = Mutex::new(());
 
 use tempfile::TempDir;
 use workpen::{
-    GcConfig, GcDecision, GcError, KeepReason, classify_for_age_gc, classify_worktree,
-    parse_max_age, remove_explicit, run_gc, worktree_last_used,
+    DenyPolicy, GcConfig, GcDecision, GcError, KeepReason, classify_for_age_gc,
+    classify_for_age_gc_with_policy, classify_worktree, classify_worktree_with_policy,
+    parse_max_age, remove_explicit, remove_explicit_with_policy, run_gc, run_gc_with_policy,
+    worktree_last_used,
 };
 
 const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# cache\n";
@@ -1497,4 +1499,161 @@ fn remove_explicit_bare_repo_worktree_reclaims() {
     }
     assert!(!from_bare.exists(), "from-bare worktree must be removed");
     assert!(bare.exists(), "bare repo must stay");
+}
+
+fn leftover_with_gitignored_cache_file(
+    repo: &Path,
+    name: &str,
+    rel: &str,
+    bytes: &[u8],
+) -> PathBuf {
+    fs::write(repo.join(".gitignore"), b"target\n").expect("gitignore");
+    git(repo, &["add", ".gitignore"]);
+    git(repo, &["commit", "-m", "ignore target"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(repo, &leftover, name);
+    let dest = wt.join(rel);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).expect("cache parent");
+    }
+    fs::write(&dest, bytes).expect("cache file");
+    wt
+}
+
+#[test]
+fn extra_deny_policy_keeps_target_my_secret() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let wt = leftover_with_gitignored_cache_file(
+        &repo,
+        "extra-secret",
+        "target/my-secret",
+        b"host extra\n",
+    );
+    let secret = wt.join("target").join("my-secret");
+    let policy = DenyPolicy::with_extra(["**/my-secret".into()]);
+    match classify_worktree_with_policy(&wt, false, &policy) {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => panic!(
+            "extra **/my-secret plus target/my-secret must Keep UniqueUntracked, got {other:?}"
+        ),
+    }
+    let now = SystemTime::now() + Duration::from_secs(10);
+    match classify_for_age_gc_with_policy(&wt, false, Duration::from_secs(0), now, &policy) {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => panic!("old leftover with extra-policy target/my-secret must Keep, got {other:?}"),
+    }
+    match remove_explicit_with_policy(&wt, "refs/workpen/reclaimed", false, &policy) {
+        Ok(GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        }) => {}
+        other => panic!("remove_explicit_with_policy must keep extra-policy secret, got {other:?}"),
+    }
+    let rows =
+        run_gc_with_policy(&repo, &cfg(&repo, Duration::from_secs(0), now), &policy).expect("gc");
+    let row = rows
+        .iter()
+        .find(|(p, _)| p.file_name() == wt.file_name())
+        .expect("extra-secret row");
+    match &row.1 {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => {
+            panic!("run_gc_with_policy must keep leftover with target/my-secret, got {other:?}")
+        }
+    }
+    assert!(
+        wt.exists(),
+        "worktree with extra-policy target/my-secret must stay"
+    );
+    assert_eq!(fs::read(&secret).expect("read"), b"host extra\n");
+}
+
+#[test]
+fn default_policy_reclaims_target_my_secret() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let wt = leftover_with_gitignored_cache_file(
+        &repo,
+        "default-secret",
+        "target/my-secret",
+        b"not a default dest-deny\n",
+    );
+    match classify_worktree(&wt, false) {
+        GcDecision::Reclaim { .. } => {}
+        other => panic!("default policy must Reclaim extra-only target/my-secret, got {other:?}"),
+    }
+    match classify_worktree_with_policy(&wt, false, &DenyPolicy::default()) {
+        GcDecision::Reclaim { .. } => {}
+        other => {
+            panic!("default with_policy must Reclaim extra-only target/my-secret, got {other:?}")
+        }
+    }
+    let now = SystemTime::now() + Duration::from_secs(10);
+    match classify_for_age_gc(&wt, false, Duration::from_secs(0), now) {
+        GcDecision::Reclaim { .. } => {}
+        other => {
+            panic!("old leftover with default-policy target/my-secret must Reclaim, got {other:?}")
+        }
+    }
+    let rows = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now)).expect("gc");
+    assert!(
+        rows.iter().any(|(p, d)| {
+            p.file_name() == wt.file_name() && matches!(d, GcDecision::Reclaim { .. })
+        }),
+        "CLI default run_gc must reclaim extra-only target/my-secret: {rows:?}"
+    );
+    assert!(
+        !wt.exists(),
+        "default policy must reclaim leftover with only target/my-secret"
+    );
+}
+
+#[test]
+fn default_policy_still_keeps_target_env() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let wt =
+        leftover_with_gitignored_cache_file(&repo, "default-env", "target/.env", b"SECRET=1\n");
+    let env = wt.join("target").join(".env");
+    match classify_worktree_with_policy(&wt, false, &DenyPolicy::default()) {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => panic!("default policy must still Keep target/.env, got {other:?}"),
+    }
+    let now = SystemTime::now() + Duration::from_secs(10);
+    match classify_for_age_gc_with_policy(
+        &wt,
+        false,
+        Duration::from_secs(0),
+        now,
+        &DenyPolicy::default(),
+    ) {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => panic!("old leftover with default-policy target/.env must Keep, got {other:?}"),
+    }
+    let rows = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now)).expect("gc");
+    let row = rows
+        .iter()
+        .find(|(p, _)| p.file_name() == wt.file_name())
+        .expect("default-env row");
+    match &row.1 {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => panic!("run_gc must still keep leftover with target/.env, got {other:?}"),
+    }
+    assert!(
+        wt.exists(),
+        "worktree with default-policy target/.env must stay"
+    );
+    assert_eq!(fs::read(&env).expect("read env"), b"SECRET=1\n");
 }

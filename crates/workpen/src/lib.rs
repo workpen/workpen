@@ -32,8 +32,10 @@ pub use deny::{
 };
 #[cfg(feature = "gc")]
 pub use gc::{
-    GcConfig, GcDecision, GcError, KeepReason, classify_for_age_gc, classify_worktree,
-    parse_max_age, remove_explicit, run_gc, worktree_last_used,
+    GcConfig, GcDecision, GcError, KeepReason, classify_for_age_gc,
+    classify_for_age_gc_with_policy, classify_worktree, classify_worktree_with_policy,
+    parse_max_age, remove_explicit, remove_explicit_with_policy, run_gc, run_gc_with_policy,
+    worktree_last_used,
 };
 pub use guard::{
     AbsolutePathPolicy, ExtraRootError, PathGuard, PathGuardBuilder, PathGuardDeny, PathGuardError,
