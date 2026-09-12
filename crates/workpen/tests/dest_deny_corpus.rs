@@ -67,6 +67,7 @@ fn dest_deny_message_wording_splits_glob_and_hardlink() {
         kind: DestDenyKind::DenyGlob,
         path: Path::new(".env").to_path_buf(),
         display: ".env".into(),
+        matched: None,
     };
     let glob_msg = glob.message().to_ascii_lowercase();
     assert!(glob_msg.contains("matches deny glob"), "{glob_msg}");
@@ -79,6 +80,7 @@ fn dest_deny_message_wording_splits_glob_and_hardlink() {
         kind: DestDenyKind::HardlinkSibling,
         path: Path::new("notes.txt").to_path_buf(),
         display: "notes.txt".into(),
+        matched: None,
     };
     let link_msg = link.message().to_ascii_lowercase();
     assert!(link_msg.contains("hardlink"), "{link_msg}");
@@ -184,10 +186,31 @@ fn dest_deny_message_reports_hardlink_not_glob_for_sibling() {
     );
     assert!(!msg.contains("unlink extra names"), "{msg}");
     assert!(!msg.contains("matches deny glob"), "{msg}");
+    assert!(
+        msg.contains(".env"),
+        "hardlink dest-deny must name the denied sibling: {msg}"
+    );
     let glob_msg = dest_deny_message(&env, &env.to_string_lossy(), &policy)
         .expect(".env is a deny glob")
         .to_ascii_lowercase();
     assert!(glob_msg.contains("matches deny glob"), "{glob_msg}");
+    assert!(
+        glob_msg.contains("**/.env"),
+        "glob dest-deny must name the matching glob: {glob_msg}"
+    );
+}
+
+#[test]
+fn dest_deny_message_names_auth_star_glob() {
+    let policy = DenyPolicy::default();
+    let msg = dest_deny_message(Path::new("auth-work.json"), "auth-work.json", &policy)
+        .expect("auth-work.json must dest-deny");
+    let lower = msg.to_ascii_lowercase();
+    assert!(lower.contains("matches deny glob"), "{msg}");
+    assert!(
+        msg.contains("**/auth-*.json"),
+        "glob dest-deny must name **/auth-*.json: {msg}"
+    );
 }
 
 #[cfg(unix)]
