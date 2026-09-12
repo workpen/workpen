@@ -43,6 +43,8 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
             "unknown flag: {flag} (use --root DIR or --extra-root DIR)"
         ));
     }
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root = resolve_workspace_root(&cwd, &root.to_string_lossy()).map_err(|e| e.to_string())?;
     let extras = resolve_extras(&root, &extras)?;
     let path = rest
         .first()
