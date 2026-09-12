@@ -178,6 +178,10 @@ fn system_read_dirs() -> Vec<&'static Path> {
 
 fn add_rw(grants: &mut Vec<KernelGrant>, path: &Path) -> Result<(), KernelError> {
     let resolved = canonicalize_dir(path)?;
+    // Grant the path as given so symlink lookups (`/tmp` -> `/private/tmp`) work.
+    if !is_fs_root(path) && path != resolved.as_path() {
+        push_grant(grants, path.to_path_buf(), KernelAccess::ReadWrite);
+    }
     push_grant(grants, resolved, KernelAccess::ReadWrite);
     Ok(())
 }

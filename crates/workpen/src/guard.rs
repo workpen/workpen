@@ -418,7 +418,17 @@ fn walk_guarded(start: &Path, roots: &[PathBuf]) -> Result<PathBuf, PathGuardKin
             Err(PathGuardKind::Escape)
         };
     }
-    let prefix_canon = dunce::canonicalize(&prefix).map_err(|_| PathGuardKind::Escape)?;
+    let prefix_canon = match dunce::canonicalize(&prefix) {
+        Ok(canon) => canon,
+        Err(_) => {
+            // Broken in-tree symlink: the dirent exists, but following it
+            // would leave the workspace (or fail). Do not treat as missing.
+            if chain_has_symlink(&prefix) && inside_any_root(&prefix, roots) {
+                return Err(PathGuardKind::SymlinkVault);
+            }
+            return Err(PathGuardKind::Escape);
+        }
+    };
     let rest = lexical.strip_prefix(&prefix).unwrap_or(Path::new(""));
     let resolved = prefix_canon.join(rest);
     if inside_any_root(&resolved, roots) {
@@ -451,7 +461,9 @@ fn longest_existing_prefix(path: &Path) -> PathBuf {
     let mut cur = PathBuf::new();
     for component in path.components() {
         cur.push(component);
-        if cur.exists() {
+        // `exists` follows the last component. A broken symlink is a dirent
+        // and must count as present so walk_guarded can classify it.
+        if std::fs::symlink_metadata(&cur).is_ok() {
             last.clone_from(&cur);
         } else {
             break;

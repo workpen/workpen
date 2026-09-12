@@ -116,6 +116,23 @@ fn symlink_out_of_tree_is_symlink_vault() {
 
 #[cfg(unix)]
 #[test]
+fn broken_out_of_tree_symlink_is_symlink_vault() {
+    let dir = workspace();
+    let link = dir.path().join("vault");
+    std::os::unix::fs::symlink("../no-such-secret", &link).expect("broken symlink");
+    let guard = PathGuard::new(dir.path(), AbsolutePathPolicy::AllowIfContained).expect("guard");
+    match guard.check(Path::new("vault")) {
+        Err(PathGuardError::Denied(deny)) => {
+            assert_eq!(deny.kind, PathGuardKind::SymlinkVault);
+            assert!(deny.message().contains("symlink"));
+            assert!(!deny.message().contains("deny glob"));
+        }
+        other => panic!("expected SymlinkVault, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn symlink_inside_workspace_is_allowed() {
     let dir = workspace();
     std::os::unix::fs::symlink(dir.path().join("ok.txt"), dir.path().join("alias"))
