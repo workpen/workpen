@@ -1414,3 +1414,87 @@ fn run_gc_reflog_failure_keeps_and_continues() {
     }
     assert!(!ok.exists(), "other trees must still reclaim");
 }
+
+fn configure_identity(cwd: &Path) {
+    git(cwd, &["config", "user.email", "dev@example.com"]);
+    git(cwd, &["config", "user.name", "dev"]);
+    git(cwd, &["config", "commit.gpgsign", "false"]);
+    git(cwd, &["config", "core.autocrlf", "false"]);
+    git(cwd, &["config", "core.eol", "lf"]);
+}
+
+#[test]
+fn remove_explicit_separate_git_dir_reclaims_linked() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().expect("tmp");
+    let store = dir.path().join("store.git");
+    let ws = dir.path().join("ws");
+    let linked = dir.path().join("linked");
+    git(
+        dir.path(),
+        &[
+            "init",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            store.to_str().expect("utf8"),
+            ws.to_str().expect("utf8"),
+        ],
+    );
+    configure_identity(&ws);
+    fs::write(ws.join("README"), b"x").expect("readme");
+    git(&ws, &["add", "README"]);
+    git(&ws, &["commit", "-m", "init"]);
+    git(
+        &ws,
+        &[
+            "worktree",
+            "add",
+            linked.to_str().expect("utf8"),
+            "-b",
+            "extra",
+        ],
+    );
+    match remove_explicit(&linked, "refs/workpen/reclaimed", false) {
+        Ok(GcDecision::Reclaim { .. }) => {}
+        other => panic!("separate-git-dir linked must reclaim, got {other:?}"),
+    }
+    assert!(!linked.exists(), "linked worktree must be removed");
+    assert!(ws.join("README").exists(), "main checkout must stay");
+}
+
+#[test]
+fn remove_explicit_bare_repo_worktree_reclaims() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().expect("tmp");
+    let bare = dir.path().join("bare.git");
+    let seed = dir.path().join("seed");
+    let from_bare = dir.path().join("from-bare");
+    git(
+        dir.path(),
+        &["init", "--bare", "-b", "main", bare.to_str().expect("utf8")],
+    );
+    git(
+        dir.path(),
+        &["init", "-b", "main", seed.to_str().expect("utf8")],
+    );
+    configure_identity(&seed);
+    fs::write(seed.join("README"), b"x").expect("readme");
+    git(&seed, &["add", "README"]);
+    git(&seed, &["commit", "-m", "init"]);
+    git(
+        &seed,
+        &["remote", "add", "origin", bare.to_str().expect("utf8")],
+    );
+    git(&seed, &["push", "-u", "origin", "main"]);
+    git(
+        &bare,
+        &["worktree", "add", from_bare.to_str().expect("utf8"), "main"],
+    );
+    match remove_explicit(&from_bare, "refs/workpen/reclaimed", false) {
+        Ok(GcDecision::Reclaim { .. }) => {}
+        other => panic!("bare-repo worktree must reclaim, got {other:?}"),
+    }
+    assert!(!from_bare.exists(), "from-bare worktree must be removed");
+    assert!(bare.exists(), "bare repo must stay");
+}

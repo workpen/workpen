@@ -37,7 +37,7 @@ pub use gc::{
 };
 pub use guard::{
     AbsolutePathPolicy, ExtraRootError, PathGuard, PathGuardBuilder, PathGuardDeny, PathGuardError,
-    PathGuardKind, check_dests, resolve_extra_root,
+    PathGuardKind, check_dests, resolve_extra_root, resolve_workspace_root,
 };
 pub use why::{Why, explain};
 #[cfg(feature = "nono")]

@@ -773,8 +773,12 @@ fn git_common_dir(path: &Path) -> Result<PathBuf, GcError> {
     }
 }
 
+/// `$repo/.git` -> `$repo`. Bare or `--separate-git-dir` store -> the git dir.
 fn repo_cwd_from_common_dir(common: &Path) -> PathBuf {
-    common.parent().unwrap_or(common).to_path_buf()
+    match common.file_name() {
+        Some(name) if name == ".git" => common.parent().unwrap_or(common).to_path_buf(),
+        _ => common.to_path_buf(),
+    }
 }
 
 fn registry_unreadable(err: GcError) -> GcError {

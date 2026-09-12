@@ -1,5 +1,6 @@
 //! dest-deny for `why`/`run` must use --root, not process cwd.
 
+use std::fs;
 use std::process::Command;
 
 use tempfile::TempDir;
@@ -198,5 +199,81 @@ fn why_plain_file_under_root_is_allowed() {
     assert!(
         stdout.contains("allowed"),
         "why readme.md must report allowed: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_relative_parent_root_dest_denies_hardlink_not_escape() {
+    let parent = TempDir::new().expect("parent");
+    let ws = parent.path().join("ws");
+    let cwd = parent.path().join("here");
+    fs::create_dir(&ws).expect("ws");
+    fs::create_dir(&cwd).expect("cwd");
+    fs::write(ws.join(".env"), "SECRET=1\n").expect("write .env");
+    fs::hard_link(ws.join(".env"), ws.join("notes.txt")).expect("hardlink");
+    for root in ["../ws", "./../ws"] {
+        let out = workpen()
+            .args(["run", "--root", root, "--", "/bin/cat", "notes.txt"])
+            .current_dir(&cwd)
+            .output()
+            .expect("spawn workpen");
+        assert!(
+            !out.status.success(),
+            "run --root {root} cat notes.txt must fail, stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let text = combined(&out);
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            !lower.contains("escapes workspace"),
+            "run --root {root} must not treat the workspace as an escape: {text}"
+        );
+        assert!(
+            lower.contains("hardlink") || lower.contains("deny"),
+            "run --root {root} dest-deny must mention hardlink or deny: {text}"
+        );
+        assert!(
+            !stdout.contains("SECRET"),
+            "run --root {root} must dest-deny before spawn, stdout={stdout}"
+        );
+    }
+}
+
+#[test]
+fn run_missing_root_is_clear_error_not_escape() {
+    let cwd = TempDir::new().expect("cwd");
+    let out = workpen()
+        .args([
+            "run",
+            "--root",
+            "../no-such-workpen-ws",
+            "--",
+            "/bin/cat",
+            "notes.txt",
+        ])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "missing --root must fail, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = combined(&out);
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        !lower.contains("escapes workspace"),
+        "missing --root must not claim an escape: {text}"
+    );
+    assert!(
+        lower.contains("does not exist")
+            || lower.contains("no such")
+            || lower.contains("not a directory")
+            || lower.contains("root"),
+        "missing --root must be a clear root error: {text}"
     );
 }

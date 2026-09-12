@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use workpen::{
     CheckDestError, DenyPolicy, GcConfig, GcDecision, PathGuard, check_command_argv,
-    dest_under_root, parse_max_age, resolve_extra_root, run_gc,
+    dest_under_root, parse_max_age, resolve_extra_root, resolve_workspace_root, run_gc,
 };
 
 fn main() -> ExitCode {
@@ -77,6 +77,8 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
             "unknown flag: {flag} (use --root DIR or --extra-root DIR)"
         ));
     }
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root = resolve_workspace_root(&cwd, &root.to_string_lossy()).map_err(|e| e.to_string())?;
     let extras = resolve_extras(&root, &extras)?;
     let cmd = if rest.first().map(String::as_str) == Some("--") {
         &rest[1..]
@@ -88,15 +90,12 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     }
     let policy = DenyPolicy::default();
     let guard = PathGuard::with_extra_roots(&root, &extras).map_err(|e| e.to_string())?;
-    if let Err(e) = workpen::check_dests(&guard, &[Path::new(&root)]) {
-        return Err(e.to_string());
-    }
-    if let Err(e) = check_command_argv(cmd, Path::new(&root), &policy) {
+    if let Err(e) = check_command_argv(cmd, guard.canon_root(), &policy) {
         return Err(e.to_string());
     }
     let mut child = Command::new(&cmd[0]);
-    child.args(&cmd[1..]).current_dir(&root);
-    workpen::process_jail(&root, &extras)
+    child.args(&cmd[1..]).current_dir(guard.canon_root());
+    workpen::process_jail(guard.canon_root(), &extras)
         .and_then(|policy| policy.apply_pre_exec(&mut child))
         .map_err(|e| e.to_string())?;
     let status = child
