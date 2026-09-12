@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
-use crate::deny::{DenyPolicy, is_path_denied};
+use crate::deny::{DenyPolicy, path_is_denied_glob};
 
 /// Host knobs. Bline passes leftover_dir = ".bline-worktrees",
 /// saved_ref_prefix = "refs/bline/reclaimed".
@@ -120,6 +120,11 @@ pub fn classify_for_age_gc(
     if untracked {
         return GcDecision::Keep {
             reason: KeepReason::UntrackedWorktree,
+        };
+    }
+    if newest_tree_mtime(path).is_err() {
+        return GcDecision::Keep {
+            reason: KeepReason::StatusUnreadable,
         };
     }
     let last_used = worktree_last_used(path).unwrap_or(now);
@@ -495,7 +500,7 @@ pub fn worktree_last_used(path: &Path) -> Option<SystemTime> {
     if let Some(t) = index_mtime(path) {
         latest = Some(latest.map_or(t, |n| n.max(t)));
     }
-    if let Some(t) = newest_tree_mtime(path) {
+    if let Ok(Some(t)) = newest_tree_mtime(path) {
         latest = Some(latest.map_or(t, |n| n.max(t)));
     }
     latest
@@ -518,21 +523,24 @@ fn index_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(index).and_then(|m| m.modified()).ok()
 }
 
-fn newest_tree_mtime(root: &Path) -> Option<SystemTime> {
+/// Finished walk of file mtimes. `Err` if `read_dir` failed or the
+/// budget ran out with directories still queued. `DirEntry::metadata`
+/// (lstat); do not switch to `fs::metadata`.
+fn newest_tree_mtime(root: &Path) -> Result<Option<SystemTime>, ()> {
     let mut newest: Option<SystemTime> = None;
     let mut remaining = LAST_USED_WALK_LIMIT;
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(root.to_path_buf());
     while remaining > 0 {
         let Some(dir) = queue.pop_front() else {
-            break;
+            return Ok(newest);
         };
         let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
+            return Err(());
         };
         for entry in rd.flatten() {
             if remaining == 0 {
-                break;
+                return Err(());
             }
             remaining -= 1;
             let p = entry.path();
@@ -553,7 +561,10 @@ fn newest_tree_mtime(root: &Path) -> Option<SystemTime> {
             }
         }
     }
-    newest
+    if !queue.is_empty() {
+        return Err(());
+    }
+    Ok(newest)
 }
 
 fn is_age_cache_dir_name(name: &str) -> bool {
@@ -562,9 +573,12 @@ fn is_age_cache_dir_name(name: &str) -> bool {
 
 /// First path component matches [`CACHE_DIR_NAMES`] by name. No `CACHEDIR.TAG`.
 /// Porcelain often lists only `!! target/`, not `!! target/.env`.
+/// Cache walk matches deny globs only (full path and basename). It does
+/// not apply dest-deny hardlink / incomplete-nlink fail-closed, and it
+/// does not follow directory symlinks out of the cache tree.
 fn cache_tree_has_denied_name(root: &Path, rel: &Path) -> bool {
     let policy = DenyPolicy::default();
-    if is_path_denied(rel, &policy) {
+    if cache_path_denied_glob(&policy, rel) {
         return true;
     }
     let Some(std::path::Component::Normal(name)) = rel.components().next() else {
@@ -588,15 +602,31 @@ fn cache_tree_has_denied_name(root: &Path, rel: &Path) -> bool {
             }
             remaining -= 1;
             let p = entry.path();
-            if is_path_denied(&p, &policy) {
+            if cache_path_denied_glob(&policy, &p) {
                 return true;
             }
-            if p.is_dir() {
+            let is_real_dir = match entry.file_type() {
+                Ok(ft) => ft.is_dir(),
+                Err(_) => match std::fs::symlink_metadata(&p) {
+                    Ok(meta) => meta.file_type().is_dir(),
+                    Err(_) => return true,
+                },
+            };
+            if is_real_dir {
                 queue.push_back(p);
             }
         }
     }
     !queue.is_empty()
+}
+
+fn cache_path_denied_glob(policy: &DenyPolicy, path: &Path) -> bool {
+    let full = path.to_string_lossy().replace('\\', "/");
+    if path_is_denied_glob(policy.globs(), &full) {
+        return true;
+    }
+    path.file_name()
+        .is_some_and(|base| path_is_denied_glob(policy.globs(), &base.to_string_lossy()))
 }
 
 fn is_under_known_cache(root: &Path, file: &Path) -> bool {
@@ -611,7 +641,7 @@ fn is_under_known_cache(root: &Path, file: &Path) -> bool {
 
 /// Unique-work is `git status --porcelain=v1 -uall --ignored`. Git CLI, not gix.
 /// Porcelain `??` / `!!` under a first-component cache dir name is not unique
-/// work unless a dest-deny name exists in that tree (git often lists only
+/// work unless a deny-glob name exists in that tree (git often lists only
 /// `!! target/`, not `!! target/.env`). Other XY statuses under those names
 /// are DirtyWork (tracked dirty cache paths).
 fn unique_work_reason(path: &Path) -> Option<KeepReason> {

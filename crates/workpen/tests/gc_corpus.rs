@@ -680,6 +680,86 @@ fn unreadable_gitignored_cache_dir_is_kept() {
     assert_eq!(fs::read(&env).expect("read env"), b"SECRET=1\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn cache_cross_dir_hardlinked_rlib_is_reclaimable() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"target\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore target"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "cache-hardlink-rlib");
+    let target = wt.join("target");
+    fs::create_dir_all(target.join("nested")).expect("nested");
+    let a = target.join("a.rlib");
+    let b = target.join("nested").join("b.rlib");
+    fs::write(&a, b"obj").expect("a.rlib");
+    fs::hard_link(&a, &b).expect("hardlink rlib");
+    match classify_worktree(&wt, false) {
+        GcDecision::Reclaim { .. } => {}
+        other => panic!("cross-dir hardlinked rlib under target/ must Reclaim, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_hardlink_of_env_under_target_is_kept() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"target\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore target"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "cache-hardlink-env");
+    let target = wt.join("target");
+    fs::create_dir_all(&target).expect("target");
+    let env = target.join(".env");
+    fs::write(&env, b"SECRET=1\n").expect("env");
+    fs::hard_link(&env, target.join("notes.txt")).expect("hardlink notes");
+    match classify_worktree(&wt, false) {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => {
+            panic!("hardlink of target/.env to notes.txt must Keep UniqueUntracked, got {other:?}")
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_dir_symlink_to_outside_env_is_reclaimable() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"target\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore target"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "cache-symlink-out");
+    let target = wt.join("target");
+    fs::create_dir_all(&target).expect("target");
+    fs::write(target.join("lib.rlib"), b"obj").expect("lib.rlib");
+    let outside = repo.parent().expect("temp parent").join("outside-secrets");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::write(outside.join(".env"), b"SECRET=1\n").expect("outside env");
+    std::os::unix::fs::symlink(&outside, target.join("out")).expect("dir symlink");
+    match classify_worktree(&wt, false) {
+        GcDecision::Reclaim { .. } => {}
+        other => panic!("target/out symlink to outside dir with .env must Reclaim, got {other:?}"),
+    }
+    let real = add_leftover_worktree(&repo, &leftover, "cache-real-env");
+    let real_target = real.join("target");
+    fs::create_dir_all(&real_target).expect("real target");
+    fs::write(real_target.join(".env"), b"SECRET=1\n").expect("real env");
+    match classify_worktree(&real, false) {
+        GcDecision::Keep {
+            reason: KeepReason::UniqueUntracked,
+        } => {}
+        other => panic!("real target/.env must Keep UniqueUntracked, got {other:?}"),
+    }
+}
+
 #[test]
 fn unique_dangling_commit_is_saved_under_prefix() {
     let fx = init_repo();
@@ -922,6 +1002,76 @@ fn recent_index_keeps_tree_when_head_and_files_are_old() {
             reason: KeepReason::TooNew,
         } => {}
         other => panic!("fresh index must keep the tree, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_dir_in_age_walk_is_kept() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "age-unreadable");
+    let hidden = wt.join("hidden");
+    fs::create_dir_all(&hidden).expect("hidden");
+    let recent = hidden.join("just_touched");
+    fs::write(&recent, b"x").expect("just_touched");
+    git(&wt, &["add", "hidden/just_touched"]);
+    git(&wt, &["commit", "-m", "tracked hidden"]);
+
+    let amend = Command::new("git")
+        .args([
+            "commit",
+            "--amend",
+            "--no-edit",
+            "--date=2020-01-01T00:00:00",
+        ])
+        .env("GIT_COMMITTER_DATE", "2020-01-01T00:00:00")
+        .current_dir(&wt)
+        .status()
+        .expect("amend");
+    if !amend.success() {
+        return;
+    }
+    let index = git_path(&wt, "index");
+    let stamp = |p: &Path| {
+        Command::new("touch")
+            .args(["-t", "202001010000", p.to_str().expect("utf8")])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !stamp(&wt) || !stamp(&index) || !stamp(&wt.join("README")) || !stamp(&recent) {
+        return;
+    }
+    if !Command::new("touch")
+        .arg(recent.to_str().expect("utf8"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    struct RestoreMode<'a>(&'a Path);
+    impl Drop for RestoreMode<'_> {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = RestoreMode(&hidden);
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    if fs::read_dir(&hidden).is_ok() {
+        return;
+    }
+
+    match classify_for_age_gc(&wt, false, Duration::from_secs(60 * 60), SystemTime::now()) {
+        GcDecision::Keep {
+            reason: KeepReason::TooNew | KeepReason::StatusUnreadable,
+        } => {}
+        other => panic!("unreadable hidden/ with recent tracked file must Keep, got {other:?}"),
     }
 }
 
