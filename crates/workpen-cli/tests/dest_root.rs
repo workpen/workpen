@@ -1,5 +1,6 @@
 //! dest-deny for `why`/`run` must use --root, not process cwd.
 
+#[cfg(unix)]
 use std::fs;
 use std::process::Command;
 
