@@ -618,6 +618,68 @@ fn gitignored_env_under_cache_dir_is_kept() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn unreadable_gitignored_cache_dir_is_kept() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"target\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore target"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "cache-unreadable");
+    let target = wt.join("target");
+    fs::create_dir_all(&target).expect("target");
+    let env = target.join(".env");
+    fs::write(&env, b"SECRET=1\n").expect("env");
+
+    struct RestoreMode<'a>(&'a Path);
+    impl Drop for RestoreMode<'_> {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = RestoreMode(&target);
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    if fs::read_dir(&target).is_ok() {
+        return;
+    }
+
+    match classify_worktree(&wt, false) {
+        GcDecision::Keep {
+            reason:
+                KeepReason::UniqueUntracked | KeepReason::DirtyWork | KeepReason::StatusUnreadable,
+        } => {}
+        other => panic!("unreadable target/ with .env must Keep, got {other:?}"),
+    }
+    let now = SystemTime::now() + Duration::from_secs(10);
+    match classify_for_age_gc(&wt, false, Duration::from_secs(0), now) {
+        GcDecision::Keep {
+            reason:
+                KeepReason::UniqueUntracked | KeepReason::DirtyWork | KeepReason::StatusUnreadable,
+        } => {}
+        other => panic!("old leftover with unreadable target/ must Keep, got {other:?}"),
+    }
+    let rows = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now)).expect("gc");
+    let row = rows
+        .iter()
+        .find(|(p, _)| p.file_name() == wt.file_name())
+        .expect("cache-unreadable row");
+    match &row.1 {
+        GcDecision::Keep { .. } => {}
+        other => panic!("run_gc must keep leftover with unreadable target/, got {other:?}"),
+    }
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("restore for read");
+    assert!(
+        wt.exists(),
+        "worktree with unreadable target/.env must stay"
+    );
+    assert!(env.exists(), "target/.env must remain");
+    assert_eq!(fs::read(&env).expect("read env"), b"SECRET=1\n");
+}
+
 #[test]
 fn unique_dangling_commit_is_saved_under_prefix() {
     let fx = init_repo();

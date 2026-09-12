@@ -576,14 +576,15 @@ fn cache_tree_has_denied_name(root: &Path, rel: &Path) -> bool {
     queue.push_back(start);
     while remaining > 0 {
         let Some(dir) = queue.pop_front() else {
-            break;
+            return false;
         };
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(_) => return true,
         };
         for entry in rd.flatten() {
             if remaining == 0 {
-                break;
+                return true;
             }
             remaining -= 1;
             let p = entry.path();
@@ -595,7 +596,7 @@ fn cache_tree_has_denied_name(root: &Path, rel: &Path) -> bool {
             }
         }
     }
-    false
+    !queue.is_empty()
 }
 
 fn is_under_known_cache(root: &Path, file: &Path) -> bool {
@@ -644,6 +645,18 @@ fn unique_work_reason(path: &Path) -> Option<KeepReason> {
             has_unique = true;
         } else {
             return Some(KeepReason::DirtyWork);
+        }
+    }
+    // Git omits unreadable ignored dirs from porcelain. Walk them anyway.
+    if !has_unique {
+        for name in CACHE_DIR_NAMES {
+            if !path.join(name).is_dir() {
+                continue;
+            }
+            if cache_tree_has_denied_name(path, Path::new(name)) {
+                has_unique = true;
+                break;
+            }
         }
     }
     if has_unique {

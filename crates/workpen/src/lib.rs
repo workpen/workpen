@@ -24,10 +24,11 @@ mod why;
 mod wrap;
 
 pub use deny::{
-    CheckDestError, DenyPolicy, DestDeny, DestDenyError, DestDenyKind, check_dest, classify_dest,
-    default_secret_denies, deny_patch_dests, deny_patch_dests_with_display, dest_deny_message,
-    is_env_template_basename, is_path_denied, open_verified_read, path_is_denied_glob,
-    path_matches_deny_glob, reject_command_secret_path_tokens, verify_post_open,
+    CheckDestError, DenyPolicy, DestDeny, DestDenyError, DestDenyKind, check_command_dests,
+    check_dest, classify_dest, default_secret_denies, deny_patch_dests,
+    deny_patch_dests_with_display, dest_deny_message, is_env_template_basename, is_path_denied,
+    open_verified_read, path_is_denied_glob, path_matches_deny_glob,
+    reject_command_secret_path_tokens, verify_post_open,
 };
 #[cfg(feature = "gc")]
 pub use gc::{

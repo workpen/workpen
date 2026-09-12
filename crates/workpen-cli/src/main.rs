@@ -5,8 +5,8 @@ use std::process::{Command, ExitCode};
 use std::time::SystemTime;
 
 use workpen::{
-    CheckDestError, DenyPolicy, GcConfig, GcDecision, PathGuard, parse_max_age,
-    reject_command_secret_path_tokens, resolve_extra_root, run_gc,
+    CheckDestError, DenyPolicy, GcConfig, GcDecision, PathGuard, check_command_dests,
+    parse_max_age, reject_command_secret_path_tokens, resolve_extra_root, run_gc,
 };
 
 fn main() -> ExitCode {
@@ -91,14 +91,8 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     if let Err(e) = workpen::check_dests(&guard, &[Path::new(&root)]) {
         return Err(e.to_string());
     }
-    for token in cmd {
-        if token.starts_with('-') {
-            continue;
-        }
-        let dest = dest_under_root(&root, token);
-        if let Err(e) = workpen::check_dest(&dest.to_string_lossy(), &policy, None) {
-            return Err(e.to_string());
-        }
+    if let Err(e) = check_command_dests(&joined, Path::new(&root), &policy) {
+        return Err(e.to_string());
     }
     let mut child = Command::new(&cmd[0]);
     child.args(&cmd[1..]).current_dir(&root);

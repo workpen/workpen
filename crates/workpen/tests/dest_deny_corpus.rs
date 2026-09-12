@@ -4,10 +4,10 @@
 use std::path::Path;
 
 use workpen::{
-    CheckDestError, DenyPolicy, DestDeny, DestDenyError, DestDenyKind, PathGuard, check_dest,
-    classify_dest, default_secret_denies, deny_patch_dests, deny_patch_dests_with_display,
-    dest_deny_message, is_env_template_basename, is_path_denied, open_verified_read,
-    path_is_denied_glob, reject_command_secret_path_tokens, verify_post_open,
+    CheckDestError, DenyPolicy, DestDeny, DestDenyError, DestDenyKind, PathGuard,
+    check_command_dests, check_dest, classify_dest, default_secret_denies, deny_patch_dests,
+    deny_patch_dests_with_display, dest_deny_message, is_env_template_basename, is_path_denied,
+    open_verified_read, path_is_denied_glob, reject_command_secret_path_tokens, verify_post_open,
 };
 
 #[test]
@@ -293,6 +293,29 @@ fn argv_shell_meta_bash_c_interpreter_function_call_and_git_colon() {
         .expect("template exception still allowed");
     reject_command_secret_path_tokens("git show HEAD:src/main.rs", &policy)
         .expect("non-secret pathspec ok");
+}
+
+#[test]
+fn check_command_dests_joins_quoted_c_body_under_root_not_cwd() {
+    let ws = tempfile::tempdir().expect("workspace");
+    let _other = tempfile::tempdir().expect("other cwd");
+    let env = ws.path().join(".env");
+    std::fs::write(&env, "SECRET=1\n").expect("write .env");
+    std::fs::hard_link(&env, ws.path().join("notes.txt")).expect("hardlink");
+    let policy = DenyPolicy::default();
+    let err = check_command_dests("sh -c 'cat notes.txt'", ws.path(), &policy)
+        .expect_err("quoted -c notes.txt hardlink must dest-deny");
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(
+                d.kind,
+                DestDenyKind::HardlinkSibling,
+                "joined notes.txt must be HardlinkSibling, got {:?}",
+                d.kind
+            );
+        }
+        other => panic!("expected DestDeny HardlinkSibling, got {other:?}"),
+    }
 }
 
 #[test]
