@@ -53,6 +53,32 @@ fn extra_root_is_readwrite() {
     assert_eq!(grant.access, KernelAccess::ReadWrite);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn extra_root_tmp_grants_presented_and_canonical() {
+    let tmp = Path::new("/tmp");
+    if !tmp.is_dir() {
+        return;
+    }
+    let Ok(canon) = fs::canonicalize(tmp) else {
+        return;
+    };
+    let dir = workspace();
+    let policy = process_jail(dir.path(), [tmp]).expect("policy");
+    let presented = policy
+        .grants()
+        .iter()
+        .find(|g| g.path == tmp)
+        .expect("presented /tmp grant");
+    assert_eq!(presented.access, KernelAccess::ReadWrite);
+    let resolved = policy
+        .grants()
+        .iter()
+        .find(|g| g.path == canon)
+        .expect("canonical /tmp grant");
+    assert_eq!(resolved.access, KernelAccess::ReadWrite);
+}
+
 #[test]
 fn never_grants_filesystem_root() {
     let dir = workspace();
@@ -111,10 +137,11 @@ fn missing_workspace_is_root_error() {
 #[test]
 fn existing_system_dirs_are_read() {
     let dir = workspace();
-    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
-    let workspace = fs::canonicalize(dir.path()).expect("canon");
+    let presented = dir.path();
+    let policy = process_jail(presented, std::iter::empty::<&Path>()).expect("policy");
+    let workspace = fs::canonicalize(presented).expect("canon");
     for grant in policy.grants() {
-        if grant.path == workspace {
+        if grant.path == workspace || grant.path == presented {
             continue;
         }
         assert_eq!(

@@ -7,7 +7,7 @@ use std::path::Path;
 use tempfile::TempDir;
 use workpen::{
     AbsolutePathPolicy, DenyPolicy, ExtraRootError, PathGuard, PathGuardError, PathGuardKind,
-    check_dests, classify_dest, resolve_extra_root,
+    check_dests, classify_dest, resolve_extra_root, resolve_workspace_root,
 };
 
 fn workspace() -> TempDir {
@@ -103,6 +103,23 @@ fn symlink_out_of_tree_is_symlink_vault() {
     fs::write(outside.path().join("vault.txt"), b"secret").expect("vault");
     let link = dir.path().join("vault");
     std::os::unix::fs::symlink(outside.path().join("vault.txt"), &link).expect("symlink");
+    let guard = PathGuard::new(dir.path(), AbsolutePathPolicy::AllowIfContained).expect("guard");
+    match guard.check(Path::new("vault")) {
+        Err(PathGuardError::Denied(deny)) => {
+            assert_eq!(deny.kind, PathGuardKind::SymlinkVault);
+            assert!(deny.message().contains("symlink"));
+            assert!(!deny.message().contains("deny glob"));
+        }
+        other => panic!("expected SymlinkVault, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn broken_out_of_tree_symlink_is_symlink_vault() {
+    let dir = workspace();
+    let link = dir.path().join("vault");
+    std::os::unix::fs::symlink("../no-such-secret", &link).expect("broken symlink");
     let guard = PathGuard::new(dir.path(), AbsolutePathPolicy::AllowIfContained).expect("guard");
     match guard.check(Path::new("vault")) {
         Err(PathGuardError::Denied(deny)) => {
@@ -365,6 +382,72 @@ fn resolve_extra_root_rejects_symlink_to_tmp() {
 fn resolve_extra_root_allows_explicit_tmp() {
     let dir = workspace();
     let got = resolve_extra_root(dir.path(), "/tmp").expect("explicit /tmp");
+    assert!(
+        got == Path::new("/tmp") || got == Path::new("/private/tmp"),
+        "explicit /tmp resolved to {}",
+        got.display()
+    );
+}
+
+#[test]
+fn resolve_workspace_root_rejects_empty_missing_and_file() {
+    let dir = workspace();
+    match resolve_workspace_root(dir.path(), "   ") {
+        Err(PathGuardError::Root(_)) => {}
+        other => panic!("expected Root, got {other:?}"),
+    }
+    match resolve_workspace_root(dir.path(), "no-such-workspace-root") {
+        Err(PathGuardError::Root(_)) => {}
+        other => panic!("expected Root, got {other:?}"),
+    }
+    match resolve_workspace_root(dir.path(), "ok.txt") {
+        Err(PathGuardError::Root(_)) => {}
+        other => panic!("expected Root, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_workspace_root_relative_parent_is_workspace() {
+    let parent = TempDir::new().expect("parent");
+    let ws = parent.path().join("ws");
+    let sibling = parent.path().join("sibling");
+    fs::create_dir_all(&ws).expect("ws");
+    fs::create_dir_all(&sibling).expect("sibling");
+    let got = resolve_workspace_root(&sibling, "../ws").expect("relative ../ws");
+    let want = dunce::canonicalize(&ws).expect("canon");
+    assert_eq!(got, want);
+    assert!(got.is_absolute(), "relative ../ws must become absolute");
+}
+
+#[test]
+fn resolve_workspace_root_rejects_implicit_filesystem_root() {
+    let dir = workspace();
+    let via_dotdot = dir.path().join("..").join("..").join("..").join("..");
+    match resolve_workspace_root(dir.path(), &via_dotdot.to_string_lossy()) {
+        Err(PathGuardError::Root(_)) => {}
+        Ok(p) if p.parent().is_some_and(|x| !x.as_os_str().is_empty()) => {
+            // sandbox may not walk to fs root; still must not grant implicit /
+        }
+        other => panic!("implicit root must not be granted, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_workspace_root_rejects_implicit_host_temp() {
+    let dir = workspace();
+    let marker = TempDir::new().expect("implicit-temp marker");
+    let via = marker.path().join("..");
+    match resolve_workspace_root(dir.path(), &via.to_string_lossy()) {
+        Err(PathGuardError::Root(_)) => {}
+        other => panic!("implicit host temp must be refused, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_workspace_root_allows_explicit_tmp() {
+    let dir = workspace();
+    let got = resolve_workspace_root(dir.path(), "/tmp").expect("explicit /tmp");
     assert!(
         got == Path::new("/tmp") || got == Path::new("/private/tmp"),
         "explicit /tmp resolved to {}",
