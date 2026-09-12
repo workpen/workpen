@@ -288,6 +288,109 @@ fn run_relative_parent_root_dest_denies_hardlink_not_escape() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn why_relative_parent_root_dest_denies_hardlink_not_escape() {
+    let parent = TempDir::new().expect("parent");
+    let ws = parent.path().join("ws");
+    let cwd = parent.path().join("here");
+    fs::create_dir(&ws).expect("ws");
+    fs::create_dir(&cwd).expect("cwd");
+    fs::write(ws.join(".env"), "SECRET=1\n").expect("write .env");
+    fs::hard_link(ws.join(".env"), ws.join("notes.txt")).expect("hardlink");
+    for root in ["../ws", "./../ws"] {
+        let out = workpen()
+            .args(["why", "--root", root, "notes.txt"])
+            .current_dir(&cwd)
+            .output()
+            .expect("spawn workpen");
+        assert!(
+            !out.status.success(),
+            "why --root {root} notes.txt must fail, stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = combined(&out);
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            !lower.contains("escapes workspace"),
+            "why --root {root} must not treat the workspace as an escape: {text}"
+        );
+        assert!(
+            lower.contains("hardlink"),
+            "why --root {root} dest-deny must mention hardlink: {text}"
+        );
+        assert!(
+            text.contains("denied name .env"),
+            "why --root {root} dest-deny must say denied name .env: {text}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn why_relative_parent_root_plain_file_is_allowed_not_escape() {
+    let parent = TempDir::new().expect("parent");
+    let ws = parent.path().join("ws");
+    let cwd = parent.path().join("here");
+    fs::create_dir(&ws).expect("ws");
+    fs::create_dir(&cwd).expect("cwd");
+    fs::write(ws.join("readme.md"), "ok\n").expect("write readme");
+    for root in ["../ws", "./../ws"] {
+        let out = workpen()
+            .args(["why", "--root", root, "readme.md"])
+            .current_dir(&cwd)
+            .output()
+            .expect("spawn workpen");
+        let text = combined(&out);
+        let lower = text.to_ascii_lowercase();
+        assert!(
+            !lower.contains("escapes workspace"),
+            "why --root {root} readme.md must not treat the workspace as an escape: {text}"
+        );
+        assert!(
+            out.status.success(),
+            "why --root {root} readme.md must be allowed, stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+        assert!(
+            stdout.contains("allowed"),
+            "why --root {root} readme.md must report allowed: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn why_missing_root_is_clear_error_not_escape() {
+    let cwd = TempDir::new().expect("cwd");
+    let out = workpen()
+        .args(["why", "--root", "../no-such-workpen-ws", "notes.txt"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "missing --root must fail, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = combined(&out);
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        !lower.contains("escapes workspace"),
+        "missing --root must not claim an escape: {text}"
+    );
+    assert!(
+        lower.contains("does not exist")
+            || lower.contains("no such")
+            || lower.contains("not a directory")
+            || lower.contains("root"),
+        "missing --root must be a clear root error: {text}"
+    );
+}
+
 #[test]
 fn run_missing_root_is_clear_error_not_escape() {
     let cwd = TempDir::new().expect("cwd");
