@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::deny::{DenyPolicy, DestDeny, classify_dest};
+use crate::deny::{DenyPolicy, DestDeny, dest_deny_at};
 use crate::guard::{PathGuard, PathGuardDeny, PathGuardError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,12 +30,8 @@ impl Why {
 }
 
 pub fn explain(path: &Path, policy: &DenyPolicy, guard: Option<&PathGuard>) -> Why {
-    if let Some(kind) = classify_dest(path, policy) {
-        return Why::DestDeny(DestDeny {
-            kind,
-            path: path.to_path_buf(),
-            display: path.display().to_string(),
-        });
+    if let Some(deny) = dest_deny_at(path, path.display().to_string(), policy) {
+        return Why::DestDeny(deny);
     }
     if let Some(guard) = guard {
         match guard.check(path) {
@@ -53,12 +49,8 @@ pub fn explain(path: &Path, policy: &DenyPolicy, guard: Option<&PathGuard>) -> W
                 });
             }
             Ok(resolved) => {
-                if let Some(kind) = classify_dest(&resolved, policy) {
-                    return Why::DestDeny(DestDeny {
-                        kind,
-                        path: resolved,
-                        display: path.display().to_string(),
-                    });
+                if let Some(deny) = dest_deny_at(&resolved, path.display().to_string(), policy) {
+                    return Why::DestDeny(deny);
                 }
             }
         }
@@ -94,6 +86,11 @@ mod tests {
         match explain(std::path::Path::new("notes.txt"), &policy, Some(&guard)) {
             Why::DestDeny(d) => {
                 assert_eq!(d.kind, crate::DestDenyKind::HardlinkSibling);
+                let msg = d.message();
+                assert!(
+                    msg.contains(".env"),
+                    "explain hardlink must name .env: {msg}"
+                );
             }
             other => panic!("resolved hardlink sibling must DestDeny, got {other:?}"),
         }

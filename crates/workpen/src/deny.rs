@@ -71,18 +71,28 @@ pub struct DestDeny {
     pub kind: DestDenyKind,
     pub path: PathBuf,
     pub display: String,
+    /// Matching deny glob, or the other hardlink's basename.
+    pub matched: Option<String>,
 }
 
 impl DestDeny {
     /// Wording distinguishes glob vs hardlink.
     /// Hardlink must not say "matches deny glob".
     pub fn message(&self) -> String {
-        match self.kind {
-            DestDenyKind::DenyGlob => format!(
+        match (&self.kind, self.matched.as_deref()) {
+            (DestDenyKind::DenyGlob, Some(glob)) => format!(
+                "path denied by sandbox profile (matches deny glob {glob}): {}",
+                self.display
+            ),
+            (DestDenyKind::DenyGlob, None) => format!(
                 "path denied by sandbox profile (matches deny glob): {}",
                 self.display
             ),
-            DestDenyKind::HardlinkSibling => format!(
+            (DestDenyKind::HardlinkSibling, Some(sib)) => format!(
+                "path denied by sandbox profile (hardlink of a denied name {sib}): {}",
+                self.display
+            ),
+            (DestDenyKind::HardlinkSibling, None) => format!(
                 "path denied by sandbox profile (hardlink of a denied name): {}",
                 self.display
             ),
@@ -135,20 +145,51 @@ impl std::fmt::Display for DestDeny {
 
 /// Classify one dest. Glob vs hardlink only. Does not jail `..`.
 pub fn classify_dest(path: &Path, policy: &DenyPolicy) -> Option<DestDenyKind> {
-    if path_is_denied_glob(policy.globs(), &path_as_glob(path)) {
-        return Some(DestDenyKind::DenyGlob);
+    classify_dest_hit(path, policy).map(|hit| hit.kind)
+}
+
+struct DestDenyHit {
+    kind: DestDenyKind,
+    matched: Option<String>,
+}
+
+fn classify_dest_hit(path: &Path, policy: &DenyPolicy) -> Option<DestDenyHit> {
+    if let Some(glob) = first_matching_deny_glob(policy.globs(), &path_as_glob(path)) {
+        return Some(DestDenyHit {
+            kind: DestDenyKind::DenyGlob,
+            matched: Some(glob),
+        });
     }
 
     let canon = std::fs::canonicalize(path).ok();
     if let Some(canon) = &canon
-        && path_is_denied_glob(policy.globs(), &path_as_glob(canon))
+        && let Some(glob) = first_matching_deny_glob(policy.globs(), &path_as_glob(canon))
     {
-        return Some(DestDenyKind::DenyGlob);
+        return Some(DestDenyHit {
+            kind: DestDenyKind::DenyGlob,
+            matched: Some(glob),
+        });
     }
-    if hardlink_sibling_denied(path, canon.as_deref(), policy) {
-        return Some(DestDenyKind::HardlinkSibling);
+    match hardlink_sibling_hit(path, canon.as_deref(), policy) {
+        HardlinkHit::Denied { sibling } => Some(DestDenyHit {
+            kind: DestDenyKind::HardlinkSibling,
+            matched: sibling,
+        }),
+        HardlinkHit::Allowed => None,
     }
-    None
+}
+
+pub(crate) fn dest_deny_at(
+    classified: &Path,
+    display: String,
+    policy: &DenyPolicy,
+) -> Option<DestDeny> {
+    classify_dest_hit(classified, policy).map(|hit| DestDeny {
+        kind: hit.kind,
+        path: classified.to_path_buf(),
+        display,
+        matched: hit.matched,
+    })
 }
 
 pub fn is_path_denied(path: &Path, policy: &DenyPolicy) -> bool {
@@ -156,14 +197,7 @@ pub fn is_path_denied(path: &Path, policy: &DenyPolicy) -> bool {
 }
 
 pub fn dest_deny_message(path: &Path, display: &str, policy: &DenyPolicy) -> Option<String> {
-    classify_dest(path, policy).map(|kind| {
-        DestDeny {
-            kind,
-            path: path.to_path_buf(),
-            display: display.to_owned(),
-        }
-        .message()
-    })
+    dest_deny_at(path, display.to_owned(), policy).map(|d| d.message())
 }
 
 /// Dest-deny raw; if `guard` is `Some`, PathGuard; dest-deny resolved.
@@ -181,12 +215,8 @@ pub fn check_dest(
         return Err(CheckDestError::Nul);
     }
     let raw = Path::new(path);
-    if let Some(kind) = classify_dest(raw, policy) {
-        return Err(CheckDestError::DestDeny(DestDenyError::Denied(DestDeny {
-            kind,
-            path: raw.to_path_buf(),
-            display: path.to_owned(),
-        })));
+    if let Some(deny) = dest_deny_at(raw, path.to_owned(), policy) {
+        return Err(CheckDestError::DestDeny(DestDenyError::Denied(deny)));
     }
 
     let resolved = match guard {
@@ -208,12 +238,8 @@ pub fn check_dest(
         }
     };
 
-    if let Some(kind) = classify_dest(&resolved, policy) {
-        return Err(CheckDestError::DestDeny(DestDenyError::Denied(DestDeny {
-            kind,
-            path: resolved,
-            display: path.to_owned(),
-        })));
+    if let Some(deny) = dest_deny_at(&resolved, path.to_owned(), policy) {
+        return Err(CheckDestError::DestDeny(DestDenyError::Denied(deny)));
     }
     reject_special_file(&resolved)?;
     Ok(resolved)
@@ -359,12 +385,8 @@ pub fn deny_patch_dests(
 ) -> Result<(), DestDenyError> {
     for dest in dests {
         let dest = dest.as_ref();
-        if let Some(kind) = classify_dest(dest, policy) {
-            return Err(DestDenyError::Denied(DestDeny {
-                kind,
-                path: dest.to_path_buf(),
-                display: dest.display().to_string(),
-            }));
+        if let Some(deny) = dest_deny_at(dest, dest.display().to_string(), policy) {
+            return Err(DestDenyError::Denied(deny));
         }
     }
     Ok(())
@@ -376,12 +398,8 @@ pub fn deny_patch_dests_with_display(
     policy: &DenyPolicy,
 ) -> Result<(), DestDenyError> {
     for (dest, display) in dests {
-        if let Some(kind) = classify_dest(dest, policy) {
-            return Err(DestDenyError::Denied(DestDeny {
-                kind,
-                path: dest.to_path_buf(),
-                display: (*display).to_owned(),
-            }));
+        if let Some(deny) = dest_deny_at(dest, (*display).to_owned(), policy) {
+            return Err(DestDenyError::Denied(deny));
         }
     }
     Ok(())
@@ -475,14 +493,21 @@ pub fn path_matches_deny_glob(pattern: &str, path: &str) -> bool {
 }
 
 pub fn path_is_denied_glob(globs: &[String], path: &str) -> bool {
+    first_matching_deny_glob(globs, path).is_some()
+}
+
+fn first_matching_deny_glob(globs: &[String], path: &str) -> Option<String> {
     let template = is_env_template_basename(path);
     let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    globs.iter().any(|g| {
-        if template && is_default_env_star_glob(g) {
-            return false;
-        }
-        path_matches_deny_glob(g, path) || path_matches_deny_glob(g, base)
-    })
+    globs
+        .iter()
+        .find(|g| {
+            if template && is_default_env_star_glob(g) {
+                return false;
+            }
+            path_matches_deny_glob(g, path) || path_matches_deny_glob(g, base)
+        })
+        .cloned()
 }
 
 fn is_default_env_star_glob(pattern: &str) -> bool {
@@ -541,24 +566,40 @@ fn match_star(pat: &[u8], text: &[u8]) -> bool {
     }
 }
 
+enum HardlinkHit {
+    Allowed,
+    Denied { sibling: Option<String> },
+}
+
 fn hardlink_sibling_denied(path: &Path, canon: Option<&Path>, policy: &DenyPolicy) -> bool {
+    matches!(
+        hardlink_sibling_hit(path, canon, policy),
+        HardlinkHit::Denied { .. }
+    )
+}
+
+fn hardlink_sibling_hit(path: &Path, canon: Option<&Path>, policy: &DenyPolicy) -> HardlinkHit {
     #[cfg(unix)]
     {
-        hardlink_sibling_denied_unix(path, canon, policy)
+        hardlink_sibling_hit_unix(path, canon, policy)
     }
     #[cfg(windows)]
     {
-        hardlink_sibling_denied_windows(path, canon, policy)
+        hardlink_sibling_hit_windows(path, canon, policy)
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, canon, policy);
-        false
+        HardlinkHit::Allowed
     }
 }
 
 #[cfg(unix)]
-fn hardlink_sibling_denied_unix(path: &Path, canon: Option<&Path>, policy: &DenyPolicy) -> bool {
+fn hardlink_sibling_hit_unix(
+    path: &Path,
+    canon: Option<&Path>,
+    policy: &DenyPolicy,
+) -> HardlinkHit {
     use std::os::unix::fs::MetadataExt;
 
     let meta = match canon
@@ -566,16 +607,18 @@ fn hardlink_sibling_denied_unix(path: &Path, canon: Option<&Path>, policy: &Deny
         .unwrap_or_else(|| std::fs::symlink_metadata(path))
     {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return true,
-        Err(_) => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return HardlinkHit::Denied { sibling: None };
+        }
+        Err(_) => return HardlinkHit::Allowed,
     };
     // Directory nlink counts children, not extra names for this inode.
     if meta.file_type().is_dir() {
-        return false;
+        return HardlinkHit::Allowed;
     }
     let nlink = meta.nlink();
     if nlink <= 1 {
-        return false;
+        return HardlinkHit::Allowed;
     }
     let mut parents = Vec::new();
     push_scan_parent(&mut parents, path.parent());
@@ -583,13 +626,13 @@ fn hardlink_sibling_denied_unix(path: &Path, canon: Option<&Path>, policy: &Deny
         push_scan_parent(&mut parents, c.parent());
     }
     if parents.is_empty() {
-        return true;
+        return HardlinkHit::Denied { sibling: None };
     }
     let mut found = 0u64;
     for parent in &parents {
         let entries = match std::fs::read_dir(parent) {
             Ok(rd) => rd,
-            Err(_) => return true,
+            Err(_) => return HardlinkHit::Denied { sibling: None },
         };
         for entry in entries.flatten() {
             let entry_path = entry.path();
@@ -601,12 +644,19 @@ fn hardlink_sibling_denied_unix(path: &Path, canon: Option<&Path>, policy: &Deny
                 continue;
             }
             if path_is_denied_glob(policy.globs(), &path_as_glob(&entry_path)) {
-                return true;
+                let sibling = entry_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned());
+                return HardlinkHit::Denied { sibling };
             }
             found += 1;
         }
     }
-    found < nlink
+    if found < nlink {
+        HardlinkHit::Denied { sibling: None }
+    } else {
+        HardlinkHit::Allowed
+    }
 }
 
 #[cfg(unix)]
@@ -625,23 +675,37 @@ fn push_scan_parent(parents: &mut Vec<PathBuf>, parent: Option<&Path>) {
 /// `MetadataExt::file_index` is unstable (`windows_by_handle`). List names
 /// with FindFirstFileNameW instead.
 #[cfg(windows)]
-fn hardlink_sibling_denied_windows(path: &Path, canon: Option<&Path>, policy: &DenyPolicy) -> bool {
+fn hardlink_sibling_hit_windows(
+    path: &Path,
+    canon: Option<&Path>,
+    policy: &DenyPolicy,
+) -> HardlinkHit {
     let probe = canon.unwrap_or(path);
     let meta = match std::fs::metadata(probe) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return true,
-        Err(_) => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return HardlinkHit::Denied { sibling: None };
+        }
+        Err(_) => return HardlinkHit::Allowed,
     };
     if meta.is_dir() {
-        return false;
+        return HardlinkHit::Allowed;
     }
     match win_hardlink_names(probe) {
-        Ok(names) if names.len() <= 1 => false,
-        Ok(names) => names.iter().any(|n| {
-            let s = n.to_string_lossy().replace('\\', "/");
-            path_is_denied_glob(policy.globs(), &s)
-        }),
-        Err(_) => true,
+        Ok(names) if names.len() <= 1 => HardlinkHit::Allowed,
+        Ok(names) => {
+            for n in &names {
+                let s = n.to_string_lossy().replace('\\', "/");
+                if path_is_denied_glob(policy.globs(), &s) {
+                    let sibling = Path::new(&s)
+                        .file_name()
+                        .map(|base| base.to_string_lossy().into_owned());
+                    return HardlinkHit::Denied { sibling };
+                }
+            }
+            HardlinkHit::Allowed
+        }
+        Err(_) => HardlinkHit::Denied { sibling: None },
     }
 }
 

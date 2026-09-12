@@ -56,6 +56,35 @@ fn why_dest_denies_hardlink_sibling_under_root_not_cwd() {
         !stdout.trim().eq_ignore_ascii_case("allowed"),
         "why dest-deny must not be only allowed: {stdout}"
     );
+    assert!(
+        text.contains(".env"),
+        "why hardlink dest-deny must name .env: {text}"
+    );
+}
+
+#[test]
+fn why_glob_dest_names_matching_auth_glob() {
+    let ws = TempDir::new().expect("workspace");
+    let cwd = TempDir::new().expect("other cwd");
+    std::fs::write(ws.path().join("auth-work.json"), "{}\n").expect("write auth");
+    let out = workpen()
+        .args(["why", "--root"])
+        .arg(ws.path())
+        .arg("auth-work.json")
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "why auth-work.json must dest-deny, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = combined(&out);
+    assert!(
+        text.contains("**/auth-*.json"),
+        "why glob dest-deny must name **/auth-*.json: {text}"
+    );
 }
 
 #[test]
