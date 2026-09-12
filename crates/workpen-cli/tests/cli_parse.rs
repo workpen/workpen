@@ -162,9 +162,37 @@ fn why_equals_root_is_not_a_path() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         !stdout.to_ascii_lowercase().contains("allowed"),
         "why --root=/ws must not print allowed: {stdout}"
+    );
+    assert!(
+        err.contains("--root") && err.contains("DIR"),
+        "why --root=/ws must name --root DIR: {err}"
+    );
+}
+
+#[test]
+fn run_equals_root_is_unknown_flag() {
+    let out = workpen()
+        .args(["run", "--root=/ws", "--", "/bin/true"])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "run --root=/ws must fail, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--root") && err.contains("DIR"),
+        "run --root=/ws must name --root DIR: {err}"
+    );
+    assert!(
+        !err.contains("failed to spawn"),
+        "run --root=/ws must not spawn: {err}"
     );
 }
 

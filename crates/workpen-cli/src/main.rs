@@ -39,7 +39,9 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
 fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
     if let Some(flag) = rest.iter().find(|t| t.starts_with('-')) {
-        return Err(format!("unknown flag: {flag}"));
+        return Err(format!(
+            "unknown flag: {flag} (use --root DIR or --extra-root DIR)"
+        ));
     }
     let extras = resolve_extras(&root, &extras)?;
     let path = rest
@@ -71,7 +73,9 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
     if let Some(flag) = rest.first().filter(|t| t.starts_with('-') && *t != "--") {
-        return Err(format!("unknown flag: {flag}"));
+        return Err(format!(
+            "unknown flag: {flag} (use --root DIR or --extra-root DIR)"
+        ));
     }
     let extras = resolve_extras(&root, &extras)?;
     let cmd = if rest.first().map(String::as_str) == Some("--") {

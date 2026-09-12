@@ -54,7 +54,7 @@ impl KeepReason {
             Self::DirtyWork => "unique uncommitted work",
             Self::UniqueUntracked => "unique untracked files",
             Self::TooNew => "newer than --max-age",
-            Self::UntrackedWorktree => "untracked (use worktree rm)",
+            Self::UntrackedWorktree => "untracked leftover (not a registered worktree)",
             Self::NotAGitDir => "not a git worktree",
             Self::StatusUnreadable => "git status unreadable",
             Self::LiveCwd => "live process cwd",

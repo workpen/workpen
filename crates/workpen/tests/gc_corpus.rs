@@ -769,7 +769,7 @@ fn keep_reason_as_str_is_stable() {
     assert_eq!(KeepReason::TooNew.as_str(), "newer than --max-age");
     assert_eq!(
         KeepReason::UntrackedWorktree.as_str(),
-        "untracked (use worktree rm)"
+        "untracked leftover (not a registered worktree)"
     );
     assert_eq!(KeepReason::NotAGitDir.as_str(), "not a git worktree");
     assert_eq!(
