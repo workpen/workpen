@@ -5,8 +5,8 @@ use std::process::{Command, ExitCode};
 use std::time::SystemTime;
 
 use workpen::{
-    CheckDestError, DenyPolicy, GcConfig, GcDecision, PathGuard, check_command_dests,
-    parse_max_age, reject_command_secret_path_tokens, resolve_extra_root, run_gc,
+    CheckDestError, DenyPolicy, GcConfig, GcDecision, PathGuard, check_command_argv,
+    dest_under_root, parse_max_age, resolve_extra_root, run_gc,
 };
 
 fn main() -> ExitCode {
@@ -82,16 +82,12 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     if cmd.is_empty() {
         return Err("usage: workpen run [--root DIR] [--extra-root DIR] [--] CMD...".into());
     }
-    let joined = cmd.join(" ");
     let policy = DenyPolicy::default();
-    if let Err(e) = reject_command_secret_path_tokens(&joined, &policy) {
-        return Err(e.to_string());
-    }
     let guard = PathGuard::with_extra_roots(&root, &extras).map_err(|e| e.to_string())?;
     if let Err(e) = workpen::check_dests(&guard, &[Path::new(&root)]) {
         return Err(e.to_string());
     }
-    if let Err(e) = check_command_dests(&joined, Path::new(&root), &policy) {
+    if let Err(e) = check_command_argv(cmd, Path::new(&root), &policy) {
         return Err(e.to_string());
     }
     let mut child = Command::new(&cmd[0]);
@@ -162,16 +158,6 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
         }
     }
     Ok(ExitCode::SUCCESS)
-}
-
-/// Join a relative dest to `--root`. Absolute dests stay as given.
-fn dest_under_root(root: &Path, path: &str) -> PathBuf {
-    let p = Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        root.join(p)
-    }
 }
 
 /// Blank `why` PATH stays blank so PathGuard reports empty, not the workspace.

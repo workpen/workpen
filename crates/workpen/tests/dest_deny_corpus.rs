@@ -5,9 +5,10 @@ use std::path::Path;
 
 use workpen::{
     CheckDestError, DenyPolicy, DestDeny, DestDenyError, DestDenyKind, PathGuard,
-    check_command_dests, check_dest, classify_dest, default_secret_denies, deny_patch_dests,
-    deny_patch_dests_with_display, dest_deny_message, is_env_template_basename, is_path_denied,
-    open_verified_read, path_is_denied_glob, reject_command_secret_path_tokens, verify_post_open,
+    check_command_argv, check_command_dests, check_dest, classify_dest, default_secret_denies,
+    deny_patch_dests, deny_patch_dests_with_display, dest_deny_message, is_env_template_basename,
+    is_path_denied, open_verified_read, path_is_denied_glob, reject_command_secret_path_tokens,
+    verify_post_open,
 };
 
 #[test]
@@ -311,6 +312,50 @@ fn check_command_dests_joins_quoted_c_body_under_root_not_cwd() {
                 d.kind,
                 DestDenyKind::HardlinkSibling,
                 "joined notes.txt must be HardlinkSibling, got {:?}",
+                d.kind
+            );
+        }
+        other => panic!("expected DestDeny HardlinkSibling, got {other:?}"),
+    }
+}
+
+#[test]
+fn check_command_argv_denies_spaced_hardlink_token() {
+    let ws = tempfile::tempdir().expect("workspace");
+    let env = ws.path().join(".env");
+    std::fs::write(&env, "SECRET=1\n").expect("write .env");
+    std::fs::hard_link(&env, ws.path().join("my notes.txt")).expect("hardlink");
+    let policy = DenyPolicy::default();
+    let err = check_command_argv(&["/bin/cat", "my notes.txt"], ws.path(), &policy)
+        .expect_err("raw argv my notes.txt hardlink must dest-deny");
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(
+                d.kind,
+                DestDenyKind::HardlinkSibling,
+                "spaced argv dest must be HardlinkSibling, got {:?}",
+                d.kind
+            );
+        }
+        other => panic!("expected DestDeny HardlinkSibling, got {other:?}"),
+    }
+}
+
+#[test]
+fn check_command_argv_denies_c_body_hardlink_under_root() {
+    let ws = tempfile::tempdir().expect("workspace");
+    let env = ws.path().join(".env");
+    std::fs::write(&env, "SECRET=1\n").expect("write .env");
+    std::fs::hard_link(&env, ws.path().join("notes.txt")).expect("hardlink");
+    let policy = DenyPolicy::default();
+    let err = check_command_argv(&["/bin/sh", "-c", "cat notes.txt"], ws.path(), &policy)
+        .expect_err("-c body notes.txt hardlink must dest-deny");
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(
+                d.kind,
+                DestDenyKind::HardlinkSibling,
+                "-c body dest must be HardlinkSibling, got {:?}",
                 d.kind
             );
         }

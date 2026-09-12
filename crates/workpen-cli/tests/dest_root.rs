@@ -87,6 +87,40 @@ fn run_dest_denies_hardlink_sibling_under_root_before_spawn() {
 
 #[cfg(unix)]
 #[test]
+fn run_dest_denies_spaced_hardlink_argv_under_root_before_spawn() {
+    let ws = TempDir::new().expect("workspace");
+    let cwd = TempDir::new().expect("other cwd");
+    std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
+    std::fs::hard_link(ws.path().join(".env"), ws.path().join("my notes.txt")).expect("hardlink");
+    let out = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "/bin/cat"])
+        .arg("my notes.txt")
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "run cat my notes.txt hardlink sibling must fail, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let text = combined(&out);
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        lower.contains("hardlink") || lower.contains("deny"),
+        "run dest-deny must mention hardlink or deny: {text}"
+    );
+    assert!(
+        !stdout.contains("SECRET"),
+        "run must dest-deny before spawn, stdout={stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn run_dest_denies_hardlink_inside_sh_c_under_root_before_spawn() {
     let (ws, cwd) = workspace_with_env_hardlink();
     let out = workpen()
