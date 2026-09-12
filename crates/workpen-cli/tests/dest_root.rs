@@ -49,16 +49,16 @@ fn why_dest_denies_hardlink_sibling_under_root_not_cwd() {
     let text = combined(&out);
     let lower = text.to_ascii_lowercase();
     assert!(
-        lower.contains("hardlink") || lower.contains("deny"),
-        "why dest-deny must mention hardlink or deny: {text}"
+        lower.contains("hardlink"),
+        "why dest-deny must mention hardlink: {text}"
     );
     assert!(
         !stdout.trim().eq_ignore_ascii_case("allowed"),
         "why dest-deny must not be only allowed: {stdout}"
     );
     assert!(
-        text.contains(".env"),
-        "why hardlink dest-deny must name .env: {text}"
+        text.contains("denied name .env"),
+        "why hardlink dest-deny must say denied name .env: {text}"
     );
 }
 
@@ -107,8 +107,12 @@ fn run_dest_denies_hardlink_sibling_under_root_before_spawn() {
     let text = combined(&out);
     let lower = text.to_ascii_lowercase();
     assert!(
-        lower.contains("hardlink") || lower.contains("deny"),
-        "run dest-deny must mention hardlink or deny: {text}"
+        lower.contains("hardlink"),
+        "run dest-deny must mention hardlink: {text}"
+    );
+    assert!(
+        text.contains("denied name .env"),
+        "run hardlink dest-deny must say denied name .env: {text}"
     );
     assert!(
         !stdout.contains("SECRET"),
@@ -141,8 +145,12 @@ fn run_dest_denies_spaced_hardlink_argv_under_root_before_spawn() {
     let text = combined(&out);
     let lower = text.to_ascii_lowercase();
     assert!(
-        lower.contains("hardlink") || lower.contains("deny"),
-        "run dest-deny must mention hardlink or deny: {text}"
+        lower.contains("hardlink"),
+        "run dest-deny must mention hardlink: {text}"
+    );
+    assert!(
+        text.contains("denied name .env"),
+        "run hardlink dest-deny must say denied name .env: {text}"
     );
     assert!(
         !stdout.contains("SECRET"),
@@ -171,8 +179,12 @@ fn run_dest_denies_hardlink_inside_sh_c_under_root_before_spawn() {
     let text = combined(&out);
     let lower = text.to_ascii_lowercase();
     assert!(
-        lower.contains("hardlink") || lower.contains("deny"),
-        "run dest-deny must mention hardlink or deny: {text}"
+        lower.contains("hardlink"),
+        "run dest-deny must mention hardlink: {text}"
+    );
+    assert!(
+        text.contains("denied name .env"),
+        "run hardlink dest-deny must say denied name .env: {text}"
     );
     assert!(
         !stdout.contains("SECRET"),
@@ -262,8 +274,12 @@ fn run_relative_parent_root_dest_denies_hardlink_not_escape() {
             "run --root {root} must not treat the workspace as an escape: {text}"
         );
         assert!(
-            lower.contains("hardlink") || lower.contains("deny"),
-            "run --root {root} dest-deny must mention hardlink or deny: {text}"
+            lower.contains("hardlink"),
+            "run --root {root} dest-deny must mention hardlink: {text}"
+        );
+        assert!(
+            text.contains("denied name .env"),
+            "run --root {root} dest-deny must say denied name .env: {text}"
         );
         assert!(
             !stdout.contains("SECRET"),

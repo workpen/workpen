@@ -86,10 +86,11 @@ mod tests {
         match explain(std::path::Path::new("notes.txt"), &policy, Some(&guard)) {
             Why::DestDeny(d) => {
                 assert_eq!(d.kind, crate::DestDenyKind::HardlinkSibling);
+                assert_eq!(d.matched.as_deref(), Some(".env"));
                 let msg = d.message();
                 assert!(
-                    msg.contains(".env"),
-                    "explain hardlink must name .env: {msg}"
+                    msg.contains("denied name .env"),
+                    "explain hardlink must say denied name .env: {msg}"
                 );
             }
             other => panic!("resolved hardlink sibling must DestDeny, got {other:?}"),
@@ -97,6 +98,7 @@ mod tests {
         match crate::check_dest("notes.txt", &policy, Some(&guard)) {
             Err(crate::CheckDestError::DestDeny(crate::DestDenyError::Denied(d))) => {
                 assert_eq!(d.kind, crate::DestDenyKind::HardlinkSibling);
+                assert_eq!(d.matched.as_deref(), Some(".env"));
             }
             other => panic!("check_dest must dest-deny the same shape, got {other:?}"),
         }
