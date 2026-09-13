@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use workpen::resolve_extra_root;
 use workpen::{
     KernelAccess, KernelApply, KernelError, child_env_deny_names, is_denied_child_env,
     kernel_supported, process_jail, scrub_child_command, spawn_after_setup, with_bash_noprofile,
@@ -82,6 +84,29 @@ fn extra_root_tmp_grants_presented_and_canonical() {
     assert_eq!(resolved.access, KernelAccess::ReadWrite);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn process_jail_grants_presented_tmp_after_resolve_extra_root() {
+    let tmp = Path::new("/tmp");
+    if !tmp.is_dir() {
+        return;
+    }
+    let dir = workspace();
+    let canon = resolve_extra_root(dir.path(), "/tmp").expect("explicit /tmp");
+    let policy = process_jail(dir.path(), [tmp]).expect("policy");
+    let presented = policy
+        .grants()
+        .iter()
+        .find(|g| g.path == tmp)
+        .unwrap_or_else(|| {
+            panic!(
+                "presented /tmp grant after resolve_extra_root -> {}",
+                canon.display()
+            )
+        });
+    assert_eq!(presented.access, KernelAccess::ReadWrite);
+}
+
 #[test]
 fn never_grants_filesystem_root() {
     let dir = workspace();
@@ -100,14 +125,14 @@ fn filesystem_root_as_workspace_is_refused() {
     #[cfg(unix)]
     {
         let err = process_jail("/", std::iter::empty::<&Path>()).expect_err("root");
-        assert!(matches!(err, KernelError::FsRoot));
+        assert!(matches!(err, KernelError::FsRoot(_)));
     }
     #[cfg(windows)]
     {
         let root = Path::new(r"C:\");
         if root.exists() {
             let err = process_jail(root, std::iter::empty::<&Path>()).expect_err("root");
-            assert!(matches!(err, KernelError::FsRoot));
+            assert!(matches!(err, KernelError::FsRoot(_)));
         }
     }
 }
@@ -118,14 +143,48 @@ fn extra_root_filesystem_root_is_refused() {
     #[cfg(unix)]
     {
         let err = process_jail(dir.path(), ["/"]).expect_err("extra root");
-        assert!(matches!(err, KernelError::FsRoot));
+        assert!(matches!(err, KernelError::FsRoot(_)));
     }
     #[cfg(windows)]
     {
         let root = Path::new(r"C:\");
         if root.exists() {
             let err = process_jail(dir.path(), [root]).expect_err("extra root");
-            assert!(matches!(err, KernelError::FsRoot));
+            assert!(matches!(err, KernelError::FsRoot(_)));
+        }
+    }
+}
+
+#[test]
+fn filesystem_root_error_names_path_and_subdirectory() {
+    fn assert_names_path_and_next_step(err: &KernelError, refused: &Path) {
+        let msg = err.to_string();
+        let path = refused.display().to_string();
+        assert!(
+            msg.contains(&path),
+            "FsRoot must name refused path {path}: {msg}"
+        );
+        assert!(
+            msg.to_ascii_lowercase().contains("subdirectory"),
+            "FsRoot must say use a subdirectory: {msg}"
+        );
+    }
+    #[cfg(unix)]
+    {
+        let refused = Path::new("/");
+        let err = process_jail(refused, std::iter::empty::<&Path>()).expect_err("root");
+        assert_names_path_and_next_step(&err, refused);
+        let extra = process_jail(workspace().path(), [refused]).expect_err("extra root");
+        assert_names_path_and_next_step(&extra, refused);
+    }
+    #[cfg(windows)]
+    {
+        let refused = Path::new(r"C:\");
+        if refused.exists() {
+            let err = process_jail(refused, std::iter::empty::<&Path>()).expect_err("root");
+            assert_names_path_and_next_step(&err, refused);
+            let extra = process_jail(workspace().path(), [refused]).expect_err("extra root");
+            assert_names_path_and_next_step(&extra, refused);
         }
     }
 }
@@ -399,11 +458,209 @@ fn run_inserts_noprofile_norc_for_bash_argv0() {
 
 #[test]
 fn run_leaves_cmd_exe_argv_unchanged() {
-    for program in ["cmd.exe", "/bin/sh", "pwsh", "git", "rbash", "env"] {
+    for program in ["cmd.exe", "/bin/sh", "pwsh", "git", "rbash"] {
         let (got, args) = with_bash_noprofile(program, ["/C", "echo ok"]);
         assert_eq!(got, program);
         assert_eq!(args, ["/C", "echo ok"], "non-bash argv0 {program}");
     }
+    let (got, args) = with_bash_noprofile("env", ["/C", "echo ok"]);
+    assert_eq!(got, "env");
+    assert_eq!(args, ["/C", "echo ok"], "env operand that is not bash");
+}
+
+#[test]
+fn run_inserts_noprofile_norc_after_env_bash_operand() {
+    for program in ["env", "/usr/bin/env", r"C:\Windows\System32\env.exe", "ENV"] {
+        let (got, args) = with_bash_noprofile(program, ["bash", "-l", "-c", "true"]);
+        assert_eq!(got, program);
+        assert_eq!(
+            args,
+            ["bash", "--noprofile", "--norc", "-l", "-c", "true"],
+            "env argv0 {program}"
+        );
+    }
+    let (got, args) = with_bash_noprofile("env.exe", ["bash.exe", "-c", "true"]);
+    assert_eq!(got, "env.exe");
+    assert_eq!(args, ["bash.exe", "--noprofile", "--norc", "-c", "true"]);
+    let (_got, args) =
+        with_bash_noprofile("/usr/bin/env", ["-i", "-u", "FOO", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        [
+            "-i",
+            "-u",
+            "FOO",
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            "true"
+        ]
+    );
+    let (_got, args) = with_bash_noprofile("env", ["-S", "bash -c true"]);
+    assert_eq!(args, ["-S", "bash -c true"], "env -S takes the next token");
+    let (_got, args) = with_bash_noprofile("env", ["python", "-c", "true"]);
+    assert_eq!(args, ["python", "-c", "true"], "env python is not bash");
+    let (_got, args) = with_bash_noprofile("env", ["bash", "--noprofile", "-c", "true"]);
+    assert_eq!(args, ["bash", "--noprofile", "--norc", "-c", "true"]);
+}
+
+#[test]
+fn run_inserts_noprofile_norc_after_clustered_env_flags() {
+    let (_got, args) = with_bash_noprofile("env", ["-iC", "/tmp", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["-iC", "/tmp", "bash", "--noprofile", "--norc", "-c", "true"],
+        "env -iC /tmp bash must skip /tmp as -C operand"
+    );
+    let (_got, args) = with_bash_noprofile("env", ["-f", "dotenv", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        [
+            "-f",
+            "dotenv",
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            "true"
+        ],
+        "env -f dotenv bash must skip dotenv as -f operand"
+    );
+    let (_got, args) = with_bash_noprofile("env", ["--file", "dotenv", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        [
+            "--file",
+            "dotenv",
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            "true"
+        ],
+        "env --file dotenv bash must skip dotenv as --file operand"
+    );
+    let (_got, args) = with_bash_noprofile("env", ["-C/tmp", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["-C/tmp", "bash", "--noprofile", "--norc", "-c", "true"],
+        "attached -C/tmp stays skip 1"
+    );
+    let (_got, args) = with_bash_noprofile("env", ["--file=.env", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["--file=.env", "bash", "--noprofile", "--norc", "-c", "true"],
+        "attached --file=.env stays skip 1"
+    );
+    let (_got, args) = with_bash_noprofile("env", ["-vSbash", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["-vSbash", "-c", "true"],
+        "attached -vSbash stays skip 1 and is not argv bash"
+    );
+}
+
+#[test]
+fn with_bash_noprofile_drops_denied_env_assignments() {
+    let (_got, args) = with_bash_noprofile(
+        "env",
+        ["BASH_ENV=.env", "bash", "-c", r#"printf %s "$BASH_ENV""#],
+    );
+    assert!(
+        !args.iter().any(|a| {
+            a.to_string_lossy()
+                .split_once('=')
+                .is_some_and(|(n, _)| n.eq_ignore_ascii_case("BASH_ENV"))
+        }),
+        "denied BASH_ENV assignment must be dropped: {args:?}"
+    );
+    assert_eq!(
+        args,
+        [
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            r#"printf %s "$BASH_ENV""#
+        ]
+    );
+    let (_got, args) = with_bash_noprofile(
+        "/usr/bin/env",
+        [
+            "FOO=bar",
+            "LD_PRELOAD=./x.so",
+            "PATH=/bin",
+            "bash",
+            "-c",
+            "true",
+        ],
+    );
+    assert_eq!(
+        args,
+        [
+            "FOO=bar",
+            "PATH=/bin",
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            "true"
+        ],
+        "denylist assignments drop; other NAME=value stay"
+    );
+    let (_got, args) = with_bash_noprofile("env.exe", ["bash_env=.env", "python", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["python", "-c", "true"],
+        "case-insensitive denylist drop without rewriting non-bash"
+    );
+}
+
+#[test]
+fn with_bash_noprofile_drops_denied_assignments_inside_env_s() {
+    let (_got, args) = with_bash_noprofile("env", ["-S", "BASH_ENV=.env", "bash", "-c", "true"]);
+    assert!(
+        !args.iter().any(|a| {
+            a.to_string_lossy()
+                .split_once('=')
+                .is_some_and(|(n, _)| n.eq_ignore_ascii_case("BASH_ENV"))
+        }),
+        "denied BASH_ENV inside env -S must be dropped: {args:?}"
+    );
+    assert_eq!(
+        args,
+        ["-S", "", "bash", "--noprofile", "--norc", "-c", "true"]
+    );
+    let (_got, args) = with_bash_noprofile("env", ["-S", "FOO=bar BASH_ENV=.env bash -c true"]);
+    assert_eq!(
+        args,
+        ["-S", "FOO=bar bash -c true"],
+        "denylist drop inside -S leftover; other tokens stay"
+    );
+    let (_got, args) = with_bash_noprofile(
+        "env",
+        ["--split-string=BASH_ENV=.env", "python", "-c", "true"],
+    );
+    assert_eq!(
+        args,
+        ["--split-string=", "python", "-c", "true"],
+        "attached --split-string denylist assignment must drop"
+    );
+    let (_got, args) = with_bash_noprofile("env", ["-S", "--file=readme.md", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        [
+            "-S",
+            "--file=readme.md",
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            "true"
+        ],
+        "env -S --file=readme.md leftover flag is not an assignment drop"
+    );
 }
 
 #[test]

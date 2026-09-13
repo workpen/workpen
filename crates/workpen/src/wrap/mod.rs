@@ -49,8 +49,8 @@ pub enum KernelApply {
 pub enum KernelError {
     #[error("kernel wrap root is not usable: {0}")]
     Root(String),
-    #[error("kernel wrap refused filesystem root")]
-    FsRoot,
+    #[error("kernel wrap refused filesystem root {0}; use a subdirectory, not `/`")]
+    FsRoot(PathBuf),
     #[error("kernel wrap apply failed: {0}")]
     Apply(String),
 }
@@ -245,6 +245,12 @@ pub fn scrub_child_command(cmd: &mut Command) {
 }
 
 /// Insert `--noprofile` and `--norc` after argv0 when the program is bash.
+///
+/// When argv0 is `env`/`env.exe`, drop `NAME=value` assignments whose name
+/// is on the child-env denylist, including leftover tokens inside a `-S` /
+/// `--split-string` operand, then insert after the first non-flag operand
+/// that is bash. Walks clustered shorts (`-iC /tmp`) and value flags
+/// (`-u NAME`, `-f FILE`, `--file FILE`). Attached forms stay one token.
 #[must_use]
 pub fn with_bash_noprofile(
     program: impl AsRef<OsStr>,
@@ -255,26 +261,183 @@ pub fn with_bash_noprofile(
         .into_iter()
         .map(|a| a.as_ref().to_os_string())
         .collect();
+    if is_env_argv0(&program) {
+        drop_denied_env_assignments(&mut args);
+    }
     if is_bash_argv0(&program) {
-        if !args.iter().any(|a| a == "--noprofile") {
-            args.insert(0, OsString::from("--noprofile"));
-        }
-        if !args.iter().any(|a| a == "--norc") {
-            let idx = args
-                .iter()
-                .position(|a| a == "--noprofile")
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            args.insert(idx, OsString::from("--norc"));
-        }
+        insert_bash_noprofile(&mut args, 0);
+    } else if is_env_argv0(&program)
+        && let Some(idx) = first_env_bash_operand(&args)
+    {
+        insert_bash_noprofile(&mut args, idx + 1);
     }
     (program, args)
+}
+
+fn drop_denied_env_assignments(args: &mut Vec<OsString>) {
+    let mut i = 0;
+    let mut options_done = false;
+    while i < args.len() {
+        let raw = args[i].to_string_lossy().into_owned();
+        if !options_done {
+            if raw == "--" {
+                options_done = true;
+                i += 1;
+                continue;
+            }
+            if let Some(skip) = env_flag_skip(&raw) {
+                rewrite_denied_in_env_s(args, i);
+                i = i.saturating_add(skip);
+                continue;
+            }
+        }
+        if let Some(eq) = raw.find('=') {
+            let name = &raw[..eq];
+            if !name.is_empty() && is_denied_child_env(name) {
+                args.remove(i);
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+}
+
+fn rewrite_denied_in_env_s(args: &mut [OsString], i: usize) {
+    let raw = args[i].to_string_lossy().into_owned();
+    if let Some(value) = raw.strip_prefix("--split-string=") {
+        let dropped = drop_denied_from_split_string(value);
+        args[i] = OsString::from(format!("--split-string={dropped}"));
+        return;
+    }
+    if raw == "--split-string" {
+        rewrite_next_s_operand(args, i);
+        return;
+    }
+    if let Some((prefix, attached)) = env_s_cluster(&raw) {
+        if attached.is_empty() {
+            rewrite_next_s_operand(args, i);
+        } else {
+            let dropped = drop_denied_from_split_string(attached);
+            args[i] = OsString::from(format!("{prefix}{dropped}"));
+        }
+    }
+}
+
+fn rewrite_next_s_operand(args: &mut [OsString], i: usize) {
+    if let Some(op) = args.get_mut(i + 1) {
+        let dropped = drop_denied_from_split_string(&op.to_string_lossy());
+        *op = OsString::from(dropped);
+    }
+}
+
+/// Clustered `-*S` / `-S` (not `--`). Prefix includes `S`; rest is attached.
+fn env_s_cluster(arg: &str) -> Option<(&str, &str)> {
+    if !arg.starts_with('-') || arg.starts_with("--") || arg == "-" {
+        return None;
+    }
+    let rest = &arg[1..];
+    let mut idx = 0;
+    for c in rest.chars() {
+        if c == 'S' {
+            let prefix_end = 1 + idx + c.len_utf8();
+            return Some((&arg[..prefix_end], &arg[prefix_end..]));
+        }
+        if crate::deny::env_takes_value(c) {
+            return None;
+        }
+        idx += c.len_utf8();
+    }
+    None
+}
+
+fn drop_denied_from_split_string(s: &str) -> String {
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let raw = tokens[i];
+        if raw == "--" || raw == "-" {
+            out.extend_from_slice(&tokens[i..]);
+            break;
+        }
+        if let Some(skip) = env_flag_skip(raw) {
+            let end = (i + skip).min(tokens.len());
+            out.extend_from_slice(&tokens[i..end]);
+            i = end;
+            continue;
+        }
+        if let Some(eq) = raw.find('=') {
+            let name = &raw[..eq];
+            if !name.is_empty() && is_denied_child_env(name) {
+                i += 1;
+                continue;
+            }
+            out.push(raw);
+            i += 1;
+            continue;
+        }
+        out.extend_from_slice(&tokens[i..]);
+        break;
+    }
+    out.join(" ")
+}
+
+fn insert_bash_noprofile(args: &mut Vec<OsString>, at: usize) {
+    let has_noprofile = args[at..].iter().any(|a| a == "--noprofile");
+    let has_norc = args[at..].iter().any(|a| a == "--norc");
+    if !has_noprofile {
+        args.insert(at, OsString::from("--noprofile"));
+    }
+    if !has_norc {
+        let idx = args[at..]
+            .iter()
+            .position(|a| a == "--noprofile")
+            .map(|i| at + i + 1)
+            .unwrap_or(at);
+        args.insert(idx, OsString::from("--norc"));
+    }
 }
 
 fn is_bash_argv0(program: &OsStr) -> bool {
     let raw = program.to_string_lossy();
     let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw.as_ref());
     name.eq_ignore_ascii_case("bash") || name.eq_ignore_ascii_case("bash.exe")
+}
+
+fn is_env_argv0(program: &OsStr) -> bool {
+    crate::deny::is_env_program(program)
+}
+
+fn first_env_bash_operand(args: &[OsString]) -> Option<usize> {
+    let mut i = 0;
+    while i < args.len() {
+        let raw = args[i].to_string_lossy();
+        if raw == "--" {
+            return args
+                .get(i + 1)
+                .filter(|a| is_bash_argv0(a.as_os_str()))
+                .map(|_| i + 1);
+        }
+        if let Some(skip) = env_flag_skip(&raw) {
+            i = i.saturating_add(skip);
+            continue;
+        }
+        if raw.contains('=') {
+            i += 1;
+            continue;
+        }
+        if is_bash_argv0(args[i].as_os_str()) {
+            return Some(i);
+        }
+        return None;
+    }
+    None
+}
+
+fn env_flag_skip(arg: &str) -> Option<usize> {
+    crate::deny::env_flag_skip(arg)
 }
 
 /// Call `spawn` only when token or job setup succeeded.
@@ -374,7 +537,7 @@ fn canonicalize_dir(path: &Path) -> Result<PathBuf, KernelError> {
         )));
     }
     if is_fs_root(&resolved) {
-        return Err(KernelError::FsRoot);
+        return Err(KernelError::FsRoot(resolved));
     }
     Ok(resolved)
 }

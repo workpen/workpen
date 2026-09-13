@@ -471,6 +471,82 @@ fn check_command_argv_denies_clustered_shell_c_body_hardlink() {
 }
 
 #[test]
+fn check_command_argv_denies_env_split_string_and_file() {
+    let ws = tempfile::tempdir().expect("workspace");
+    std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("write readme");
+    let policy = DenyPolicy::default();
+    let err = check_command_argv(&["env", "-S", "cat .env"], ws.path(), &policy)
+        .expect_err("env -S cat .env must dest-deny");
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(
+                d.kind,
+                DestDenyKind::DenyGlob,
+                "env -S body dest must be DenyGlob, got {:?}",
+                d.kind
+            );
+        }
+        other => panic!("expected DestDeny DenyGlob for env -S, got {other:?}"),
+    }
+    let err = check_command_argv(&["env", "--file=.env", "bash"], ws.path(), &policy)
+        .expect_err("env --file=.env must dest-deny");
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(
+                d.kind,
+                DestDenyKind::DenyGlob,
+                "env --file=.env dest must be DenyGlob, got {:?}",
+                d.kind
+            );
+        }
+        other => panic!("expected DestDeny DenyGlob for env --file=.env, got {other:?}"),
+    }
+    check_command_argv(&["/usr/bin/env", "-S", "cat .env"], ws.path(), &policy)
+        .expect_err("/usr/bin/env -S cat .env must dest-deny");
+    check_command_argv(
+        &["env.exe", "--split-string", "cat .env"],
+        ws.path(),
+        &policy,
+    )
+    .expect_err("env.exe --split-string cat .env must dest-deny");
+    check_command_argv(&["env", "-S", "echo hello"], ws.path(), &policy)
+        .expect("env -S echo hello must be allowed");
+    check_command_argv(&["env", "-S", "cat readme.md"], ws.path(), &policy)
+        .expect("env -S cat readme.md must be allowed");
+    check_command_argv(&["env", "--file=readme.md", "bash"], ws.path(), &policy)
+        .expect("env --file=readme.md must be allowed");
+    check_command_argv(&["env", "-S", "--file=readme.md"], ws.path(), &policy)
+        .expect("env -S --file=readme.md must be allowed");
+    check_command_argv(&["tool", "--file=.env", "bash"], ws.path(), &policy)
+        .expect("generic --file=.env must not dest-deny");
+    let leftover_denies: &[&[&str]] = &[
+        &["env", "-S", "--file=.env"],
+        &["env", "-S", "--file=.env", "bash"],
+        &["env", "--split-string=--file=.env"],
+        &["env", "-S", "-f.env"],
+        &["env", "-S", "BASH_ENV=.env", "bash"],
+    ];
+    for argv in leftover_denies {
+        let err = match check_command_argv(argv, ws.path(), &policy) {
+            Err(e) => e,
+            Ok(()) => panic!("env -S leftover {argv:?} must dest-deny"),
+        };
+        match err {
+            CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+                assert_eq!(
+                    d.kind,
+                    DestDenyKind::DenyGlob,
+                    "env -S leftover {argv:?} dest must be DenyGlob, got {:?}",
+                    d.kind
+                );
+            }
+            other => panic!("expected DestDeny DenyGlob for {argv:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn path_is_denied_table() {
     let deny = default_secret_denies();
     assert!(path_is_denied_glob(&deny, "/tmp/x/.env"));

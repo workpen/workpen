@@ -264,17 +264,27 @@ fn run_keeps_inherited_path() {
 }
 
 #[cfg(unix)]
+fn login_bash_home() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = TempDir::new().expect("workspace");
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).expect("home");
+    let home = std::fs::canonicalize(&home).expect("canon home");
+    let marker = home.join("profile-ran");
+    std::fs::write(
+        home.join(".bash_profile"),
+        "echo PROFILE_RAN\ntouch \"$HOME/profile-ran\"\n",
+    )
+    .expect("bash_profile");
+    (dir, home, marker)
+}
+
+#[cfg(unix)]
 #[test]
 fn run_inserts_noprofile_so_login_bash_skips_home_profile() {
     if !std::path::Path::new("/bin/bash").is_file() {
         return;
     }
-    let dir = TempDir::new().expect("workspace");
-    let home = dir.path().join("home");
-    std::fs::create_dir(&home).expect("home");
-    let marker = home.join("profile-ran");
-    std::fs::write(home.join(".bash_profile"), "touch \"$HOME/profile-ran\"\n")
-        .expect("bash_profile");
+    let (dir, home, marker) = login_bash_home();
     let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
         .env("HOME", &home)
         .arg("run")
@@ -293,4 +303,133 @@ fn run_inserts_noprofile_so_login_bash_skips_home_profile() {
         !marker.exists(),
         "login bash must not run HOME/.bash_profile"
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("PROFILE_RAN"),
+        "login bash must not print profile output: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_inserts_noprofile_so_env_login_bash_skips_home_profile() {
+    let env_bin = ["/usr/bin/env", "/bin/env"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file());
+    let Some(env_bin) = env_bin else {
+        return;
+    };
+    if !std::path::Path::new("/bin/bash").is_file() {
+        return;
+    }
+    let (dir, home, marker) = login_bash_home();
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .env("HOME", &home)
+        .arg("run")
+        .arg("--root")
+        .arg(dir.path())
+        .args(["--", env_bin, "bash", "-l", "-c", "true"])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        out.status.success(),
+        "env login bash -c true must succeed: status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "env login bash must not run HOME/.bash_profile"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("PROFILE_RAN"),
+        "env login bash must not print profile output: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_drops_env_argv_bash_env_assignment() {
+    let env_bin = ["/usr/bin/env", "/bin/env"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file());
+    let Some(env_bin) = env_bin else {
+        return;
+    };
+    if !std::path::Path::new("/bin/bash").is_file() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    std::fs::write(dir.path().join(".env"), "SECRET=1\n").expect("write .env");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .arg("run")
+        .arg("--root")
+        .arg(dir.path())
+        .args([
+            "--",
+            env_bin,
+            "BASH_ENV=.env",
+            "bash",
+            "-c",
+            r#"printf %s "$BASH_ENV""#,
+        ])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        out.status.success(),
+        "env without denied assignment must still run: status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(".env"),
+        "env BASH_ENV=.env must be dropped: {stdout:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn run_extra_root_tmp_can_write_presented_path() {
+    if !std::path::Path::new("/tmp").is_dir() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let marker = std::path::PathBuf::from(format!(
+        "/tmp/workpen-extra-root-{}-{stamp}",
+        std::process::id()
+    ));
+    let script = dir.path().join("write.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "printf x > {}\ncat {}\n",
+            marker.display(),
+            marker.display()
+        ),
+    )
+    .expect("write.sh");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .arg("run")
+        .arg("--root")
+        .arg(dir.path())
+        .args(["--extra-root", "/tmp", "--", "/bin/sh", "write.sh"])
+        .output()
+        .expect("spawn workpen");
+    let wrote = std::fs::read_to_string(&marker).ok();
+    let _ = std::fs::remove_file(&marker);
+    assert!(
+        out.status.success(),
+        "run --extra-root /tmp must write presented /tmp, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(wrote.as_deref(), Some("x"), "presented /tmp marker");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains('x'), "child must cat the marker: {stdout}");
 }

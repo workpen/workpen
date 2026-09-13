@@ -217,6 +217,36 @@ fn run_help_without_separator_is_unknown_flag() {
 }
 
 #[test]
+fn run_leading_dash_flag_names_separator_and_cmd() {
+    for args in [
+        vec!["run", "-c", "echo"],
+        vec!["run", "--verbose", "--", "echo"],
+    ] {
+        let out = workpen().args(&args).output().expect("spawn workpen");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "run {args:?} must exit 2, stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("unknown flag"),
+            "run {args:?} must say unknown flag: {err}"
+        );
+        assert!(
+            err.contains("[--]") && err.contains("CMD"),
+            "run {args:?} must mention [--] CMD, not only --root: {err}"
+        );
+        assert!(
+            !err.contains("failed to spawn"),
+            "run {args:?} must not spawn: {err}"
+        );
+    }
+}
+
+#[test]
 fn gc_root_after_max_age_is_not_unknown() {
     let repo = init_git_repo();
     let out = workpen()
