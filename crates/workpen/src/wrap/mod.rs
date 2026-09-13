@@ -1,13 +1,18 @@
-//! Process-jail wrap via pinned nono. Feature `nono`.
+//! Process-jail wrap. Feature `nono`.
 //!
-//! Never grant filesystem root (`/` or a Windows drive root). Inspect
-//! [`KernelPolicy::grants`]; do not parse nono internals. Do not call
-//! [`KernelPolicy::apply`] from unit tests (`Sandbox::apply_auto` is
-//! irreversible). [`KernelPolicy::apply_pre_exec`] is safe in tests: it
-//! only installs a child hook.
+//! Unix uses pinned nono (Landlock / Seatbelt). Windows uses a
+//! write-restricted token. Never grant filesystem root (`/` or a
+//! Windows drive root). Inspect [`KernelPolicy::grants`]; do not parse
+//! nono internals. Do not call [`KernelPolicy::apply`] from unit tests
+//! (`Sandbox::apply_auto` is irreversible). [`KernelPolicy::apply_pre_exec`]
+//! only installs a Unix child hook. Hosts that need a jail on every OS
+//! call [`KernelPolicy::run_child`].
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
+
+#[cfg(windows)]
+mod windows;
 
 /// Access granted for one path. Hosts branch on this; do not parse messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,7 +21,7 @@ pub enum KernelAccess {
     ReadWrite,
 }
 
-/// One grant we will hand to nono.
+/// One grant we will hand to the kernel backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelGrant {
     pub path: PathBuf,
@@ -33,9 +38,9 @@ pub struct KernelPolicy {
 /// Result of applying the jail. Hosts branch on this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelApply {
-    /// Kernel jail is active in this process, or hooked for the child.
+    /// Kernel jail is active in this process, or hooked/spawned for the child.
     Applied,
-    /// Platform has no kernel backend (Windows). Userspace dest-deny + PathGuard only.
+    /// Platform has no kernel backend. Userspace dest-deny + PathGuard only.
     UserspaceOnly,
 }
 
@@ -56,7 +61,11 @@ pub fn kernel_supported() -> bool {
     {
         nono::Sandbox::is_supported()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows::write_restricted_supported()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
     }
@@ -73,7 +82,7 @@ pub fn process_jail(
         add_rw(&mut grants, extra.as_ref())?;
     }
     for dir in system_read_dirs() {
-        add_read_if_dir(&mut grants, dir);
+        add_read_if_dir(&mut grants, &dir);
     }
     Ok(KernelPolicy {
         grants,
@@ -93,6 +102,8 @@ impl KernelPolicy {
     /// Apply Landlock/Seatbelt for this process. Irreversible. Not for tests.
     ///
     /// Uses `SignalMode::AllowAll` so a jailed parent can still signal children.
+    /// Windows cannot retoken the current process; this stays
+    /// [`KernelApply::UserspaceOnly`].
     pub fn apply(&self) -> Result<KernelApply, KernelError> {
         if !kernel_supported() {
             return Ok(KernelApply::UserspaceOnly);
@@ -113,7 +124,8 @@ impl KernelPolicy {
     ///
     /// Builds the capability set in the parent (allocation is not safe after
     /// fork). Uses `SignalMode::Isolated` so the child cannot signal the parent.
-    /// Does not jail this process.
+    /// Does not jail this process. Windows has no `pre_exec`; this stays
+    /// [`KernelApply::UserspaceOnly`]. Use [`Self::run_child`] to jail a child.
     pub fn apply_pre_exec(&self, cmd: &mut Command) -> Result<KernelApply, KernelError> {
         if !kernel_supported() {
             let _ = cmd;
@@ -141,6 +153,40 @@ impl KernelPolicy {
         }
     }
 
+    /// Spawn `cmd` under the kernel jail and wait for it.
+    ///
+    /// Unix installs `pre_exec` then `status`. Windows creates a
+    /// write-restricted token and `CreateProcessAsUserW`. A Windows
+    /// token or job failure is [`KernelError::Apply`]; the child is
+    /// not started unsandboxed.
+    pub fn run_child(&self, cmd: Command) -> Result<(KernelApply, ExitStatus), KernelError> {
+        #[cfg(unix)]
+        {
+            let mut cmd = cmd;
+            let applied = self.apply_pre_exec(&mut cmd)?;
+            let status = cmd
+                .status()
+                .map_err(|e| KernelError::Apply(e.to_string()))?;
+            Ok((applied, status))
+        }
+        #[cfg(windows)]
+        {
+            if !kernel_supported() {
+                return Err(KernelError::Apply(
+                    "write-restricted token is not available".into(),
+                ));
+            }
+            windows::spawn_write_restricted(self, &cmd)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = cmd;
+            Err(KernelError::Apply(
+                "no kernel backend on this platform".into(),
+            ))
+        }
+    }
+
     #[cfg(unix)]
     fn to_capability_set(
         &self,
@@ -160,20 +206,43 @@ impl KernelPolicy {
     }
 }
 
-fn system_read_dirs() -> Vec<&'static Path> {
-    vec![
-        Path::new("/usr"),
-        Path::new("/bin"),
-        Path::new("/lib"),
-        Path::new("/lib64"),
-        Path::new("/sbin"),
-        Path::new("/System"),
-        Path::new("/Library"),
-        Path::new("/dev"),
-        Path::new("/etc"),
-        Path::new("/opt/homebrew"),
-        Path::new("/usr/local"),
-    ]
+fn system_read_dirs() -> Vec<PathBuf> {
+    #[cfg(unix)]
+    {
+        [
+            "/usr",
+            "/bin",
+            "/lib",
+            "/lib64",
+            "/sbin",
+            "/System",
+            "/Library",
+            "/dev",
+            "/etc",
+            "/opt/homebrew",
+            "/usr/local",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+    }
+    #[cfg(windows)]
+    {
+        let mut dirs = Vec::new();
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            let root = PathBuf::from(root);
+            dirs.push(root.join("System32"));
+            dirs.push(root);
+        }
+        if let Some(pf) = std::env::var_os("ProgramFiles") {
+            dirs.push(PathBuf::from(pf));
+        }
+        dirs
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Vec::new()
+    }
 }
 
 fn add_rw(grants: &mut Vec<KernelGrant>, path: &Path) -> Result<(), KernelError> {
