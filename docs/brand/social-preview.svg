@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640" role="img">
+  <rect width="1280" height="640" fill="#1B1814"/>
+  <g transform="translate(360 40) scale(4.375)">
+<defs>
+    <clipPath id="rails">
+      <circle cx="64" cy="64" r="45.6"/>
+    </clipPath>
+  </defs>
+  <rect width="128" height="128" fill="#1B1814"/>
+  <circle cx="64" cy="64" r="62" fill="#C9A66B"/>
+  <circle cx="64" cy="64" r="50" fill="#1B1814"/>
+  <circle cx="64" cy="64" r="61.15" fill="none" stroke="#8A7048" stroke-width="1.5"/>
+  <circle cx="64" cy="64" r="51.15" fill="none" stroke="#E0C48A" stroke-width="1.7"/>
+  <circle cx="64" cy="64" r="46.8" fill="none" stroke="#C9A66B" stroke-width="1.5"/>
+  <g fill="#1B1814" stroke="#8A7048" stroke-width="0.7">
+    <circle cx="64" cy="8" r="2.2"/>
+    <circle cx="120" cy="64" r="2.2"/>
+    <circle cx="64" cy="120" r="2.2"/>
+    <circle cx="8" cy="64" r="2.2"/>
+  </g>
+  <!-- W + rails as one unit, raised so the heavy base does not sit low. -->
+  <g transform="translate(0 -4.6)">
+    <path d="M30.5 31 L46 96 L62.2 54.5 L65.8 54.5 L82 96 L97.5 31"
+          fill="none" stroke="#F4EDE2" stroke-width="13"
+          stroke-linejoin="miter" stroke-miterlimit="1.8"
+          stroke-linecap="butt"/>
+  </g>
+  <g clip-path="url(#rails)">
+    <g transform="translate(0 -4.6)">
+      <rect x="14" y="51.5" width="100" height="7" fill="#C9A66B"/>
+      <rect x="14" y="69.5" width="100" height="7" fill="#C9A66B"/>
+    </g>
+  </g>
+  </g>
+</svg>
