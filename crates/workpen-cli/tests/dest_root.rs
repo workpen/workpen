@@ -322,10 +322,48 @@ fn why_plain_file_under_root_is_allowed() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lower = stdout.to_ascii_lowercase();
     assert!(
-        stdout.contains("allowed"),
+        lower.contains("allowed"),
         "why readme.md must report allowed: {stdout}"
+    );
+    assert!(
+        stdout.contains("readme.md"),
+        "why readme.md must name the dest that passed: {stdout}"
+    );
+}
+
+#[test]
+fn why_extra_path_token_is_error_not_allowed() {
+    let (ws, cwd) = workspace_with_env_hardlink();
+    let out = workpen()
+        .args(["why", "--root"])
+        .arg(ws.path())
+        .args(["readme.md", "notes.txt"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "why extra path token must fail, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = combined(&out);
+    assert!(
+        text.contains("notes.txt"),
+        "why extra token must name notes.txt: {text}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.trim().eq_ignore_ascii_case("allowed"),
+        "why extra token must not be only allowed: {stdout}"
+    );
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        lower.contains("usage") || lower.contains("unexpected"),
+        "why extra token must mention usage or unexpected: {text}"
     );
 }
 
@@ -451,10 +489,15 @@ fn why_relative_parent_root_plain_file_is_allowed_not_escape() {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        let stdout = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let allowed = stdout.to_ascii_lowercase();
         assert!(
-            stdout.contains("allowed"),
+            allowed.contains("allowed"),
             "why --root {root} readme.md must report allowed: {stdout}"
+        );
+        assert!(
+            stdout.contains("readme.md"),
+            "why --root {root} readme.md must name the dest that passed: {stdout}"
         );
     }
 }

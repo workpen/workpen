@@ -43,6 +43,12 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
             "unknown flag: {flag} (use --root DIR or --extra-root DIR)"
         ));
     }
+    if rest.len() > 1 {
+        return Err(format!(
+            "unexpected argument: {} (usage: workpen why [--root DIR] [--extra-root DIR] PATH)",
+            rest[1]
+        ));
+    }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = resolve_workspace_root(&cwd, &root.to_string_lossy()).map_err(|e| e.to_string())?;
     let extras = resolve_extras(&root, &extras)?;
@@ -56,8 +62,8 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
         &DenyPolicy::default(),
         Some(&guard),
     ) {
-        Ok(_) => {
-            println!("allowed");
+        Ok(resolved) => {
+            println!("allowed {}", resolved.display());
             Ok(ExitCode::SUCCESS)
         }
         Err(CheckDestError::DestDeny(e)) => {
@@ -100,7 +106,15 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     child.args(args).current_dir(guard.canon_root());
     let (_applied, status) = workpen::process_jail(guard.canon_root(), &extras)
         .and_then(|policy| policy.run_child(child))
-        .map_err(|e| format!("failed to spawn {}: {e}", cmd[0]))?;
+        .map_err(|e| {
+            if e.to_string().contains("restore DACL") {
+                format!(
+                    "child finished but {e}; workspace ACL may still grant the write-restricted SID"
+                )
+            } else {
+                format!("failed to spawn {}: {e}", cmd[0])
+            }
+        })?;
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
