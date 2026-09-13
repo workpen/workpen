@@ -183,10 +183,10 @@ fn extra_root_overlapping_system_dir_stays_readwrite() {
 }
 
 #[test]
-fn kernel_supported_matches_unix_backends() {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+fn kernel_supported_matches_os_backends() {
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     assert!(kernel_supported());
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     assert!(!kernel_supported());
 }
 
@@ -266,4 +266,93 @@ fn apply_pre_exec_child_can_echo() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+}
+
+#[test]
+fn run_child_does_not_jail_the_parent() {
+    let dir = workspace();
+    let outside = TempDir::new().expect("outside");
+    let marker = outside.path().join("parent-still-free-run-child");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = inner_true_cmd();
+    cmd.current_dir(dir.path());
+    let (applied, status) = policy.run_child(cmd).expect("run_child");
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    assert_eq!(applied, KernelApply::Applied);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    assert_eq!(applied, KernelApply::UserspaceOnly);
+    assert!(status.success(), "inner true/cmd must succeed: {status:?}");
+    fs::write(&marker, "free").expect("parent must still write outside the workspace");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn run_child_cannot_write_outside_workspace() {
+    let dir = workspace();
+    let outside = TempDir::new().expect("outside");
+    let marker = outside.path().join("should-not-exist");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let script = format!("echo x > {}", marker.display());
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", &script]).current_dir(dir.path());
+    let (applied, _) = policy.run_child(cmd).expect("run_child");
+    assert_eq!(applied, KernelApply::Applied);
+    assert!(
+        !marker.exists(),
+        "child wrote outside workspace at {}",
+        marker.display()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn run_child_cannot_write_outside_workspace() {
+    let dir = workspace();
+    let outside = TempDir::new().expect("outside");
+    let marker = outside.path().join("should-not-exist");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new(windows_comspec());
+    cmd.args(["/C", &format!("echo x 1>{}", marker.display())])
+        .current_dir(dir.path());
+    let (applied, _) = policy.run_child(cmd).expect("run_child");
+    assert_eq!(applied, KernelApply::Applied);
+    assert!(
+        !marker.exists(),
+        "child wrote outside workspace at {}",
+        marker.display()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn run_child_can_write_inside_workspace() {
+    let dir = workspace();
+    let inside = dir.path().join("inside.txt");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new(windows_comspec());
+    cmd.args(["/C", "echo ok 1>inside.txt"])
+        .current_dir(dir.path());
+    let (applied, status) = policy.run_child(cmd).expect("run_child");
+    assert_eq!(applied, KernelApply::Applied);
+    assert!(status.success(), "inside write must succeed: {status:?}");
+    let body = fs::read_to_string(&inside).expect("inside write");
+    assert!(body.contains("ok"), "inside body={body:?}");
+}
+
+fn inner_true_cmd() -> Command {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new(windows_comspec());
+        cmd.args(["/C", "exit 0"]);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("true")
+    }
+}
+
+#[cfg(windows)]
+fn windows_comspec() -> std::ffi::OsString {
+    std::env::var_os("COMSPEC").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into())
 }

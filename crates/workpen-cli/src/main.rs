@@ -97,11 +97,8 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     }
     let mut child = Command::new(&cmd[0]);
     child.args(&cmd[1..]).current_dir(guard.canon_root());
-    workpen::process_jail(guard.canon_root(), &extras)
-        .and_then(|policy| policy.apply_pre_exec(&mut child))
-        .map_err(|e| e.to_string())?;
-    let status = child
-        .status()
+    let (_applied, status) = workpen::process_jail(guard.canon_root(), &extras)
+        .and_then(|policy| policy.run_child(child))
         .map_err(|e| format!("failed to spawn {}: {e}", cmd[0]))?;
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
