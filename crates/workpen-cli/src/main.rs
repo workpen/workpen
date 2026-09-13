@@ -51,7 +51,7 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = resolve_workspace_root(&cwd, &root.to_string_lossy()).map_err(|e| e.to_string())?;
-    let extras = resolve_extras(&root, &extras)?;
+    let (extras, _presented) = resolve_extras(&cwd, &extras)?;
     let path = rest
         .first()
         .ok_or_else(|| "usage: workpen why [--root DIR] [--extra-root DIR] PATH".to_string())?;
@@ -87,7 +87,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = resolve_workspace_root(&cwd, &root.to_string_lossy()).map_err(|e| e.to_string())?;
-    let extras = resolve_extras(&root, &extras)?;
+    let (extras, presented) = resolve_extras(&cwd, &extras)?;
     let cmd = if rest.first().map(String::as_str) == Some("--") {
         &rest[1..]
     } else {
@@ -104,7 +104,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let (program, args) = workpen::with_bash_noprofile(&cmd[0], &cmd[1..]);
     let mut child = Command::new(program);
     child.args(args).current_dir(guard.canon_root());
-    let (_applied, status) = workpen::process_jail(guard.canon_root(), &extras)
+    let (_applied, status) = workpen::process_jail(guard.canon_root(), &presented)
         .and_then(|policy| policy.run_child(child))
         .map_err(|e| {
             if e.to_string().contains("restore DACL") {
@@ -186,11 +186,20 @@ fn why_dest(root: &Path, path: &str) -> PathBuf {
     }
 }
 
-fn resolve_extras(root: &Path, extras: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
-    extras
-        .iter()
-        .map(|extra| resolve_extra_root(root, &extra.to_string_lossy()).map_err(|e| e.to_string()))
-        .collect()
+fn resolve_extras(cwd: &Path, extras: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+    let mut canon = Vec::with_capacity(extras.len());
+    let mut presented = Vec::with_capacity(extras.len());
+    for extra in extras {
+        let raw = extra.to_string_lossy();
+        canon.push(resolve_extra_root(cwd, &raw).map_err(|e| e.to_string())?);
+        let path = PathBuf::from(raw.trim());
+        presented.push(if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        });
+    }
+    Ok((canon, presented))
 }
 
 fn gc_usage() -> String {

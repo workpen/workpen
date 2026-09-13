@@ -245,6 +245,9 @@ pub fn scrub_child_command(cmd: &mut Command) {
 }
 
 /// Insert `--noprofile` and `--norc` after argv0 when the program is bash.
+///
+/// When argv0 is `env`/`env.exe`, insert after the first non-flag operand
+/// that is bash. Skips env flags such as `-i`, `-u NAME`, and `-S`.
 #[must_use]
 pub fn with_bash_noprofile(
     program: impl AsRef<OsStr>,
@@ -256,25 +259,85 @@ pub fn with_bash_noprofile(
         .map(|a| a.as_ref().to_os_string())
         .collect();
     if is_bash_argv0(&program) {
-        if !args.iter().any(|a| a == "--noprofile") {
-            args.insert(0, OsString::from("--noprofile"));
-        }
-        if !args.iter().any(|a| a == "--norc") {
-            let idx = args
-                .iter()
-                .position(|a| a == "--noprofile")
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            args.insert(idx, OsString::from("--norc"));
-        }
+        insert_bash_noprofile(&mut args, 0);
+    } else if is_env_argv0(&program)
+        && let Some(idx) = first_env_bash_operand(&args)
+    {
+        insert_bash_noprofile(&mut args, idx + 1);
     }
     (program, args)
+}
+
+fn insert_bash_noprofile(args: &mut Vec<OsString>, at: usize) {
+    let has_noprofile = args[at..].iter().any(|a| a == "--noprofile");
+    let has_norc = args[at..].iter().any(|a| a == "--norc");
+    if !has_noprofile {
+        args.insert(at, OsString::from("--noprofile"));
+    }
+    if !has_norc {
+        let idx = args[at..]
+            .iter()
+            .position(|a| a == "--noprofile")
+            .map(|i| at + i + 1)
+            .unwrap_or(at);
+        args.insert(idx, OsString::from("--norc"));
+    }
 }
 
 fn is_bash_argv0(program: &OsStr) -> bool {
     let raw = program.to_string_lossy();
     let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw.as_ref());
     name.eq_ignore_ascii_case("bash") || name.eq_ignore_ascii_case("bash.exe")
+}
+
+fn is_env_argv0(program: &OsStr) -> bool {
+    let raw = program.to_string_lossy();
+    let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw.as_ref());
+    name.eq_ignore_ascii_case("env") || name.eq_ignore_ascii_case("env.exe")
+}
+
+fn first_env_bash_operand(args: &[OsString]) -> Option<usize> {
+    let mut i = 0;
+    while i < args.len() {
+        let raw = args[i].to_string_lossy();
+        if raw == "--" {
+            return args
+                .get(i + 1)
+                .filter(|a| is_bash_argv0(a.as_os_str()))
+                .map(|_| i + 1);
+        }
+        if let Some(skip) = env_flag_skip(&raw) {
+            i = i.saturating_add(skip);
+            continue;
+        }
+        if raw.contains('=') {
+            i += 1;
+            continue;
+        }
+        if is_bash_argv0(args[i].as_os_str()) {
+            return Some(i);
+        }
+        return None;
+    }
+    None
+}
+
+fn env_flag_skip(arg: &str) -> Option<usize> {
+    if arg == "-" {
+        return Some(1);
+    }
+    if !arg.starts_with('-') {
+        return None;
+    }
+    if arg.starts_with("--") && arg.contains('=') {
+        return Some(1);
+    }
+    match arg {
+        "-u" | "--unset" | "-S" | "--split-string" | "-C" | "--chdir" | "-P" | "-a" | "--argv0" => {
+            Some(2)
+        }
+        _ => Some(1),
+    }
 }
 
 /// Call `spawn` only when token or job setup succeeded.

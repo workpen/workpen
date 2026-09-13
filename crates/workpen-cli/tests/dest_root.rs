@@ -546,6 +546,45 @@ fn why_relative_parent_root_plain_file_is_allowed_not_escape() {
 }
 
 #[test]
+fn why_extra_root_resolves_against_process_cwd_not_workspace() {
+    let parent = TempDir::new().expect("parent");
+    let ws = parent.path().join("ws");
+    let here = parent.path().join("here");
+    let extra = here.join("extra");
+    std::fs::create_dir(&ws).expect("ws");
+    std::fs::create_dir_all(&extra).expect("extra");
+    let tool = extra.join("tool.txt");
+    std::fs::write(&tool, "ok\n").expect("tool");
+    let out = workpen()
+        .args(["why", "--root", "../ws", "--extra-root", "extra"])
+        .arg(&tool)
+        .current_dir(&here)
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        out.status.success(),
+        "why --extra-root extra from cwd must be allowed, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lower = stdout.to_ascii_lowercase();
+    assert!(
+        lower.contains("allowed"),
+        "why extra tool.txt must report allowed: {stdout}"
+    );
+    assert!(
+        stdout.contains("tool.txt"),
+        "why extra tool.txt must name the dest: {stdout}"
+    );
+    let text = combined(&out);
+    assert!(
+        !text.contains("does not exist"),
+        "extra-root extra must resolve against process cwd, not --root: {text}"
+    );
+}
+
+#[test]
 fn why_missing_root_is_clear_error_not_escape() {
     let cwd = TempDir::new().expect("cwd");
     let out = workpen()

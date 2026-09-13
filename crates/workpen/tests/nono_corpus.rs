@@ -9,7 +9,8 @@ use std::process::Command;
 use tempfile::TempDir;
 use workpen::{
     KernelAccess, KernelApply, KernelError, child_env_deny_names, is_denied_child_env,
-    kernel_supported, process_jail, scrub_child_command, spawn_after_setup, with_bash_noprofile,
+    kernel_supported, process_jail, resolve_extra_root, scrub_child_command, spawn_after_setup,
+    with_bash_noprofile,
 };
 
 fn workspace() -> TempDir {
@@ -80,6 +81,29 @@ fn extra_root_tmp_grants_presented_and_canonical() {
         .find(|g| g.path == canon)
         .expect("canonical /tmp grant");
     assert_eq!(resolved.access, KernelAccess::ReadWrite);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn process_jail_grants_presented_tmp_after_resolve_extra_root() {
+    let tmp = Path::new("/tmp");
+    if !tmp.is_dir() {
+        return;
+    }
+    let dir = workspace();
+    let canon = resolve_extra_root(dir.path(), "/tmp").expect("explicit /tmp");
+    let policy = process_jail(dir.path(), [tmp]).expect("policy");
+    let presented = policy
+        .grants()
+        .iter()
+        .find(|g| g.path == tmp)
+        .unwrap_or_else(|| {
+            panic!(
+                "presented /tmp grant after resolve_extra_root -> {}",
+                canon.display()
+            )
+        });
+    assert_eq!(presented.access, KernelAccess::ReadWrite);
 }
 
 #[test]
@@ -399,11 +423,51 @@ fn run_inserts_noprofile_norc_for_bash_argv0() {
 
 #[test]
 fn run_leaves_cmd_exe_argv_unchanged() {
-    for program in ["cmd.exe", "/bin/sh", "pwsh", "git", "rbash", "env"] {
+    for program in ["cmd.exe", "/bin/sh", "pwsh", "git", "rbash"] {
         let (got, args) = with_bash_noprofile(program, ["/C", "echo ok"]);
         assert_eq!(got, program);
         assert_eq!(args, ["/C", "echo ok"], "non-bash argv0 {program}");
     }
+    let (got, args) = with_bash_noprofile("env", ["/C", "echo ok"]);
+    assert_eq!(got, "env");
+    assert_eq!(args, ["/C", "echo ok"], "env operand that is not bash");
+}
+
+#[test]
+fn run_inserts_noprofile_norc_after_env_bash_operand() {
+    for program in ["env", "/usr/bin/env", r"C:\Windows\System32\env.exe", "ENV"] {
+        let (got, args) = with_bash_noprofile(program, ["bash", "-l", "-c", "true"]);
+        assert_eq!(got, program);
+        assert_eq!(
+            args,
+            ["bash", "--noprofile", "--norc", "-l", "-c", "true"],
+            "env argv0 {program}"
+        );
+    }
+    let (got, args) = with_bash_noprofile("env.exe", ["bash.exe", "-c", "true"]);
+    assert_eq!(got, "env.exe");
+    assert_eq!(args, ["bash.exe", "--noprofile", "--norc", "-c", "true"]);
+    let (_got, args) =
+        with_bash_noprofile("/usr/bin/env", ["-i", "-u", "FOO", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        [
+            "-i",
+            "-u",
+            "FOO",
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            "true"
+        ]
+    );
+    let (_got, args) = with_bash_noprofile("env", ["-S", "bash -c true"]);
+    assert_eq!(args, ["-S", "bash -c true"], "env -S takes the next token");
+    let (_got, args) = with_bash_noprofile("env", ["python", "-c", "true"]);
+    assert_eq!(args, ["python", "-c", "true"], "env python is not bash");
+    let (_got, args) = with_bash_noprofile("env", ["bash", "--noprofile", "-c", "true"]);
+    assert_eq!(args, ["bash", "--noprofile", "--norc", "-c", "true"]);
 }
 
 #[test]
