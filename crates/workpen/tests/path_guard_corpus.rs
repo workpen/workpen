@@ -2,13 +2,16 @@
 //! Dest-deny stays a separate type.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use tempfile::TempDir;
+#[cfg(unix)]
+use workpen::resolve_extra_root_pair;
 use workpen::{
     AbsolutePathPolicy, DenyPolicy, ExtraRootError, PathGuard, PathGuardError, PathGuardKind,
-    check_dests, classify_dest, resolve_extra_root, resolve_extra_root_pair,
-    resolve_workspace_root,
+    check_dests, classify_dest, resolve_extra_root, resolve_workspace_root,
 };
 
 fn workspace() -> TempDir {
