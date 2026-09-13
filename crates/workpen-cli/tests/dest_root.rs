@@ -122,6 +122,40 @@ fn run_dest_denies_hardlink_sibling_under_root_before_spawn() {
 
 #[cfg(unix)]
 #[test]
+fn run_allowed_dest_after_hardlink_dest_deny() {
+    let (ws, cwd) = workspace_with_env_hardlink();
+    let echo = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "/bin/echo", "hello"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        echo.status.success(),
+        "run echo hello must succeed after dest-deny fixture, stdout={} stderr={}",
+        String::from_utf8_lossy(&echo.stdout),
+        String::from_utf8_lossy(&echo.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&echo.stdout).trim(), "hello");
+    let cat = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "/bin/cat", "readme.md"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        cat.status.success(),
+        "run cat readme.md must succeed after dest-deny fixture, stdout={} stderr={}",
+        String::from_utf8_lossy(&cat.stdout),
+        String::from_utf8_lossy(&cat.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&cat.stdout).trim(), "ok");
+}
+
+#[cfg(unix)]
+#[test]
 fn run_dest_denies_spaced_hardlink_argv_under_root_before_spawn() {
     let ws = TempDir::new().expect("workspace");
     let cwd = TempDir::new().expect("other cwd");
@@ -194,6 +228,57 @@ fn run_dest_denies_hardlink_inside_sh_c_under_root_before_spawn() {
 
 #[cfg(unix)]
 #[test]
+fn run_dest_denies_hardlink_inside_bash_lc_under_root_before_spawn() {
+    if !std::path::Path::new("/bin/bash").exists() {
+        return;
+    }
+    let (ws, cwd) = workspace_with_env_hardlink();
+    let out = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "/bin/bash", "-lc", "cat notes.txt"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "run bash -lc cat notes.txt hardlink sibling must fail, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let text = combined(&out);
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        lower.contains("hardlink"),
+        "run dest-deny must mention hardlink: {text}"
+    );
+    assert!(
+        text.contains("denied name .env"),
+        "run hardlink dest-deny must say denied name .env: {text}"
+    );
+    assert!(
+        !stdout.contains("SECRET"),
+        "run must dest-deny before spawn, stdout={stdout}"
+    );
+    let echo = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "/bin/bash", "-lc", "echo hello"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        echo.status.success(),
+        "run bash -lc echo hello must succeed after dest-deny fixture, stdout={} stderr={}",
+        String::from_utf8_lossy(&echo.stdout),
+        String::from_utf8_lossy(&echo.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&echo.stdout).trim(), "hello");
+}
+
+#[cfg(unix)]
+#[test]
 fn run_refuses_dev_null_special_file_before_spawn() {
     let ws = TempDir::new().expect("workspace");
     let cwd = TempDir::new().expect("other cwd");
@@ -237,10 +322,48 @@ fn why_plain_file_under_root_is_allowed() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let stdout = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lower = stdout.to_ascii_lowercase();
     assert!(
-        stdout.contains("allowed"),
+        lower.contains("allowed"),
         "why readme.md must report allowed: {stdout}"
+    );
+    assert!(
+        stdout.contains("readme.md"),
+        "why readme.md must name the dest that passed: {stdout}"
+    );
+}
+
+#[test]
+fn why_extra_path_token_is_error_not_allowed() {
+    let (ws, cwd) = workspace_with_env_hardlink();
+    let out = workpen()
+        .args(["why", "--root"])
+        .arg(ws.path())
+        .args(["readme.md", "notes.txt"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "why extra path token must fail, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = combined(&out);
+    assert!(
+        text.contains("notes.txt"),
+        "why extra token must name notes.txt: {text}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.trim().eq_ignore_ascii_case("allowed"),
+        "why extra token must not be only allowed: {stdout}"
+    );
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        lower.contains("usage") || lower.contains("unexpected"),
+        "why extra token must mention usage or unexpected: {text}"
     );
 }
 
@@ -286,6 +409,18 @@ fn run_relative_parent_root_dest_denies_hardlink_not_escape() {
             "run --root {root} must dest-deny before spawn, stdout={stdout}"
         );
     }
+    let allowed = workpen()
+        .args(["run", "--root", "../ws", "--", "/bin/echo", "hello"])
+        .current_dir(&cwd)
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        allowed.status.success(),
+        "run --root ../ws echo hello must succeed after dest-deny, stdout={} stderr={}",
+        String::from_utf8_lossy(&allowed.stdout),
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&allowed.stdout).trim(), "hello");
 }
 
 #[cfg(unix)]
@@ -354,10 +489,15 @@ fn why_relative_parent_root_plain_file_is_allowed_not_escape() {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        let stdout = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let allowed = stdout.to_ascii_lowercase();
         assert!(
-            stdout.contains("allowed"),
+            allowed.contains("allowed"),
             "why --root {root} readme.md must report allowed: {stdout}"
+        );
+        assert!(
+            stdout.contains("readme.md"),
+            "why --root {root} readme.md must name the dest that passed: {stdout}"
         );
     }
 }

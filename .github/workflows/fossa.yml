@@ -50,3 +50,8 @@ jobs:
       - name: Skip without key
         if: steps.check-key.outputs.skip == 'true'
         run: echo "FOSSA skipped"
+      - name: Run FOSSA analysis
+        if: steps.check-key.outputs.skip != 'true'
+        uses: fossas/fossa-action@29693cc50323968e039056be419b32989fc5880c # v2.0.0
+        with:
+          api-key: ${{ secrets.FOSSA_API_KEY }}

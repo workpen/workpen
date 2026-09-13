@@ -428,11 +428,41 @@ pub fn dest_under_root(root: &Path, path: &str) -> PathBuf {
     }
 }
 
+/// Script body after a shell `-c` cluster (`-c`, `-lc`, `-ic`) or `-cBODY`.
+///
+/// Cluster letters are the usual bash short options that combine with
+/// `-c`. A long word such as `-color` is not a cluster.
+fn shell_c_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
+    let rest = token.strip_prefix('-')?;
+    if rest.starts_with('-') {
+        return None;
+    }
+    if is_shell_c_cluster(rest) {
+        return next;
+    }
+    if let Some(after) = rest.strip_prefix('c')
+        && !after.is_empty()
+    {
+        return Some(after);
+    }
+    None
+}
+
+fn is_shell_c_cluster(rest: &str) -> bool {
+    !rest.is_empty()
+        && rest.len() <= 6
+        && rest.contains('c')
+        && rest
+            .chars()
+            .all(|ch| matches!(ch, 'c' | 'i' | 'l' | 's' | 'n' | 'x' | 'e' | 'v'))
+}
+
 /// Dest-deny each raw argv dest under `root`.
 ///
-/// Empty and flag-looking tokens are skipped. A `-c` token also
-/// dest-denies paths inside the next argv token via [`check_command_dests`].
-/// Does not dest-deny a flattened join of all argv.
+/// Empty and flag-looking tokens are skipped. A shell `-c` token, including
+/// short-option clusters that contain `c` (`-lc`, `-ic`, `-lic`, `-cl`)
+/// and an attached `-cBODY`, dest-denies paths inside the script body
+/// via [`check_command_dests`]. Does not dest-deny a flattened join of all argv.
 pub fn check_command_argv(
     cmd: &[impl AsRef<str>],
     root: &Path,
@@ -444,10 +474,8 @@ pub fn check_command_argv(
             let dest = dest_under_root(root, token);
             check_dest(&dest.to_string_lossy(), policy, None)?;
         }
-        if token == "-c"
-            && let Some(body) = cmd.get(i + 1)
-        {
-            check_command_dests(body.as_ref(), root, policy)?;
+        if let Some(body) = shell_c_body(token, cmd.get(i + 1).map(|s| s.as_ref())) {
+            check_command_dests(body, root, policy)?;
         }
     }
     Ok(())

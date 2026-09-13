@@ -43,6 +43,20 @@ class WorkflowTriggerTests(unittest.TestCase):
         text = (WORKFLOWS / "security.yml").read_text(encoding="utf-8")
         self.assertNotIn("tool: gitleaks@", text)
         self.assertIn("gitleaks/gitleaks/releases/download/", text)
+        self.assertIn("ver=8.30.1", text)
+        self.assertNotIn("ver=8.24.3", text)
+
+    def test_security_has_trivy_and_weekly_deny(self) -> None:
+        text = (WORKFLOWS / "security.yml").read_text(encoding="utf-8")
+        self.assertIn("aquasecurity/trivy-action@", text)
+        self.assertIn("scan-type: fs", text)
+        self.assertIn("name: cargo-deny", text)
+        self.assertIn("github.event_name == 'schedule'", text)
+
+    def test_fossa_analyzes_when_key_present(self) -> None:
+        text = (WORKFLOWS / "fossa.yml").read_text(encoding="utf-8")
+        self.assertIn("fossas/fossa-action@", text)
+        self.assertIn("steps.check-key.outputs.skip != 'true'", text)
 
     def test_release_please_uses_simple_for_virtual_workspace(self) -> None:
         text = (ROOT / "release-please-config.json").read_text(encoding="utf-8")

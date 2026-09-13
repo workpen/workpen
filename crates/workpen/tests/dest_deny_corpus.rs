@@ -411,6 +411,57 @@ fn check_command_argv_denies_c_body_hardlink_under_root() {
 }
 
 #[test]
+fn check_command_argv_denies_clustered_shell_c_body_hardlink() {
+    let ws = tempfile::tempdir().expect("workspace");
+    let env = ws.path().join(".env");
+    std::fs::write(&env, "SECRET=1\n").expect("write .env");
+    std::fs::hard_link(&env, ws.path().join("notes.txt")).expect("hardlink");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("write readme");
+    let policy = DenyPolicy::default();
+    for flag in ["-lc", "-ic", "-cl", "-lic"] {
+        let err =
+            match check_command_argv(&["/bin/bash", flag, "cat notes.txt"], ws.path(), &policy) {
+                Err(e) => e,
+                Ok(()) => panic!("{flag} body notes.txt hardlink must dest-deny"),
+            };
+        match err {
+            CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+                assert_eq!(
+                    d.kind,
+                    DestDenyKind::HardlinkSibling,
+                    "{flag} body dest must be HardlinkSibling, got {:?}",
+                    d.kind
+                );
+            }
+            other => panic!("expected DestDeny HardlinkSibling for {flag}, got {other:?}"),
+        }
+    }
+    let err = check_command_argv(
+        &["/bin/bash", "-l", "-c", "cat notes.txt"],
+        ws.path(),
+        &policy,
+    )
+    .expect_err("split -l -c body notes.txt hardlink must dest-deny");
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(
+                d.kind,
+                DestDenyKind::HardlinkSibling,
+                "split -l -c body dest must be HardlinkSibling, got {:?}",
+                d.kind
+            );
+        }
+        other => panic!("expected DestDeny HardlinkSibling, got {other:?}"),
+    }
+    check_command_argv(&["/bin/bash", "-lc", "echo hello"], ws.path(), &policy)
+        .expect("clustered -lc echo hello must be allowed");
+    check_command_argv(&["/bin/bash", "-lc", "cat readme.md"], ws.path(), &policy)
+        .expect("clustered -lc cat readme.md must be allowed");
+    check_command_argv(&["tool", "-color", "cat notes.txt"], ws.path(), &policy)
+        .expect("-color must not dest-deny the next argv as a -c body");
+}
+
+#[test]
 fn path_is_denied_table() {
     let deny = default_secret_denies();
     assert!(path_is_denied_glob(&deny, "/tmp/x/.env"));
