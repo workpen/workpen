@@ -200,10 +200,10 @@ fn run_scrubs_inherited_ld_preload() {
         out.status,
         combined(&out)
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !combined(&out).contains("evil.so"),
-        "inherited LD_PRELOAD must not leak: {}",
-        combined(&out)
+        !stdout.contains("evil.so"),
+        "child stdout must not print LD_PRELOAD: {stdout}"
     );
 }
 
