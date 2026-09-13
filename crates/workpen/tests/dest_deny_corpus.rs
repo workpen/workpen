@@ -466,6 +466,8 @@ fn check_command_argv_denies_clustered_shell_c_body_hardlink() {
     }
     check_command_argv(&["/bin/sh", "-c", "cat<.env"], ws.path(), &policy)
         .expect_err("infix redirect .env must dest-deny");
+    check_command_argv(&["/bin/bash", "-lccat .env"], ws.path(), &policy)
+        .expect_err("attached -lc body must dest-deny");
 }
 
 #[test]

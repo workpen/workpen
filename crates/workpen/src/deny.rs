@@ -440,12 +440,16 @@ fn shell_c_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
     if is_shell_c_cluster(rest) {
         return next;
     }
-    if let Some(after) = rest.strip_prefix('c')
-        && !after.is_empty()
-    {
-        return Some(after);
+    let c_at = rest.find('c')?;
+    let prefix = rest.get(..=c_at)?;
+    if !is_shell_c_cluster(prefix) {
+        return None;
     }
-    None
+    let after = rest.get(c_at + 1..)?;
+    if after.is_empty() {
+        return next;
+    }
+    Some(after)
 }
 
 fn is_shell_c_cluster(rest: &str) -> bool {
