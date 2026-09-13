@@ -429,12 +429,15 @@ pub fn dest_under_root(root: &Path, path: &str) -> PathBuf {
 }
 
 /// Script body after a shell `-c` cluster (`-c`, `-lc`, `-ic`) or `-cBODY`.
+///
+/// Cluster letters are the usual bash short options that combine with
+/// `-c`. A long word such as `-color` is not a cluster.
 fn shell_c_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
     let rest = token.strip_prefix('-')?;
     if rest.starts_with('-') {
         return None;
     }
-    if rest.chars().all(|c| c.is_ascii_alphabetic()) && rest.contains('c') {
+    if is_shell_c_cluster(rest) {
         return next;
     }
     if let Some(after) = rest.strip_prefix('c')
@@ -443,6 +446,15 @@ fn shell_c_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
         return Some(after);
     }
     None
+}
+
+fn is_shell_c_cluster(rest: &str) -> bool {
+    !rest.is_empty()
+        && rest.len() <= 6
+        && rest.contains('c')
+        && rest
+            .chars()
+            .all(|ch| matches!(ch, 'c' | 'i' | 'l' | 's' | 'n' | 'x' | 'e' | 'v'))
 }
 
 /// Dest-deny each raw argv dest under `root`.
