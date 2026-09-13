@@ -464,10 +464,11 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// short-option clusters that contain `c` (`-lc`, `-ic`, `-lic`, `-cl`)
 /// and an attached `-cBODY`, dest-denies paths inside the script body
 /// via [`check_command_dests`]. When argv0 is `env`/`env.exe`, dest-denies
-/// the operand of `-S`/`--split-string` via [`check_command_dests`] and
-/// `-f`/`--file` (including attached `--file=.env`) via [`check_dest`].
-/// Does not dest-deny a flattened join of all argv. Does not peel generic
-/// `--flag=.env`.
+/// the operand of `-S`/`--split-string` via [`check_command_dests`], then
+/// leftover tokens in that string as env flags (`--file=`, `-f`, `NAME=value`).
+/// Dest-denies argv `-f`/`--file` (including attached `--file=.env`) via
+/// [`check_dest`]. Does not dest-deny a flattened join of all argv. Does
+/// not peel generic `--flag=.env`.
 pub fn check_command_argv(
     cmd: &[impl AsRef<str>],
     root: &Path,
@@ -529,6 +530,27 @@ fn check_env_flag_dests(
     root: &Path,
     policy: &DenyPolicy,
 ) -> Result<(), CheckDestError> {
+    check_env_flag_dests_inner(args, root, policy, false)
+}
+
+/// Dest-deny a `-S`/`--split-string` operand as a command string, then
+/// re-walk leftover tokens as env flags (`--file=`, `-f`, `NAME=value`).
+fn check_env_split_string_dests(
+    operand: &str,
+    root: &Path,
+    policy: &DenyPolicy,
+) -> Result<(), CheckDestError> {
+    check_command_dests(operand, root, policy)?;
+    let leftover: Vec<&str> = operand.split_whitespace().collect();
+    check_env_flag_dests_inner(&leftover, root, policy, true)
+}
+
+fn check_env_flag_dests_inner(
+    args: &[impl AsRef<str>],
+    root: &Path,
+    policy: &DenyPolicy,
+    deny_assign_values: bool,
+) -> Result<(), CheckDestError> {
     let mut i = 0;
     while i < args.len() {
         let raw = args[i].as_ref();
@@ -537,6 +559,12 @@ fn check_env_flag_dests(
         }
         if !raw.starts_with('-') {
             if raw.contains('=') {
+                if deny_assign_values
+                    && let Some((_, value)) = raw.split_once('=')
+                    && !value.is_empty()
+                {
+                    check_env_file_dest(value, root, policy)?;
+                }
                 i += 1;
                 continue;
             }
@@ -579,7 +607,7 @@ fn check_env_flag_dests(
                 };
                 if let Some(operand) = operand {
                     match flag {
-                        'S' => check_command_dests(operand, root, policy)?,
+                        'S' => check_env_split_string_dests(operand, root, policy)?,
                         'f' => check_env_file_dest(operand, root, policy)?,
                         _ => {}
                     }
@@ -599,7 +627,7 @@ fn check_env_named_operand(
     policy: &DenyPolicy,
 ) -> Result<(), CheckDestError> {
     match name {
-        "split-string" => check_command_dests(value, root, policy),
+        "split-string" => check_env_split_string_dests(value, root, policy),
         "file" => check_env_file_dest(value, root, policy),
         _ => Ok(()),
     }

@@ -617,6 +617,52 @@ fn with_bash_noprofile_drops_denied_env_assignments() {
 }
 
 #[test]
+fn with_bash_noprofile_drops_denied_assignments_inside_env_s() {
+    let (_got, args) = with_bash_noprofile("env", ["-S", "BASH_ENV=.env", "bash", "-c", "true"]);
+    assert!(
+        !args.iter().any(|a| {
+            a.to_string_lossy()
+                .split_once('=')
+                .is_some_and(|(n, _)| n.eq_ignore_ascii_case("BASH_ENV"))
+        }),
+        "denied BASH_ENV inside env -S must be dropped: {args:?}"
+    );
+    assert_eq!(
+        args,
+        ["-S", "", "bash", "--noprofile", "--norc", "-c", "true"]
+    );
+    let (_got, args) = with_bash_noprofile("env", ["-S", "FOO=bar BASH_ENV=.env bash -c true"]);
+    assert_eq!(
+        args,
+        ["-S", "FOO=bar bash -c true"],
+        "denylist drop inside -S leftover; other tokens stay"
+    );
+    let (_got, args) = with_bash_noprofile(
+        "env",
+        ["--split-string=BASH_ENV=.env", "python", "-c", "true"],
+    );
+    assert_eq!(
+        args,
+        ["--split-string=", "python", "-c", "true"],
+        "attached --split-string denylist assignment must drop"
+    );
+    let (_got, args) = with_bash_noprofile("env", ["-S", "--file=readme.md", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        [
+            "-S",
+            "--file=readme.md",
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            "true"
+        ],
+        "env -S --file=readme.md leftover flag is not an assignment drop"
+    );
+}
+
+#[test]
 fn run_does_not_duplicate_existing_noprofile() {
     let (_got, args) = with_bash_noprofile("bash", ["--noprofile", "--norc", "-c", "true"]);
     assert_eq!(args, ["--noprofile", "--norc", "-c", "true"]);

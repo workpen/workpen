@@ -247,9 +247,10 @@ pub fn scrub_child_command(cmd: &mut Command) {
 /// Insert `--noprofile` and `--norc` after argv0 when the program is bash.
 ///
 /// When argv0 is `env`/`env.exe`, drop `NAME=value` assignments whose name
-/// is on the child-env denylist, then insert after the first non-flag
-/// operand that is bash. Walks clustered shorts (`-iC /tmp`) and value
-/// flags (`-u NAME`, `-f FILE`, `--file FILE`). Attached forms stay one token.
+/// is on the child-env denylist, including leftover tokens inside a `-S` /
+/// `--split-string` operand, then insert after the first non-flag operand
+/// that is bash. Walks clustered shorts (`-iC /tmp`) and value flags
+/// (`-u NAME`, `-f FILE`, `--file FILE`). Attached forms stay one token.
 #[must_use]
 pub fn with_bash_noprofile(
     program: impl AsRef<OsStr>,
@@ -277,7 +278,7 @@ fn drop_denied_env_assignments(args: &mut Vec<OsString>) {
     let mut i = 0;
     let mut options_done = false;
     while i < args.len() {
-        let raw = args[i].to_string_lossy();
+        let raw = args[i].to_string_lossy().into_owned();
         if !options_done {
             if raw == "--" {
                 options_done = true;
@@ -285,6 +286,7 @@ fn drop_denied_env_assignments(args: &mut Vec<OsString>) {
                 continue;
             }
             if let Some(skip) = env_flag_skip(&raw) {
+                rewrite_denied_in_env_s(args, i);
                 i = i.saturating_add(skip);
                 continue;
             }
@@ -300,6 +302,86 @@ fn drop_denied_env_assignments(args: &mut Vec<OsString>) {
         }
         break;
     }
+}
+
+fn rewrite_denied_in_env_s(args: &mut [OsString], i: usize) {
+    let raw = args[i].to_string_lossy().into_owned();
+    if let Some(value) = raw.strip_prefix("--split-string=") {
+        let dropped = drop_denied_from_split_string(value);
+        args[i] = OsString::from(format!("--split-string={dropped}"));
+        return;
+    }
+    if raw == "--split-string" {
+        rewrite_next_s_operand(args, i);
+        return;
+    }
+    if let Some((prefix, attached)) = env_s_cluster(&raw) {
+        if attached.is_empty() {
+            rewrite_next_s_operand(args, i);
+        } else {
+            let dropped = drop_denied_from_split_string(attached);
+            args[i] = OsString::from(format!("{prefix}{dropped}"));
+        }
+    }
+}
+
+fn rewrite_next_s_operand(args: &mut [OsString], i: usize) {
+    if let Some(op) = args.get_mut(i + 1) {
+        let dropped = drop_denied_from_split_string(&op.to_string_lossy());
+        *op = OsString::from(dropped);
+    }
+}
+
+/// Clustered `-*S` / `-S` (not `--`). Prefix includes `S`; rest is attached.
+fn env_s_cluster(arg: &str) -> Option<(&str, &str)> {
+    if !arg.starts_with('-') || arg.starts_with("--") || arg == "-" {
+        return None;
+    }
+    let rest = &arg[1..];
+    let mut idx = 0;
+    for c in rest.chars() {
+        if c == 'S' {
+            let prefix_end = 1 + idx + c.len_utf8();
+            return Some((&arg[..prefix_end], &arg[prefix_end..]));
+        }
+        if crate::deny::env_takes_value(c) {
+            return None;
+        }
+        idx += c.len_utf8();
+    }
+    None
+}
+
+fn drop_denied_from_split_string(s: &str) -> String {
+    let tokens: Vec<&str> = s.split_whitespace().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let raw = tokens[i];
+        if raw == "--" || raw == "-" {
+            out.extend_from_slice(&tokens[i..]);
+            break;
+        }
+        if let Some(skip) = env_flag_skip(raw) {
+            let end = (i + skip).min(tokens.len());
+            out.extend_from_slice(&tokens[i..end]);
+            i = end;
+            continue;
+        }
+        if let Some(eq) = raw.find('=') {
+            let name = &raw[..eq];
+            if !name.is_empty() && is_denied_child_env(name) {
+                i += 1;
+                continue;
+            }
+            out.push(raw);
+            i += 1;
+            continue;
+        }
+        out.extend_from_slice(&tokens[i..]);
+        break;
+    }
+    out.join(" ")
 }
 
 fn insert_bash_noprofile(args: &mut Vec<OsString>, at: usize) {
