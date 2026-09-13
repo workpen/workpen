@@ -459,6 +459,13 @@ fn check_command_argv_denies_clustered_shell_c_body_hardlink() {
         .expect("clustered -lc cat readme.md must be allowed");
     check_command_argv(&["tool", "-color", "cat notes.txt"], ws.path(), &policy)
         .expect("-color must not dest-deny the next argv as a -c body");
+    for flag in ["-uc", "-euc", "-fc"] {
+        if check_command_argv(&["/bin/bash", flag, "cat notes.txt"], ws.path(), &policy).is_ok() {
+            panic!("{flag} body notes.txt hardlink must dest-deny");
+        }
+    }
+    check_command_argv(&["/bin/sh", "-c", "cat<.env"], ws.path(), &policy)
+        .expect_err("infix redirect .env must dest-deny");
 }
 
 #[test]

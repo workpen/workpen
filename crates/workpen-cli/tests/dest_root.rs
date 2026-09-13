@@ -279,6 +279,49 @@ fn run_dest_denies_hardlink_inside_bash_lc_under_root_before_spawn() {
 
 #[cfg(unix)]
 #[test]
+fn run_dest_denies_hardlink_inside_bash_uc_and_infix_redirect() {
+    if !std::path::Path::new("/bin/bash").exists() {
+        return;
+    }
+    let (ws, cwd) = workspace_with_env_hardlink();
+    let out = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "/bin/bash", "-uc", "cat notes.txt"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "run bash -uc cat notes.txt must fail, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("SECRET"),
+        "run bash -uc must dest-deny before spawn"
+    );
+    let redirect = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "/bin/sh", "-c", "cat<.env"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !redirect.status.success(),
+        "run sh -c cat<.env must fail, stdout={} stderr={}",
+        String::from_utf8_lossy(&redirect.stdout),
+        String::from_utf8_lossy(&redirect.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&redirect.stdout).contains("SECRET"),
+        "run infix redirect must dest-deny before spawn"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn run_refuses_dev_null_special_file_before_spawn() {
     let ws = TempDir::new().expect("workspace");
     let cwd = TempDir::new().expect("other cwd");

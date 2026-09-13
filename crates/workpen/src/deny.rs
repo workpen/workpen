@@ -449,12 +449,8 @@ fn shell_c_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
 }
 
 fn is_shell_c_cluster(rest: &str) -> bool {
-    !rest.is_empty()
-        && rest.len() <= 6
-        && rest.contains('c')
-        && rest
-            .chars()
-            .all(|ch| matches!(ch, 'c' | 'i' | 'l' | 's' | 'n' | 'x' | 'e' | 'v'))
+    let len = rest.len();
+    (1..=4).contains(&len) && rest.contains('c') && rest.chars().all(|ch| ch.is_ascii_alphabetic())
 }
 
 /// Dest-deny each raw argv dest under `root`.
@@ -491,12 +487,13 @@ pub fn check_command_dests(
     policy: &DenyPolicy,
 ) -> Result<(), CheckDestError> {
     for (_display, candidate) in command_path_tokens(command) {
-        let peeled = peel_shell_meta(&candidate);
-        if peeled.is_empty() || peeled.starts_with('-') {
-            continue;
+        for peeled in peel_shell_parts(&candidate) {
+            if peeled.is_empty() || peeled.starts_with('-') {
+                continue;
+            }
+            let dest = dest_under_root(root, peeled);
+            check_dest(&dest.to_string_lossy(), policy, None)?;
         }
-        let dest = dest_under_root(root, peeled);
-        check_dest(&dest.to_string_lossy(), policy, None)?;
     }
     Ok(())
 }
@@ -984,19 +981,28 @@ fn peel_shell_meta(s: &str) -> &str {
     s.trim_matches(|c: char| matches!(c, ';' | '|' | '&' | ')' | '(' | '<' | '>' | '`' | ','))
 }
 
+fn peel_shell_parts(s: &str) -> impl Iterator<Item = &str> {
+    s.split([';', '|', '&', ')', '(', '<', '>', '`', ','])
+        .map(peel_shell_meta)
+        .filter(|p| !p.is_empty())
+}
+
 fn candidate_is_denied(candidate: &str, policy: &DenyPolicy) -> bool {
-    let peeled = peel_shell_meta(candidate);
-    if peeled.is_empty() || peeled.starts_with('-') {
-        return false;
-    }
-    if is_path_denied(Path::new(peeled), policy) {
-        return true;
-    }
-    if let Some((_, after)) = peeled.rsplit_once(':') {
-        let after = peel_shell_meta(after);
-        if !after.is_empty() && !after.starts_with('-') && is_path_denied(Path::new(after), policy)
-        {
+    for peeled in peel_shell_parts(candidate) {
+        if peeled.starts_with('-') {
+            continue;
+        }
+        if is_path_denied(Path::new(peeled), policy) {
             return true;
+        }
+        if let Some((_, after)) = peeled.rsplit_once(':') {
+            let after = peel_shell_meta(after);
+            if !after.is_empty()
+                && !after.starts_with('-')
+                && is_path_denied(Path::new(after), policy)
+            {
+                return true;
+            }
         }
     }
     false
