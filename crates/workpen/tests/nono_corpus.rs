@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use workpen::resolve_extra_root;
 use workpen::{
     KernelAccess, KernelApply, KernelError, child_env_deny_names, is_denied_child_env,
-    kernel_supported, process_jail, resolve_extra_root, scrub_child_command, spawn_after_setup,
-    with_bash_noprofile,
+    kernel_supported, process_jail, scrub_child_command, spawn_after_setup, with_bash_noprofile,
 };
 
 fn workspace() -> TempDir {
