@@ -122,6 +122,40 @@ fn run_dest_denies_hardlink_sibling_under_root_before_spawn() {
 
 #[cfg(unix)]
 #[test]
+fn run_allowed_dest_after_hardlink_dest_deny() {
+    let (ws, cwd) = workspace_with_env_hardlink();
+    let echo = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "/bin/echo", "hello"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        echo.status.success(),
+        "run echo hello must succeed after dest-deny fixture, stdout={} stderr={}",
+        String::from_utf8_lossy(&echo.stdout),
+        String::from_utf8_lossy(&echo.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&echo.stdout).trim(), "hello");
+    let cat = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "/bin/cat", "readme.md"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        cat.status.success(),
+        "run cat readme.md must succeed after dest-deny fixture, stdout={} stderr={}",
+        String::from_utf8_lossy(&cat.stdout),
+        String::from_utf8_lossy(&cat.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&cat.stdout).trim(), "ok");
+}
+
+#[cfg(unix)]
+#[test]
 fn run_dest_denies_spaced_hardlink_argv_under_root_before_spawn() {
     let ws = TempDir::new().expect("workspace");
     let cwd = TempDir::new().expect("other cwd");
@@ -286,6 +320,18 @@ fn run_relative_parent_root_dest_denies_hardlink_not_escape() {
             "run --root {root} must dest-deny before spawn, stdout={stdout}"
         );
     }
+    let allowed = workpen()
+        .args(["run", "--root", "../ws", "--", "/bin/echo", "hello"])
+        .current_dir(&cwd)
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        allowed.status.success(),
+        "run --root ../ws echo hello must succeed after dest-deny, stdout={} stderr={}",
+        String::from_utf8_lossy(&allowed.stdout),
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&allowed.stdout).trim(), "hello");
 }
 
 #[cfg(unix)]

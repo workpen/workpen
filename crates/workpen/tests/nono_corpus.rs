@@ -8,8 +8,8 @@ use std::process::Command;
 
 use tempfile::TempDir;
 use workpen::{
-    KernelAccess, KernelApply, KernelError, child_env_deny_names, kernel_supported, process_jail,
-    spawn_after_setup, with_bash_noprofile,
+    KernelAccess, KernelApply, KernelError, child_env_deny_names, is_denied_child_env,
+    kernel_supported, process_jail, scrub_child_command, spawn_after_setup, with_bash_noprofile,
 };
 
 fn workspace() -> TempDir {
@@ -326,6 +326,22 @@ fn run_child_cannot_write_outside_workspace() {
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn run_child_can_write_inside_workspace() {
+    let dir = workspace();
+    let inside = dir.path().join("inside.txt");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "echo ok > inside.txt"])
+        .current_dir(dir.path());
+    let (applied, status) = policy.run_child(cmd).expect("run_child");
+    assert_eq!(applied, KernelApply::Applied);
+    assert!(status.success(), "inside write must succeed: {status:?}");
+    let body = fs::read_to_string(&inside).expect("inside write");
+    assert!(body.contains("ok"), "inside body={body:?}");
+}
+
 #[cfg(windows)]
 #[test]
 fn run_child_can_write_inside_workspace() {
@@ -376,11 +392,14 @@ fn run_inserts_noprofile_norc_for_bash_argv0() {
             "bash argv0 {program}"
         );
     }
+    let (got, args) = with_bash_noprofile("bash", [] as [&str; 0]);
+    assert_eq!(got, "bash");
+    assert_eq!(args, ["--noprofile", "--norc"]);
 }
 
 #[test]
 fn run_leaves_cmd_exe_argv_unchanged() {
-    for program in ["cmd.exe", "/bin/sh", "pwsh", "git"] {
+    for program in ["cmd.exe", "/bin/sh", "pwsh", "git", "rbash", "env"] {
         let (got, args) = with_bash_noprofile(program, ["/C", "echo ok"]);
         assert_eq!(got, program);
         assert_eq!(args, ["/C", "echo ok"], "non-bash argv0 {program}");
@@ -395,6 +414,29 @@ fn run_does_not_duplicate_existing_noprofile() {
     assert_eq!(args, ["--noprofile", "--norc", "-c", "true"]);
     let (_got, args) = with_bash_noprofile("bash", ["--norc", "-c", "true"]);
     assert_eq!(args, ["--noprofile", "--norc", "-c", "true"]);
+}
+
+#[test]
+fn is_denied_child_env_keys_and_not_path() {
+    assert!(is_denied_child_env("xai_api_key"));
+    assert!(is_denied_child_env("Ld_Preload"));
+    assert!(!is_denied_child_env("PATH"));
+}
+
+#[test]
+fn scrub_child_command_removes_denied_names() {
+    let mut cmd = Command::new("true");
+    cmd.env("XAI_API_KEY", "secret")
+        .env("LD_PRELOAD", "evil.so")
+        .env("BASH_ENV", "/tmp/evil.sh");
+    scrub_child_command(&mut cmd);
+    for name in ["XAI_API_KEY", "LD_PRELOAD", "BASH_ENV"] {
+        let value = cmd
+            .get_envs()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value);
+        assert_eq!(value, Some(None), "{name} must be removed from cmd envs");
+    }
 }
 
 #[test]

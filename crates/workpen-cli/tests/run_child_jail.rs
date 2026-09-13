@@ -136,3 +136,161 @@ fn run_can_write_inside_workspace() {
     let body = std::fs::read_to_string(&inside).expect("inside write");
     assert!(body.contains("ok"), "inside body={body:?}");
 }
+
+#[cfg(unix)]
+fn printenv_available() -> bool {
+    std::path::Path::new("/usr/bin/printenv").is_file()
+}
+
+#[cfg(unix)]
+fn combined(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn run_scrubs_inherited_xai_api_key() {
+    if !printenv_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .env("XAI_API_KEY", "secret")
+        .arg("run")
+        .arg("--root")
+        .arg(dir.path())
+        .args(["--", "/usr/bin/printenv", "XAI_API_KEY"])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "inherited XAI_API_KEY must be absent: status={:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        !combined(&out).contains("secret"),
+        "inherited XAI_API_KEY must not leak: {}",
+        combined(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_scrubs_inherited_ld_preload() {
+    if !printenv_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .env("LD_PRELOAD", "evil.so")
+        .arg("run")
+        .arg("--root")
+        .arg(dir.path())
+        .args(["--", "/usr/bin/printenv", "LD_PRELOAD"])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "inherited LD_PRELOAD must be absent: status={:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        !combined(&out).contains("evil.so"),
+        "inherited LD_PRELOAD must not leak: {}",
+        combined(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_scrubs_inherited_bash_env() {
+    if !printenv_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .env("BASH_ENV", "/tmp/evil.sh")
+        .arg("run")
+        .arg("--root")
+        .arg(dir.path())
+        .args(["--", "/usr/bin/printenv", "BASH_ENV"])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "inherited BASH_ENV must be absent: status={:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    assert!(
+        !combined(&out).contains("/tmp/evil.sh"),
+        "inherited BASH_ENV must not leak: {}",
+        combined(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_keeps_inherited_path() {
+    if !printenv_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .env("PATH", "/usr/bin:/bin")
+        .arg("run")
+        .arg("--root")
+        .arg(dir.path())
+        .args(["--", "/usr/bin/printenv", "PATH"])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        out.status.success(),
+        "PATH must remain: status={:?} out={}",
+        out.status,
+        combined(&out)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains('/'),
+        "printenv PATH must print a path: {stdout:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_inserts_noprofile_so_login_bash_skips_home_profile() {
+    if !std::path::Path::new("/bin/bash").is_file() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).expect("home");
+    let marker = home.join("profile-ran");
+    std::fs::write(home.join(".bash_profile"), "touch \"$HOME/profile-ran\"\n")
+        .expect("bash_profile");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .env("HOME", &home)
+        .arg("run")
+        .arg("--root")
+        .arg(dir.path())
+        .args(["--", "/bin/bash", "-l", "-c", "true"])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        out.status.success(),
+        "login bash -c true must succeed: status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "login bash must not run HOME/.bash_profile"
+    );
+}
