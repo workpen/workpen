@@ -49,8 +49,8 @@ pub enum KernelApply {
 pub enum KernelError {
     #[error("kernel wrap root is not usable: {0}")]
     Root(String),
-    #[error("kernel wrap refused filesystem root")]
-    FsRoot,
+    #[error("kernel wrap refused filesystem root {0}; use a subdirectory, not `/`")]
+    FsRoot(PathBuf),
     #[error("kernel wrap apply failed: {0}")]
     Apply(String),
 }
@@ -449,7 +449,7 @@ fn canonicalize_dir(path: &Path) -> Result<PathBuf, KernelError> {
         )));
     }
     if is_fs_root(&resolved) {
-        return Err(KernelError::FsRoot);
+        return Err(KernelError::FsRoot(resolved));
     }
     Ok(resolved)
 }

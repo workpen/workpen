@@ -82,7 +82,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
     if let Some(flag) = rest.first().filter(|t| t.starts_with('-') && *t != "--") {
         return Err(format!(
-            "unknown flag: {flag} (use --root DIR or --extra-root DIR)"
+            "unknown flag: {flag} (usage: workpen run [--root DIR] [--extra-root DIR] [--] CMD...)"
         ));
     }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;

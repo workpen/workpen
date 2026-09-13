@@ -124,14 +124,14 @@ fn filesystem_root_as_workspace_is_refused() {
     #[cfg(unix)]
     {
         let err = process_jail("/", std::iter::empty::<&Path>()).expect_err("root");
-        assert!(matches!(err, KernelError::FsRoot));
+        assert!(matches!(err, KernelError::FsRoot(_)));
     }
     #[cfg(windows)]
     {
         let root = Path::new(r"C:\");
         if root.exists() {
             let err = process_jail(root, std::iter::empty::<&Path>()).expect_err("root");
-            assert!(matches!(err, KernelError::FsRoot));
+            assert!(matches!(err, KernelError::FsRoot(_)));
         }
     }
 }
@@ -142,14 +142,48 @@ fn extra_root_filesystem_root_is_refused() {
     #[cfg(unix)]
     {
         let err = process_jail(dir.path(), ["/"]).expect_err("extra root");
-        assert!(matches!(err, KernelError::FsRoot));
+        assert!(matches!(err, KernelError::FsRoot(_)));
     }
     #[cfg(windows)]
     {
         let root = Path::new(r"C:\");
         if root.exists() {
             let err = process_jail(dir.path(), [root]).expect_err("extra root");
-            assert!(matches!(err, KernelError::FsRoot));
+            assert!(matches!(err, KernelError::FsRoot(_)));
+        }
+    }
+}
+
+#[test]
+fn filesystem_root_error_names_path_and_subdirectory() {
+    fn assert_names_path_and_next_step(err: &KernelError, refused: &Path) {
+        let msg = err.to_string();
+        let path = refused.display().to_string();
+        assert!(
+            msg.contains(&path),
+            "FsRoot must name refused path {path}: {msg}"
+        );
+        assert!(
+            msg.to_ascii_lowercase().contains("subdirectory"),
+            "FsRoot must say use a subdirectory: {msg}"
+        );
+    }
+    #[cfg(unix)]
+    {
+        let refused = Path::new("/");
+        let err = process_jail(refused, std::iter::empty::<&Path>()).expect_err("root");
+        assert_names_path_and_next_step(&err, refused);
+        let extra = process_jail(workspace().path(), [refused]).expect_err("extra root");
+        assert_names_path_and_next_step(&extra, refused);
+    }
+    #[cfg(windows)]
+    {
+        let refused = Path::new(r"C:\");
+        if refused.exists() {
+            let err = process_jail(refused, std::iter::empty::<&Path>()).expect_err("root");
+            assert_names_path_and_next_step(&err, refused);
+            let extra = process_jail(workspace().path(), [refused]).expect_err("extra root");
+            assert_names_path_and_next_step(&extra, refused);
         }
     }
 }
