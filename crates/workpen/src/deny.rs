@@ -1,5 +1,6 @@
 //! Dest-deny predicate. Glob match, hardlink sibling, patch dests, argv tokens.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -462,7 +463,11 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// Empty and flag-looking tokens are skipped. A shell `-c` token, including
 /// short-option clusters that contain `c` (`-lc`, `-ic`, `-lic`, `-cl`)
 /// and an attached `-cBODY`, dest-denies paths inside the script body
-/// via [`check_command_dests`]. Does not dest-deny a flattened join of all argv.
+/// via [`check_command_dests`]. When argv0 is `env`/`env.exe`, dest-denies
+/// the operand of `-S`/`--split-string` via [`check_command_dests`] and
+/// `-f`/`--file` (including attached `--file=.env`) via [`check_dest`].
+/// Does not dest-deny a flattened join of all argv. Does not peel generic
+/// `--flag=.env`.
 pub fn check_command_argv(
     cmd: &[impl AsRef<str>],
     root: &Path,
@@ -478,7 +483,131 @@ pub fn check_command_argv(
             check_command_dests(body, root, policy)?;
         }
     }
+    if cmd.first().is_some_and(|t| is_env_program(t.as_ref())) {
+        check_env_flag_dests(&cmd[1..], root, policy)?;
+    }
     Ok(())
+}
+
+pub(crate) fn is_env_program(program: impl AsRef<OsStr>) -> bool {
+    let raw = program.as_ref().to_string_lossy();
+    let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw.as_ref());
+    name.eq_ignore_ascii_case("env") || name.eq_ignore_ascii_case("env.exe")
+}
+
+pub(crate) fn env_takes_value(flag: char) -> bool {
+    matches!(flag, 'u' | 'C' | 'S' | 'P' | 'a' | 'f')
+}
+
+pub(crate) fn env_flag_skip(arg: &str) -> Option<usize> {
+    if arg == "-" {
+        return Some(1);
+    }
+    if !arg.starts_with('-') {
+        return None;
+    }
+    if let Some(long) = arg.strip_prefix("--") {
+        if long.contains('=') {
+            return Some(1);
+        }
+        return Some(match long {
+            "unset" | "split-string" | "chdir" | "argv0" | "file" => 2,
+            _ => 1,
+        });
+    }
+    let mut chars = arg[1..].chars();
+    while let Some(c) = chars.next() {
+        if env_takes_value(c) {
+            return Some(if chars.next().is_some() { 1 } else { 2 });
+        }
+    }
+    Some(1)
+}
+
+fn check_env_flag_dests(
+    args: &[impl AsRef<str>],
+    root: &Path,
+    policy: &DenyPolicy,
+) -> Result<(), CheckDestError> {
+    let mut i = 0;
+    while i < args.len() {
+        let raw = args[i].as_ref();
+        if raw == "--" || raw == "-" {
+            break;
+        }
+        if !raw.starts_with('-') {
+            if raw.contains('=') {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        if let Some(long) = raw.strip_prefix("--") {
+            if let Some((name, value)) = long.split_once('=') {
+                check_env_named_operand(name, value, root, policy)?;
+                i += 1;
+                continue;
+            }
+            let next = args.get(i + 1).map(|s| s.as_ref());
+            match long {
+                "split-string" | "file" | "unset" | "chdir" | "argv0" => {
+                    if let Some(next) = next {
+                        check_env_named_operand(long, next, root, policy)?;
+                    }
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+            continue;
+        }
+        let mut chars = raw[1..].chars();
+        let mut value_flag = None;
+        let mut attached = String::new();
+        while let Some(c) = chars.next() {
+            if env_takes_value(c) {
+                value_flag = Some(c);
+                attached = chars.collect();
+                break;
+            }
+        }
+        match value_flag {
+            Some(flag) => {
+                let operand = if attached.is_empty() {
+                    args.get(i + 1).map(|s| s.as_ref())
+                } else {
+                    Some(attached.as_str())
+                };
+                if let Some(operand) = operand {
+                    match flag {
+                        'S' => check_command_dests(operand, root, policy)?,
+                        'f' => check_env_file_dest(operand, root, policy)?,
+                        _ => {}
+                    }
+                }
+                i += if attached.is_empty() { 2 } else { 1 };
+            }
+            None => i += 1,
+        }
+    }
+    Ok(())
+}
+
+fn check_env_named_operand(
+    name: &str,
+    value: &str,
+    root: &Path,
+    policy: &DenyPolicy,
+) -> Result<(), CheckDestError> {
+    match name {
+        "split-string" => check_command_dests(value, root, policy),
+        "file" => check_env_file_dest(value, root, policy),
+        _ => Ok(()),
+    }
+}
+
+fn check_env_file_dest(path: &str, root: &Path, policy: &DenyPolicy) -> Result<(), CheckDestError> {
+    let dest = dest_under_root(root, path);
+    check_dest(&dest.to_string_lossy(), policy, None).map(|_| ())
 }
 
 /// Join extracted command dests under `root` and dest-deny each.

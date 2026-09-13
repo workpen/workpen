@@ -348,6 +348,47 @@ fn run_inserts_noprofile_so_env_login_bash_skips_home_profile() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn run_drops_env_argv_bash_env_assignment() {
+    let env_bin = ["/usr/bin/env", "/bin/env"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file());
+    let Some(env_bin) = env_bin else {
+        return;
+    };
+    if !std::path::Path::new("/bin/bash").is_file() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    std::fs::write(dir.path().join(".env"), "SECRET=1\n").expect("write .env");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .arg("run")
+        .arg("--root")
+        .arg(dir.path())
+        .args([
+            "--",
+            env_bin,
+            "BASH_ENV=.env",
+            "bash",
+            "-c",
+            r#"printf %s "$BASH_ENV""#,
+        ])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        out.status.success(),
+        "env without denied assignment must still run: status={:?} stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains(".env"),
+        "env BASH_ENV=.env must be dropped: {stdout:?}"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn run_extra_root_tmp_can_write_presented_path() {

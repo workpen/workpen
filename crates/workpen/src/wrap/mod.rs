@@ -246,9 +246,10 @@ pub fn scrub_child_command(cmd: &mut Command) {
 
 /// Insert `--noprofile` and `--norc` after argv0 when the program is bash.
 ///
-/// When argv0 is `env`/`env.exe`, insert after the first non-flag operand
-/// that is bash. Walks clustered shorts (`-iC /tmp`) and value flags
-/// (`-u NAME`, `-f FILE`, `--file FILE`). Attached forms stay one token.
+/// When argv0 is `env`/`env.exe`, drop `NAME=value` assignments whose name
+/// is on the child-env denylist, then insert after the first non-flag
+/// operand that is bash. Walks clustered shorts (`-iC /tmp`) and value
+/// flags (`-u NAME`, `-f FILE`, `--file FILE`). Attached forms stay one token.
 #[must_use]
 pub fn with_bash_noprofile(
     program: impl AsRef<OsStr>,
@@ -259,6 +260,9 @@ pub fn with_bash_noprofile(
         .into_iter()
         .map(|a| a.as_ref().to_os_string())
         .collect();
+    if is_env_argv0(&program) {
+        drop_denied_env_assignments(&mut args);
+    }
     if is_bash_argv0(&program) {
         insert_bash_noprofile(&mut args, 0);
     } else if is_env_argv0(&program)
@@ -267,6 +271,35 @@ pub fn with_bash_noprofile(
         insert_bash_noprofile(&mut args, idx + 1);
     }
     (program, args)
+}
+
+fn drop_denied_env_assignments(args: &mut Vec<OsString>) {
+    let mut i = 0;
+    let mut options_done = false;
+    while i < args.len() {
+        let raw = args[i].to_string_lossy();
+        if !options_done {
+            if raw == "--" {
+                options_done = true;
+                i += 1;
+                continue;
+            }
+            if let Some(skip) = env_flag_skip(&raw) {
+                i = i.saturating_add(skip);
+                continue;
+            }
+        }
+        if let Some(eq) = raw.find('=') {
+            let name = &raw[..eq];
+            if !name.is_empty() && is_denied_child_env(name) {
+                args.remove(i);
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
 }
 
 fn insert_bash_noprofile(args: &mut Vec<OsString>, at: usize) {
@@ -292,9 +325,7 @@ fn is_bash_argv0(program: &OsStr) -> bool {
 }
 
 fn is_env_argv0(program: &OsStr) -> bool {
-    let raw = program.to_string_lossy();
-    let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw.as_ref());
-    name.eq_ignore_ascii_case("env") || name.eq_ignore_ascii_case("env.exe")
+    crate::deny::is_env_program(program)
 }
 
 fn first_env_bash_operand(args: &[OsString]) -> Option<usize> {
@@ -323,33 +354,8 @@ fn first_env_bash_operand(args: &[OsString]) -> Option<usize> {
     None
 }
 
-fn env_takes_value(flag: char) -> bool {
-    matches!(flag, 'u' | 'C' | 'S' | 'P' | 'a' | 'f')
-}
-
 fn env_flag_skip(arg: &str) -> Option<usize> {
-    if arg == "-" {
-        return Some(1);
-    }
-    if !arg.starts_with('-') {
-        return None;
-    }
-    if let Some(long) = arg.strip_prefix("--") {
-        if long.contains('=') {
-            return Some(1);
-        }
-        return Some(match long {
-            "unset" | "split-string" | "chdir" | "argv0" | "file" => 2,
-            _ => 1,
-        });
-    }
-    let mut chars = arg[1..].chars();
-    while let Some(c) = chars.next() {
-        if env_takes_value(c) {
-            return Some(if chars.next().is_some() { 1 } else { 2 });
-        }
-    }
-    Some(1)
+    crate::deny::env_flag_skip(arg)
 }
 
 /// Call `spawn` only when token or job setup succeeded.

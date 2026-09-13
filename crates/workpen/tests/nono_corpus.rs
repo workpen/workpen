@@ -561,6 +561,62 @@ fn run_inserts_noprofile_norc_after_clustered_env_flags() {
 }
 
 #[test]
+fn with_bash_noprofile_drops_denied_env_assignments() {
+    let (_got, args) = with_bash_noprofile(
+        "env",
+        ["BASH_ENV=.env", "bash", "-c", r#"printf %s "$BASH_ENV""#],
+    );
+    assert!(
+        !args.iter().any(|a| {
+            a.to_string_lossy()
+                .split_once('=')
+                .is_some_and(|(n, _)| n.eq_ignore_ascii_case("BASH_ENV"))
+        }),
+        "denied BASH_ENV assignment must be dropped: {args:?}"
+    );
+    assert_eq!(
+        args,
+        [
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            r#"printf %s "$BASH_ENV""#
+        ]
+    );
+    let (_got, args) = with_bash_noprofile(
+        "/usr/bin/env",
+        [
+            "FOO=bar",
+            "LD_PRELOAD=./x.so",
+            "PATH=/bin",
+            "bash",
+            "-c",
+            "true",
+        ],
+    );
+    assert_eq!(
+        args,
+        [
+            "FOO=bar",
+            "PATH=/bin",
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            "true"
+        ],
+        "denylist assignments drop; other NAME=value stay"
+    );
+    let (_got, args) = with_bash_noprofile("env.exe", ["bash_env=.env", "python", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["python", "-c", "true"],
+        "case-insensitive denylist drop without rewriting non-bash"
+    );
+}
+
+#[test]
 fn run_does_not_duplicate_existing_noprofile() {
     let (_got, args) = with_bash_noprofile("bash", ["--noprofile", "--norc", "-c", "true"]);
     assert_eq!(args, ["--noprofile", "--norc", "-c", "true"]);
