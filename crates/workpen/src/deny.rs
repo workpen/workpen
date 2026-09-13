@@ -566,6 +566,7 @@ fn match_star(pat: &[u8], text: &[u8]) -> bool {
     }
 }
 
+#[derive(Debug)]
 enum HardlinkHit {
     Allowed,
     Denied { sibling: Option<String> },
@@ -672,6 +673,44 @@ fn push_scan_parent(parents: &mut Vec<PathBuf>, parent: Option<&Path>) {
     }
 }
 
+/// Win32 `ERROR_NO_MORE_FILES` (FindNextFile).
+#[cfg(any(windows, test))]
+const WIN_ERROR_NO_MORE_FILES: u32 = 18;
+/// Win32 `ERROR_HANDLE_EOF` (FindNextFileNameW).
+#[cfg(any(windows, test))]
+const WIN_ERROR_HANDLE_EOF: u32 = 38;
+
+#[cfg(any(windows, test))]
+fn win_find_next_exhausted(err: u32) -> bool {
+    err == WIN_ERROR_NO_MORE_FILES || err == WIN_ERROR_HANDLE_EOF
+}
+
+/// Dest-deny from NTFS names plus `nNumberOfLinks`.
+/// Incomplete listing (`names.len() < nlink`) is HardlinkSibling.
+#[cfg(any(windows, test))]
+fn hardlink_hit_from_win_names(
+    names: &[std::ffi::OsString],
+    nlink: u32,
+    policy: &DenyPolicy,
+) -> HardlinkHit {
+    if names.len() < nlink as usize {
+        return HardlinkHit::Denied { sibling: None };
+    }
+    if names.len() <= 1 {
+        return HardlinkHit::Allowed;
+    }
+    for n in names {
+        let s = n.to_string_lossy().replace('\\', "/");
+        if path_is_denied_glob(policy.globs(), &s) {
+            let sibling = Path::new(&s)
+                .file_name()
+                .map(|base| base.to_string_lossy().into_owned());
+            return HardlinkHit::Denied { sibling };
+        }
+    }
+    HardlinkHit::Allowed
+}
+
 /// `MetadataExt::file_index` is unstable (`windows_by_handle`). List names
 /// with FindFirstFileNameW instead.
 #[cfg(windows)]
@@ -691,20 +730,12 @@ fn hardlink_sibling_hit_windows(
     if meta.is_dir() {
         return HardlinkHit::Allowed;
     }
+    let nlink = match win_path_by_handle(probe) {
+        Ok(info) => info.nlink,
+        Err(_) => return HardlinkHit::Denied { sibling: None },
+    };
     match win_hardlink_names(probe) {
-        Ok(names) if names.len() <= 1 => HardlinkHit::Allowed,
-        Ok(names) => {
-            for n in &names {
-                let s = n.to_string_lossy().replace('\\', "/");
-                if path_is_denied_glob(policy.globs(), &s) {
-                    let sibling = Path::new(&s)
-                        .file_name()
-                        .map(|base| base.to_string_lossy().into_owned());
-                    return HardlinkHit::Denied { sibling };
-                }
-            }
-            HardlinkHit::Allowed
-        }
+        Ok(names) => hardlink_hit_from_win_names(&names, nlink, policy),
         Err(_) => HardlinkHit::Denied { sibling: None },
     }
 }
@@ -735,6 +766,19 @@ fn win_hardlink_names(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
         fn GetLastError() -> Dword;
     }
 
+    struct FindNameHandle(Handle);
+    impl Drop for FindNameHandle {
+        fn drop(&mut self) {
+            if self.0 != INVALID_HANDLE_VALUE {
+                // SAFETY: `self.0` came from FindFirstFileNameW.
+                unsafe {
+                    FindClose(self.0);
+                }
+                self.0 = INVALID_HANDLE_VALUE;
+            }
+        }
+    }
+
     fn wide_to_os(buf: &[u16], claimed: usize) -> std::ffi::OsString {
         let end = buf
             .iter()
@@ -754,7 +798,7 @@ fn win_hardlink_names(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
         // SAFETY: `wide` is a NUL-terminated path; `buf` is at least `len` units.
         let h = unsafe { FindFirstFileNameW(wide.as_ptr(), 0, &mut len, buf.as_mut_ptr()) };
         if h != INVALID_HANDLE_VALUE {
-            break h;
+            break FindNameHandle(h);
         }
         let err = unsafe { GetLastError() };
         if err == ERROR_MORE_DATA {
@@ -767,21 +811,20 @@ fn win_hardlink_names(path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
     let mut names = vec![wide_to_os(&buf, len as usize)];
     loop {
         len = buf.len() as Dword;
-        // SAFETY: `handle` came from FindFirstFileNameW; `buf` matches `len`.
-        let ok = unsafe { FindNextFileNameW(handle, &mut len, buf.as_mut_ptr()) };
+        // SAFETY: `handle.0` came from FindFirstFileNameW; `buf` matches `len`.
+        let ok = unsafe { FindNextFileNameW(handle.0, &mut len, buf.as_mut_ptr()) };
         if ok == 0 {
             let err = unsafe { GetLastError() };
             if err == ERROR_MORE_DATA {
                 buf.resize(len as usize, 0);
                 continue;
             }
-            break;
+            if win_find_next_exhausted(err) {
+                break;
+            }
+            return Err(std::io::Error::from_raw_os_error(err as i32));
         }
         names.push(wide_to_os(&buf, len as usize));
-    }
-    // SAFETY: `handle` is an open FindFirst handle.
-    unsafe {
-        FindClose(handle);
     }
     Ok(names)
 }
@@ -1098,5 +1141,56 @@ mod classify_hardlink_tests {
             None,
             &policy
         ));
+    }
+
+    #[test]
+    fn win_find_next_exhausted_is_eof_not_other_errors() {
+        assert!(win_find_next_exhausted(WIN_ERROR_NO_MORE_FILES));
+        assert!(win_find_next_exhausted(WIN_ERROR_HANDLE_EOF));
+        assert!(!win_find_next_exhausted(5));
+        assert!(!win_find_next_exhausted(234));
+    }
+
+    #[test]
+    fn win_names_shorter_than_nlink_is_hardlink_sibling() {
+        let policy = DenyPolicy::default();
+        let names = [std::ffi::OsString::from(r"C:\ws\notes.txt")];
+        match hardlink_hit_from_win_names(&names, 2, &policy) {
+            HardlinkHit::Denied { sibling: None } => {}
+            other => panic!("incomplete name list must deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn win_names_matching_nlink_without_deny_glob_is_allowed() {
+        let policy = DenyPolicy::default();
+        let names = [std::ffi::OsString::from(r"C:\ws\notes.txt")];
+        match hardlink_hit_from_win_names(&names, 1, &policy) {
+            HardlinkHit::Allowed => {}
+            other => panic!("single name and nlink 1 must allow, got {other:?}"),
+        }
+        let two = [
+            std::ffi::OsString::from(r"C:\ws\a.txt"),
+            std::ffi::OsString::from(r"C:\ws\b.txt"),
+        ];
+        match hardlink_hit_from_win_names(&two, 2, &policy) {
+            HardlinkHit::Allowed => {}
+            other => panic!("listed names with no deny glob must allow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn win_names_denied_glob_reports_sibling_basename() {
+        let policy = DenyPolicy::default();
+        let names = [
+            std::ffi::OsString::from(r"C:\ws\.env"),
+            std::ffi::OsString::from(r"C:\ws\notes.txt"),
+        ];
+        match hardlink_hit_from_win_names(&names, 2, &policy) {
+            HardlinkHit::Denied {
+                sibling: Some(name),
+            } => assert_eq!(name, ".env"),
+            other => panic!("hardlink of .env must name sibling, got {other:?}"),
+        }
     }
 }
