@@ -228,6 +228,57 @@ fn run_dest_denies_hardlink_inside_sh_c_under_root_before_spawn() {
 
 #[cfg(unix)]
 #[test]
+fn run_dest_denies_hardlink_inside_bash_lc_under_root_before_spawn() {
+    if !std::path::Path::new("/bin/bash").exists() {
+        return;
+    }
+    let (ws, cwd) = workspace_with_env_hardlink();
+    let out = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "/bin/bash", "-lc", "cat notes.txt"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "run bash -lc cat notes.txt hardlink sibling must fail, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let text = combined(&out);
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        lower.contains("hardlink"),
+        "run dest-deny must mention hardlink: {text}"
+    );
+    assert!(
+        text.contains("denied name .env"),
+        "run hardlink dest-deny must say denied name .env: {text}"
+    );
+    assert!(
+        !stdout.contains("SECRET"),
+        "run must dest-deny before spawn, stdout={stdout}"
+    );
+    let echo = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "/bin/bash", "-lc", "echo hello"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        echo.status.success(),
+        "run bash -lc echo hello must succeed after dest-deny fixture, stdout={} stderr={}",
+        String::from_utf8_lossy(&echo.stdout),
+        String::from_utf8_lossy(&echo.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&echo.stdout).trim(), "hello");
+}
+
+#[cfg(unix)]
+#[test]
 fn run_refuses_dev_null_special_file_before_spawn() {
     let ws = TempDir::new().expect("workspace");
     let cwd = TempDir::new().expect("other cwd");
