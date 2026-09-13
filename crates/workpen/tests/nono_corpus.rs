@@ -471,6 +471,62 @@ fn run_inserts_noprofile_norc_after_env_bash_operand() {
 }
 
 #[test]
+fn run_inserts_noprofile_norc_after_clustered_env_flags() {
+    let (_got, args) = with_bash_noprofile("env", ["-iC", "/tmp", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["-iC", "/tmp", "bash", "--noprofile", "--norc", "-c", "true"],
+        "env -iC /tmp bash must skip /tmp as -C operand"
+    );
+    let (_got, args) = with_bash_noprofile("env", ["-f", "dotenv", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        [
+            "-f",
+            "dotenv",
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            "true"
+        ],
+        "env -f dotenv bash must skip dotenv as -f operand"
+    );
+    let (_got, args) = with_bash_noprofile("env", ["--file", "dotenv", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        [
+            "--file",
+            "dotenv",
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            "true"
+        ],
+        "env --file dotenv bash must skip dotenv as --file operand"
+    );
+    let (_got, args) = with_bash_noprofile("env", ["-C/tmp", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["-C/tmp", "bash", "--noprofile", "--norc", "-c", "true"],
+        "attached -C/tmp stays skip 1"
+    );
+    let (_got, args) = with_bash_noprofile("env", ["--file=.env", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["--file=.env", "bash", "--noprofile", "--norc", "-c", "true"],
+        "attached --file=.env stays skip 1"
+    );
+    let (_got, args) = with_bash_noprofile("env", ["-vSbash", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["-vSbash", "-c", "true"],
+        "attached -vSbash stays skip 1 and is not argv bash"
+    );
+}
+
+#[test]
 fn run_does_not_duplicate_existing_noprofile() {
     let (_got, args) = with_bash_noprofile("bash", ["--noprofile", "--norc", "-c", "true"]);
     assert_eq!(args, ["--noprofile", "--norc", "-c", "true"]);

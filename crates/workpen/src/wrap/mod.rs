@@ -247,7 +247,8 @@ pub fn scrub_child_command(cmd: &mut Command) {
 /// Insert `--noprofile` and `--norc` after argv0 when the program is bash.
 ///
 /// When argv0 is `env`/`env.exe`, insert after the first non-flag operand
-/// that is bash. Skips env flags such as `-i`, `-u NAME`, and `-S`.
+/// that is bash. Walks clustered shorts (`-iC /tmp`) and value flags
+/// (`-u NAME`, `-f FILE`, `--file FILE`). Attached forms stay one token.
 #[must_use]
 pub fn with_bash_noprofile(
     program: impl AsRef<OsStr>,
@@ -322,6 +323,10 @@ fn first_env_bash_operand(args: &[OsString]) -> Option<usize> {
     None
 }
 
+fn env_takes_value(flag: char) -> bool {
+    matches!(flag, 'u' | 'C' | 'S' | 'P' | 'a' | 'f')
+}
+
 fn env_flag_skip(arg: &str) -> Option<usize> {
     if arg == "-" {
         return Some(1);
@@ -329,15 +334,22 @@ fn env_flag_skip(arg: &str) -> Option<usize> {
     if !arg.starts_with('-') {
         return None;
     }
-    if arg.starts_with("--") && arg.contains('=') {
-        return Some(1);
-    }
-    match arg {
-        "-u" | "--unset" | "-S" | "--split-string" | "-C" | "--chdir" | "-P" | "-a" | "--argv0" => {
-            Some(2)
+    if let Some(long) = arg.strip_prefix("--") {
+        if long.contains('=') {
+            return Some(1);
         }
-        _ => Some(1),
+        return Some(match long {
+            "unset" | "split-string" | "chdir" | "argv0" | "file" => 2,
+            _ => 1,
+        });
     }
+    let mut chars = arg[1..].chars();
+    while let Some(c) = chars.next() {
+        if env_takes_value(c) {
+            return Some(if chars.next().is_some() { 1 } else { 2 });
+        }
+    }
+    Some(1)
 }
 
 /// Call `spawn` only when token or job setup succeeded.

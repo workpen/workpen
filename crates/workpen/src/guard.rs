@@ -326,28 +326,39 @@ pub fn resolve_workspace_root(cwd: &Path, root: &str) -> Result<PathBuf, PathGua
 /// not-a-dir, canonicalize failure, or implicit escape to `/` or host temp
 /// unless the caller named that root explicitly.
 pub fn resolve_extra_root(cwd: &Path, extra: &str) -> Result<PathBuf, ExtraRootError> {
+    resolve_extra_root_pair(cwd, extra).map(|(_, canon)| canon)
+}
+
+/// Same as [`resolve_extra_root`], plus the absolute path before canonicalize.
+///
+/// `presented` is `cwd` joined with the trimmed extra when relative. Hosts
+/// grant that path so a symlink extra such as `/tmp` stays writable on macOS.
+pub fn resolve_extra_root_pair(
+    cwd: &Path,
+    extra: &str,
+) -> Result<(PathBuf, PathBuf), ExtraRootError> {
     let extra = extra.trim();
     if extra.is_empty() {
         return Err(ExtraRootError::Empty);
     }
     let raw = PathBuf::from(extra);
-    let abs = if raw.is_absolute() {
+    let presented = if raw.is_absolute() {
         raw
     } else {
         cwd.join(raw)
     };
-    if !abs.exists() {
+    if !presented.exists() {
         return Err(ExtraRootError::Missing {
-            path: abs.display().to_string(),
+            path: presented.display().to_string(),
         });
     }
-    if !abs.is_dir() {
+    if !presented.is_dir() {
         return Err(ExtraRootError::NotDirectory {
-            path: abs.display().to_string(),
+            path: presented.display().to_string(),
         });
     }
-    let canon = dunce::canonicalize(&abs).map_err(|e| ExtraRootError::Canonicalize {
-        path: abs.display().to_string(),
+    let canon = dunce::canonicalize(&presented).map_err(|e| ExtraRootError::Canonicalize {
+        path: presented.display().to_string(),
         detail: e.to_string(),
     })?;
     if is_filesystem_root(&canon) && !requested_is_explicit_root(extra) {
@@ -362,7 +373,7 @@ pub fn resolve_extra_root(cwd: &Path, extra: &str) -> Result<PathBuf, ExtraRootE
             resolved: canon.display().to_string(),
         });
     }
-    Ok(canon)
+    Ok((presented, canon))
 }
 
 #[derive(Clone, Copy)]

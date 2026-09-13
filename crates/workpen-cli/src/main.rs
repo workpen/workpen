@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use workpen::{
     CheckDestError, DenyPolicy, GcConfig, GcDecision, PathGuard, check_command_argv,
-    dest_under_root, parse_max_age, resolve_extra_root, resolve_workspace_root, run_gc,
+    dest_under_root, parse_max_age, resolve_extra_root_pair, resolve_workspace_root, run_gc,
 };
 
 fn main() -> ExitCode {
@@ -190,14 +190,10 @@ fn resolve_extras(cwd: &Path, extras: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<P
     let mut canon = Vec::with_capacity(extras.len());
     let mut presented = Vec::with_capacity(extras.len());
     for extra in extras {
-        let raw = extra.to_string_lossy();
-        canon.push(resolve_extra_root(cwd, &raw).map_err(|e| e.to_string())?);
-        let path = PathBuf::from(raw.trim());
-        presented.push(if path.is_absolute() {
-            path
-        } else {
-            cwd.join(path)
-        });
+        let (presented_abs, resolved) =
+            resolve_extra_root_pair(cwd, &extra.to_string_lossy()).map_err(|e| e.to_string())?;
+        presented.push(presented_abs);
+        canon.push(resolved);
     }
     Ok((canon, presented))
 }

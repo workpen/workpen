@@ -2,12 +2,13 @@
 //! Dest-deny stays a separate type.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 use workpen::{
     AbsolutePathPolicy, DenyPolicy, ExtraRootError, PathGuard, PathGuardError, PathGuardKind,
-    check_dests, classify_dest, resolve_extra_root, resolve_workspace_root,
+    check_dests, classify_dest, resolve_extra_root, resolve_extra_root_pair,
+    resolve_workspace_root,
 };
 
 fn workspace() -> TempDir {
@@ -387,6 +388,27 @@ fn resolve_extra_root_allows_explicit_tmp() {
         "explicit /tmp resolved to {}",
         got.display()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn resolve_extra_root_pair_presented_tmp_differs_from_canon_on_macos() {
+    let dir = workspace();
+    let (presented, canon) = resolve_extra_root_pair(dir.path(), "/tmp").expect("explicit /tmp");
+    assert_eq!(presented, PathBuf::from("/tmp"));
+    assert_eq!(
+        canon,
+        resolve_extra_root(dir.path(), "/tmp").expect("same canon")
+    );
+    #[cfg(target_os = "macos")]
+    {
+        assert_ne!(
+            presented,
+            canon,
+            "macOS /tmp presented must stay /tmp, canon is {}",
+            canon.display()
+        );
+    }
 }
 
 #[test]
