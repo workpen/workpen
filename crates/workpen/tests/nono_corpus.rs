@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
-use workpen::{KernelAccess, KernelApply, KernelError, kernel_supported, process_jail};
+use workpen::{
+    KernelAccess, KernelApply, KernelError, child_env_deny_names, kernel_supported, process_jail,
+    spawn_after_setup, with_bash_noprofile,
+};
 
 fn workspace() -> TempDir {
     TempDir::new().expect("temp workspace")
@@ -355,4 +358,211 @@ fn inner_true_cmd() -> Command {
 #[cfg(windows)]
 fn windows_comspec() -> std::ffi::OsString {
     std::env::var_os("COMSPEC").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into())
+}
+
+#[test]
+fn run_inserts_noprofile_norc_for_bash_argv0() {
+    for program in [
+        "bash",
+        "/usr/bin/bash",
+        r"C:\Program Files\Git\bin\bash.exe",
+        "BASH.EXE",
+    ] {
+        let (got, args) = with_bash_noprofile(program, ["-c", "echo ok"]);
+        assert_eq!(got, program);
+        assert_eq!(
+            args,
+            ["--noprofile", "--norc", "-c", "echo ok"],
+            "bash argv0 {program}"
+        );
+    }
+}
+
+#[test]
+fn run_leaves_cmd_exe_argv_unchanged() {
+    for program in ["cmd.exe", "/bin/sh", "pwsh", "git"] {
+        let (got, args) = with_bash_noprofile(program, ["/C", "echo ok"]);
+        assert_eq!(got, program);
+        assert_eq!(args, ["/C", "echo ok"], "non-bash argv0 {program}");
+    }
+}
+
+#[test]
+fn run_does_not_duplicate_existing_noprofile() {
+    let (_got, args) = with_bash_noprofile("bash", ["--noprofile", "--norc", "-c", "true"]);
+    assert_eq!(args, ["--noprofile", "--norc", "-c", "true"]);
+    let (_got, args) = with_bash_noprofile("bash", ["--noprofile", "-c", "true"]);
+    assert_eq!(args, ["--noprofile", "--norc", "-c", "true"]);
+    let (_got, args) = with_bash_noprofile("bash", ["--norc", "-c", "true"]);
+    assert_eq!(args, ["--noprofile", "--norc", "-c", "true"]);
+}
+
+#[test]
+fn child_env_deny_names_include_loader_and_keys() {
+    let names = child_env_deny_names();
+    for required in [
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "BASH_ENV",
+        "ENV",
+        "NODE_OPTIONS",
+        "PYTHONPATH",
+        "PERL5OPT",
+        "XAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_ACCESS_KEY_ID",
+    ] {
+        assert!(
+            names.contains(&required),
+            "denylist must include {required}: {names:?}"
+        );
+    }
+    for keep in [
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "SystemRoot",
+        "COMSPEC",
+        "TMPDIR",
+        "TEMP",
+    ] {
+        assert!(
+            !names.contains(&keep),
+            "denylist must not strip {keep}: {names:?}"
+        );
+    }
+}
+
+fn env_defined_cmd(name: &str) -> Command {
+    #[cfg(unix)]
+    {
+        let mut cmd = Command::new("/usr/bin/printenv");
+        cmd.arg(name);
+        cmd
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new(windows_comspec());
+        cmd.args(["/C", &format!("if defined {name} (exit 0) else (exit 1)")]);
+        cmd
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = name;
+        Command::new("false")
+    }
+}
+
+#[cfg(unix)]
+fn printenv_available() -> bool {
+    Path::new("/usr/bin/printenv").is_file()
+}
+
+#[cfg(not(unix))]
+fn printenv_available() -> bool {
+    true
+}
+
+#[test]
+fn run_child_scrubs_ld_preload() {
+    if !printenv_available() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = env_defined_cmd("LD_PRELOAD");
+    cmd.env("LD_PRELOAD", "evil.so").current_dir(dir.path());
+    let (_applied, status) = policy.run_child(cmd).expect("run_child");
+    assert!(
+        !status.success(),
+        "LD_PRELOAD must be absent after scrub: {status:?}"
+    );
+}
+
+#[test]
+fn run_child_scrubs_bash_env() {
+    if !printenv_available() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = env_defined_cmd("BASH_ENV");
+    cmd.env("BASH_ENV", "/tmp/evil.sh").current_dir(dir.path());
+    let (_applied, status) = policy.run_child(cmd).expect("run_child");
+    assert!(
+        !status.success(),
+        "BASH_ENV must be absent after scrub: {status:?}"
+    );
+}
+
+#[test]
+fn run_child_scrubs_xai_api_key() {
+    if !printenv_available() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = env_defined_cmd("XAI_API_KEY");
+    cmd.env("XAI_API_KEY", "secret").current_dir(dir.path());
+    let (_applied, status) = policy.run_child(cmd).expect("run_child");
+    assert!(
+        !status.success(),
+        "XAI_API_KEY must be absent after scrub: {status:?}"
+    );
+}
+
+#[test]
+fn run_child_keeps_path() {
+    if !printenv_available() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = env_defined_cmd("PATH");
+    cmd.env("PATH", "/usr/bin:/bin").current_dir(dir.path());
+    let (_applied, status) = policy.run_child(cmd).expect("run_child");
+    assert!(status.success(), "PATH must remain after scrub: {status:?}");
+}
+
+#[test]
+fn run_child_token_err_is_apply_and_does_not_spawn() {
+    let mut spawned = false;
+    let err = spawn_after_setup(
+        Err::<(), _>(KernelError::Apply("token setup failed".into())),
+        |_| {
+            spawned = true;
+            panic!("must not spawn after token setup Err");
+        },
+    )
+    .expect_err("token Err must refuse spawn");
+    match err {
+        KernelError::Apply(msg) => {
+            assert!(msg.contains("token"), "error must name token: {msg}");
+        }
+        other => panic!("expected Apply, got {other}"),
+    }
+    assert!(!spawned, "spawn must not run after token Err");
+}
+
+#[test]
+fn run_child_job_err_is_apply_and_does_not_spawn() {
+    let mut spawned = false;
+    let err = spawn_after_setup(
+        Err::<(), _>(KernelError::Apply("job setup failed".into())),
+        |_| {
+            spawned = true;
+            panic!("must not spawn after job setup Err");
+        },
+    )
+    .expect_err("job Err must refuse spawn");
+    match err {
+        KernelError::Apply(msg) => {
+            assert!(msg.contains("job"), "error must name job: {msg}");
+        }
+        other => panic!("expected Apply, got {other}"),
+    }
+    assert!(!spawned, "spawn must not run after job Err");
 }

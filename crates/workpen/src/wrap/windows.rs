@@ -8,7 +8,9 @@ use std::process::{Command, ExitStatus};
 use std::ptr;
 use std::sync::OnceLock;
 
-use super::{KernelAccess, KernelApply, KernelError, KernelPolicy};
+use super::{
+    KernelAccess, KernelApply, KernelError, KernelPolicy, is_denied_child_env, spawn_after_setup,
+};
 
 type Handle = *mut core::ffi::c_void;
 type Dword = u32;
@@ -410,10 +412,23 @@ fn probe_write_restricted() -> bool {
     true
 }
 
+struct Prepared {
+    token: CloseOnDrop,
+    job: CloseOnDrop,
+    _acl_guards: Vec<AclRestore>,
+    _sid: RestrictedSid,
+}
+
 pub(super) fn spawn_write_restricted(
     policy: &KernelPolicy,
     cmd: &Command,
 ) -> Result<(KernelApply, ExitStatus), KernelError> {
+    spawn_after_setup(prepare_write_restricted(policy), |prepared| {
+        spawn_prepared(prepared, cmd)
+    })
+}
+
+fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelError> {
     let rw_paths = rw_grant_paths(policy);
     if rw_paths.is_empty() {
         return Err(KernelError::Apply(
@@ -421,10 +436,30 @@ pub(super) fn spawn_write_restricted(
         ));
     }
     let sid = RestrictedSid::new()?;
-    let _acl_guards = grant_write_aces(&rw_paths, sid.0)?;
-    let token = create_write_restricted_token(sid.0)?;
-    let job = create_kill_job()?;
+    let acl_guards = grant_write_aces(&rw_paths, sid.0)?;
+    let token = create_write_restricted_token(sid.0).map_err(prefix_apply("token setup"))?;
+    let job = create_kill_job().map_err(prefix_apply("job setup"))?;
+    Ok(Prepared {
+        token,
+        job,
+        _acl_guards: acl_guards,
+        _sid: sid,
+    })
+}
+
+fn prefix_apply(kind: &'static str) -> impl FnOnce(KernelError) -> KernelError {
+    move |err| match err {
+        KernelError::Apply(msg) => KernelError::Apply(format!("{kind} failed: {msg}")),
+        other => other,
+    }
+}
+
+fn spawn_prepared(
+    prepared: Prepared,
+    cmd: &Command,
+) -> Result<(KernelApply, ExitStatus), KernelError> {
     let (app, mut cmdline, cwd) = command_line(cmd)?;
+    let mut env_block = environment_block(cmd);
     let mut startup = StartupInfoW {
         cb: std::mem::size_of::<StartupInfoW>() as Dword,
         lp_reserved: ptr::null_mut(),
@@ -456,14 +491,14 @@ pub(super) fn spawn_write_restricted(
     // and live for the call. cmdline is writable as CreateProcessAsUserW requires.
     let created = unsafe {
         CreateProcessAsUserW(
-            token.0,
+            prepared.token.0,
             app.as_ptr(),
             cmdline.as_mut_ptr(),
             ptr::null_mut(),
             ptr::null_mut(),
             1,
             CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-            ptr::null_mut(),
+            env_block.as_mut_ptr().cast(),
             cwd_ptr,
             &mut startup,
             &mut info,
@@ -475,7 +510,7 @@ pub(super) fn spawn_write_restricted(
     let process = CloseOnDrop(info.h_process);
     let thread = CloseOnDrop(info.h_thread);
     // SAFETY: `job` is our job object; `process` is the new suspended process.
-    let assigned = unsafe { AssignProcessToJobObject(job.0, process.0) };
+    let assigned = unsafe { AssignProcessToJobObject(prepared.job.0, process.0) };
     if assigned == 0 {
         // SAFETY: process is still suspended; terminate so it never runs unsandboxed.
         unsafe {
@@ -680,6 +715,34 @@ fn create_kill_job() -> Result<CloseOnDrop, KernelError> {
         return Err(last_error("SetInformationJobObject"));
     }
     Ok(job)
+}
+
+fn environment_block(cmd: &Command) -> Vec<u16> {
+    let mut pairs: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    for (key, value) in cmd.get_envs() {
+        pairs.retain(|(k, _)| !env_key_eq(k, key));
+        if let Some(value) = value {
+            pairs.push((key.to_os_string(), value.to_os_string()));
+        }
+    }
+    pairs.retain(|(k, _)| !is_denied_child_env(k));
+    let mut out = Vec::new();
+    for (key, value) in pairs {
+        out.extend(key.encode_wide());
+        out.push(u16::from(b'='));
+        out.extend(value.encode_wide());
+        out.push(0);
+    }
+    if out.is_empty() {
+        out.push(0);
+    }
+    out.push(0);
+    out
+}
+
+fn env_key_eq(left: &OsStr, right: &OsStr) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
 fn command_line(cmd: &Command) -> Result<(Vec<u16>, Vec<u16>, Option<Vec<u16>>), KernelError> {

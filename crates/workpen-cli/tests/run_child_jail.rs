@@ -6,7 +6,7 @@ use tempfile::TempDir;
 
 #[cfg(unix)]
 #[test]
-fn run_echo_succeeds_under_child_jail() {
+fn run_echo_succeeds_without_bash_rewrite() {
     let dir = TempDir::new().expect("workspace");
     let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
         .arg("run")
