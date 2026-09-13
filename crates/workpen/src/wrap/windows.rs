@@ -324,9 +324,13 @@ struct AclRestore {
     /// Owns the security descriptor so `dacl` stays valid until restore.
     _sd: LocalMem,
     dacl: Handle,
+    restored: bool,
 }
-impl Drop for AclRestore {
-    fn drop(&mut self) {
+impl AclRestore {
+    fn restore(&mut self) -> Result<(), KernelError> {
+        if self.restored {
+            return Ok(());
+        }
         // SAFETY: `path` is a NUL-terminated file path; `dacl` is from the saved SD.
         let err = unsafe {
             SetNamedSecurityInfoW(
@@ -340,10 +344,16 @@ impl Drop for AclRestore {
             )
         };
         if err != 0 {
-            eprintln!(
-                "workpen: restore DACL failed on {}: win32 {err}",
-                String::from_utf16_lossy(&self.path)
-            );
+            return Err(win32_error("restore DACL", err));
+        }
+        self.restored = true;
+        Ok(())
+    }
+}
+impl Drop for AclRestore {
+    fn drop(&mut self) {
+        if let Err(err) = self.restore() {
+            eprintln!("workpen: {err}");
         }
     }
 }
@@ -415,7 +425,7 @@ fn probe_write_restricted() -> bool {
 struct Prepared {
     token: CloseOnDrop,
     job: CloseOnDrop,
-    _acl_guards: Vec<AclRestore>,
+    acl_guards: Vec<AclRestore>,
     _sid: RestrictedSid,
 }
 
@@ -442,7 +452,7 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
     Ok(Prepared {
         token,
         job,
-        _acl_guards: acl_guards,
+        acl_guards,
         _sid: sid,
     })
 }
@@ -537,6 +547,10 @@ fn spawn_prepared(
     if got == 0 {
         return Err(last_error("GetExitCodeProcess"));
     }
+    let mut prepared = prepared;
+    for guard in &mut prepared.acl_guards {
+        guard.restore()?;
+    }
     Ok((KernelApply::Applied, ExitStatus::from_raw(code)))
 }
 
@@ -620,6 +634,7 @@ fn grant_write_ace(path: &Path, sid: Handle) -> Result<AclRestore, KernelError> 
         path: wide,
         _sd: sd,
         dacl,
+        restored: false,
     })
 }
 
