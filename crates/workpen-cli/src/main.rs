@@ -95,8 +95,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     if let Err(e) = check_command_argv(cmd, guard.canon_root(), &policy) {
         return Err(e.to_string());
     }
-    let mut child = Command::new(&cmd[0]);
-    child.args(&cmd[1..]).current_dir(guard.canon_root());
+    let (program, args) = workpen::with_bash_noprofile(&cmd[0], &cmd[1..]);
+    let mut child = Command::new(program);
+    child.args(args).current_dir(guard.canon_root());
     let (_applied, status) = workpen::process_jail(guard.canon_root(), &extras)
         .and_then(|policy| policy.run_child(child))
         .map_err(|e| format!("failed to spawn {}: {e}", cmd[0]))?;

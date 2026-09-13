@@ -8,6 +8,7 @@
 //! only installs a Unix child hook. Hosts that need a jail on every OS
 //! call [`KernelPolicy::run_child`].
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
@@ -163,6 +164,7 @@ impl KernelPolicy {
         #[cfg(unix)]
         {
             let mut cmd = cmd;
+            scrub_child_command(&mut cmd);
             let applied = self.apply_pre_exec(&mut cmd)?;
             let status = cmd
                 .status()
@@ -204,6 +206,83 @@ impl KernelPolicy {
         }
         Ok(caps.block_network().set_signal_mode(signal))
     }
+}
+
+/// Names `run_child` strips from the child environment.
+#[must_use]
+pub fn child_env_deny_names() -> &'static [&'static str] {
+    &[
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "BASH_ENV",
+        "ENV",
+        "NODE_OPTIONS",
+        "PYTHONPATH",
+        "PERL5OPT",
+        "XAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_ACCESS_KEY_ID",
+    ]
+}
+
+/// True when `name` is on the child-env denylist (ASCII case-insensitive).
+#[must_use]
+pub fn is_denied_child_env(name: impl AsRef<OsStr>) -> bool {
+    let raw = name.as_ref().to_string_lossy();
+    child_env_deny_names()
+        .iter()
+        .any(|n| raw.eq_ignore_ascii_case(n))
+}
+
+/// Remove denylist keys from `cmd` so Unix `status` does not inherit them.
+pub fn scrub_child_command(cmd: &mut Command) {
+    for name in child_env_deny_names() {
+        cmd.env_remove(name);
+    }
+}
+
+/// Insert `--noprofile` and `--norc` after argv0 when the program is bash.
+#[must_use]
+pub fn with_bash_noprofile(
+    program: impl AsRef<OsStr>,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+) -> (OsString, Vec<OsString>) {
+    let program = program.as_ref().to_os_string();
+    let mut args: Vec<OsString> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .collect();
+    if is_bash_argv0(&program) {
+        if !args.iter().any(|a| a == "--noprofile") {
+            args.insert(0, OsString::from("--noprofile"));
+        }
+        if !args.iter().any(|a| a == "--norc") {
+            let idx = args
+                .iter()
+                .position(|a| a == "--noprofile")
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            args.insert(idx, OsString::from("--norc"));
+        }
+    }
+    (program, args)
+}
+
+fn is_bash_argv0(program: &OsStr) -> bool {
+    let raw = program.to_string_lossy();
+    let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw.as_ref());
+    name.eq_ignore_ascii_case("bash") || name.eq_ignore_ascii_case("bash.exe")
+}
+
+/// Call `spawn` only when token or job setup succeeded.
+pub fn spawn_after_setup<T>(
+    setup: Result<T, KernelError>,
+    spawn: impl FnOnce(T) -> Result<(KernelApply, ExitStatus), KernelError>,
+) -> Result<(KernelApply, ExitStatus), KernelError> {
+    spawn(setup?)
 }
 
 fn system_read_dirs() -> Vec<PathBuf> {
