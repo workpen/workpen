@@ -33,6 +33,11 @@ const SECURITY_NT_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 5];
 const SECURITY_RESTRICTED_CODE_RID: Dword = 12;
 const GENERIC_ALL: Dword = 0x1000_0000;
 const GRANT_ACCESS: u32 = 1;
+const DENY_ACCESS: u32 = 3;
+const FILE_READ_DATA: Dword = 0x0001;
+const FILE_WRITE_DATA: Dword = 0x0002;
+const FILE_APPEND_DATA: Dword = 0x0004;
+const NO_INHERITANCE: Dword = 0;
 const TRUSTEE_IS_SID: u32 = 0;
 const TRUSTEE_IS_WELL_KNOWN_GROUP: u32 = 5;
 const NO_MULTIPLE_TRUSTEE: u32 = 0;
@@ -446,7 +451,8 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
         ));
     }
     let sid = RestrictedSid::new()?;
-    let acl_guards = grant_write_aces(&rw_paths, sid.0)?;
+    let mut acl_guards = grant_write_aces(&rw_paths, sid.0)?;
+    acl_guards.extend(deny_dest_aces(&dest_deny_paths(policy), sid.0)?);
     let token = create_write_restricted_token(sid.0).map_err(prefix_apply("token setup"))?;
     let job = create_kill_job().map_err(prefix_apply("job setup"))?;
     Ok(Prepared {
@@ -554,6 +560,42 @@ fn spawn_prepared(
     Ok((KernelApply::Applied, ExitStatus::from_raw(code)))
 }
 
+fn dest_deny_paths(policy: &KernelPolicy) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for deny in policy.dest_denies() {
+        if !paths.iter().any(|p| p == &deny.path) {
+            paths.push(deny.path.clone());
+        }
+    }
+    paths
+}
+
+fn deny_dest_aces(paths: &[PathBuf], sid: Handle) -> Result<Vec<AclRestore>, KernelError> {
+    let mut guards = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        guards.push(deny_dest_ace(path, sid)?);
+    }
+    Ok(guards)
+}
+
+fn deny_dest_ace(path: &Path, sid: Handle) -> Result<AclRestore, KernelError> {
+    let inherit = if path.is_dir() {
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT
+    } else {
+        NO_INHERITANCE
+    };
+    set_acl_entry(
+        path,
+        sid,
+        FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA,
+        DENY_ACCESS,
+        inherit,
+    )
+}
+
 fn rw_grant_paths(policy: &KernelPolicy) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for grant in policy.grants() {
@@ -573,6 +615,22 @@ fn grant_write_aces(paths: &[PathBuf], sid: Handle) -> Result<Vec<AclRestore>, K
 }
 
 fn grant_write_ace(path: &Path, sid: Handle) -> Result<AclRestore, KernelError> {
+    set_acl_entry(
+        path,
+        sid,
+        GENERIC_ALL,
+        GRANT_ACCESS,
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    )
+}
+
+fn set_acl_entry(
+    path: &Path,
+    sid: Handle,
+    permissions: Dword,
+    mode: u32,
+    inheritance: Dword,
+) -> Result<AclRestore, KernelError> {
     let mut wide = wide_path(path);
     let mut owner = ptr::null_mut();
     let mut group = ptr::null_mut();
@@ -597,9 +655,9 @@ fn grant_write_ace(path: &Path, sid: Handle) -> Result<AclRestore, KernelError> 
     }
     let sd = LocalMem(sd);
     let mut entry = ExplicitAccessW {
-        grf_access_permissions: GENERIC_ALL,
-        grf_access_mode: GRANT_ACCESS,
-        grf_inheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        grf_access_permissions: permissions,
+        grf_access_mode: mode,
+        grf_inheritance: inheritance,
         trustee: TrusteeW {
             p_multiple_trustee: ptr::null_mut(),
             multiple_trustee_operation: NO_MULTIPLE_TRUSTEE,
