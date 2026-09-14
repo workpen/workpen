@@ -764,14 +764,15 @@ fn run_child_timeout_kills_sleep() {
 
 #[cfg(windows)]
 #[test]
-fn run_child_timeout_kills_ping() {
+fn run_child_timeout_kills_sleeper() {
     if !kernel_supported() {
         return;
     }
     let dir = workspace();
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
-    let mut cmd = Command::new("timeout");
-    cmd.args(["/t", "30", "/nobreak"]).current_dir(dir.path());
+    let sleeper = write_windows_sleep_probe(dir.path(), 30);
+    let mut cmd = Command::new(&sleeper);
+    cmd.current_dir(dir.path());
     let start = Instant::now();
     let err = policy
         .run_child_timeout(cmd, Duration::from_secs(1))
@@ -1012,23 +1013,37 @@ fn run_child_network_blocked_tcp_fails() {
 }
 
 #[cfg(windows)]
+fn write_windows_sleep_probe(dir: &Path, secs: u64) -> PathBuf {
+    rustc_windows_probe(
+        dir,
+        "sleep_probe",
+        &format!("fn main() {{ std::thread::sleep(std::time::Duration::from_secs({secs})); }}\n"),
+    )
+}
+
+#[cfg(windows)]
 fn write_windows_tcp_probe(dir: &Path, port: u16) -> PathBuf {
-    let src = dir.join("tcp_probe.rs");
-    let exe = dir.join("tcp_probe.exe");
-    fs::write(
-        &src,
-        format!(
+    rustc_windows_probe(
+        dir,
+        "tcp_probe",
+        &format!(
             "fn main() {{ match std::net::TcpStream::connect((\"127.0.0.1\", {port})) {{ Ok(_) => std::process::exit(0), Err(_) => std::process::exit(1) }} }}\n"
         ),
     )
-    .expect("probe src");
+}
+
+#[cfg(windows)]
+fn rustc_windows_probe(dir: &Path, name: &str, src_body: &str) -> PathBuf {
+    let src = dir.join(format!("{name}.rs"));
+    let exe = dir.join(format!("{name}.exe"));
+    fs::write(&src, src_body).expect("probe src");
     let status = Command::new("rustc")
         .args(["--edition=2021", "-C", "debuginfo=0", "-o"])
         .arg(&exe)
         .arg(&src)
         .status()
         .expect("rustc probe");
-    assert!(status.success(), "rustc probe failed: {status:?}");
+    assert!(status.success(), "rustc {name} failed: {status:?}");
     exe
 }
 

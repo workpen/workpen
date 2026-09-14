@@ -24,7 +24,7 @@ fn main() -> ExitCode {
     match child.status() {
         Ok(st) => std::process::exit(st.code().unwrap_or(1)),
         Err(e) => {
-            eprintln!("workpen-net-helper: spawn: {e}");
+            eprintln!("workpen-net-helper: spawn {}: {e}", cmd[0].to_string_lossy());
             ExitCode::from(1)
         }
     }

@@ -1174,7 +1174,13 @@ fn command_line(cmd: &Command) -> Result<(Vec<u16>, Vec<u16>, Option<Vec<u16>>),
 fn resolve_program(program: &OsStr) -> Result<PathBuf, KernelError> {
     let path = Path::new(program);
     if path.components().count() > 1 || path.is_absolute() {
-        return Ok(path.to_path_buf());
+        if path.exists() {
+            return Ok(path.to_path_buf());
+        }
+        return Err(KernelError::Apply(format!(
+            "{}: not found",
+            program.to_string_lossy()
+        )));
     }
     let name = wide_os(program);
     let ext: Vec<u16> = OsStr::new(".exe")
@@ -1194,7 +1200,13 @@ fn resolve_program(program: &OsStr) -> Result<PathBuf, KernelError> {
         )
     };
     if n == 0 || n as usize >= buf.len() {
-        return Ok(path.to_path_buf());
+        if path.exists() {
+            return Ok(path.to_path_buf());
+        }
+        return Err(KernelError::Apply(format!(
+            "{}: not found",
+            program.to_string_lossy()
+        )));
     }
     Ok(PathBuf::from(OsString::from_wide(&buf[..n as usize])))
 }
