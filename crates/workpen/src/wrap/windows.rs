@@ -13,6 +13,8 @@ use super::{
     KernelAccess, KernelApply, KernelError, KernelPolicy, is_denied_child_env, spawn_after_setup,
 };
 
+mod windows_net;
+
 type Handle = *mut core::ffi::c_void;
 type Dword = u32;
 type Bool = i32;
@@ -207,6 +209,8 @@ unsafe extern "system" {
         dw_flags_and_attributes: Dword,
         h_template_file: Handle,
     ) -> Handle;
+    fn GetModuleHandleW(lp_module_name: *const u16) -> Handle;
+    fn GetProcAddress(h_module: Handle, lp_proc_name: *const u8) -> *mut core::ffi::c_void;
 }
 
 #[link(name = "advapi32")]
@@ -441,6 +445,13 @@ impl Drop for AclRestore {
     }
 }
 
+pub(super) unsafe fn free_sid(sid: Handle) {
+    // SAFETY: caller owns a SID from AllocateAndInitializeSid or userenv.
+    unsafe {
+        FreeSid(sid);
+    }
+}
+
 fn last_error(op: &str) -> KernelError {
     // SAFETY: GetLastError has no preconditions.
     let err = unsafe { GetLastError() };
@@ -511,6 +522,14 @@ struct Prepared {
     acl_guards: Vec<AclRestore>,
     _sid: RestrictedSid,
     _world: WorldSid,
+    helper: Option<PathBuf>,
+    _net: Option<NetGuards>,
+}
+
+struct NetGuards {
+    _profile: windows_net::AppContainerProfile,
+    _helper: windows_net::HelperFile,
+    _wfp: windows_net::WfpSession,
 }
 
 pub(super) fn spawn_write_restricted(
@@ -518,6 +537,11 @@ pub(super) fn spawn_write_restricted(
     cmd: &Command,
     timeout: Option<Duration>,
 ) -> Result<(KernelApply, ExitStatus), KernelError> {
+    if policy.network_blocked() {
+        return spawn_after_setup(prepare_network_blocked(policy), |prepared| {
+            spawn_prepared(prepared, cmd, timeout)
+        });
+    }
     spawn_after_setup(prepare_write_restricted(policy), |prepared| {
         spawn_prepared(prepared, cmd, timeout)
     })
@@ -542,7 +566,140 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
         acl_guards,
         _sid: sid,
         _world: world,
+        helper: None,
+        _net: None,
     })
+}
+
+fn prepare_network_blocked(policy: &KernelPolicy) -> Result<Prepared, KernelError> {
+    let workspace = policy
+        .grants()
+        .iter()
+        .find(|g| g.access == KernelAccess::ReadWrite)
+        .map(|g| g.path.clone())
+        .ok_or_else(|| KernelError::Apply("network deny needs a ReadWrite grant".into()))?;
+    let profile =
+        windows_net::AppContainerProfile::create().map_err(prefix_apply("AppContainer profile"))?;
+    let helper =
+        windows_net::HelperFile::install(&workspace).map_err(prefix_apply("net helper"))?;
+    let mut prepared = prepare_write_restricted(policy)?;
+    let mut remaining = 65_536usize;
+    for path in rw_grant_paths(policy) {
+        grant_package_tree(
+            &path,
+            profile.sid(),
+            &mut prepared.acl_guards,
+            &mut remaining,
+        )?;
+    }
+    prepared.acl_guards.push(set_acl_entry(
+        helper.path(),
+        profile.sid(),
+        GENERIC_ALL,
+        GRANT_ACCESS,
+        NO_INHERITANCE,
+    )?);
+    let wfp = windows_net::WfpSession::apply(profile.sid(), helper.path())
+        .map_err(prefix_apply("WFP package filter"))?;
+    prepared.token = wrap_appcontainer_token(prepared.token, profile.sid())?;
+    prepared.helper = Some(helper.path().to_path_buf());
+    prepared._net = Some(NetGuards {
+        _profile: profile,
+        _helper: helper,
+        _wfp: wfp,
+    });
+    Ok(prepared)
+}
+
+fn wrap_appcontainer_token(
+    restricted: CloseOnDrop,
+    package_sid: Handle,
+) -> Result<CloseOnDrop, KernelError> {
+    match windows_net::create_appcontainer_token(restricted.0, package_sid) {
+        Ok(handle) => {
+            drop(restricted);
+            Ok(CloseOnDrop(handle))
+        }
+        Err(first) => {
+            let current = current_primary_token()?;
+            match windows_net::create_appcontainer_token(current.0, package_sid) {
+                Ok(handle) => {
+                    drop((restricted, current));
+                    Ok(CloseOnDrop(handle))
+                }
+                Err(second) => Err(KernelError::Apply(format!(
+                    "AppContainer token failed ({first}); fallback ({second})"
+                ))),
+            }
+        }
+    }
+}
+
+fn current_primary_token() -> Result<CloseOnDrop, KernelError> {
+    let mut process_token = ptr::null_mut();
+    // SAFETY: current process handle is valid.
+    let opened =
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_PRIMARY_MASK, &mut process_token) };
+    if opened == 0 {
+        return Err(last_error("OpenProcessToken"));
+    }
+    let process_token = CloseOnDrop(process_token);
+    let mut primary = ptr::null_mut();
+    // SAFETY: process_token is an open process token.
+    let dup = unsafe {
+        DuplicateTokenEx(
+            process_token.0,
+            TOKEN_PRIMARY_MASK,
+            ptr::null_mut(),
+            SECURITY_IMPERSONATION,
+            TOKEN_PRIMARY,
+            &mut primary,
+        )
+    };
+    if dup == 0 {
+        return Err(last_error("DuplicateTokenEx"));
+    }
+    Ok(CloseOnDrop(primary))
+}
+
+fn grant_package_tree(
+    root: &Path,
+    sid: Handle,
+    guards: &mut Vec<AclRestore>,
+    remaining: &mut usize,
+) -> Result<(), KernelError> {
+    if *remaining == 0 {
+        return Err(KernelError::Apply(
+            "package ACE walk exceeded 65536 entries".into(),
+        ));
+    }
+    *remaining -= 1;
+    let meta = std::fs::symlink_metadata(root)
+        .map_err(|e| KernelError::Apply(format!("package ACE walk {}: {e}", root.display())))?;
+    let is_dir = meta.is_dir() && !meta.file_type().is_symlink();
+    let inherit = if is_dir {
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT
+    } else {
+        NO_INHERITANCE
+    };
+    guards.push(set_acl_entry(
+        root,
+        sid,
+        GENERIC_ALL,
+        GRANT_ACCESS,
+        inherit,
+    )?);
+    if !is_dir {
+        return Ok(());
+    }
+    let rd = std::fs::read_dir(root)
+        .map_err(|e| KernelError::Apply(format!("package ACE walk {}: {e}", root.display())))?;
+    for ent in rd {
+        let ent = ent
+            .map_err(|e| KernelError::Apply(format!("package ACE walk {}: {e}", root.display())))?;
+        grant_package_tree(&ent.path(), sid, guards, remaining)?;
+    }
+    Ok(())
 }
 
 fn prefix_apply(kind: &'static str) -> impl FnOnce(KernelError) -> KernelError {
@@ -609,7 +766,10 @@ fn spawn_prepared(
     cmd: &Command,
     timeout: Option<Duration>,
 ) -> Result<(KernelApply, ExitStatus), KernelError> {
-    let (app, mut cmdline, cwd) = command_line(cmd)?;
+    let (app, mut cmdline, cwd) = match prepared.helper.as_deref() {
+        Some(helper) => wrap_command_line(helper, cmd)?,
+        None => command_line(cmd)?,
+    };
     let mut env_block = environment_block(cmd);
     let std_in = inheritable_std_handle(STD_INPUT_HANDLE, false)?;
     let std_out = inheritable_std_handle(STD_OUTPUT_HANDLE, true)?;
@@ -977,6 +1137,24 @@ fn environment_block(cmd: &Command) -> Vec<u16> {
 fn env_key_eq(left: &OsStr, right: &OsStr) -> bool {
     left.to_string_lossy()
         .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+fn wrap_command_line(
+    helper: &Path,
+    cmd: &Command,
+) -> Result<(Vec<u16>, Vec<u16>, Option<Vec<u16>>), KernelError> {
+    let (_orig_app, orig_line, cwd) = command_line(cmd)?;
+    let mut line = Vec::new();
+    append_quoted(&mut line, helper.as_os_str());
+    line.extend_from_slice(&[0x20, 0x2d, 0x2d, 0x20]);
+    let orig = orig_line
+        .last()
+        .is_some_and(|c| *c == 0)
+        .then(|| &orig_line[..orig_line.len() - 1])
+        .unwrap_or(orig_line.as_slice());
+    line.extend_from_slice(orig);
+    line.push(0);
+    Ok((wide_path(helper), line, cwd))
 }
 
 fn command_line(cmd: &Command) -> Result<(Vec<u16>, Vec<u16>, Option<Vec<u16>>), KernelError> {
