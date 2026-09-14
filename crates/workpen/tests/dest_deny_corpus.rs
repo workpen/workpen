@@ -700,6 +700,9 @@ fn check_command_argv_denies_cmd_and_powershell_script_bodies() {
         &["cmd.exe", "/S", "/C", "type .env"],
         &["pwsh", "-comma", "Get-Content .env"],
         &["pwsh", "-NoProfile", "-Command", "Get-Content .env"],
+        &["pwsh", "--Command", "Get-Content .env"],
+        &["pwsh", "-cwa", "Get-Content .env"],
+        &["pwsh", "-CommandWithArgs", "Get-Content .env"],
     ];
     for argv in denies {
         if check_command_argv(argv, ws.path(), &policy).is_ok() {
@@ -728,6 +731,20 @@ fn check_command_argv_denies_cmd_and_powershell_script_bodies() {
         &policy,
     )
     .expect("powershell -Command Get-Content readme.md must be allowed");
+    check_command_argv(
+        &["pwsh", "--Command", "Get-Content readme.md"],
+        ws.path(),
+        &policy,
+    )
+    .expect("pwsh --Command Get-Content readme.md must be allowed");
+    check_command_argv(
+        &["pwsh", "-cwa", "Get-Content readme.md"],
+        ws.path(),
+        &policy,
+    )
+    .expect("pwsh -cwa Get-Content readme.md must be allowed");
+    check_command_argv(&["tool", "-cwa", "Get-Content .env"], ws.path(), &policy)
+        .expect("generic -cwa must not dest-deny");
     check_command_argv(
         &["powershell", "-c", "Get-Content .env"],
         ws.path(),
@@ -799,6 +816,7 @@ fn check_command_argv_denies_powershell_encoded_command_bodies() {
         &["pwsh", "-NoProfile", "-EncodedCommand", ENV_B64],
         &["pwsh", "-enco", ENV_B64],
         &["pwsh", "-en", ENV_B64],
+        &["pwsh", "--EncodedCommand", ENV_B64],
         &[
             "bash",
             "-lc",
@@ -853,10 +871,18 @@ fn check_command_argv_denies_powershell_encoded_command_bodies() {
         .expect("pwsh -enco Get-Content readme.md must be allowed");
     check_command_argv(&["pwsh", "-en", README_B64], ws.path(), &policy)
         .expect("pwsh -en Get-Content readme.md must be allowed");
+    check_command_argv(
+        &["pwsh", "--EncodedCommand", README_B64],
+        ws.path(),
+        &policy,
+    )
+    .expect("pwsh --EncodedCommand Get-Content readme.md must be allowed");
     check_command_argv(&["pwsh", "-ex", "Bypass"], ws.path(), &policy)
         .expect("pwsh -ex Bypass must not dest-deny");
     check_command_argv(&["tool", "-EncodedCommand", ENV_B64], ws.path(), &policy)
         .expect("generic -EncodedCommand must not dest-deny");
+    check_command_argv(&["tool", "--EncodedCommand", ENV_B64], ws.path(), &policy)
+        .expect("generic --EncodedCommand must not dest-deny");
     check_command_argv(&["tool", "-en", ENV_B64], ws.path(), &policy)
         .expect("generic -en must not dest-deny");
     check_command_argv(
@@ -867,6 +893,33 @@ fn check_command_argv_denies_powershell_encoded_command_bodies() {
     .expect("powershell -ErrorAction Continue must not dest-deny");
     check_command_argv(&["pwsh", "-ErrorAction", "Continue"], ws.path(), &policy)
         .expect("pwsh -ErrorAction Continue must not dest-deny");
+    // UTF-16LE base64 of `.env` / `ok` / `readme.md` (EncodedArguments payload)
+    const EA_ENV_B64: &str = "LgBlAG4AdgA=";
+    const EA_OK_B64: &str = "bwBrAA==";
+    const EA_README_B64: &str = "cgBlAGEAZABtAGUALgBtAGQA";
+    check_command_argv(&["pwsh", "-ea", EA_ENV_B64], ws.path(), &policy)
+        .expect_err("pwsh -ea EncodedArguments .env must dest-deny");
+    check_command_argv(
+        &["pwsh", "-EncodedArguments", EA_ENV_B64],
+        ws.path(),
+        &policy,
+    )
+    .expect_err("pwsh -EncodedArguments .env must dest-deny");
+    check_command_argv(&["pwsh", "-ea", EA_OK_B64], ws.path(), &policy)
+        .expect("pwsh -ea EncodedArguments ok must be allowed");
+    check_command_argv(&["pwsh", "-ea", EA_README_B64], ws.path(), &policy)
+        .expect("pwsh -ea EncodedArguments readme.md must be allowed");
+    check_command_argv(&["tool", "-ea", ENV_B64], ws.path(), &policy)
+        .expect("generic -ea must not dest-deny");
+    let ea_junk = check_command_argv(&["pwsh", "-ea", "!!!not-base64!!!"], ws.path(), &policy)
+        .expect_err("invalid EncodedArguments must fail closed");
+    assert!(
+        matches!(
+            ea_junk,
+            CheckDestError::DestDeny(DestDenyError::EncodedCommand)
+        ),
+        "invalid EncodedArguments must name EncodedCommand, got {ea_junk}"
+    );
 }
 
 #[test]
@@ -880,6 +933,7 @@ fn check_command_argv_denies_powershell_file_dests() {
         &["pwsh", "-f:.env"],
         &["pwsh", "-File", ".env"],
         &["pwsh", "-NoProfile", "-File:.env"],
+        &["pwsh", "--File:.env"],
     ];
     for argv in denies {
         if check_command_argv(argv, ws.path(), &policy).is_ok() {
@@ -890,6 +944,8 @@ fn check_command_argv_denies_powershell_file_dests() {
         .expect("pwsh -File:readme.md must be allowed");
     check_command_argv(&["pwsh", "-File", "readme.md"], ws.path(), &policy)
         .expect("pwsh -File readme.md must be allowed");
+    check_command_argv(&["pwsh", "--File:readme.md"], ws.path(), &policy)
+        .expect("pwsh --File:readme.md must be allowed");
     check_command_argv(&["tool", "-File:.env"], ws.path(), &policy)
         .expect("generic -File:.env must not dest-deny");
 }
