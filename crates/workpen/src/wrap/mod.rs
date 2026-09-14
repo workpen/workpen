@@ -44,8 +44,9 @@ pub struct KernelGrant {
 /// macOS `run_child` applies Seatbelt `(deny file-read* / file-write*)`
 /// literals (and `subpath` for directories) via nono `add_platform_rule`.
 /// Linux `run_child` bind-overs dest-deny paths in a private mount ns
-/// (Landlock cannot dest-deny inside an allowed tree). Windows read
-/// deny is a follow-up.
+/// when unprivileged user namespaces are available. If `unshare` is
+/// denied, remount is skipped and Landlock still applies (in-tree
+/// dest-deny stays a hole). Windows read deny is a follow-up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelPolicy {
     grants: Vec<KernelGrant>,

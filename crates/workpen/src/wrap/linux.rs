@@ -12,7 +12,9 @@ pub(super) fn apply_dest_deny_remounts(paths: &[std::path::PathBuf]) -> io::Resu
     if paths.is_empty() {
         return Ok(());
     }
-    enter_private_mount_ns()?;
+    if !enter_private_mount_ns()? {
+        return Ok(());
+    }
     let hide_file = hide_node(false)?;
     let hide_dir = hide_node(true)?;
     for path in paths {
@@ -22,13 +24,22 @@ pub(super) fn apply_dest_deny_remounts(paths: &[std::path::PathBuf]) -> io::Resu
     Ok(())
 }
 
-fn enter_private_mount_ns() -> io::Result<()> {
+/// Returns `Ok(false)` when unprivileged user namespaces are denied.
+/// Bind-over failure after a successful unshare is still an error.
+fn enter_private_mount_ns() -> io::Result<bool> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     // Safety: unshare only this thread, which is the forked child before exec.
     let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) };
     if rc != 0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::PermissionDenied
+            || err.raw_os_error() == Some(libc::ENOSYS)
+            || err.raw_os_error() == Some(libc::EPERM)
+        {
+            return Ok(false);
+        }
+        return Err(err);
     }
     std::fs::write("/proc/self/setgroups", "deny")?;
     std::fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))?;
@@ -45,7 +56,7 @@ fn enter_private_mount_ns() -> io::Result<()> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(())
+    Ok(true)
 }
 
 fn hide_node(dir: bool) -> io::Result<std::path::PathBuf> {
