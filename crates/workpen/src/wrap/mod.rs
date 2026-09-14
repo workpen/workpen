@@ -251,6 +251,10 @@ pub fn scrub_child_command(cmd: &mut Command) {
 /// `--split-string` operand, then insert after the first non-flag operand
 /// that is bash. Walks clustered shorts (`-iC /tmp`) and value flags
 /// (`-u NAME`, `-f FILE`, `--file FILE`). Attached forms stay one token.
+///
+/// When argv0 is `timeout`/`nohup`/`nice` (or `.exe`), skip wrapper flags
+/// plus the timeout duration or `nice -n N`, then insert after the first
+/// bash operand. Non-bash commands (`timeout 30 echo hi`) stay unchanged.
 #[must_use]
 pub fn with_bash_noprofile(
     program: impl AsRef<OsStr>,
@@ -268,6 +272,10 @@ pub fn with_bash_noprofile(
         insert_bash_noprofile(&mut args, 0);
     } else if is_env_argv0(&program)
         && let Some(idx) = first_env_bash_operand(&args)
+    {
+        insert_bash_noprofile(&mut args, idx + 1);
+    } else if let Some(kind) = cmd_wrapper(&program)
+        && let Some(idx) = first_wrapper_bash_operand(kind, &args)
     {
         insert_bash_noprofile(&mut args, idx + 1);
     }
@@ -434,6 +442,99 @@ fn first_env_bash_operand(args: &[OsString]) -> Option<usize> {
         return None;
     }
     None
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CmdWrapper {
+    Timeout,
+    Nohup,
+    Nice,
+}
+
+fn cmd_wrapper(program: &OsStr) -> Option<CmdWrapper> {
+    let raw = program.to_string_lossy();
+    let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw.as_ref());
+    if name.eq_ignore_ascii_case("timeout") || name.eq_ignore_ascii_case("timeout.exe") {
+        Some(CmdWrapper::Timeout)
+    } else if name.eq_ignore_ascii_case("nohup") || name.eq_ignore_ascii_case("nohup.exe") {
+        Some(CmdWrapper::Nohup)
+    } else if name.eq_ignore_ascii_case("nice") || name.eq_ignore_ascii_case("nice.exe") {
+        Some(CmdWrapper::Nice)
+    } else {
+        None
+    }
+}
+
+fn first_wrapper_bash_operand(kind: CmdWrapper, args: &[OsString]) -> Option<usize> {
+    let mut i = 0;
+    let mut options_done = false;
+    let mut skip_timeout_duration = kind == CmdWrapper::Timeout;
+    while i < args.len() {
+        let raw = args[i].to_string_lossy();
+        if !options_done {
+            if raw == "--" {
+                options_done = true;
+                i += 1;
+                continue;
+            }
+            if let Some(skip) = wrapper_flag_skip(kind, &raw) {
+                i = i.saturating_add(skip);
+                continue;
+            }
+        }
+        if skip_timeout_duration {
+            skip_timeout_duration = false;
+            i += 1;
+            continue;
+        }
+        if is_bash_argv0(args[i].as_os_str()) {
+            return Some(i);
+        }
+        return None;
+    }
+    None
+}
+
+fn wrapper_takes_value(kind: CmdWrapper, flag: char) -> bool {
+    match kind {
+        CmdWrapper::Timeout => matches!(flag, 's' | 'k'),
+        CmdWrapper::Nice => flag == 'n',
+        CmdWrapper::Nohup => false,
+    }
+}
+
+fn wrapper_long_takes_value(kind: CmdWrapper, long: &str) -> bool {
+    match kind {
+        CmdWrapper::Timeout => matches!(long, "signal" | "kill-after"),
+        CmdWrapper::Nice => long == "adjustment",
+        CmdWrapper::Nohup => false,
+    }
+}
+
+fn wrapper_flag_skip(kind: CmdWrapper, arg: &str) -> Option<usize> {
+    if arg == "-" {
+        return Some(1);
+    }
+    if !arg.starts_with('-') {
+        return None;
+    }
+    if let Some(long) = arg.strip_prefix("--") {
+        if long.contains('=') {
+            return Some(1);
+        }
+        return Some(if wrapper_long_takes_value(kind, long) {
+            2
+        } else {
+            1
+        });
+    }
+    let mut chars = arg[1..].chars();
+    while let Some(c) = chars.next() {
+        if wrapper_takes_value(kind, c) {
+            return Some(if chars.next().is_some() { 1 } else { 2 });
+        }
+    }
+    Some(1)
 }
 
 fn env_flag_skip(arg: &str) -> Option<usize> {

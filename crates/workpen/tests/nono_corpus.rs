@@ -664,6 +664,92 @@ fn with_bash_noprofile_drops_denied_assignments_inside_env_s() {
 }
 
 #[test]
+fn run_inserts_noprofile_norc_after_timeout_nohup_nice_bash() {
+    for program in [
+        "timeout",
+        "/usr/bin/timeout",
+        r"C:\Windows\System32\timeout.exe",
+        "TIMEOUT.EXE",
+    ] {
+        let (got, args) = with_bash_noprofile(program, ["30", "bash", "-l", "-c", "true"]);
+        assert_eq!(got, program);
+        assert_eq!(
+            args,
+            ["30", "bash", "--noprofile", "--norc", "-l", "-c", "true"],
+            "timeout argv0 {program}"
+        );
+    }
+    for program in ["nohup", "/usr/bin/nohup", "NOHUP.EXE"] {
+        let (got, args) = with_bash_noprofile(program, ["bash", "-l", "-c", "true"]);
+        assert_eq!(got, program);
+        assert_eq!(
+            args,
+            ["bash", "--noprofile", "--norc", "-l", "-c", "true"],
+            "nohup argv0 {program}"
+        );
+    }
+    for program in ["nice", "/usr/bin/nice", "NICE.EXE"] {
+        let (got, args) = with_bash_noprofile(program, ["bash", "-l", "-c", "true"]);
+        assert_eq!(got, program);
+        assert_eq!(
+            args,
+            ["bash", "--noprofile", "--norc", "-l", "-c", "true"],
+            "nice argv0 {program}"
+        );
+    }
+    let (_got, args) = with_bash_noprofile("timeout", ["30", "echo", "hi"]);
+    assert_eq!(
+        args,
+        ["30", "echo", "hi"],
+        "timeout 30 echo hi must not invent bash flags"
+    );
+    let (_got, args) = with_bash_noprofile("nice", ["-n", "10", "bash", "-l", "-c", "true"]);
+    assert_eq!(
+        args,
+        [
+            "-n",
+            "10",
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-l",
+            "-c",
+            "true"
+        ],
+        "nice -n 10 must skip the adjustment"
+    );
+    let (_got, args) = with_bash_noprofile("timeout", ["--foreground", "30", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        [
+            "--foreground",
+            "30",
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            "true"
+        ],
+        "timeout flags then duration then bash"
+    );
+    let (_got, args) = with_bash_noprofile("timeout", ["-s", "TERM", "30", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        [
+            "-s",
+            "TERM",
+            "30",
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            "true"
+        ],
+        "timeout -s SIGNAL must skip the signal operand"
+    );
+}
+
+#[test]
 fn run_does_not_duplicate_existing_noprofile() {
     let (_got, args) = with_bash_noprofile("bash", ["--noprofile", "--norc", "-c", "true"]);
     assert_eq!(args, ["--noprofile", "--norc", "-c", "true"]);
