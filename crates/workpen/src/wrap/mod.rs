@@ -278,7 +278,14 @@ impl KernelPolicy {
                 .map_err(|e| KernelError::Apply(e.to_string()))?;
         }
         #[cfg(target_os = "macos")]
-        add_macos_dest_deny_rules(&mut caps, &self.dest_denies)?;
+        {
+            let workspace = self
+                .grants
+                .iter()
+                .find(|g| g.access == KernelAccess::ReadWrite)
+                .map(|g| g.path.as_path());
+            add_macos_dest_deny_rules(&mut caps, &self.dest_denies, workspace)?;
+        }
         Ok(caps.block_network().set_signal_mode(signal))
     }
 }
@@ -652,6 +659,7 @@ fn push_dest_deny(out: &mut Vec<DestDeny>, deny: DestDeny) {
 fn add_macos_dest_deny_rules(
     caps: &mut nono::CapabilitySet,
     denies: &[DestDeny],
+    workspace: Option<&Path>,
 ) -> Result<(), KernelError> {
     for deny in denies {
         for path in dest_deny_rule_paths(&deny.path) {
@@ -674,6 +682,41 @@ fn add_macos_dest_deny_rules(
             }
         }
     }
+    if let Some(workspace) = workspace {
+        add_macos_post_create_rules(caps, workspace)?;
+    }
+    Ok(())
+}
+
+/// Name-based denies so a child `touch .env` then `cat .env` is still blocked.
+#[cfg(target_os = "macos")]
+fn add_macos_post_create_rules(
+    caps: &mut nono::CapabilitySet,
+    workspace: &Path,
+) -> Result<(), KernelError> {
+    for workspace in dest_deny_rule_paths(workspace) {
+        let Some(raw) = workspace.to_str() else {
+            return Err(KernelError::Apply(format!(
+                "workspace path is not UTF-8: {}",
+                workspace.display()
+            )));
+        };
+        let prefix = escape_regex_literal(raw);
+        // One filter only. Combined (subpath)(regex) denied the whole tree.
+        for regex in [
+            format!("^{prefix}/[.]env$"),
+            format!("^{prefix}/.*/[.]env$"),
+            format!("^{prefix}/[.]env[.].*$"),
+            format!("^{prefix}/.*/[.]env[.].*$"),
+        ] {
+            let regex = escape_sbpl_literal(&regex);
+            for action in ["file-read*", "file-write*"] {
+                let rule = format!("(deny {action} (regex \"{regex}\"))");
+                caps.add_platform_rule(&rule)
+                    .map_err(|e| KernelError::Apply(e.to_string()))?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -691,6 +734,21 @@ fn dest_deny_rule_paths(path: &Path) -> Vec<PathBuf> {
 #[cfg(target_os = "macos")]
 fn escape_sbpl_literal(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(target_os = "macos")]
+fn escape_regex_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn refuse_home_workspace(workspace: &Path) -> Result<(), KernelError> {
