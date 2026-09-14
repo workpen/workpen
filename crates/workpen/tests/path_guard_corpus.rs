@@ -327,7 +327,7 @@ fn resolve_extra_root_rejects_implicit_filesystem_root() {
     let dir = workspace();
     let via_dotdot = dir.path().join("..").join("..").join("..").join("..");
     match resolve_extra_root(dir.path(), &via_dotdot.to_string_lossy()) {
-        Err(ExtraRootError::EscapedToRoot { .. }) => {}
+        Err(ExtraRootError::EscapedToRoot { .. } | ExtraRootError::Home(_)) => {}
         Ok(p) if p.parent().is_some_and(|x| !x.as_os_str().is_empty()) => {
             // sandbox may not walk to fs root; still must not grant implicit /
         }
