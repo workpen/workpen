@@ -560,15 +560,30 @@ fn head_commit_time(path: &Path) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
 }
 
-fn index_mtime(path: &Path) -> Option<SystemTime> {
+fn index_file(path: &Path) -> Option<PathBuf> {
     let raw = git(path, &["rev-parse", "--git-path", "index"]).ok()?;
     let index = PathBuf::from(raw.trim());
-    let index = if index.is_absolute() {
+    Some(if index.is_absolute() {
         index
     } else {
         path.join(index)
+    })
+}
+
+fn index_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(index_file(path)?)
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// `git status` refreshes the index. That must not bump last-used.
+fn restore_index_mtime(path: &Path, prev: SystemTime) {
+    let Some(index) = index_file(path) else {
+        return;
     };
-    std::fs::metadata(index).and_then(|m| m.modified()).ok()
+    if let Ok(file) = std::fs::File::open(index) {
+        let _ = file.set_modified(prev);
+    }
 }
 
 /// Finished walk of file mtimes. `Err` if `read_dir` failed or the
@@ -692,6 +707,7 @@ fn is_under_known_cache(root: &Path, file: &Path) -> bool {
 /// `!! target/`, not `!! target/.env`). Other XY statuses under those names
 /// are DirtyWork (tracked dirty cache paths).
 fn unique_work_reason(path: &Path, policy: &DenyPolicy) -> Option<KeepReason> {
+    let index_before = index_mtime(path);
     let out = match git(
         path,
         &[
@@ -706,6 +722,9 @@ fn unique_work_reason(path: &Path, policy: &DenyPolicy) -> Option<KeepReason> {
         Ok(s) => s,
         Err(_) => return Some(KeepReason::StatusUnreadable),
     };
+    if let Some(prev) = index_before {
+        restore_index_mtime(path, prev);
+    }
     let mut has_unique = false;
     for line in out.lines() {
         if line.is_empty() {

@@ -843,6 +843,62 @@ fn dry_run_does_not_remove() {
 }
 
 #[test]
+fn dry_run_does_not_refresh_last_used() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let out = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00")
+        .args([
+            "commit",
+            "--amend",
+            "--no-edit",
+            "--date=2000-01-01T00:00:00",
+        ])
+        .current_dir(&repo)
+        .output()
+        .expect("amend committer");
+    assert!(
+        out.status.success(),
+        "amend: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "aged");
+    let _ = Command::new("find")
+        .args([
+            wt.to_str().expect("utf8"),
+            repo.join(".git/worktrees").to_str().expect("utf8"),
+            "-exec",
+            "touch",
+            "-t",
+            "200001010000",
+            "{}",
+            "+",
+        ])
+        .status();
+    let mut gc = cfg(&repo, Duration::from_secs(86400), SystemTime::now());
+    gc.dry_run = true;
+    let first = run_gc(&repo, &gc).expect("dry-run 1");
+    assert!(
+        first.iter().any(
+            |(p, d)| p.file_name() == wt.file_name() && matches!(d, GcDecision::Reclaim { .. })
+        ),
+        "first dry-run must reclaim: {first:?}"
+    );
+    let second = run_gc(&repo, &gc).expect("dry-run 2");
+    assert!(
+        second.iter().any(
+            |(p, d)| p.file_name() == wt.file_name() && matches!(d, GcDecision::Reclaim { .. })
+        ),
+        "second dry-run must still reclaim (git status must not bump last-used): {second:?}"
+    );
+    assert!(wt.exists(), "dry-run must leave the tree");
+}
+
+#[test]
 fn registry_unreadable_is_error() {
     let dir = TempDir::new().expect("tmp");
     match run_gc(
