@@ -476,6 +476,32 @@ fn home_as_workspace_is_refused() {
 }
 
 #[test]
+fn home_as_extra_root_is_refused() {
+    let Some(home) = user_home_dir() else {
+        return;
+    };
+    if !home.is_dir() {
+        return;
+    }
+    let dir = workspace();
+    let err = process_jail(dir.path(), [&home]).expect_err("home extra");
+    match err {
+        KernelError::Home(path) => {
+            let msg = KernelError::Home(path.clone()).to_string();
+            assert!(
+                msg.contains(&path.display().to_string()),
+                "Home extra must name refused path: {msg}"
+            );
+            assert!(
+                msg.to_ascii_lowercase().contains("subdirectory"),
+                "Home extra must say use a subdirectory: {msg}"
+            );
+        }
+        other => panic!("expected Home extra, got {other}"),
+    }
+}
+
+#[test]
 fn temp_workspace_is_not_home() {
     let dir = workspace();
     process_jail(dir.path(), std::iter::empty::<&Path>()).expect("temp workspace");

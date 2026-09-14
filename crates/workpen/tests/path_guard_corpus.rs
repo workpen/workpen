@@ -481,6 +481,38 @@ fn resolve_workspace_root_allows_explicit_tmp() {
 }
 
 #[test]
+fn resolve_extra_root_rejects_home() {
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        return;
+    };
+    let Ok(home) = dunce::canonicalize(&home) else {
+        return;
+    };
+    if !home.is_dir() {
+        return;
+    };
+    let dir = workspace();
+    match resolve_extra_root(dir.path(), &home.to_string_lossy()) {
+        Err(ExtraRootError::Home(path)) => {
+            let msg = ExtraRootError::Home(path.clone()).to_string();
+            assert!(
+                msg.contains(&path.display().to_string()),
+                "home extra must name refused path: {msg}"
+            );
+            assert!(
+                msg.to_ascii_lowercase().contains("subdirectory"),
+                "home extra must say use a project subdirectory: {msg}"
+            );
+        }
+        other => panic!("home extra must be ExtraRootError::Home, got {other:?}"),
+    }
+    if let Some(cache) = home.join(".cache").is_dir().then(|| home.join(".cache")) {
+        resolve_extra_root(dir.path(), &cache.to_string_lossy())
+            .expect("home subdirectory extra must stay allowed");
+    }
+}
+
+#[test]
 fn resolve_workspace_root_rejects_home() {
     let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
         return;

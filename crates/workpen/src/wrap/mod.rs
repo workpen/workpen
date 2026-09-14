@@ -96,7 +96,8 @@ pub fn kernel_supported() -> bool {
 /// Build a process-jail policy. Does not apply it.
 ///
 /// Refuses filesystem root and the current user's home directory as the
-/// workspace. Extra-roots may still be an explicit `/tmp`.
+/// workspace or as an extra-root. Extra-roots may still be an explicit
+/// `/tmp` or a subdirectory of home.
 ///
 /// Dest-deny names default to [`crate::default_secret_denies()`] resolved
 /// under the workspace, including hardlink siblings. Hosts match
@@ -803,6 +804,9 @@ fn system_read_dirs() -> Vec<PathBuf> {
 
 fn add_rw(grants: &mut Vec<KernelGrant>, path: &Path) -> Result<(), KernelError> {
     let resolved = canonicalize_dir(path)?;
+    if crate::guard::is_user_home_dir(&resolved) {
+        return Err(KernelError::Home(resolved));
+    }
     // Grant the path as given so symlink lookups (`/tmp` -> `/private/tmp`) work.
     if !is_fs_root(path) && path != resolved.as_path() {
         push_grant(grants, path.to_path_buf(), KernelAccess::ReadWrite);

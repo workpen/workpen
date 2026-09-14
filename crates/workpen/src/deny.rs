@@ -471,6 +471,7 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// tokens in that string as env flags (`--file=`, `-f`, `NAME=value`).
 /// After skipping a `timeout`/`nohup`/`nice` prefix (same skip as wrap),
 /// dest-denies those env flags when the remaining argv starts with env.
+/// A nested `env` operand (or `env -- env …`) is walked the same way.
 /// Dest-denies argv `-f`/`--file` (including attached `--file=.env`) via
 /// [`check_dest`]. Does not dest-deny a flattened join of all argv. Does
 /// not peel generic `--flag=.env`.
@@ -660,7 +661,7 @@ fn check_env_flag_dests_inner(
     while i < args.len() {
         let raw = args[i].as_ref();
         if raw == "--" || raw == "-" {
-            break;
+            return continue_env_after_operand(&args[i + 1..], root, policy);
         }
         if !raw.starts_with('-') {
             if raw.contains('=') {
@@ -673,7 +674,7 @@ fn check_env_flag_dests_inner(
                 i += 1;
                 continue;
             }
-            break;
+            return continue_env_after_operand(&args[i..], root, policy);
         }
         if let Some(long) = raw.strip_prefix("--") {
             if let Some((name, value)) = long.split_once('=') {
@@ -720,6 +721,29 @@ fn check_env_flag_dests_inner(
                 i += if attached.is_empty() { 2 } else { 1 };
             }
             None => i += 1,
+        }
+    }
+    Ok(())
+}
+
+fn continue_env_after_operand(
+    args: &[impl AsRef<str>],
+    root: &Path,
+    policy: &DenyPolicy,
+) -> Result<(), CheckDestError> {
+    let Some(first) = args.first() else {
+        return Ok(());
+    };
+    if is_env_program(first.as_ref()) {
+        return check_env_flag_dests(&args[1..], root, policy);
+    }
+    if let Some(kind) = cmd_wrapper(first.as_ref()) {
+        let start = skip_wrapper_prefix(kind, &args[1..]);
+        if args
+            .get(1 + start)
+            .is_some_and(|t| is_env_program(t.as_ref()))
+        {
+            return check_env_flag_dests(&args[2 + start..], root, policy);
         }
     }
     Ok(())

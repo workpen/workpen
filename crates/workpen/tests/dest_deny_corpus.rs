@@ -512,6 +512,14 @@ fn check_command_argv_denies_env_split_string_and_file() {
     .expect_err("env.exe --split-string cat .env must dest-deny");
     check_command_argv(&["env", "-S", "echo hello"], ws.path(), &policy)
         .expect("env -S echo hello must be allowed");
+    check_command_argv(&["env", "env", "-S", "cat .env"], ws.path(), &policy)
+        .expect_err("nested env env -S cat .env must dest-deny");
+    check_command_argv(&["env", "--", "env", "-S", "cat .env"], ws.path(), &policy)
+        .expect_err("env -- env -S cat .env must dest-deny");
+    check_command_argv(&["env", "env", "-S", "cat readme.md"], ws.path(), &policy)
+        .expect("nested env env -S cat readme.md must be allowed");
+    check_command_argv(&["env", "echo", "--file=.env"], ws.path(), &policy)
+        .expect("env echo --file=.env must not dest-deny");
     check_command_argv(&["env", "-S", "cat readme.md"], ws.path(), &policy)
         .expect("env -S cat readme.md must be allowed");
     check_command_argv(&["env", "--file=readme.md", "bash"], ws.path(), &policy)
@@ -566,6 +574,7 @@ fn check_command_argv_denies_env_flags_after_timeout_nohup_nice() {
             "bash",
         ],
         &["timeout", "-s", "TERM", "30", "env", "-S", "cat .env"],
+        &["timeout", "30", "env", "env", "-S", "cat .env"],
         &["nohup", "env", "-S", "--file=.env"],
         &["/usr/bin/nohup", "env", "--file=.env", "bash"],
         &["NOHUP.EXE", "env", "-S", "cat .env"],
