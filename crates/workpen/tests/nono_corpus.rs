@@ -12,9 +12,9 @@ use tempfile::TempDir;
 use workpen::resolve_extra_root;
 use workpen::{
     AGENT_LOCK_NAME, DenyPolicy, DestDenyKind, KernelAccess, KernelApply, KernelError,
-    child_env_deny_names, collect_workspace_dest_denies, is_denied_child_env, kernel_supported,
-    load_agent_lock, process_jail, process_jail_with_policy, require_applied, scrub_child_command,
-    spawn_after_setup, with_bash_noprofile,
+    child_env_deny_names, collect_workspace_dest_denies, collect_workspace_dest_denies_limited,
+    is_denied_child_env, kernel_supported, load_agent_lock, process_jail, process_jail_with_policy,
+    require_applied, scrub_child_command, spawn_after_setup, with_bash_noprofile,
 };
 
 fn workspace() -> TempDir {
@@ -310,6 +310,49 @@ fn run_child_cannot_read_env_hardlink_sibling() {
     assert!(
         !leaked.contains("SECRET"),
         "hardlink sibling must be dest-denied: {leaked:?}"
+    );
+}
+
+#[test]
+fn dest_deny_walk_skips_git_and_does_not_charge_cache_artifacts() {
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    fs::create_dir_all(dir.path().join("target/deps")).expect("target/deps");
+    fs::write(dir.path().join("target/.env"), "SECRET=1\n").expect("target env");
+    for i in 0..30 {
+        fs::write(
+            dir.path()
+                .join("target/deps")
+                .join(format!("crate{i}.rmeta")),
+            [],
+        )
+        .expect("dummy");
+    }
+    fs::create_dir_all(dir.path().join(".git")).expect("git");
+    fs::write(dir.path().join(".git/config"), "[core]\n").expect("git config");
+    fs::write(dir.path().join(".git/.env"), "SECRET=1\n").expect("git env");
+    let found = collect_workspace_dest_denies_limited(dir.path(), &DenyPolicy::default(), 8)
+        .expect("cache artifacts must not exhaust dest-deny walk");
+    assert!(
+        found.iter().any(|d| d.path == dir.path().join(".env")),
+        "workspace .env must dest-deny: {found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|d| d.path == dir.path().join("target/.env")),
+        "target/.env must dest-deny: {found:?}"
+    );
+    assert!(
+        found.iter().all(|d| d.path != dir.path().join(".git/.env")),
+        "must not dest-deny .git/.env: {found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .all(|d| d.path.file_name().is_none_or(|n| n != "readme.md")),
+        "readme.md must not dest-deny: {found:?}"
     );
 }
 

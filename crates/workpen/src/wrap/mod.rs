@@ -670,19 +670,58 @@ pub fn require_applied(applied: KernelApply) -> Result<KernelApply, KernelError>
 }
 
 const DEST_DENY_WALK_LIMIT: usize = 65_536;
+/// Duplicated from gc (feature-gated). Do not import `gc::CACHE_DIR_NAMES`.
+const DEST_DENY_CACHE_DIR_NAMES: &[&str] =
+    &["target", "node_modules", ".venv", "dist", "__pycache__"];
 
 /// Existing dest-deny files under `workspace`, including hardlink siblings.
 ///
-/// Does not apply the jail. Does not follow directory symlinks. Walk
-/// failure or an entry cap is [`KernelError::Root`].
+/// Does not apply the jail. Does not follow directory symlinks. Does
+/// not descend `.git`. Cache trees are walked for dest-deny names
+/// only; non-deny rustc artifacts do not count toward the entry cap.
+/// Walk failure or an entry cap is [`KernelError::Root`].
 pub fn collect_workspace_dest_denies(
     workspace: &Path,
     policy: &DenyPolicy,
 ) -> Result<Vec<DestDeny>, KernelError> {
+    collect_workspace_dest_denies_limited(workspace, policy, DEST_DENY_WALK_LIMIT)
+}
+
+/// Same as [`collect_workspace_dest_denies`] with a host-chosen entry cap.
+pub fn collect_workspace_dest_denies_limited(
+    workspace: &Path,
+    policy: &DenyPolicy,
+    limit: usize,
+) -> Result<Vec<DestDeny>, KernelError> {
     let mut out = Vec::new();
-    let mut remaining = DEST_DENY_WALK_LIMIT;
-    walk_dest_denies(workspace, policy, &mut out, &mut remaining)?;
+    let mut remaining = limit;
+    walk_dest_denies(workspace, policy, &mut out, &mut remaining, limit)?;
     Ok(out)
+}
+
+fn dest_deny_walk_cap(dir: &Path, limit: usize) -> KernelError {
+    KernelError::Root(format!(
+        "dest-deny walk exceeded {limit} entries under {}",
+        dir.display()
+    ))
+}
+
+fn dest_deny_walk_io(dir: &Path, err: std::io::Error) -> KernelError {
+    KernelError::Root(format!("dest-deny walk {}: {err}", dir.display()))
+}
+
+fn entry_file_name(path: &Path) -> &str {
+    path.file_name().and_then(|n| n.to_str()).unwrap_or("")
+}
+
+fn is_git_dir_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(".git")
+}
+
+fn is_dest_deny_cache_dir_name(name: &str) -> bool {
+    DEST_DENY_CACHE_DIR_NAMES
+        .iter()
+        .any(|n| name.eq_ignore_ascii_case(n))
 }
 
 fn walk_dest_denies(
@@ -690,34 +729,66 @@ fn walk_dest_denies(
     policy: &DenyPolicy,
     out: &mut Vec<DestDeny>,
     remaining: &mut usize,
+    limit: usize,
 ) -> Result<(), KernelError> {
     if *remaining == 0 {
-        return Err(KernelError::Root(format!(
-            "dest-deny walk exceeded {DEST_DENY_WALK_LIMIT} entries under {}",
-            dir.display()
-        )));
+        return Err(dest_deny_walk_cap(dir, limit));
     }
-    let rd = std::fs::read_dir(dir)
-        .map_err(|e| KernelError::Root(format!("dest-deny walk {}: {e}", dir.display())))?;
+    let rd = std::fs::read_dir(dir).map_err(|e| dest_deny_walk_io(dir, e))?;
     for ent in rd {
+        let ent = ent.map_err(|e| dest_deny_walk_io(dir, e))?;
+        let path = ent.path();
+        let name = entry_file_name(&path);
+        if is_git_dir_name(name) {
+            continue;
+        }
+        let ft = ent.file_type().map_err(|e| dest_deny_walk_io(&path, e))?;
+        if is_dest_deny_cache_dir_name(name) && ft.is_dir() && !ft.is_symlink() {
+            walk_cache_dest_denies(&path, policy, out, remaining, limit)?;
+            continue;
+        }
         if *remaining == 0 {
-            return Err(KernelError::Root(format!(
-                "dest-deny walk exceeded {DEST_DENY_WALK_LIMIT} entries under {}",
-                dir.display()
-            )));
+            return Err(dest_deny_walk_cap(dir, limit));
         }
         *remaining -= 1;
-        let ent =
-            ent.map_err(|e| KernelError::Root(format!("dest-deny walk {}: {e}", dir.display())))?;
-        let path = ent.path();
-        let ft = ent
-            .file_type()
-            .map_err(|e| KernelError::Root(format!("dest-deny walk {}: {e}", path.display())))?;
         if ft.is_dir() && !ft.is_symlink() {
-            walk_dest_denies(&path, policy, out, remaining)?;
+            walk_dest_denies(&path, policy, out, remaining, limit)?;
             continue;
         }
         if let Some(deny) = dest_deny_at(&path, path.display().to_string(), policy) {
+            push_dest_deny(out, deny);
+        }
+    }
+    Ok(())
+}
+
+/// Walk a cache tree for dest-deny hits only. Non-deny files are not
+/// charged to the entry cap. Does not follow directory symlinks.
+fn walk_cache_dest_denies(
+    dir: &Path,
+    policy: &DenyPolicy,
+    out: &mut Vec<DestDeny>,
+    remaining: &mut usize,
+    limit: usize,
+) -> Result<(), KernelError> {
+    let rd = std::fs::read_dir(dir).map_err(|e| dest_deny_walk_io(dir, e))?;
+    for ent in rd {
+        let ent = ent.map_err(|e| dest_deny_walk_io(dir, e))?;
+        let path = ent.path();
+        let name = entry_file_name(&path);
+        if is_git_dir_name(name) {
+            continue;
+        }
+        let ft = ent.file_type().map_err(|e| dest_deny_walk_io(&path, e))?;
+        if ft.is_dir() && !ft.is_symlink() {
+            walk_cache_dest_denies(&path, policy, out, remaining, limit)?;
+            continue;
+        }
+        if let Some(deny) = dest_deny_at(&path, path.display().to_string(), policy) {
+            if *remaining == 0 {
+                return Err(dest_deny_walk_cap(dir, limit));
+            }
+            *remaining -= 1;
             push_dest_deny(out, deny);
         }
     }
