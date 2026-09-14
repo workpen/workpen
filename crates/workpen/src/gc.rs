@@ -366,11 +366,7 @@ fn refuse_home(repo: &Path) -> Result<(), GcError> {
 }
 
 fn is_home(path: &Path) -> bool {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .and_then(|h| std::fs::canonicalize(h).ok())
-        .and_then(|home| std::fs::canonicalize(path).ok().map(|p| p == home))
-        .unwrap_or(false)
+    crate::guard::is_user_home_dir(path)
 }
 
 fn repo_root(cwd: &Path) -> Result<PathBuf, GcError> {

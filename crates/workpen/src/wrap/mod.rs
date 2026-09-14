@@ -2,11 +2,14 @@
 //!
 //! Unix uses pinned nono (Landlock / Seatbelt). Windows uses a
 //! write-restricted token. Never grant filesystem root (`/` or a
-//! Windows drive root). Inspect [`KernelPolicy::grants`]; do not parse
-//! nono internals. Do not call [`KernelPolicy::apply`] from unit tests
-//! (`Sandbox::apply_auto` is irreversible). [`KernelPolicy::apply_pre_exec`]
-//! only installs a Unix child hook. Hosts that need a jail on every OS
-//! call [`KernelPolicy::run_child`].
+//! Windows drive root) or the current user's home directory. Inspect
+//! [`KernelPolicy::grants`]; do not parse nono internals. Do not call
+//! [`KernelPolicy::apply`] from unit tests (`Sandbox::apply_auto` is
+//! irreversible). [`KernelPolicy::apply_pre_exec`] only installs a Unix
+//! child hook. Hosts that need a jail on every OS call
+//! [`KernelPolicy::run_child`], which errors instead of spawning when
+//! the kernel cannot apply. The default crate (`default = []`) does not
+//! compile this module.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -51,6 +54,8 @@ pub enum KernelError {
     Root(String),
     #[error("kernel wrap refused filesystem root {0}; use a subdirectory, not `/`")]
     FsRoot(PathBuf),
+    #[error("kernel wrap refused home directory {0}; use a project subdirectory, not $HOME")]
+    Home(PathBuf),
     #[error("kernel wrap apply failed: {0}")]
     Apply(String),
 }
@@ -73,10 +78,14 @@ pub fn kernel_supported() -> bool {
 }
 
 /// Build a process-jail policy. Does not apply it.
+///
+/// Refuses filesystem root and the current user's home directory as the
+/// workspace. Extra-roots may still be an explicit `/tmp`.
 pub fn process_jail(
     workspace: impl AsRef<Path>,
     extra: impl IntoIterator<Item = impl AsRef<Path>>,
 ) -> Result<KernelPolicy, KernelError> {
+    refuse_home_workspace(workspace.as_ref())?;
     let mut grants = Vec::new();
     add_rw(&mut grants, workspace.as_ref())?;
     for extra in extra {
@@ -96,6 +105,11 @@ impl KernelPolicy {
         &self.grants
     }
 
+    /// True when the policy asked the kernel backend to block sockets.
+    ///
+    /// Unix `run_child` passes this to nono `block_network()`. Windows
+    /// write-restricted tokens do not block TCP; this flag is stored
+    /// but not enforced there.
     pub fn network_blocked(&self) -> bool {
         self.network_blocked
     }
@@ -157,15 +171,21 @@ impl KernelPolicy {
     /// Spawn `cmd` under the kernel jail and wait for it.
     ///
     /// Unix installs `pre_exec` then `status`. Windows creates a
-    /// write-restricted token and `CreateProcessAsUserW`. A Windows
-    /// token or job failure is [`KernelError::Apply`]; the child is
-    /// not started unsandboxed.
+    /// write-restricted token and `CreateProcessAsUserW`. If the kernel
+    /// cannot apply, this returns [`KernelError::Apply`] and does not
+    /// start the child. [`KernelApply::UserspaceOnly`] stays on
+    /// [`Self::apply`] / [`Self::apply_pre_exec`] inspect paths only.
     pub fn run_child(&self, cmd: Command) -> Result<(KernelApply, ExitStatus), KernelError> {
         #[cfg(unix)]
         {
+            if !kernel_supported() {
+                return Err(KernelError::Apply(
+                    "kernel jail is not available; child was not started".into(),
+                ));
+            }
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
-            let applied = self.apply_pre_exec(&mut cmd)?;
+            let applied = require_applied(self.apply_pre_exec(&mut cmd)?)?;
             let status = cmd
                 .status()
                 .map_err(|e| KernelError::Apply(e.to_string()))?;
@@ -484,6 +504,27 @@ pub fn spawn_after_setup<T>(
     spawn: impl FnOnce(T) -> Result<(KernelApply, ExitStatus), KernelError>,
 ) -> Result<(KernelApply, ExitStatus), KernelError> {
     spawn(setup?)
+}
+
+/// Refuse a userspace-only inspect result on the spawn path.
+pub fn require_applied(applied: KernelApply) -> Result<KernelApply, KernelError> {
+    match applied {
+        KernelApply::Applied => Ok(applied),
+        KernelApply::UserspaceOnly => Err(KernelError::Apply(
+            "kernel jail did not apply; child was not started".into(),
+        )),
+    }
+}
+
+fn refuse_home_workspace(workspace: &Path) -> Result<(), KernelError> {
+    let resolved = match std::fs::canonicalize(workspace) {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+    if crate::guard::is_user_home_dir(&resolved) {
+        return Err(KernelError::Home(resolved));
+    }
+    Ok(())
 }
 
 fn system_read_dirs() -> Vec<PathBuf> {

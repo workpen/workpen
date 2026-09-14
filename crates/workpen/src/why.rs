@@ -39,6 +39,7 @@ pub fn explain(path: &Path, policy: &DenyPolicy, guard: Option<&PathGuard>) -> W
             Err(PathGuardError::EmptyPath) => return Why::EmptyPath,
             Err(
                 PathGuardError::Root(_)
+                | PathGuardError::Home(_)
                 | PathGuardError::AbsolutePath(_)
                 | PathGuardError::Canonicalize { .. },
             ) => {
