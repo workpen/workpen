@@ -561,15 +561,12 @@ fn prepare_network_blocked(policy: &KernelPolicy) -> Result<Prepared, KernelErro
     let helper =
         windows_net::HelperFile::install(&workspace).map_err(prefix_apply("net helper"))?;
     let mut prepared = prepare_write_restricted(policy)?;
-    let mut remaining = 65_536usize;
     for path in rw_grant_paths(policy) {
-        grant_package_tree(
-            &path,
-            profile.sid(),
-            &mut prepared.acl_guards,
-            &mut remaining,
-        )?;
+        grant_package_root(&path, profile.sid(), &mut prepared.acl_guards)?;
     }
+    prepared
+        .acl_guards
+        .extend(deny_dest_aces(&dest_deny_paths(policy), profile.sid())?);
     prepared.acl_guards.push(set_acl_entry(
         helper.path(),
         profile.sid(),
@@ -618,20 +615,15 @@ fn current_primary_token() -> Result<CloseOnDrop, KernelError> {
     duplicate_primary_token(process_token.0)
 }
 
-fn grant_package_tree(
+/// One inheritable GRANT on the ReadWrite root. Dest-deny files get an
+/// explicit package DENY after this so inherit cannot reopen them.
+fn grant_package_root(
     root: &Path,
     sid: Handle,
     guards: &mut Vec<AclRestore>,
-    remaining: &mut usize,
 ) -> Result<(), KernelError> {
-    if *remaining == 0 {
-        return Err(KernelError::Apply(
-            "package ACE walk exceeded 65536 entries".into(),
-        ));
-    }
-    *remaining -= 1;
     let meta = std::fs::symlink_metadata(root)
-        .map_err(|e| KernelError::Apply(format!("package ACE walk {}: {e}", root.display())))?;
+        .map_err(|e| KernelError::Apply(format!("package ACE {}: {e}", root.display())))?;
     let is_dir = meta.is_dir() && !meta.file_type().is_symlink();
     let inherit = if is_dir {
         SUB_CONTAINERS_AND_OBJECTS_INHERIT
@@ -645,16 +637,6 @@ fn grant_package_tree(
         GRANT_ACCESS,
         inherit,
     )?);
-    if !is_dir {
-        return Ok(());
-    }
-    let rd = std::fs::read_dir(root)
-        .map_err(|e| KernelError::Apply(format!("package ACE walk {}: {e}", root.display())))?;
-    for ent in rd {
-        let ent = ent
-            .map_err(|e| KernelError::Apply(format!("package ACE walk {}: {e}", root.display())))?;
-        grant_package_tree(&ent.path(), sid, guards, remaining)?;
-    }
     Ok(())
 }
 
@@ -723,8 +705,8 @@ fn spawn_prepared(
     timeout: Option<Duration>,
 ) -> Result<(KernelApply, ExitStatus), KernelError> {
     let result = spawn_prepared_child(&mut prepared, cmd, timeout);
-    restore_guards(&mut prepared.acl_guards)?;
-    result
+    let restore = restore_guards(&mut prepared.acl_guards);
+    super::combine_spawn_restore(result, restore)
 }
 
 fn spawn_prepared_child(
