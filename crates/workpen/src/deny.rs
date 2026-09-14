@@ -463,9 +463,14 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// Empty and flag-looking tokens are skipped. A shell `-c` token, including
 /// short-option clusters that contain `c` (`-lc`, `-ic`, `-lic`, `-cl`)
 /// and an attached `-cBODY`, dest-denies paths inside the script body
-/// via [`check_command_dests`]. When argv0 is `env`/`env.exe`, dest-denies
-/// the operand of `-S`/`--split-string` via [`check_command_dests`], then
-/// leftover tokens in that string as env flags (`--file=`, `-f`, `NAME=value`).
+/// via [`check_command_dests`]. When that body (or any peeled command
+/// string) contains an `env`/`env.exe` token, dest-denies the following
+/// tokens with the same env-flag dest check used for argv0 env.
+/// When argv0 is `env`/`env.exe`, dest-denies the operand of
+/// `-S`/`--split-string` via [`check_command_dests`], then leftover
+/// tokens in that string as env flags (`--file=`, `-f`, `NAME=value`).
+/// After skipping a `timeout`/`nohup`/`nice` prefix (same skip as wrap),
+/// dest-denies those env flags when the remaining argv starts with env.
 /// Dest-denies argv `-f`/`--file` (including attached `--file=.env`) via
 /// [`check_dest`]. Does not dest-deny a flattened join of all argv. Does
 /// not peel generic `--flag=.env`.
@@ -486,6 +491,14 @@ pub fn check_command_argv(
     }
     if cmd.first().is_some_and(|t| is_env_program(t.as_ref())) {
         check_env_flag_dests(&cmd[1..], root, policy)?;
+    } else if let Some(kind) = cmd.first().and_then(|t| cmd_wrapper(t.as_ref())) {
+        let start = skip_wrapper_prefix(kind, &cmd[1..]);
+        if cmd
+            .get(1 + start)
+            .is_some_and(|t| is_env_program(t.as_ref()))
+        {
+            check_env_flag_dests(&cmd[2 + start..], root, policy)?;
+        }
     }
     Ok(())
 }
@@ -494,6 +507,98 @@ pub(crate) fn is_env_program(program: impl AsRef<OsStr>) -> bool {
     let raw = program.as_ref().to_string_lossy();
     let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw.as_ref());
     name.eq_ignore_ascii_case("env") || name.eq_ignore_ascii_case("env.exe")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CmdWrapper {
+    Timeout,
+    Nohup,
+    Nice,
+}
+
+pub(crate) fn cmd_wrapper(program: impl AsRef<OsStr>) -> Option<CmdWrapper> {
+    let raw = program.as_ref().to_string_lossy();
+    let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw.as_ref());
+    if name.eq_ignore_ascii_case("timeout") || name.eq_ignore_ascii_case("timeout.exe") {
+        Some(CmdWrapper::Timeout)
+    } else if name.eq_ignore_ascii_case("nohup") || name.eq_ignore_ascii_case("nohup.exe") {
+        Some(CmdWrapper::Nohup)
+    } else if name.eq_ignore_ascii_case("nice") || name.eq_ignore_ascii_case("nice.exe") {
+        Some(CmdWrapper::Nice)
+    } else {
+        None
+    }
+}
+
+/// Skip timeout/nohup/nice flags plus the timeout duration. Returns the
+/// index of the first remaining command operand.
+pub(crate) fn skip_wrapper_prefix(kind: CmdWrapper, args: &[impl AsRef<str>]) -> usize {
+    let mut i = 0;
+    let mut options_done = false;
+    let mut skip_timeout_duration = kind == CmdWrapper::Timeout;
+    while i < args.len() {
+        let raw = args[i].as_ref();
+        if !options_done {
+            if raw == "--" {
+                options_done = true;
+                i += 1;
+                continue;
+            }
+            if let Some(skip) = wrapper_flag_skip(kind, raw) {
+                i = i.saturating_add(skip);
+                continue;
+            }
+        }
+        if skip_timeout_duration {
+            skip_timeout_duration = false;
+            i += 1;
+            continue;
+        }
+        return i;
+    }
+    i
+}
+
+fn wrapper_takes_value(kind: CmdWrapper, flag: char) -> bool {
+    match kind {
+        CmdWrapper::Timeout => matches!(flag, 's' | 'k'),
+        CmdWrapper::Nice => flag == 'n',
+        CmdWrapper::Nohup => false,
+    }
+}
+
+fn wrapper_long_takes_value(kind: CmdWrapper, long: &str) -> bool {
+    match kind {
+        CmdWrapper::Timeout => matches!(long, "signal" | "kill-after"),
+        CmdWrapper::Nice => long == "adjustment",
+        CmdWrapper::Nohup => false,
+    }
+}
+
+fn wrapper_flag_skip(kind: CmdWrapper, arg: &str) -> Option<usize> {
+    if arg == "-" {
+        return Some(1);
+    }
+    if !arg.starts_with('-') {
+        return None;
+    }
+    if let Some(long) = arg.strip_prefix("--") {
+        if long.contains('=') {
+            return Some(1);
+        }
+        return Some(if wrapper_long_takes_value(kind, long) {
+            2
+        } else {
+            1
+        });
+    }
+    let mut chars = arg[1..].chars();
+    while let Some(c) = chars.next() {
+        if wrapper_takes_value(kind, c) {
+            return Some(if chars.next().is_some() { 1 } else { 2 });
+        }
+    }
+    Some(1)
 }
 
 pub(crate) fn env_takes_value(flag: char) -> bool {
@@ -641,7 +746,9 @@ fn check_env_file_dest(path: &str, root: &Path, policy: &DenyPolicy) -> Result<(
 /// Join extracted command dests under `root` and dest-deny each.
 ///
 /// Absolute dests stay as given. Empty and flag-looking peeled tokens
-/// are skipped. Does not peel `--flag=.env`.
+/// are skipped. After peeling, an `env`/`env.exe` token dest-denies
+/// the following tokens with the same env-flag dest check used for
+/// argv0 env. Does not peel `--flag=.env`.
 pub fn check_command_dests(
     command: &str,
     root: &Path,
@@ -656,7 +763,61 @@ pub fn check_command_dests(
             check_dest(&dest.to_string_lossy(), policy, None)?;
         }
     }
+    check_command_string_env_dests(command, root, policy)
+}
+
+/// After peeling a command string, dest-deny env `-S`/`--file` operands.
+///
+/// Recurses into a shell `-c` body. Does not peel generic `--flag=.env`.
+fn check_command_string_env_dests(
+    command: &str,
+    root: &Path,
+    policy: &DenyPolicy,
+) -> Result<(), CheckDestError> {
+    for part in peel_shell_parts(command) {
+        let tokens = command_string_tokens(part);
+        for (i, token) in tokens.iter().enumerate() {
+            if is_env_program(*token) {
+                check_env_flag_dests(&tokens[i + 1..], root, policy)?;
+            }
+            if let Some(body) = shell_c_body(token, tokens.get(i + 1).copied()) {
+                check_command_string_env_dests(body, root, policy)?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// Whitespace words; matching quotes yield the inner string as one token.
+fn command_string_tokens(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\'' || bytes[i] == b'"' {
+            let q = bytes[i];
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != q {
+                i += 1;
+            }
+            out.push(&command[start..i]);
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        out.push(&command[start..i]);
+    }
+    out
 }
 
 /// Committed dotenv templates, not live env files.

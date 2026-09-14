@@ -251,6 +251,12 @@ pub fn scrub_child_command(cmd: &mut Command) {
 /// `--split-string` operand, then insert after the first non-flag operand
 /// that is bash. Walks clustered shorts (`-iC /tmp`) and value flags
 /// (`-u NAME`, `-f FILE`, `--file FILE`). Attached forms stay one token.
+///
+/// When argv0 is `timeout`/`nohup`/`nice` (or `.exe`), skip wrapper flags
+/// plus the timeout duration or `nice -n N`. If the remaining argv starts
+/// with env, drop denylist assignments on that env argv, then insert after
+/// the first bash operand (wrapper bash or env bash). Non-bash commands
+/// (`timeout 30 echo hi`) stay unchanged.
 #[must_use]
 pub fn with_bash_noprofile(
     program: impl AsRef<OsStr>,
@@ -262,7 +268,12 @@ pub fn with_bash_noprofile(
         .map(|a| a.as_ref().to_os_string())
         .collect();
     if is_env_argv0(&program) {
-        drop_denied_env_assignments(&mut args);
+        drop_denied_env_assignments(&mut args, 0);
+    } else if let Some(kind) = cmd_wrapper(&program) {
+        let start = skip_wrapper_os(kind, &args);
+        if args.get(start).is_some_and(|a| is_env_argv0(a.as_os_str())) {
+            drop_denied_env_assignments(&mut args, start + 1);
+        }
     }
     if is_bash_argv0(&program) {
         insert_bash_noprofile(&mut args, 0);
@@ -270,12 +281,15 @@ pub fn with_bash_noprofile(
         && let Some(idx) = first_env_bash_operand(&args)
     {
         insert_bash_noprofile(&mut args, idx + 1);
+    } else if let Some(kind) = cmd_wrapper(&program)
+        && let Some(idx) = first_wrapper_bash_operand(kind, &args)
+    {
+        insert_bash_noprofile(&mut args, idx + 1);
     }
     (program, args)
 }
 
-fn drop_denied_env_assignments(args: &mut Vec<OsString>) {
-    let mut i = 0;
+fn drop_denied_env_assignments(args: &mut Vec<OsString>, mut i: usize) {
     let mut options_done = false;
     while i < args.len() {
         let raw = args[i].to_string_lossy().into_owned();
@@ -432,6 +446,30 @@ fn first_env_bash_operand(args: &[OsString]) -> Option<usize> {
             return Some(i);
         }
         return None;
+    }
+    None
+}
+
+fn cmd_wrapper(program: &OsStr) -> Option<crate::deny::CmdWrapper> {
+    crate::deny::cmd_wrapper(program)
+}
+
+fn skip_wrapper_os(kind: crate::deny::CmdWrapper, args: &[OsString]) -> usize {
+    let raws: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    crate::deny::skip_wrapper_prefix(kind, &raws)
+}
+
+fn first_wrapper_bash_operand(kind: crate::deny::CmdWrapper, args: &[OsString]) -> Option<usize> {
+    let start = skip_wrapper_os(kind, args);
+    let rest = args.get(start..)?;
+    if rest.first().is_some_and(|a| is_bash_argv0(a.as_os_str())) {
+        return Some(start);
+    }
+    if rest.first().is_some_and(|a| is_env_argv0(a.as_os_str())) {
+        return first_env_bash_operand(&rest[1..]).map(|i| start + 1 + i);
     }
     None
 }

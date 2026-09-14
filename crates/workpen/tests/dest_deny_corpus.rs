@@ -547,6 +547,158 @@ fn check_command_argv_denies_env_split_string_and_file() {
 }
 
 #[test]
+fn check_command_argv_denies_env_flags_after_timeout_nohup_nice() {
+    let ws = tempfile::tempdir().expect("workspace");
+    std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("write readme");
+    let policy = DenyPolicy::default();
+    let denies: &[&[&str]] = &[
+        &["timeout", "30", "env", "--file=.env", "bash"],
+        &["timeout", "30", "env", "-S", "cat .env"],
+        &["/usr/bin/timeout", "30", "env", "--file=.env", "bash"],
+        &["timeout.exe", "30", "env", "-S", "cat .env"],
+        &[
+            "timeout",
+            "--foreground",
+            "30",
+            "env",
+            "--file=.env",
+            "bash",
+        ],
+        &["timeout", "-s", "TERM", "30", "env", "-S", "cat .env"],
+        &["nohup", "env", "-S", "--file=.env"],
+        &["/usr/bin/nohup", "env", "--file=.env", "bash"],
+        &["NOHUP.EXE", "env", "-S", "cat .env"],
+        &["nice", "env", "--file=.env", "bash"],
+        &["nice", "-n", "10", "env", "-S", "cat .env"],
+        &["/usr/bin/nice", "env", "-S", "--file=.env"],
+        &["timeout", "30", "env", "-S", "--file=.env"],
+        &["timeout", "30", "/usr/bin/env", "--file=.env", "bash"],
+    ];
+    for argv in denies {
+        let err = match check_command_argv(argv, ws.path(), &policy) {
+            Err(e) => e,
+            Ok(()) => panic!("wrapper then env {argv:?} must dest-deny"),
+        };
+        match err {
+            CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+                assert_eq!(
+                    d.kind,
+                    DestDenyKind::DenyGlob,
+                    "wrapper then env {argv:?} dest must be DenyGlob, got {:?}",
+                    d.kind
+                );
+            }
+            other => panic!("expected DestDeny DenyGlob for {argv:?}, got {other:?}"),
+        }
+    }
+    check_command_argv(
+        &["timeout", "30", "env", "-S", "cat readme.md"],
+        ws.path(),
+        &policy,
+    )
+    .expect("timeout 30 env -S cat readme.md must be allowed");
+    check_command_argv(&["timeout", "30", "cat", "readme.md"], ws.path(), &policy)
+        .expect("timeout 30 cat readme.md must be allowed");
+    check_command_argv(&["timeout", "30", "echo", "hi"], ws.path(), &policy)
+        .expect("timeout 30 echo hi must be allowed");
+    check_command_argv(&["nohup", "cat", "readme.md"], ws.path(), &policy)
+        .expect("nohup cat readme.md must be allowed");
+    check_command_argv(&["nice", "-n", "10", "echo", "hi"], ws.path(), &policy)
+        .expect("nice -n 10 echo hi must be allowed");
+}
+
+#[test]
+fn check_command_argv_denies_env_flags_inside_shell_c_body() {
+    let ws = tempfile::tempdir().expect("workspace");
+    std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("write readme");
+    let policy = DenyPolicy::default();
+    let denies: &[&[&str]] = &[
+        &["bash", "-lc", "env --file=.env true"],
+        &["/bin/bash", "-lc", "env --file=.env true"],
+        &["/bin/sh", "-c", "env --file=.env true"],
+        &["bash", "-c", "env -S cat .env"],
+        &["bash", "-lc", "env -S cat .env"],
+        &["bash", "-ic", "env --file=.env true"],
+        &["bash", "-cl", "env -S --file=.env"],
+        &["bash", "-lc", "/usr/bin/env --file=.env bash"],
+        &["bash", "-lc", "env.exe --file=.env bash"],
+        &["bash", "-lc", "env --split-string cat .env"],
+        &["bash", "-lc", "env -f.env bash"],
+        &["bash", "-lc", "env -f .env bash"],
+        &["bash", "-lc", "env --file .env bash"],
+        &["bash", "-lc", "timeout 30 env --file=.env true"],
+        &["bash", "-lc", "echo hello; env --file=.env true"],
+    ];
+    for argv in denies {
+        let err = match check_command_argv(argv, ws.path(), &policy) {
+            Err(e) => e,
+            Ok(()) => panic!("shell -c env {argv:?} must dest-deny"),
+        };
+        match err {
+            CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+                assert_eq!(
+                    d.kind,
+                    DestDenyKind::DenyGlob,
+                    "shell -c env {argv:?} dest must be DenyGlob, got {:?}",
+                    d.kind
+                );
+            }
+            other => panic!("expected DestDeny DenyGlob for {argv:?}, got {other:?}"),
+        }
+    }
+    let dest_denies = [
+        "env --file=.env true",
+        "sh -c 'env --file=.env true'",
+        "echo hello; env --file=.env true",
+        "env -S cat .env",
+    ];
+    for command in dest_denies {
+        let err = match check_command_dests(command, ws.path(), &policy) {
+            Err(e) => e,
+            Ok(()) => panic!("command string {command:?} must dest-deny"),
+        };
+        match err {
+            CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+                assert_eq!(
+                    d.kind,
+                    DestDenyKind::DenyGlob,
+                    "command string {command:?} dest must be DenyGlob, got {:?}",
+                    d.kind
+                );
+            }
+            other => panic!("expected DestDeny DenyGlob for {command:?}, got {other:?}"),
+        }
+    }
+    check_command_argv(
+        &["bash", "-lc", "env --file=readme.md true"],
+        ws.path(),
+        &policy,
+    )
+    .expect("bash -lc env --file=readme.md true must be allowed");
+    check_command_argv(&["bash", "-lc", "echo hello"], ws.path(), &policy)
+        .expect("bash -lc echo hello must be allowed");
+    check_command_argv(&["bash", "-lc", "cat readme.md"], ws.path(), &policy)
+        .expect("bash -lc cat readme.md must be allowed");
+    check_command_argv(
+        &["bash", "-lc", "tool --file=.env true"],
+        ws.path(),
+        &policy,
+    )
+    .expect("bash -lc generic --file=.env must not dest-deny");
+    check_command_argv(&["bash", "-lc", "cat --file=.env"], ws.path(), &policy)
+        .expect("bash -lc cat --file=.env must not dest-deny");
+    check_command_dests("env --file=readme.md true", ws.path(), &policy)
+        .expect("env --file=readme.md true must be allowed");
+    check_command_dests("echo hello", ws.path(), &policy).expect("echo hello must be allowed");
+    check_command_dests("cat readme.md", ws.path(), &policy)
+        .expect("cat readme.md must be allowed");
+    check_command_dests("tool --file=.env true", ws.path(), &policy)
+        .expect("generic --file=.env must not dest-deny");
+}
+
+#[test]
 fn path_is_denied_table() {
     let deny = default_secret_denies();
     assert!(path_is_denied_glob(&deny, "/tmp/x/.env"));
