@@ -46,8 +46,8 @@ pub use why::{Why, explain};
 #[cfg(feature = "nono")]
 pub use wrap::{
     KernelAccess, KernelApply, KernelError, KernelGrant, KernelPolicy, child_env_deny_names,
-    is_denied_child_env, kernel_supported, process_jail, scrub_child_command, spawn_after_setup,
-    with_bash_noprofile,
+    is_denied_child_env, kernel_supported, process_jail, require_applied, scrub_child_command,
+    spawn_after_setup, with_bash_noprofile,
 };
 
 /// Crate version from Cargo.toml.

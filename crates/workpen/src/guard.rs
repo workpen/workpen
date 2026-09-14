@@ -71,6 +71,8 @@ pub enum PathGuardError {
     Denied(PathGuardDeny),
     #[error("path guard root is not usable: {0}")]
     Root(String),
+    #[error("workspace root is the home directory {0}; use a project subdirectory, not $HOME")]
+    Home(PathBuf),
     #[error("failed to canonicalize path: {path}: {source}")]
     Canonicalize {
         path: String,
@@ -319,6 +321,9 @@ pub fn resolve_workspace_root(cwd: &Path, root: &str) -> Result<PathBuf, PathGua
             canon.display()
         )));
     }
+    if is_user_home_dir(&canon) {
+        return Err(PathGuardError::Home(canon));
+    }
     Ok(canon)
 }
 
@@ -407,6 +412,25 @@ fn relative_escapes_primary(path: &Path) -> bool {
 
 fn canonicalize_root(path: &Path) -> Result<PathBuf, PathGuardError> {
     dunce::canonicalize(path).map_err(|e| PathGuardError::Root(format!("{} ({e})", path.display())))
+}
+
+/// True when `path` is the current user's home directory.
+///
+/// Compares `HOME` (Unix) or `USERPROFILE` (Windows) after
+/// `dunce::canonicalize`. Missing or unreadable home is not a match.
+/// `/tmp` and `/private/tmp` are not home.
+pub(crate) fn is_user_home_dir(path: &Path) -> bool {
+    let Some(raw) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        return false;
+    };
+    if raw.is_empty() {
+        return false;
+    }
+    let Ok(home) = dunce::canonicalize(&raw) else {
+        return false;
+    };
+    let path = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path == home
 }
 
 fn walk_guarded(start: &Path, roots: &[PathBuf]) -> Result<PathBuf, PathGuardKind> {

@@ -11,7 +11,8 @@ use tempfile::TempDir;
 use workpen::resolve_extra_root;
 use workpen::{
     KernelAccess, KernelApply, KernelError, child_env_deny_names, is_denied_child_env,
-    kernel_supported, process_jail, scrub_child_command, spawn_after_setup, with_bash_noprofile,
+    kernel_supported, process_jail, require_applied, scrub_child_command, spawn_after_setup,
+    with_bash_noprofile,
 };
 
 fn workspace() -> TempDir {
@@ -190,6 +191,52 @@ fn filesystem_root_error_names_path_and_subdirectory() {
 }
 
 #[test]
+fn home_as_workspace_is_refused() {
+    let Some(home) = user_home_dir() else {
+        return;
+    };
+    if !home.is_dir() {
+        return;
+    }
+    let err = process_jail(&home, std::iter::empty::<&Path>()).expect_err("home");
+    match err {
+        KernelError::Home(path) => {
+            let msg = KernelError::Home(path.clone()).to_string();
+            assert!(
+                msg.contains(&path.display().to_string()),
+                "Home must name refused path: {msg}"
+            );
+            assert!(
+                msg.to_ascii_lowercase().contains("subdirectory"),
+                "Home must say use a subdirectory: {msg}"
+            );
+        }
+        other => panic!("expected Home, got {other}"),
+    }
+}
+
+#[test]
+fn temp_workspace_is_not_home() {
+    let dir = workspace();
+    process_jail(dir.path(), std::iter::empty::<&Path>()).expect("temp workspace");
+}
+
+#[cfg(unix)]
+#[test]
+fn extra_tmp_is_not_treated_as_home() {
+    if !Path::new("/tmp").is_dir() {
+        return;
+    }
+    let dir = workspace();
+    process_jail(dir.path(), ["/tmp"]).expect("explicit /tmp extra");
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    let raw = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    fs::canonicalize(raw).ok()
+}
+
+#[test]
 fn missing_workspace_is_root_error() {
     let missing = PathBuf::from("/no-such-workpen-workspace-dir");
     let err = process_jail(&missing, std::iter::empty::<&Path>()).expect_err("missing");
@@ -338,12 +385,20 @@ fn run_child_does_not_jail_the_parent() {
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
     let mut cmd = inner_true_cmd();
     cmd.current_dir(dir.path());
-    let (applied, status) = policy.run_child(cmd).expect("run_child");
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-    assert_eq!(applied, KernelApply::Applied);
+    {
+        let (applied, status) = policy.run_child(cmd).expect("run_child");
+        assert_eq!(applied, KernelApply::Applied);
+        assert!(status.success(), "inner true/cmd must succeed: {status:?}");
+    }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-    assert_eq!(applied, KernelApply::UserspaceOnly);
-    assert!(status.success(), "inner true/cmd must succeed: {status:?}");
+    {
+        let err = policy.run_child(cmd).expect_err("no kernel backend");
+        assert!(
+            matches!(err, KernelError::Apply(_)),
+            "unsupported OS must not spawn: {err}"
+        );
+    }
     fs::write(&marker, "free").expect("parent must still write outside the workspace");
 }
 
@@ -415,6 +470,31 @@ fn run_child_can_write_inside_workspace() {
     assert!(status.success(), "inside write must succeed: {status:?}");
     let body = fs::read_to_string(&inside).expect("inside write");
     assert!(body.contains("ok"), "inside body={body:?}");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn run_child_network_blocked_tcp_fails() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    assert!(
+        policy.network_blocked(),
+        "process_jail must ask the kernel to block sockets"
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+    let port = listener.local_addr().expect("addr").port();
+    let script = format!("echo >/dev/tcp/127.0.0.1/{port}");
+    let mut cmd = Command::new("/bin/bash");
+    cmd.args(["-c", &script]).current_dir(dir.path());
+    let (applied, status) = policy.run_child(cmd).expect("run_child");
+    assert_eq!(applied, KernelApply::Applied);
+    assert!(
+        !status.success(),
+        "jailed child must not open TCP to 127.0.0.1:{port}: {status:?}"
+    );
 }
 
 fn inner_true_cmd() -> Command {
@@ -1050,4 +1130,59 @@ fn run_child_job_err_is_apply_and_does_not_spawn() {
         other => panic!("expected Apply, got {other}"),
     }
     assert!(!spawned, "spawn must not run after job Err");
+}
+
+#[test]
+fn require_applied_userspace_only_is_apply_and_does_not_spawn() {
+    let mut spawned = false;
+    let err = spawn_after_setup(require_applied(KernelApply::UserspaceOnly), |_| {
+        spawned = true;
+        panic!("must not spawn after UserspaceOnly");
+    })
+    .expect_err("UserspaceOnly must refuse spawn");
+    match err {
+        KernelError::Apply(msg) => {
+            assert!(
+                msg.contains("did not apply"),
+                "error must say jail did not apply: {msg}"
+            );
+            assert!(
+                msg.contains("not started"),
+                "error must say child was not started: {msg}"
+            );
+        }
+        other => panic!("expected Apply, got {other}"),
+    }
+    assert!(!spawned, "spawn must not run after UserspaceOnly");
+}
+
+#[test]
+fn require_applied_keeps_applied() {
+    assert_eq!(
+        require_applied(KernelApply::Applied).expect("Applied"),
+        KernelApply::Applied
+    );
+}
+
+#[test]
+fn apply_inspect_stays_userspace_only_when_kernel_unsupported() {
+    if kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    assert_eq!(
+        policy.apply().expect("apply inspect"),
+        KernelApply::UserspaceOnly
+    );
+    let mut cmd = inner_true_cmd();
+    assert_eq!(
+        policy.apply_pre_exec(&mut cmd).expect("pre_exec inspect"),
+        KernelApply::UserspaceOnly
+    );
+    let err = policy.run_child(inner_true_cmd()).expect_err("run_child");
+    assert!(
+        matches!(err, KernelError::Apply(_)),
+        "run_child must fail closed when kernel is unsupported: {err}"
+    );
 }

@@ -479,3 +479,39 @@ fn resolve_workspace_root_allows_explicit_tmp() {
         got.display()
     );
 }
+
+#[test]
+fn resolve_workspace_root_rejects_home() {
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        return;
+    };
+    let Ok(home) = dunce::canonicalize(&home) else {
+        return;
+    };
+    if !home.is_dir() {
+        return;
+    }
+    let dir = workspace();
+    match resolve_workspace_root(dir.path(), &home.to_string_lossy()) {
+        Err(PathGuardError::Home(path)) => {
+            let msg = PathGuardError::Home(path.clone()).to_string();
+            assert!(
+                msg.contains(&path.display().to_string()),
+                "Home must name refused path: {msg}"
+            );
+            assert!(
+                msg.to_ascii_lowercase().contains("subdirectory"),
+                "Home must say use a project subdirectory: {msg}"
+            );
+        }
+        other => panic!("home workspace must be refused, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_workspace_root_allows_temp_dir() {
+    let dir = workspace();
+    let got = resolve_workspace_root(dir.path(), &dir.path().to_string_lossy()).expect("temp");
+    let want = dunce::canonicalize(dir.path()).expect("canon");
+    assert_eq!(got, want);
+}
