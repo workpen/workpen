@@ -5,6 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -721,6 +722,85 @@ fn run_child_does_not_jail_the_parent() {
         );
     }
     fs::write(&marker, "free").expect("parent must still write outside the workspace");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_child_timeout_kills_sleep() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let pid_path = dir.path().join("child.pid");
+    let script = format!("echo $$ > {}; exec /bin/sleep 30", pid_path.display());
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", &script]).current_dir(dir.path());
+    let start = Instant::now();
+    let err = policy
+        .run_child_timeout(cmd, Duration::from_secs(1))
+        .expect_err("timeout");
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "timeout must return in under 10s: {:?}",
+        start.elapsed()
+    );
+    assert!(
+        matches!(err, KernelError::Timeout),
+        "expected Timeout, got {err}"
+    );
+    let pid = fs::read_to_string(&pid_path).expect("child pid");
+    let pid = pid.trim();
+    assert!(!pid.is_empty(), "child must have written its pid");
+    let still = Command::new("/bin/kill")
+        .args(["-0", pid])
+        .status()
+        .expect("kill -0");
+    assert!(
+        !still.success(),
+        "child pid {pid} must be gone after timeout"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn run_child_timeout_kills_ping() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("ping");
+    cmd.args(["-n", "30", "127.0.0.1"]).current_dir(dir.path());
+    let start = Instant::now();
+    let err = policy
+        .run_child_timeout(cmd, Duration::from_secs(1))
+        .expect_err("timeout");
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "timeout must return in under 10s: {:?}",
+        start.elapsed()
+    );
+    assert!(
+        matches!(err, KernelError::Timeout),
+        "expected Timeout, got {err}"
+    );
+}
+
+#[test]
+fn run_child_timeout_fast_command_succeeds() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = inner_true_cmd();
+    cmd.current_dir(dir.path());
+    let (applied, status) = policy
+        .run_child_timeout(cmd, Duration::from_secs(5))
+        .expect("fast command");
+    assert_eq!(applied, KernelApply::Applied);
+    assert!(status.success(), "fast command must succeed: {status:?}");
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1537,5 +1617,12 @@ fn apply_inspect_stays_userspace_only_when_kernel_unsupported() {
     assert!(
         matches!(err, KernelError::Apply(_)),
         "run_child must fail closed when kernel is unsupported: {err}"
+    );
+    let err = policy
+        .run_child_timeout(inner_true_cmd(), Duration::from_secs(5))
+        .expect_err("run_child_timeout");
+    assert!(
+        matches!(err, KernelError::Apply(_)),
+        "run_child_timeout must fail closed when kernel is unsupported: {err}"
     );
 }

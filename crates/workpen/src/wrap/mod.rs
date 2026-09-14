@@ -14,6 +14,7 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::time::Duration;
 
 use crate::deny::{DenyPolicy, DestDeny, DestDenyKind, dest_deny_at};
 
@@ -74,6 +75,9 @@ pub enum KernelError {
     Home(PathBuf),
     #[error("kernel wrap apply failed: {0}")]
     Apply(String),
+    /// The child was killed after the deadline.
+    #[error("kernel wrap child was killed after the deadline")]
+    Timeout,
 }
 
 /// Whether this OS can apply a kernel jail.
@@ -238,6 +242,9 @@ impl KernelPolicy {
     /// cannot apply, this returns [`KernelError::Apply`] and does not
     /// start the child. [`KernelApply::UserspaceOnly`] stays on
     /// [`Self::apply`] / [`Self::apply_pre_exec`] inspect paths only.
+    ///
+    /// Blocking wait has no host-visible kill; use
+    /// [`Self::run_child_timeout`].
     pub fn run_child(&self, cmd: Command) -> Result<(KernelApply, ExitStatus), KernelError> {
         #[cfg(unix)]
         {
@@ -261,11 +268,75 @@ impl KernelPolicy {
                     "write-restricted token is not available".into(),
                 ));
             }
-            windows::spawn_write_restricted(self, &cmd)
+            windows::spawn_write_restricted(self, &cmd, None)
         }
         #[cfg(not(any(unix, windows)))]
         {
             let _ = cmd;
+            Err(KernelError::Apply(
+                "no kernel backend on this platform".into(),
+            ))
+        }
+    }
+
+    /// Spawn `cmd` under the kernel jail and kill it after `timeout`.
+    ///
+    /// Same fail-closed setup as [`Self::run_child`]. Unix places the
+    /// child in its own process group and `killpg`s on the deadline.
+    /// Windows waits with a bounded `WaitForSingleObject` and closes
+    /// the job so `KILL_ON_JOB_CLOSE` stops the child.
+    pub fn run_child_timeout(
+        &self,
+        cmd: Command,
+        timeout: Duration,
+    ) -> Result<(KernelApply, ExitStatus), KernelError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            use std::time::Instant;
+
+            if !kernel_supported() {
+                return Err(KernelError::Apply(
+                    "kernel jail is not available; child was not started".into(),
+                ));
+            }
+            let mut cmd = cmd;
+            scrub_child_command(&mut cmd);
+            let applied = require_applied(self.apply_pre_exec(&mut cmd)?)?;
+            cmd.process_group(0);
+            let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            let deadline = Instant::now() + timeout;
+            loop {
+                match child
+                    .try_wait()
+                    .map_err(|e| KernelError::Apply(e.to_string()))?
+                {
+                    Some(status) => return Ok((applied, status)),
+                    None if Instant::now() >= deadline => {
+                        let pid = child.id() as libc::pid_t;
+                        // SAFETY: pid is the child's process group (process_group(0)).
+                        unsafe {
+                            libc::killpg(pid, libc::SIGKILL);
+                        }
+                        let _ = child.wait();
+                        return Err(KernelError::Timeout);
+                    }
+                    None => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            if !kernel_supported() {
+                return Err(KernelError::Apply(
+                    "write-restricted token is not available".into(),
+                ));
+            }
+            windows::spawn_write_restricted(self, &cmd, Some(timeout))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (cmd, timeout);
             Err(KernelError::Apply(
                 "no kernel backend on this platform".into(),
             ))
