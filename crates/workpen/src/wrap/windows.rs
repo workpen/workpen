@@ -34,9 +34,6 @@ const SECURITY_RESTRICTED_CODE_RID: Dword = 12;
 const GENERIC_ALL: Dword = 0x1000_0000;
 const GRANT_ACCESS: u32 = 1;
 const DENY_ACCESS: u32 = 3;
-const FILE_READ_DATA: Dword = 0x0001;
-const FILE_WRITE_DATA: Dword = 0x0002;
-const FILE_APPEND_DATA: Dword = 0x0004;
 const NO_INHERITANCE: Dword = 0;
 const TRUSTEE_IS_SID: u32 = 0;
 const TRUSTEE_IS_WELL_KNOWN_GROUP: u32 = 5;
@@ -587,13 +584,7 @@ fn deny_dest_ace(path: &Path, sid: Handle) -> Result<AclRestore, KernelError> {
     } else {
         NO_INHERITANCE
     };
-    set_acl_entry(
-        path,
-        sid,
-        FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA,
-        DENY_ACCESS,
-        inherit,
-    )
+    set_acl_entry(path, sid, GENERIC_ALL, DENY_ACCESS, inherit)
 }
 
 fn rw_grant_paths(policy: &KernelPolicy) -> Vec<PathBuf> {
