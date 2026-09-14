@@ -54,6 +54,16 @@ const INFINITE: Dword = 0xFFFF_FFFF;
 const WAIT_OBJECT_0: Dword = 0;
 const WAIT_TIMEOUT: Dword = 0x0000_0102;
 const WAIT_FAILED: Dword = 0xFFFF_FFFF;
+const STD_INPUT_HANDLE: Dword = -10i32 as Dword;
+const STD_OUTPUT_HANDLE: Dword = -11i32 as Dword;
+const STD_ERROR_HANDLE: Dword = -12i32 as Dword;
+const STARTF_USESTDHANDLES: Dword = 0x0000_0100;
+const DUPLICATE_SAME_ACCESS: Dword = 0x0000_0002;
+const GENERIC_READ: Dword = 0x8000_0000;
+const GENERIC_WRITE: Dword = 0x4000_0000;
+const FILE_SHARE_READ: Dword = 0x0001;
+const FILE_SHARE_WRITE: Dword = 0x0002;
+const OPEN_EXISTING: Dword = 3;
 
 #[repr(C)]
 struct SidIdentifierAuthority {
@@ -114,6 +124,13 @@ struct ProcessInformation {
 }
 
 #[repr(C)]
+struct SecurityAttributes {
+    n_length: Dword,
+    lp_security_descriptor: *mut core::ffi::c_void,
+    b_inherit_handle: Bool,
+}
+
+#[repr(C)]
 struct JobobjectBasicLimitInformation {
     per_process_user_time_limit: i64,
     per_job_user_time_limit: i64,
@@ -171,6 +188,25 @@ unsafe extern "system" {
     fn WaitForSingleObject(h_handle: Handle, dw_milliseconds: Dword) -> Dword;
     fn GetExitCodeProcess(h_process: Handle, lp_exit_code: *mut Dword) -> Bool;
     fn TerminateProcess(h_process: Handle, u_exit_code: u32) -> Bool;
+    fn GetStdHandle(n_std_handle: Dword) -> Handle;
+    fn DuplicateHandle(
+        h_source_process_handle: Handle,
+        h_source_handle: Handle,
+        h_target_process_handle: Handle,
+        lp_target_handle: *mut Handle,
+        dw_desired_access: Dword,
+        b_inherit_handle: Bool,
+        dw_options: Dword,
+    ) -> Bool;
+    fn CreateFileW(
+        lp_file_name: *const u16,
+        dw_desired_access: Dword,
+        dw_share_mode: Dword,
+        lp_security_attributes: *mut core::ffi::c_void,
+        dw_creation_disposition: Dword,
+        dw_flags_and_attributes: Dword,
+        h_template_file: Handle,
+    ) -> Handle;
 }
 
 #[link(name = "advapi32")]
@@ -516,6 +552,58 @@ fn prefix_apply(kind: &'static str) -> impl FnOnce(KernelError) -> KernelError {
     }
 }
 
+fn inheritable_std_handle(std_id: Dword, write: bool) -> Result<CloseOnDrop, KernelError> {
+    // SAFETY: GetStdHandle is always valid to call.
+    let parent = unsafe { GetStdHandle(std_id) };
+    if !parent.is_null() && parent != INVALID_HANDLE_VALUE {
+        let current = unsafe { GetCurrentProcess() };
+        let mut dup = ptr::null_mut();
+        // SAFETY: `current` is this process; `parent` is a live std handle.
+        let ok = unsafe {
+            DuplicateHandle(
+                current,
+                parent,
+                current,
+                &mut dup,
+                0,
+                1,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 {
+            return open_nul(write);
+        }
+        return Ok(CloseOnDrop(dup));
+    }
+    open_nul(write)
+}
+
+fn open_nul(write: bool) -> Result<CloseOnDrop, KernelError> {
+    let name = wide_os(OsStr::new("NUL"));
+    let mut sa = SecurityAttributes {
+        n_length: std::mem::size_of::<SecurityAttributes>() as Dword,
+        lp_security_descriptor: ptr::null_mut(),
+        b_inherit_handle: 1,
+    };
+    let access = if write { GENERIC_WRITE } else { GENERIC_READ };
+    // SAFETY: `name` is NUL-terminated; `sa` lives for the call.
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            (&raw mut sa).cast(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(last_error("CreateFileW"));
+    }
+    Ok(CloseOnDrop(handle))
+}
+
 fn spawn_prepared(
     prepared: Prepared,
     cmd: &Command,
@@ -523,6 +611,9 @@ fn spawn_prepared(
 ) -> Result<(KernelApply, ExitStatus), KernelError> {
     let (app, mut cmdline, cwd) = command_line(cmd)?;
     let mut env_block = environment_block(cmd);
+    let std_in = inheritable_std_handle(STD_INPUT_HANDLE, false)?;
+    let std_out = inheritable_std_handle(STD_OUTPUT_HANDLE, true)?;
+    let std_err = inheritable_std_handle(STD_ERROR_HANDLE, true)?;
     let mut startup = StartupInfoW {
         cb: std::mem::size_of::<StartupInfoW>() as Dword,
         lp_reserved: ptr::null_mut(),
@@ -535,13 +626,13 @@ fn spawn_prepared(
         dw_x_count_chars: 0,
         dw_y_count_chars: 0,
         dw_fill_attribute: 0,
-        dw_flags: 0,
+        dw_flags: STARTF_USESTDHANDLES,
         w_show_window: 0,
         cb_reserved2: 0,
         lp_reserved2: ptr::null_mut(),
-        h_std_input: ptr::null_mut(),
-        h_std_output: ptr::null_mut(),
-        h_std_error: ptr::null_mut(),
+        h_std_input: std_in.0,
+        h_std_output: std_out.0,
+        h_std_error: std_err.0,
     };
     let mut info = ProcessInformation {
         h_process: ptr::null_mut(),
@@ -570,6 +661,7 @@ fn spawn_prepared(
     if created == 0 {
         return Err(last_error("CreateProcessAsUserW"));
     }
+    drop((std_in, std_out, std_err));
     let process = CloseOnDrop(info.h_process);
     let thread = CloseOnDrop(info.h_thread);
     // SAFETY: `job` is our job object; `process` is the new suspended process.

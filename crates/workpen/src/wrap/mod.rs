@@ -243,6 +243,11 @@ impl KernelPolicy {
     /// start the child. [`KernelApply::UserspaceOnly`] stays on
     /// [`Self::apply`] / [`Self::apply_pre_exec`] inspect paths only.
     ///
+    /// Windows spawn inherits parent stdio or grants NUL so console
+    /// children do not block on null handles. [`Command`]
+    /// [`std::process::Stdio::piped`] is still not plumbed (file
+    /// redirect or parent pipes only).
+    ///
     /// Blocking wait has no host-visible kill; use
     /// [`Self::run_child_timeout`].
     pub fn run_child(&self, cmd: Command) -> Result<(KernelApply, ExitStatus), KernelError> {
