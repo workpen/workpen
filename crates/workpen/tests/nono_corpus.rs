@@ -120,6 +120,75 @@ fn collect_workspace_dest_denies_honors_extra_glob() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn run_child_cannot_read_workspace_env() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    assert!(
+        policy
+            .dest_denies()
+            .iter()
+            .any(|d| d.path.file_name().is_some_and(|n| n == ".env")),
+        "list API must include .env before Seatbelt apply"
+    );
+    let mut deny_cmd = Command::new("/bin/sh");
+    deny_cmd
+        .args(["-c", "cat .env >env.out; echo $? >env.code"])
+        .current_dir(dir.path());
+    let (applied, status) = policy.run_child(deny_cmd).expect("run_child env");
+    assert_eq!(applied, KernelApply::Applied);
+    assert!(status.success(), "wrapper must finish: {status:?}");
+    let code = fs::read_to_string(dir.path().join("env.code")).expect("env.code");
+    assert_ne!(code.trim(), "0", "cat .env must fail under Seatbelt");
+    let leaked = fs::read_to_string(dir.path().join("env.out")).unwrap_or_default();
+    assert!(
+        !leaked.contains("SECRET"),
+        "jailed child must not read .env: {leaked:?}"
+    );
+
+    let mut allow_cmd = Command::new("/bin/sh");
+    allow_cmd
+        .args(["-c", "cat readme.md >readme.out; echo $? >readme.code"])
+        .current_dir(dir.path());
+    let (_applied, status) = policy.run_child(allow_cmd).expect("run_child readme");
+    assert!(status.success(), "readme wrapper must finish: {status:?}");
+    let code = fs::read_to_string(dir.path().join("readme.code")).expect("readme.code");
+    assert_eq!(code.trim(), "0", "cat readme.md must succeed");
+    let body = fs::read_to_string(dir.path().join("readme.out")).expect("readme.out");
+    assert!(body.contains("ok"), "readme body={body:?}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn run_child_cannot_read_env_hardlink_sibling() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    fs::hard_link(dir.path().join(".env"), dir.path().join("notes.txt")).expect("hardlink");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "cat notes.txt >notes.out; echo $? >notes.code"])
+        .current_dir(dir.path());
+    let (applied, status) = policy.run_child(cmd).expect("run_child notes");
+    assert_eq!(applied, KernelApply::Applied);
+    assert!(status.success(), "wrapper must finish: {status:?}");
+    let code = fs::read_to_string(dir.path().join("notes.code")).expect("notes.code");
+    assert_ne!(code.trim(), "0", "cat notes.txt hardlink must fail");
+    let leaked = fs::read_to_string(dir.path().join("notes.out")).unwrap_or_default();
+    assert!(
+        !leaked.contains("SECRET"),
+        "hardlink sibling must be dest-denied: {leaked:?}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn dest_deny_walk_skips_directory_symlink() {
