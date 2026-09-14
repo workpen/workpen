@@ -179,6 +179,37 @@ fn run_child_cannot_read_workspace_env_linux() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn run_child_cannot_read_env_created_after_spawn() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args([
+        "-c",
+        "printf 'SECRET=1\\n' > .env; echo $? >w.code; cat .env >r.out; echo $? >r.code",
+    ])
+    .current_dir(dir.path());
+    let (applied, status) = policy.run_child(cmd).expect("run_child");
+    assert_eq!(applied, KernelApply::Applied);
+    assert!(status.success(), "wrapper must finish: {status:?}");
+    let write_code = fs::read_to_string(dir.path().join("w.code")).unwrap_or_default();
+    let read_code = fs::read_to_string(dir.path().join("r.code")).unwrap_or_default();
+    let leaked = fs::read_to_string(dir.path().join("r.out")).unwrap_or_default();
+    assert!(
+        write_code.trim() != "0" || read_code.trim() != "0",
+        "create or read of post-spawn .env must fail, write={write_code:?} read={read_code:?}"
+    );
+    assert!(
+        !leaked.contains("SECRET"),
+        "post-create .env must not leak: {leaked:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn run_child_cannot_read_workspace_env() {
     if !kernel_supported() {
         return;
