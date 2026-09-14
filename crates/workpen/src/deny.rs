@@ -482,9 +482,6 @@ pub fn check_command_argv(
     root: &Path,
     policy: &DenyPolicy,
 ) -> Result<(), CheckDestError> {
-    let argv0 = cmd.first().map(|t| t.as_ref()).unwrap_or("");
-    let argv0_is_cmd = is_cmd_program(argv0);
-    let argv0_is_powershell = is_powershell_program(argv0);
     for (i, token) in cmd.iter().enumerate() {
         let token = token.as_ref();
         if !token.is_empty() && !token.starts_with('-') {
@@ -494,13 +491,19 @@ pub fn check_command_argv(
         if let Some(body) = shell_c_body(token, cmd.get(i + 1).map(|s| s.as_ref())) {
             check_command_dests(body, root, policy)?;
         }
-        if argv0_is_cmd
-            && let Some(body) = cmd_script_body(token, cmd.get(i + 1).map(|s| s.as_ref()))
+        if is_cmd_program(token)
+            && let Some(body) = cmd_script_body(
+                cmd.get(i + 1).map(|s| s.as_ref()).unwrap_or(""),
+                cmd.get(i + 2).map(|s| s.as_ref()),
+            )
         {
             check_command_dests(body, root, policy)?;
         }
-        if argv0_is_powershell
-            && let Some(body) = powershell_command_body(token, cmd.get(i + 1).map(|s| s.as_ref()))
+        if is_powershell_program(token)
+            && let Some(body) = powershell_command_body(
+                cmd.get(i + 1).map(|s| s.as_ref()).unwrap_or(""),
+                cmd.get(i + 2).map(|s| s.as_ref()),
+            )
         {
             check_command_dests(body, root, policy)?;
         }
@@ -549,9 +552,16 @@ fn cmd_script_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str>
     Some(after)
 }
 
-/// PowerShell `-Command` / `-c` / `/C` script body. Not `-EncodedCommand`.
+/// PowerShell `-Command` / `-c` / `/C` script body, including attached
+/// `-Command:…`. Not `-EncodedCommand`.
 fn powershell_command_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
     let rest = token.strip_prefix(['-', '/'])?;
+    if let Some((name, value)) = rest.split_once(':') {
+        if name.eq_ignore_ascii_case("command") || name.eq_ignore_ascii_case("c") {
+            return Some(value);
+        }
+        return None;
+    }
     if rest.eq_ignore_ascii_case("command") || rest.eq_ignore_ascii_case("c") {
         return next;
     }
