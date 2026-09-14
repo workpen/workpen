@@ -12,6 +12,13 @@ pub(super) fn apply_dest_deny_remounts(paths: &[std::path::PathBuf]) -> io::Resu
     if paths.is_empty() {
         return Ok(());
     }
+    match remount_all(paths) {
+        Err(e) if is_ns_denied(&e) => Ok(()),
+        other => other,
+    }
+}
+
+fn remount_all(paths: &[std::path::PathBuf]) -> io::Result<()> {
     if !enter_private_mount_ns()? {
         return Ok(());
     }
@@ -22,6 +29,13 @@ pub(super) fn apply_dest_deny_remounts(paths: &[std::path::PathBuf]) -> io::Resu
         bind_over(path, hide)?;
     }
     Ok(())
+}
+
+fn is_ns_denied(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::PermissionDenied
+        || err.raw_os_error() == Some(libc::ENOSYS)
+        || err.raw_os_error() == Some(libc::EPERM)
+        || err.raw_os_error() == Some(libc::EACCES)
 }
 
 /// Returns `Ok(false)` when unprivileged user namespaces are denied.
