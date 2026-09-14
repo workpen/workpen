@@ -969,14 +969,23 @@ fn run_child_network_blocked_tcp_fails() {
     );
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
     let port = listener.local_addr().expect("addr").port();
-    let script = format!("echo >/dev/tcp/127.0.0.1/{port}");
+    let marker = dir.path().join("tcp_started");
+    let script = format!("touch tcp_started; echo >/dev/tcp/127.0.0.1/{port}");
     let mut cmd = Command::new("/bin/bash");
     cmd.args(["-c", &script]).current_dir(dir.path());
     let (applied, status) = policy.run_child(cmd).expect("run_child");
     assert_eq!(applied, KernelApply::Applied);
+    assert!(marker.exists(), "probe must start before the TCP connect");
     assert!(
         !status.success(),
         "jailed child must not open TCP to 127.0.0.1:{port}: {status:?}"
+    );
+    listener
+        .set_nonblocking(true)
+        .expect("listener nonblocking");
+    assert!(
+        listener.accept().is_err(),
+        "jailed child must not complete a TCP handshake on 127.0.0.1:{port}"
     );
 }
 
@@ -995,10 +1004,12 @@ fn run_child_network_blocked_tcp_fails() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
     let port = listener.local_addr().expect("addr").port();
     let probe = write_windows_tcp_probe(dir.path(), port);
+    let marker = dir.path().join("tcp_started");
     let mut cmd = Command::new(&probe);
     cmd.current_dir(dir.path());
     let (applied, status) = policy.run_child(cmd).expect("run_child");
     assert_eq!(applied, KernelApply::Applied);
+    assert!(marker.exists(), "probe must start before the TCP connect");
     assert!(
         !status.success(),
         "jailed child must not open TCP to 127.0.0.1:{port}: {status:?}"
@@ -1009,6 +1020,29 @@ fn run_child_network_blocked_tcp_fails() {
     assert!(
         listener.accept().is_err(),
         "jailed child must not complete a TCP handshake on 127.0.0.1:{port}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn run_child_missing_program_is_apply_and_names_command() {
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let err = policy
+        .run_child(Command::new("no-such-workpen-prog-xyz"))
+        .expect_err("missing program");
+    assert!(
+        matches!(err, KernelError::Apply(_)),
+        "missing program must be Apply: {err}"
+    );
+    let display = err.to_string();
+    assert!(
+        display.contains("no-such-workpen-prog-xyz"),
+        "Apply must name the command: {display}"
+    );
+    assert!(
+        display.contains("not found"),
+        "Apply must say not found: {display}"
     );
 }
 
@@ -1027,7 +1061,7 @@ fn write_windows_tcp_probe(dir: &Path, port: u16) -> PathBuf {
         dir,
         "tcp_probe",
         &format!(
-            "fn main() {{ match std::net::TcpStream::connect((\"127.0.0.1\", {port})) {{ Ok(_) => std::process::exit(0), Err(_) => std::process::exit(1) }} }}\n"
+            "fn main() {{ let _ = std::fs::write(\"tcp_started\", b\"1\"); match std::net::TcpStream::connect((\"127.0.0.1\", {port})) {{ Ok(_) => std::process::exit(0), Err(_) => std::process::exit(1) }} }}\n"
         ),
     )
 }
@@ -1045,6 +1079,67 @@ fn rustc_windows_probe(dir: &Path, name: &str, src_body: &str) -> PathBuf {
         .expect("rustc probe");
     assert!(status.success(), "rustc {name} failed: {status:?}");
     exe
+}
+
+#[test]
+fn windows_net_helper_argv_contract() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("windows_net_helper.rs");
+    assert!(src.is_file(), "helper source must exist: {}", src.display());
+    let dir = workspace();
+    let bin = dir.path().join("workpen-net-helper");
+    let compiled = match Command::new("rustc")
+        .args([
+            "--edition=2024",
+            "--crate-type=bin",
+            "-C",
+            "debuginfo=0",
+            "-o",
+        ])
+        .arg(&bin)
+        .arg(&src)
+        .output()
+    {
+        Ok(out) => out,
+        Err(_) => return,
+    };
+    assert!(
+        compiled.status.success(),
+        "rustc helper failed: {}\n{}",
+        compiled.status,
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let missing = Command::new(&bin).output().expect("helper no args");
+    assert_eq!(
+        missing.status.code(),
+        Some(2),
+        "missing -- must exit 2: {:?}",
+        missing.status
+    );
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("missing --"), "stderr={stderr}");
+
+    let empty = Command::new(&bin)
+        .arg("--")
+        .output()
+        .expect("helper -- only");
+    assert_eq!(
+        empty.status.code(),
+        Some(2),
+        "empty command must exit 2: {:?}",
+        empty.status
+    );
+    let stderr = String::from_utf8_lossy(&empty.stderr);
+    assert!(stderr.contains("empty command"), "stderr={stderr}");
+
+    #[cfg(unix)]
+    {
+        let ok = Command::new(&bin)
+            .args(["--", "true"])
+            .status()
+            .expect("helper -- true");
+        assert!(ok.success(), "helper -- true must succeed: {ok:?}");
+    }
 }
 
 fn inner_true_cmd() -> Command {
