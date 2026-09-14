@@ -13,6 +13,7 @@ use super::{
     KernelAccess, KernelApply, KernelError, KernelPolicy, is_denied_child_env, spawn_after_setup,
 };
 
+#[path = "windows_net.rs"]
 mod windows_net;
 
 type Handle = *mut core::ffi::c_void;
