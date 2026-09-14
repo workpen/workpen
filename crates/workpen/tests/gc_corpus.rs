@@ -97,6 +97,22 @@ fn cfg(repo: &Path, max_age: Duration, now: SystemTime) -> GcConfig {
     cfg
 }
 
+fn stamp_mtime_tree(root: &Path, when: SystemTime) {
+    if let Ok(rd) = fs::read_dir(root) {
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if path.is_dir() {
+                stamp_mtime_tree(&path, when);
+            } else if let Ok(file) = fs::File::open(&path) {
+                let _ = file.set_modified(when);
+            }
+        }
+    }
+    if let Ok(file) = fs::File::open(root) {
+        let _ = file.set_modified(when);
+    }
+}
+
 fn keep_reason(decision: &GcDecision) -> KeepReason {
     match decision {
         GcDecision::Keep { reason } => *reason,
@@ -867,18 +883,9 @@ fn dry_run_does_not_refresh_last_used() {
     );
     let leftover = repo.join(".workpen-worktrees");
     let wt = add_leftover_worktree(&repo, &leftover, "aged");
-    let _ = Command::new("find")
-        .args([
-            wt.to_str().expect("utf8"),
-            repo.join(".git/worktrees").to_str().expect("utf8"),
-            "-exec",
-            "touch",
-            "-t",
-            "200001010000",
-            "{}",
-            "+",
-        ])
-        .status();
+    let year_2000 = SystemTime::UNIX_EPOCH + Duration::from_secs(946_684_800);
+    stamp_mtime_tree(&wt, year_2000);
+    stamp_mtime_tree(&repo.join(".git/worktrees"), year_2000);
     let mut gc = cfg(&repo, Duration::from_secs(86400), SystemTime::now());
     gc.dry_run = true;
     let first = run_gc(&repo, &gc).expect("dry-run 1");
