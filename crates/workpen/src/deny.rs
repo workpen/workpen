@@ -463,9 +463,12 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// Empty and flag-looking tokens are skipped. A shell `-c` token, including
 /// short-option clusters that contain `c` (`-lc`, `-ic`, `-lic`, `-cl`)
 /// and an attached `-cBODY`, dest-denies paths inside the script body
-/// via [`check_command_dests`]. When argv0 is `env`/`env.exe`, dest-denies
-/// the operand of `-S`/`--split-string` via [`check_command_dests`], then
-/// leftover tokens in that string as env flags (`--file=`, `-f`, `NAME=value`).
+/// via [`check_command_dests`]. When that body (or any peeled command
+/// string) contains an `env`/`env.exe` token, dest-denies the following
+/// tokens with the same env-flag dest check used for argv0 env.
+/// When argv0 is `env`/`env.exe`, dest-denies the operand of
+/// `-S`/`--split-string` via [`check_command_dests`], then leftover
+/// tokens in that string as env flags (`--file=`, `-f`, `NAME=value`).
 /// After skipping a `timeout`/`nohup`/`nice` prefix (same skip as wrap),
 /// dest-denies those env flags when the remaining argv starts with env.
 /// Dest-denies argv `-f`/`--file` (including attached `--file=.env`) via
@@ -743,7 +746,9 @@ fn check_env_file_dest(path: &str, root: &Path, policy: &DenyPolicy) -> Result<(
 /// Join extracted command dests under `root` and dest-deny each.
 ///
 /// Absolute dests stay as given. Empty and flag-looking peeled tokens
-/// are skipped. Does not peel `--flag=.env`.
+/// are skipped. After peeling, an `env`/`env.exe` token dest-denies
+/// the following tokens with the same env-flag dest check used for
+/// argv0 env. Does not peel `--flag=.env`.
 pub fn check_command_dests(
     command: &str,
     root: &Path,
@@ -758,7 +763,61 @@ pub fn check_command_dests(
             check_dest(&dest.to_string_lossy(), policy, None)?;
         }
     }
+    check_command_string_env_dests(command, root, policy)
+}
+
+/// After peeling a command string, dest-deny env `-S`/`--file` operands.
+///
+/// Recurses into a shell `-c` body. Does not peel generic `--flag=.env`.
+fn check_command_string_env_dests(
+    command: &str,
+    root: &Path,
+    policy: &DenyPolicy,
+) -> Result<(), CheckDestError> {
+    for part in peel_shell_parts(command) {
+        let tokens = command_string_tokens(part);
+        for (i, token) in tokens.iter().enumerate() {
+            if is_env_program(*token) {
+                check_env_flag_dests(&tokens[i + 1..], root, policy)?;
+            }
+            if let Some(body) = shell_c_body(token, tokens.get(i + 1).copied()) {
+                check_command_string_env_dests(body, root, policy)?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// Whitespace words; matching quotes yield the inner string as one token.
+fn command_string_tokens(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'\'' || bytes[i] == b'"' {
+            let q = bytes[i];
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != q {
+                i += 1;
+            }
+            out.push(&command[start..i]);
+            if i < bytes.len() {
+                i += 1;
+            }
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        out.push(&command[start..i]);
+    }
+    out
 }
 
 /// Committed dotenv templates, not live env files.
