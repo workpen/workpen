@@ -170,8 +170,10 @@ impl KernelPolicy {
     /// True when the policy asked the kernel backend to block sockets.
     ///
     /// Unix `run_child` passes this to nono `block_network()`. Windows
-    /// write-restricted tokens do not block TCP; this flag is stored
-    /// but not enforced there.
+    /// `run_child` wraps the command in a unique helper PE, launches
+    /// that helper in an AppContainer with no network capabilities, and
+    /// adds a dynamic WFP BLOCK on the package SID (and the helper
+    /// APP_ID). Fail closed if AppContainer or WFP cannot apply.
     pub fn network_blocked(&self) -> bool {
         self.network_blocked
     }
@@ -238,10 +240,13 @@ impl KernelPolicy {
     /// Spawn `cmd` under the kernel jail and wait for it.
     ///
     /// Unix installs `pre_exec` then `status`. Windows creates a
-    /// write-restricted token and `CreateProcessAsUserW`. If the kernel
-    /// cannot apply, this returns [`KernelError::Apply`] and does not
-    /// start the child. [`KernelApply::UserspaceOnly`] stays on
-    /// [`Self::apply`] / [`Self::apply_pre_exec`] inspect paths only.
+    /// write-restricted token and `CreateProcessAsUserW`. When
+    /// [`Self::network_blocked`] is set, Windows also wraps the command
+    /// through a unique helper PE in an AppContainer and a package-SID
+    /// WFP BLOCK. If the kernel cannot apply, this returns
+    /// [`KernelError::Apply`] and does not start the child.
+    /// [`KernelApply::UserspaceOnly`] stays on [`Self::apply`] /
+    /// [`Self::apply_pre_exec`] inspect paths only.
     ///
     /// Windows spawn inherits parent stdio or grants NUL so console
     /// children do not block on null handles. [`Command`]
