@@ -30,7 +30,9 @@ const TOKEN_PRIMARY_MASK: Dword = TOKEN_ASSIGN_PRIMARY
     | TOKEN_ADJUST_DEFAULT
     | TOKEN_ADJUST_SESSIONID;
 const SECURITY_NT_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 5];
+const SECURITY_WORLD_SID_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 1];
 const SECURITY_RESTRICTED_CODE_RID: Dword = 12;
+const SECURITY_WORLD_RID: Dword = 0;
 const GENERIC_ALL: Dword = 0x1000_0000;
 const GRANT_ACCESS: u32 = 1;
 const DENY_ACCESS: u32 = 3;
@@ -308,6 +310,47 @@ impl Drop for RestrictedSid {
     }
 }
 
+struct WorldSid(Handle);
+impl WorldSid {
+    fn new() -> Result<Self, KernelError> {
+        let authority = SidIdentifierAuthority {
+            value: SECURITY_WORLD_SID_AUTHORITY,
+        };
+        let mut sid = ptr::null_mut();
+        // SAFETY: `authority` lives for the call; `sid` is written by the API.
+        let ok = unsafe {
+            AllocateAndInitializeSid(
+                &authority,
+                1,
+                SECURITY_WORLD_RID,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &mut sid,
+            )
+        };
+        if ok == 0 || sid.is_null() {
+            return Err(last_error("AllocateAndInitializeSid"));
+        }
+        Ok(Self(sid))
+    }
+}
+impl Drop for WorldSid {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` came from AllocateAndInitializeSid.
+            unsafe {
+                FreeSid(self.0);
+            }
+            self.0 = ptr::null_mut();
+        }
+    }
+}
+
 struct LocalMem(Handle);
 impl Drop for LocalMem {
     fn drop(&mut self) {
@@ -429,6 +472,7 @@ struct Prepared {
     job: CloseOnDrop,
     acl_guards: Vec<AclRestore>,
     _sid: RestrictedSid,
+    _world: WorldSid,
 }
 
 pub(super) fn spawn_write_restricted(
@@ -448,8 +492,9 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
         ));
     }
     let sid = RestrictedSid::new()?;
+    let world = WorldSid::new()?;
     let mut acl_guards = grant_write_aces(&rw_paths, sid.0)?;
-    acl_guards.extend(deny_dest_aces(&dest_deny_paths(policy), sid.0)?);
+    acl_guards.extend(deny_dest_aces(&dest_deny_paths(policy), world.0)?);
     let token = create_write_restricted_token(sid.0).map_err(prefix_apply("token setup"))?;
     let job = create_kill_job().map_err(prefix_apply("job setup"))?;
     Ok(Prepared {
@@ -457,6 +502,7 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
         job,
         acl_guards,
         _sid: sid,
+        _world: world,
     })
 }
 
