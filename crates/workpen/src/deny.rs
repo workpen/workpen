@@ -484,10 +484,11 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// env. A nested `env` operand (or `env -- env …`) is walked the same way.
 /// `cmd /c` and `powershell -Command` / `-EncodedCommand` bodies are
 /// dest-denied as command strings. After `cmd` / `pwsh`, remaining
-/// argv is walked so `/s` / `-NoProfile` cannot hide `/c` or
-/// `-EncodedCommand`. Unique prefixes (`-enco`, `-comm`) match.
+/// argv is walked so `/s` / `-NoProfile` cannot hide `/c`,
+/// `-EncodedCommand`, or `-File`. Unique prefixes (`-en`, `-comma`) match.
+/// `-File` / `-f` / `/File` (and `-File:…`) dest-deny the script path.
 /// Those bodies are also peeled inside a shell `-c` string.
-/// Generic `/c`, `-Command`, or `-EncodedCommand` on another argv0
+/// Generic `/c`, `-Command`, `-EncodedCommand`, or `-File` on another argv0
 /// is not.
 /// Dest-denies argv `-f`/`--file` (including attached `--file=.env`) via
 /// [`check_dest`]. Does not dest-deny a flattened join of all argv. Does
@@ -571,8 +572,8 @@ fn powershell_command_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<
     None
 }
 
-/// PowerShell `-EncodedCommand` / `-enc` / `-ec` / `-e` payload, including
-/// attached `-EncodedCommand:…` and unique prefixes (`-enco`). Not `-Command`.
+/// PowerShell `-EncodedCommand` / `-enc` / `-ec` / `-en` / `-e` payload, including
+/// attached `-EncodedCommand:…` and unique prefixes (`-en`). Not `-Command`.
 fn powershell_encoded_payload<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
     let rest = token.strip_prefix(['-', '/'])?;
     if let Some((name, value)) = rest.split_once(':') {
@@ -593,7 +594,31 @@ fn is_powershell_encoded_command_name(name: &str) -> bool {
         || lower == "enc"
         || lower == "ec"
         || lower == "e"
-        || (lower.len() >= 4 && "encodedcommand".starts_with(&lower))
+        || ("encodedcommand".starts_with(&lower)
+            && !"erroraction".starts_with(&lower)
+            && !"errorvariable".starts_with(&lower)
+            && !"executionpolicy".starts_with(&lower))
+}
+
+/// PowerShell `-File` / `-f` / `/File` script dest, including attached
+/// `-File:…` / `-f:…` and unique prefixes (`-fi`, `-fil`).
+fn powershell_file_dest<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
+    let rest = token.strip_prefix(['-', '/'])?;
+    if let Some((name, value)) = rest.split_once(':') {
+        if is_powershell_file_name(name) {
+            return Some(value);
+        }
+        return None;
+    }
+    if is_powershell_file_name(rest) {
+        return next;
+    }
+    None
+}
+
+fn is_powershell_file_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "file" || lower == "f" || (lower.len() >= 2 && "file".starts_with(&lower))
 }
 
 fn is_powershell_command_name(name: &str) -> bool {
@@ -602,7 +627,7 @@ fn is_powershell_command_name(name: &str) -> bool {
 }
 
 /// After `cmd` / `pwsh`, walk remaining tokens. First `/c`/`/k`,
-/// `-EncodedCommand`, or `-Command` (including unique prefixes) wins.
+/// `-EncodedCommand`, `-File`, or `-Command` (including unique prefixes) wins.
 fn check_cmd_powershell_remaining_dests(
     program: &str,
     rest: &[impl AsRef<str>],
@@ -623,6 +648,12 @@ fn check_cmd_powershell_remaining_dests(
                 powershell_encoded_payload(token.as_ref(), rest.get(j + 1).map(|s| s.as_ref()))
             {
                 return check_powershell_encoded_dests(payload, root, policy);
+            }
+            if let Some(path) =
+                powershell_file_dest(token.as_ref(), rest.get(j + 1).map(|s| s.as_ref()))
+            {
+                let dest = dest_under_root(root, path);
+                return check_dest(&dest.to_string_lossy(), policy, None).map(|_| ());
             }
             if let Some(body) =
                 powershell_command_body(token.as_ref(), rest.get(j + 1).map(|s| s.as_ref()))
@@ -999,8 +1030,8 @@ pub fn check_command_dests(
 /// After peeling a command string, dest-deny env `-S`/`--file` operands.
 ///
 /// Recurses into a shell `-c` body. Also peels `cmd` / `pwsh` `/c`,
-/// `-Command`, and `-EncodedCommand` (including unique prefixes) from
-/// remaining string tokens. Does not peel generic `--flag=.env`.
+/// `-Command`, `-EncodedCommand`, and `-File` (including unique prefixes)
+/// from remaining string tokens. Does not peel generic `--flag=.env`.
 fn check_command_string_env_dests(
     command: &str,
     root: &Path,
