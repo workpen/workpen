@@ -10,8 +10,9 @@ use tempfile::TempDir;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use workpen::resolve_extra_root;
 use workpen::{
-    KernelAccess, KernelApply, KernelError, child_env_deny_names, is_denied_child_env,
-    kernel_supported, process_jail, require_applied, scrub_child_command, spawn_after_setup,
+    DenyPolicy, DestDenyKind, KernelAccess, KernelApply, KernelError, child_env_deny_names,
+    collect_workspace_dest_denies, is_denied_child_env, kernel_supported, process_jail,
+    process_jail_with_policy, require_applied, scrub_child_command, spawn_after_setup,
     with_bash_noprofile,
 };
 
@@ -29,6 +30,108 @@ fn kernel_access_is_read_or_readwrite_only() {
 fn kernel_apply_is_applied_or_userspace_only() {
     let kinds = [KernelApply::Applied, KernelApply::UserspaceOnly];
     assert_eq!(kinds.len(), 2);
+}
+
+#[test]
+fn process_jail_dest_denies_env_and_not_readme() {
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    assert!(
+        policy
+            .grants()
+            .iter()
+            .any(|g| g.access == KernelAccess::ReadWrite),
+        "workspace stays ReadWrite; dest-deny is a second list"
+    );
+    let env = policy
+        .dest_denies()
+        .iter()
+        .find(|d| d.path.file_name().is_some_and(|n| n == ".env"))
+        .expect(".env dest-deny");
+    assert_eq!(env.kind, DestDenyKind::DenyGlob);
+    assert!(
+        env.matched.as_deref() == Some("**/.env"),
+        "hosts match DestDenyKind and matched glob, got {:?}",
+        env.matched
+    );
+    assert!(
+        policy
+            .dest_denies()
+            .iter()
+            .all(|d| d.path.file_name().is_none_or(|n| n != "readme.md")),
+        "readme.md must not be dest-denied"
+    );
+}
+
+#[test]
+fn process_jail_dest_denies_hardlink_sibling() {
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    fs::hard_link(dir.path().join(".env"), dir.path().join("notes.txt")).expect("hardlink");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let notes = policy
+        .dest_denies()
+        .iter()
+        .find(|d| d.path.file_name().is_some_and(|n| n == "notes.txt"))
+        .expect("hardlink sibling dest-deny");
+    assert_eq!(notes.kind, DestDenyKind::HardlinkSibling);
+}
+
+#[test]
+fn with_dest_deny_paths_records_host_path() {
+    let dir = workspace();
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    let extra = dir.path().join("host-secret.bin");
+    fs::write(&extra, "x").expect("extra");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>())
+        .expect("policy")
+        .with_dest_deny_paths([&extra]);
+    assert!(
+        policy
+            .dest_denies()
+            .iter()
+            .any(|d| d.path == extra && d.kind == DestDenyKind::DenyGlob),
+        "host dest-deny path must be on the list: {:?}",
+        policy.dest_denies()
+    );
+}
+
+#[test]
+fn collect_workspace_dest_denies_honors_extra_glob() {
+    let dir = workspace();
+    fs::write(dir.path().join("my.secret"), "x\n").expect("secret");
+    let policy = DenyPolicy::with_extra(["**/*.secret".into()]);
+    let found = collect_workspace_dest_denies(dir.path(), &policy).expect("collect");
+    assert!(
+        found.iter().any(|d| {
+            d.path.file_name().is_some_and(|n| n == "my.secret") && d.kind == DestDenyKind::DenyGlob
+        }),
+        "extra glob must reach the kernel dest-deny list: {found:?}"
+    );
+    let jail =
+        process_jail_with_policy(dir.path(), std::iter::empty::<&Path>(), &policy).expect("jail");
+    assert!(
+        jail.dest_denies()
+            .iter()
+            .any(|d| d.path.file_name().is_some_and(|n| n == "my.secret")),
+        "process_jail_with_policy must use the host policy"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dest_deny_walk_skips_directory_symlink() {
+    let dir = workspace();
+    let outside = TempDir::new().expect("outside");
+    fs::write(outside.path().join(".env"), "SECRET=1\n").expect("outside env");
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("out")).expect("symlink");
+    let found = collect_workspace_dest_denies(dir.path(), &DenyPolicy::default()).expect("walk");
+    assert!(
+        found.iter().all(|d| !d.path.starts_with(outside.path())),
+        "must not follow dir symlink to outside dest-deny: {found:?}"
+    );
 }
 
 #[test]

@@ -15,6 +15,8 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
+use crate::deny::{DenyPolicy, DestDeny, DestDenyKind, dest_deny_at};
+
 #[cfg(windows)]
 mod windows;
 
@@ -33,9 +35,15 @@ pub struct KernelGrant {
 }
 
 /// Process-jail policy. Workspace RW, extra roots RW, existing system dirs Read.
+///
+/// Dest-deny names are a second list, not a grant of `/`. Linux Landlock
+/// cannot dest-deny a file inside an allowed tree
+/// ([nono #1592](https://github.com/nolabs-ai/nono/discussions/1592)).
+/// OS apply is the remount / Seatbelt / Windows-read follow-up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelPolicy {
     grants: Vec<KernelGrant>,
+    dest_denies: Vec<DestDeny>,
     network_blocked: bool,
 }
 
@@ -81,9 +89,22 @@ pub fn kernel_supported() -> bool {
 ///
 /// Refuses filesystem root and the current user's home directory as the
 /// workspace. Extra-roots may still be an explicit `/tmp`.
+///
+/// Dest-deny names default to [`crate::default_secret_denies()`] resolved
+/// under the workspace, including hardlink siblings. Hosts match
+/// [`crate::DestDenyKind`], not English.
 pub fn process_jail(
     workspace: impl AsRef<Path>,
     extra: impl IntoIterator<Item = impl AsRef<Path>>,
+) -> Result<KernelPolicy, KernelError> {
+    process_jail_with_policy(workspace, extra, &DenyPolicy::default())
+}
+
+/// Same as [`process_jail`] with a host [`DenyPolicy`].
+pub fn process_jail_with_policy(
+    workspace: impl AsRef<Path>,
+    extra: impl IntoIterator<Item = impl AsRef<Path>>,
+    policy: &DenyPolicy,
 ) -> Result<KernelPolicy, KernelError> {
     refuse_home_workspace(workspace.as_ref())?;
     let mut grants = Vec::new();
@@ -94,8 +115,10 @@ pub fn process_jail(
     for dir in system_read_dirs() {
         add_read_if_dir(&mut grants, &dir);
     }
+    let dest_denies = collect_workspace_dest_denies(workspace.as_ref(), policy)?;
     Ok(KernelPolicy {
         grants,
+        dest_denies,
         network_blocked: true,
     })
 }
@@ -103,6 +126,23 @@ pub fn process_jail(
 impl KernelPolicy {
     pub fn grants(&self) -> &[KernelGrant] {
         &self.grants
+    }
+
+    /// Dest-deny paths collected under the workspace. Not a filesystem grant.
+    pub fn dest_denies(&self) -> &[DestDeny] {
+        &self.dest_denies
+    }
+
+    /// Add host dest-deny paths. Existing files are classified (glob or
+    /// hardlink). Missing paths are still recorded as [`DestDenyKind::DenyGlob`].
+    pub fn with_dest_deny_paths(
+        mut self,
+        paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    ) -> Self {
+        for path in paths {
+            push_dest_deny(&mut self.dest_denies, dest_deny_from_path(path.as_ref()));
+        }
+        self
     }
 
     /// True when the policy asked the kernel backend to block sockets.
@@ -514,6 +554,80 @@ pub fn require_applied(applied: KernelApply) -> Result<KernelApply, KernelError>
             "kernel jail did not apply; child was not started".into(),
         )),
     }
+}
+
+const DEST_DENY_WALK_LIMIT: usize = 65_536;
+
+/// Existing dest-deny files under `workspace`, including hardlink siblings.
+///
+/// Does not apply the jail. Does not follow directory symlinks. Walk
+/// failure or an entry cap is [`KernelError::Root`].
+pub fn collect_workspace_dest_denies(
+    workspace: &Path,
+    policy: &DenyPolicy,
+) -> Result<Vec<DestDeny>, KernelError> {
+    let mut out = Vec::new();
+    let mut remaining = DEST_DENY_WALK_LIMIT;
+    walk_dest_denies(workspace, policy, &mut out, &mut remaining)?;
+    Ok(out)
+}
+
+fn walk_dest_denies(
+    dir: &Path,
+    policy: &DenyPolicy,
+    out: &mut Vec<DestDeny>,
+    remaining: &mut usize,
+) -> Result<(), KernelError> {
+    if *remaining == 0 {
+        return Err(KernelError::Root(format!(
+            "dest-deny walk exceeded {DEST_DENY_WALK_LIMIT} entries under {}",
+            dir.display()
+        )));
+    }
+    let rd = std::fs::read_dir(dir)
+        .map_err(|e| KernelError::Root(format!("dest-deny walk {}: {e}", dir.display())))?;
+    for ent in rd {
+        if *remaining == 0 {
+            return Err(KernelError::Root(format!(
+                "dest-deny walk exceeded {DEST_DENY_WALK_LIMIT} entries under {}",
+                dir.display()
+            )));
+        }
+        *remaining -= 1;
+        let ent =
+            ent.map_err(|e| KernelError::Root(format!("dest-deny walk {}: {e}", dir.display())))?;
+        let path = ent.path();
+        let ft = ent
+            .file_type()
+            .map_err(|e| KernelError::Root(format!("dest-deny walk {}: {e}", path.display())))?;
+        if ft.is_dir() && !ft.is_symlink() {
+            walk_dest_denies(&path, policy, out, remaining)?;
+            continue;
+        }
+        if let Some(deny) = dest_deny_at(&path, path.display().to_string(), policy) {
+            push_dest_deny(out, deny);
+        }
+    }
+    Ok(())
+}
+
+fn dest_deny_from_path(path: &Path) -> DestDeny {
+    dest_deny_at(path, path.display().to_string(), &DenyPolicy::default()).unwrap_or(DestDeny {
+        kind: DestDenyKind::DenyGlob,
+        path: path.to_path_buf(),
+        display: path.display().to_string(),
+        matched: None,
+    })
+}
+
+fn push_dest_deny(out: &mut Vec<DestDeny>, deny: DestDeny) {
+    if out
+        .iter()
+        .any(|d| d.path == deny.path && d.kind == deny.kind)
+    {
+        return;
+    }
+    out.push(deny);
 }
 
 fn refuse_home_workspace(workspace: &Path) -> Result<(), KernelError> {
