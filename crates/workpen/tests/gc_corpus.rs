@@ -97,6 +97,27 @@ fn cfg(repo: &Path, max_age: Duration, now: SystemTime) -> GcConfig {
     cfg
 }
 
+fn stamp_mtime_tree(root: &Path, when: SystemTime) {
+    if let Ok(rd) = fs::read_dir(root) {
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if path.is_dir() {
+                stamp_mtime_tree(&path, when);
+            } else {
+                stamp_mtime(&path, when);
+            }
+        }
+    }
+    stamp_mtime(root, when);
+}
+
+fn stamp_mtime(path: &Path, when: SystemTime) {
+    // Windows needs write access for set_modified. Do not truncate.
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(when);
+    }
+}
+
 fn keep_reason(decision: &GcDecision) -> KeepReason {
     match decision {
         GcDecision::Keep { reason } => *reason,
@@ -838,6 +859,53 @@ fn dry_run_does_not_remove() {
             |(p, d)| p.file_name() == wt.file_name() && matches!(d, GcDecision::Reclaim { .. })
         ),
         "dry-run still classifies reclaim: {rows:?}"
+    );
+    assert!(wt.exists(), "dry-run must leave the tree");
+}
+
+#[test]
+fn dry_run_does_not_refresh_last_used() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let out = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_COMMITTER_DATE", "2000-01-01 00:00:00 +0000")
+        .args([
+            "commit",
+            "--amend",
+            "--no-edit",
+            "--date=2000-01-01 00:00:00 +0000",
+        ])
+        .current_dir(&repo)
+        .output()
+        .expect("amend committer");
+    assert!(
+        out.status.success(),
+        "amend: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "aged");
+    let year_2000 = SystemTime::UNIX_EPOCH + Duration::from_secs(946_684_800);
+    stamp_mtime_tree(&wt, year_2000);
+    stamp_mtime_tree(&repo.join(".git/worktrees"), year_2000);
+    let mut gc = cfg(&repo, Duration::from_secs(86400), SystemTime::now());
+    gc.dry_run = true;
+    let first = run_gc(&repo, &gc).expect("dry-run 1");
+    assert!(
+        first.iter().any(
+            |(p, d)| p.file_name() == wt.file_name() && matches!(d, GcDecision::Reclaim { .. })
+        ),
+        "first dry-run must reclaim: {first:?}"
+    );
+    let second = run_gc(&repo, &gc).expect("dry-run 2");
+    assert!(
+        second.iter().any(
+            |(p, d)| p.file_name() == wt.file_name() && matches!(d, GcDecision::Reclaim { .. })
+        ),
+        "second dry-run must still reclaim (git status must not bump last-used): {second:?}"
     );
     assert!(wt.exists(), "dry-run must leave the tree");
 }
