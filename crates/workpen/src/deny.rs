@@ -472,8 +472,9 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// After skipping stacked `timeout`/`nohup`/`nice` prefixes (same skip as
 /// wrap), dest-denies those env flags when the remaining argv starts with
 /// env. A nested `env` operand (or `env -- env …`) is walked the same way.
-/// `cmd /c` and `powershell -Command` bodies are dest-denied as command
-/// strings. Generic `/c` or `-Command` on another argv0 is not.
+/// `cmd /c` and `powershell -Command` / `-EncodedCommand` bodies are
+/// dest-denied as command strings. Generic `/c`, `-Command`, or
+/// `-EncodedCommand` on another argv0 is not.
 /// Dest-denies argv `-f`/`--file` (including attached `--file=.env`) via
 /// [`check_dest`]. Does not dest-deny a flattened join of all argv. Does
 /// not peel generic `--flag=.env`.
@@ -506,6 +507,14 @@ pub fn check_command_argv(
             )
         {
             check_command_dests(body, root, policy)?;
+        }
+        if is_powershell_program(token)
+            && let Some(payload) = powershell_encoded_payload(
+                cmd.get(i + 1).map(|s| s.as_ref()).unwrap_or(""),
+                cmd.get(i + 2).map(|s| s.as_ref()),
+            )
+        {
+            check_powershell_encoded_dests(payload, root, policy)?;
         }
     }
     let start = skip_all_wrappers(cmd);
@@ -553,7 +562,7 @@ fn cmd_script_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str>
 }
 
 /// PowerShell `-Command` / `-c` / `/C` script body, including attached
-/// `-Command:…`. Not `-EncodedCommand`.
+/// `-Command:…`. Not `-EncodedCommand` (see [`powershell_encoded_payload`]).
 fn powershell_command_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
     let rest = token.strip_prefix(['-', '/'])?;
     if let Some((name, value)) = rest.split_once(':') {
@@ -566,6 +575,111 @@ fn powershell_command_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<
         return next;
     }
     None
+}
+
+/// PowerShell `-EncodedCommand` / `-enc` / `-ec` / `-e` payload, including
+/// attached `-EncodedCommand:…`. Exact names after `-` or `/`. Not `-Command`.
+fn powershell_encoded_payload<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
+    let rest = token.strip_prefix(['-', '/'])?;
+    if let Some((name, value)) = rest.split_once(':') {
+        if is_powershell_encoded_command_name(name) {
+            return Some(value);
+        }
+        return None;
+    }
+    if is_powershell_encoded_command_name(rest) {
+        return next;
+    }
+    None
+}
+
+fn is_powershell_encoded_command_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("encodedcommand")
+        || name.eq_ignore_ascii_case("enc")
+        || name.eq_ignore_ascii_case("ec")
+        || name.eq_ignore_ascii_case("e")
+}
+
+/// Decode `-EncodedCommand` UTF-16LE base64 and dest-deny the script.
+/// Invalid payloads fail closed as [`DestDenyError::CommandToken`].
+fn check_powershell_encoded_dests(
+    payload: &str,
+    root: &Path,
+    policy: &DenyPolicy,
+) -> Result<(), CheckDestError> {
+    let script =
+        decode_powershell_encoded_command(payload).ok_or_else(|| DestDenyError::CommandToken {
+            token: payload.to_string(),
+        })?;
+    check_command_dests(&script, root, policy)
+}
+
+/// RFC 4648 base64 of UTF-16LE. Fail-closed on empty, invalid alphabet,
+/// leftover bits, odd length, or unpaired surrogates.
+fn decode_powershell_encoded_command(payload: &str) -> Option<String> {
+    let stripped: String = payload
+        .chars()
+        .filter(|c| !matches!(*c, ' ' | '\t' | '\r' | '\n'))
+        .collect();
+    if stripped.is_empty() {
+        return None;
+    }
+    let bytes = decode_rfc4648_base64(stripped.as_bytes())?;
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+    String::from_utf16(&units).ok()
+}
+
+fn decode_rfc4648_base64(input: &[u8]) -> Option<Vec<u8>> {
+    fn digit(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let mut pad = 0usize;
+    let mut end = input.len();
+    while end > 0 && input[end - 1] == b'=' {
+        pad += 1;
+        end -= 1;
+        if pad > 2 {
+            return None;
+        }
+    }
+    if input[..end].contains(&b'=') {
+        return None;
+    }
+    if end % 4 == 1 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(end * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in &input[..end] {
+        let v = u32::from(digit(b)?);
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    if acc != 0 {
+        return None;
+    }
+    Some(out)
 }
 
 /// Skip stacked `timeout` / `nohup` / `nice` prefixes. Returns the index
