@@ -115,6 +115,9 @@ pub enum DestDenyError {
     /// Argv token hit. Distinct wording from [`DestDeny::message`].
     #[error("command references path denied by sandbox profile: {token}")]
     CommandToken { token: String },
+    /// PowerShell `-EncodedCommand` payload is not UTF-16LE RFC 4648.
+    #[error("invalid -EncodedCommand payload (need UTF-16LE base64); child was not started")]
+    EncodedCommand,
     /// Post-open hardlink hit. Distinct wording from [`DestDeny::message`].
     #[error(
         "path denied: {path} is a hardlink of a denied name; unlink extra names or do not share the inode"
@@ -480,8 +483,12 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// wrap), dest-denies those env flags when the remaining argv starts with
 /// env. A nested `env` operand (or `env -- env …`) is walked the same way.
 /// `cmd /c` and `powershell -Command` / `-EncodedCommand` bodies are
-/// dest-denied as command strings. Generic `/c`, `-Command`, or
-/// `-EncodedCommand` on another argv0 is not.
+/// dest-denied as command strings. After `cmd` / `pwsh`, remaining
+/// argv is walked so `/s` / `-NoProfile` cannot hide `/c` or
+/// `-EncodedCommand`. Unique prefixes (`-enco`, `-comm`) match.
+/// Those bodies are also peeled inside a shell `-c` string.
+/// Generic `/c`, `-Command`, or `-EncodedCommand` on another argv0
+/// is not.
 /// Dest-denies argv `-f`/`--file` (including attached `--file=.env`) via
 /// [`check_dest`]. Does not dest-deny a flattened join of all argv. Does
 /// not peel generic `--flag=.env`.
@@ -499,29 +506,8 @@ pub fn check_command_argv(
         if let Some(body) = shell_c_body(token, cmd.get(i + 1).map(|s| s.as_ref())) {
             check_command_dests(body, root, policy)?;
         }
-        if is_cmd_program(token)
-            && let Some(body) = cmd_script_body(
-                cmd.get(i + 1).map(|s| s.as_ref()).unwrap_or(""),
-                cmd.get(i + 2).map(|s| s.as_ref()),
-            )
-        {
-            check_command_dests(body, root, policy)?;
-        }
-        if is_powershell_program(token)
-            && let Some(body) = powershell_command_body(
-                cmd.get(i + 1).map(|s| s.as_ref()).unwrap_or(""),
-                cmd.get(i + 2).map(|s| s.as_ref()),
-            )
-        {
-            check_command_dests(body, root, policy)?;
-        }
-        if is_powershell_program(token)
-            && let Some(payload) = powershell_encoded_payload(
-                cmd.get(i + 1).map(|s| s.as_ref()).unwrap_or(""),
-                cmd.get(i + 2).map(|s| s.as_ref()),
-            )
-        {
-            check_powershell_encoded_dests(payload, root, policy)?;
+        if is_cmd_program(token) || is_powershell_program(token) {
+            check_cmd_powershell_remaining_dests(token, &cmd[i + 1..], root, policy)?;
         }
     }
     let start = skip_all_wrappers(cmd);
@@ -569,23 +555,24 @@ fn cmd_script_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str>
 }
 
 /// PowerShell `-Command` / `-c` / `/C` script body, including attached
-/// `-Command:…`. Not `-EncodedCommand` (see [`powershell_encoded_payload`]).
+/// `-Command:…` and unique prefixes (`-comm`). Not `-EncodedCommand`
+/// (see [`powershell_encoded_payload`]).
 fn powershell_command_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
     let rest = token.strip_prefix(['-', '/'])?;
     if let Some((name, value)) = rest.split_once(':') {
-        if name.eq_ignore_ascii_case("command") || name.eq_ignore_ascii_case("c") {
+        if is_powershell_command_name(name) {
             return Some(value);
         }
         return None;
     }
-    if rest.eq_ignore_ascii_case("command") || rest.eq_ignore_ascii_case("c") {
+    if is_powershell_command_name(rest) {
         return next;
     }
     None
 }
 
 /// PowerShell `-EncodedCommand` / `-enc` / `-ec` / `-e` payload, including
-/// attached `-EncodedCommand:…`. Exact names after `-` or `/`. Not `-Command`.
+/// attached `-EncodedCommand:…` and unique prefixes (`-enco`). Not `-Command`.
 fn powershell_encoded_payload<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
     let rest = token.strip_prefix(['-', '/'])?;
     if let Some((name, value)) = rest.split_once(':') {
@@ -601,23 +588,60 @@ fn powershell_encoded_payload<'a>(token: &'a str, next: Option<&'a str>) -> Opti
 }
 
 fn is_powershell_encoded_command_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("encodedcommand")
-        || name.eq_ignore_ascii_case("enc")
-        || name.eq_ignore_ascii_case("ec")
-        || name.eq_ignore_ascii_case("e")
+    let lower = name.to_ascii_lowercase();
+    lower == "encodedcommand"
+        || lower == "enc"
+        || lower == "ec"
+        || lower == "e"
+        || (lower.len() >= 4 && "encodedcommand".starts_with(&lower))
+}
+
+fn is_powershell_command_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "command" || lower == "c" || (lower.len() >= 4 && "command".starts_with(&lower))
+}
+
+/// After `cmd` / `pwsh`, walk remaining tokens. First `/c`/`/k`,
+/// `-EncodedCommand`, or `-Command` (including unique prefixes) wins.
+fn check_cmd_powershell_remaining_dests(
+    program: &str,
+    rest: &[impl AsRef<str>],
+    root: &Path,
+    policy: &DenyPolicy,
+) -> Result<(), CheckDestError> {
+    if is_cmd_program(program) {
+        for (j, token) in rest.iter().enumerate() {
+            if let Some(body) = cmd_script_body(token.as_ref(), rest.get(j + 1).map(|s| s.as_ref()))
+            {
+                return check_command_dests(body, root, policy);
+            }
+        }
+    }
+    if is_powershell_program(program) {
+        for (j, token) in rest.iter().enumerate() {
+            if let Some(payload) =
+                powershell_encoded_payload(token.as_ref(), rest.get(j + 1).map(|s| s.as_ref()))
+            {
+                return check_powershell_encoded_dests(payload, root, policy);
+            }
+            if let Some(body) =
+                powershell_command_body(token.as_ref(), rest.get(j + 1).map(|s| s.as_ref()))
+            {
+                return check_command_dests(body, root, policy);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Decode `-EncodedCommand` UTF-16LE base64 and dest-deny the script.
-/// Invalid payloads fail closed as [`DestDenyError::CommandToken`].
+/// Invalid payloads fail closed as [`DestDenyError::EncodedCommand`].
 fn check_powershell_encoded_dests(
     payload: &str,
     root: &Path,
     policy: &DenyPolicy,
 ) -> Result<(), CheckDestError> {
-    let script =
-        decode_powershell_encoded_command(payload).ok_or_else(|| DestDenyError::CommandToken {
-            token: payload.to_string(),
-        })?;
+    let script = decode_powershell_encoded_command(payload).ok_or(DestDenyError::EncodedCommand)?;
     check_command_dests(&script, root, policy)
 }
 
@@ -974,7 +998,9 @@ pub fn check_command_dests(
 
 /// After peeling a command string, dest-deny env `-S`/`--file` operands.
 ///
-/// Recurses into a shell `-c` body. Does not peel generic `--flag=.env`.
+/// Recurses into a shell `-c` body. Also peels `cmd` / `pwsh` `/c`,
+/// `-Command`, and `-EncodedCommand` (including unique prefixes) from
+/// remaining string tokens. Does not peel generic `--flag=.env`.
 fn check_command_string_env_dests(
     command: &str,
     root: &Path,
@@ -988,6 +1014,9 @@ fn check_command_string_env_dests(
             }
             if let Some(body) = shell_c_body(token, tokens.get(i + 1).copied()) {
                 check_command_string_env_dests(body, root, policy)?;
+            }
+            if is_cmd_program(token) || is_powershell_program(token) {
+                check_cmd_powershell_remaining_dests(token, &tokens[i + 1..], root, policy)?;
             }
         }
     }

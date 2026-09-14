@@ -57,11 +57,8 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
         .ok_or_else(|| "usage: workpen why [--root DIR] [--extra-root DIR] PATH".to_string())?;
     let guard = PathGuard::with_extra_roots(&root, &extras).map_err(|e| e.to_string())?;
     let dest = why_dest(&root, path);
-    match workpen::check_dest(
-        &dest.to_string_lossy(),
-        &DenyPolicy::default(),
-        Some(&guard),
-    ) {
+    let policy = DenyPolicy::from_workspace(&root).map_err(|e| e.to_string())?;
+    match workpen::check_dest(&dest.to_string_lossy(), &policy, Some(&guard)) {
         Ok(resolved) => {
             println!("allowed {}", resolved.display());
             Ok(ExitCode::SUCCESS)
@@ -96,7 +93,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     if cmd.is_empty() {
         return Err("usage: workpen run [--root DIR] [--extra-root DIR] [--] CMD...".into());
     }
-    let policy = DenyPolicy::default();
+    let policy = DenyPolicy::from_workspace(&root).map_err(|e| e.to_string())?;
     let guard = PathGuard::with_extra_roots(&root, &extras).map_err(|e| e.to_string())?;
     if let Err(e) = check_command_argv(cmd, guard.canon_root(), &policy) {
         return Err(e.to_string());

@@ -61,3 +61,51 @@ fn why_errors_when_root_is_home() {
         "home --root must not report allowed"
     );
 }
+
+#[test]
+fn why_honors_workspace_agent_lock_extra_glob() {
+    let ws = tempfile::TempDir::new().expect("workspace");
+    std::fs::write(ws.path().join("agent.lock"), "**/*.secret\n").expect("lock");
+    std::fs::write(ws.path().join("team.secret"), "x\n").expect("secret");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("readme");
+    let deny = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["why", "--root"])
+        .arg(ws.path())
+        .arg("team.secret")
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !deny.status.success(),
+        "why team.secret must dest-deny, stdout={} stderr={}",
+        String::from_utf8_lossy(&deny.stdout),
+        String::from_utf8_lossy(&deny.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&deny.stdout);
+    let text = format!("{}{}", stdout, String::from_utf8_lossy(&deny.stderr));
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        !stdout.to_ascii_lowercase().contains("allowed"),
+        "why team.secret must not print allowed: {stdout}"
+    );
+    assert!(
+        lower.contains("denied") || lower.contains("deny"),
+        "why team.secret must dest-deny: {text}"
+    );
+    let allow = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["why", "--root"])
+        .arg(ws.path())
+        .arg("readme.md")
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        allow.status.success(),
+        "why readme.md must be allowed, stdout={} stderr={}",
+        String::from_utf8_lossy(&allow.stdout),
+        String::from_utf8_lossy(&allow.stderr)
+    );
+    let allowed = String::from_utf8_lossy(&allow.stdout);
+    assert!(
+        allowed.to_ascii_lowercase().contains("allowed"),
+        "why readme.md must print allowed: {allowed}"
+    );
+}

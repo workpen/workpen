@@ -12,9 +12,9 @@ use tempfile::TempDir;
 use workpen::resolve_extra_root;
 use workpen::{
     AGENT_LOCK_NAME, DenyPolicy, DestDenyKind, KernelAccess, KernelApply, KernelError,
-    child_env_deny_names, collect_workspace_dest_denies, is_denied_child_env, kernel_supported,
-    load_agent_lock, process_jail, process_jail_with_policy, require_applied, scrub_child_command,
-    spawn_after_setup, with_bash_noprofile,
+    child_env_deny_names, collect_workspace_dest_denies, collect_workspace_dest_denies_limited,
+    is_denied_child_env, kernel_supported, load_agent_lock, process_jail, process_jail_with_policy,
+    require_applied, scrub_child_command, spawn_after_setup, with_bash_noprofile,
 };
 
 fn workspace() -> TempDir {
@@ -310,6 +310,49 @@ fn run_child_cannot_read_env_hardlink_sibling() {
     assert!(
         !leaked.contains("SECRET"),
         "hardlink sibling must be dest-denied: {leaked:?}"
+    );
+}
+
+#[test]
+fn dest_deny_walk_skips_git_and_does_not_charge_cache_artifacts() {
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    fs::create_dir_all(dir.path().join("target/deps")).expect("target/deps");
+    fs::write(dir.path().join("target/.env"), "SECRET=1\n").expect("target env");
+    for i in 0..30 {
+        fs::write(
+            dir.path()
+                .join("target/deps")
+                .join(format!("crate{i}.rmeta")),
+            [],
+        )
+        .expect("dummy");
+    }
+    fs::create_dir_all(dir.path().join(".git")).expect("git");
+    fs::write(dir.path().join(".git/config"), "[core]\n").expect("git config");
+    fs::write(dir.path().join(".git/.env"), "SECRET=1\n").expect("git env");
+    let found = collect_workspace_dest_denies_limited(dir.path(), &DenyPolicy::default(), 8)
+        .expect("cache artifacts must not exhaust dest-deny walk");
+    assert!(
+        found.iter().any(|d| d.path == dir.path().join(".env")),
+        "workspace .env must dest-deny: {found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|d| d.path == dir.path().join("target/.env")),
+        "target/.env must dest-deny: {found:?}"
+    );
+    assert!(
+        found.iter().all(|d| d.path != dir.path().join(".git/.env")),
+        "must not dest-deny .git/.env: {found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .all(|d| d.path.file_name().is_none_or(|n| n != "readme.md")),
+        "readme.md must not dest-deny: {found:?}"
     );
 }
 
@@ -969,14 +1012,23 @@ fn run_child_network_blocked_tcp_fails() {
     );
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
     let port = listener.local_addr().expect("addr").port();
-    let script = format!("echo >/dev/tcp/127.0.0.1/{port}");
+    let marker = dir.path().join("tcp_started");
+    let script = format!("touch tcp_started; echo >/dev/tcp/127.0.0.1/{port}");
     let mut cmd = Command::new("/bin/bash");
     cmd.args(["-c", &script]).current_dir(dir.path());
     let (applied, status) = policy.run_child(cmd).expect("run_child");
     assert_eq!(applied, KernelApply::Applied);
+    assert!(marker.exists(), "probe must start before the TCP connect");
     assert!(
         !status.success(),
         "jailed child must not open TCP to 127.0.0.1:{port}: {status:?}"
+    );
+    listener
+        .set_nonblocking(true)
+        .expect("listener nonblocking");
+    assert!(
+        listener.accept().is_err(),
+        "jailed child must not complete a TCP handshake on 127.0.0.1:{port}"
     );
 }
 
@@ -995,10 +1047,12 @@ fn run_child_network_blocked_tcp_fails() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
     let port = listener.local_addr().expect("addr").port();
     let probe = write_windows_tcp_probe(dir.path(), port);
+    let marker = dir.path().join("tcp_started");
     let mut cmd = Command::new(&probe);
     cmd.current_dir(dir.path());
     let (applied, status) = policy.run_child(cmd).expect("run_child");
     assert_eq!(applied, KernelApply::Applied);
+    assert!(marker.exists(), "probe must start before the TCP connect");
     assert!(
         !status.success(),
         "jailed child must not open TCP to 127.0.0.1:{port}: {status:?}"
@@ -1009,6 +1063,29 @@ fn run_child_network_blocked_tcp_fails() {
     assert!(
         listener.accept().is_err(),
         "jailed child must not complete a TCP handshake on 127.0.0.1:{port}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn run_child_missing_program_is_apply_and_names_command() {
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let err = policy
+        .run_child(Command::new("no-such-workpen-prog-xyz"))
+        .expect_err("missing program");
+    assert!(
+        matches!(err, KernelError::Apply(_)),
+        "missing program must be Apply: {err}"
+    );
+    let display = err.to_string();
+    assert!(
+        display.contains("no-such-workpen-prog-xyz"),
+        "Apply must name the command: {display}"
+    );
+    assert!(
+        display.contains("not found"),
+        "Apply must say not found: {display}"
     );
 }
 
@@ -1027,7 +1104,7 @@ fn write_windows_tcp_probe(dir: &Path, port: u16) -> PathBuf {
         dir,
         "tcp_probe",
         &format!(
-            "fn main() {{ match std::net::TcpStream::connect((\"127.0.0.1\", {port})) {{ Ok(_) => std::process::exit(0), Err(_) => std::process::exit(1) }} }}\n"
+            "fn main() {{ let _ = std::fs::write(\"tcp_started\", b\"1\"); match std::net::TcpStream::connect((\"127.0.0.1\", {port})) {{ Ok(_) => std::process::exit(0), Err(_) => std::process::exit(1) }} }}\n"
         ),
     )
 }
@@ -1045,6 +1122,67 @@ fn rustc_windows_probe(dir: &Path, name: &str, src_body: &str) -> PathBuf {
         .expect("rustc probe");
     assert!(status.success(), "rustc {name} failed: {status:?}");
     exe
+}
+
+#[test]
+fn windows_net_helper_argv_contract() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("windows_net_helper.rs");
+    assert!(src.is_file(), "helper source must exist: {}", src.display());
+    let dir = workspace();
+    let bin = dir.path().join("workpen-net-helper");
+    let compiled = match Command::new("rustc")
+        .args([
+            "--edition=2024",
+            "--crate-type=bin",
+            "-C",
+            "debuginfo=0",
+            "-o",
+        ])
+        .arg(&bin)
+        .arg(&src)
+        .output()
+    {
+        Ok(out) => out,
+        Err(_) => return,
+    };
+    assert!(
+        compiled.status.success(),
+        "rustc helper failed: {}\n{}",
+        compiled.status,
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let missing = Command::new(&bin).output().expect("helper no args");
+    assert_eq!(
+        missing.status.code(),
+        Some(2),
+        "missing -- must exit 2: {:?}",
+        missing.status
+    );
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("missing --"), "stderr={stderr}");
+
+    let empty = Command::new(&bin)
+        .arg("--")
+        .output()
+        .expect("helper -- only");
+    assert_eq!(
+        empty.status.code(),
+        Some(2),
+        "empty command must exit 2: {:?}",
+        empty.status
+    );
+    let stderr = String::from_utf8_lossy(&empty.stderr);
+    assert!(stderr.contains("empty command"), "stderr={stderr}");
+
+    #[cfg(unix)]
+    {
+        let ok = Command::new(&bin)
+            .args(["--", "true"])
+            .status()
+            .expect("helper -- true");
+        assert!(ok.success(), "helper -- true must succeed: {ok:?}");
+    }
 }
 
 fn inner_true_cmd() -> Command {

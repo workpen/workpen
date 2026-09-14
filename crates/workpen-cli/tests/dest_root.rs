@@ -698,6 +698,39 @@ fn why_missing_root_is_clear_error_not_escape() {
 }
 
 #[test]
+fn run_honors_workspace_agent_lock_extra_glob_before_spawn() {
+    let ws = TempDir::new().expect("workspace");
+    let cwd = TempDir::new().expect("other cwd");
+    std::fs::write(ws.path().join("agent.lock"), "**/*.secret\n").expect("lock");
+    std::fs::write(ws.path().join("team.secret"), "SECRET=1\n").expect("secret");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("readme");
+    let out = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "cat", "team.secret"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "run cat team.secret must dest-deny, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let text = combined(&out);
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        lower.contains("denied") || lower.contains("deny"),
+        "run team.secret must dest-deny before spawn: {text}"
+    );
+    assert!(
+        !stdout.contains("SECRET"),
+        "run must dest-deny team.secret before spawn, stdout={stdout}"
+    );
+}
+
+#[test]
 fn run_missing_root_is_clear_error_not_escape() {
     let cwd = TempDir::new().expect("cwd");
     let out = workpen()

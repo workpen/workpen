@@ -446,6 +446,14 @@ impl Drop for AclRestore {
     }
 }
 
+// Propagate restore errors. Drop only eprintln-swallows leftovers.
+fn restore_guards(guards: &mut [AclRestore]) -> Result<(), KernelError> {
+    for guard in guards {
+        guard.restore()?;
+    }
+    Ok(())
+}
+
 pub(super) unsafe fn free_sid(sid: Handle) {
     // SAFETY: caller owns a SID from AllocateAndInitializeSid or userenv.
     unsafe {
@@ -483,38 +491,7 @@ fn probe_write_restricted() -> bool {
     let Ok(sid) = RestrictedSid::new() else {
         return false;
     };
-    let mut process_token = ptr::null_mut();
-    // SAFETY: current process handle is valid for the call.
-    let opened =
-        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_PRIMARY_MASK, &mut process_token) };
-    if opened == 0 {
-        return false;
-    }
-    let process_token = CloseOnDrop(process_token);
-    let restrict = SidAndAttributes {
-        sid: sid.0,
-        attributes: 0,
-    };
-    let mut restricted = ptr::null_mut();
-    // SAFETY: `process_token` is an open process token; `restrict` lives for the call.
-    let ok = unsafe {
-        CreateRestrictedToken(
-            process_token.0,
-            DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,
-            0,
-            ptr::null(),
-            0,
-            ptr::null(),
-            1,
-            &restrict,
-            &mut restricted,
-        )
-    };
-    if ok == 0 {
-        return false;
-    }
-    drop(CloseOnDrop(restricted));
-    true
+    create_write_restricted_token(sid.0).is_ok()
 }
 
 struct Prepared {
@@ -584,15 +561,12 @@ fn prepare_network_blocked(policy: &KernelPolicy) -> Result<Prepared, KernelErro
     let helper =
         windows_net::HelperFile::install(&workspace).map_err(prefix_apply("net helper"))?;
     let mut prepared = prepare_write_restricted(policy)?;
-    let mut remaining = 65_536usize;
     for path in rw_grant_paths(policy) {
-        grant_package_tree(
-            &path,
-            profile.sid(),
-            &mut prepared.acl_guards,
-            &mut remaining,
-        )?;
+        grant_package_root(&path, profile.sid(), &mut prepared.acl_guards)?;
     }
+    prepared
+        .acl_guards
+        .extend(deny_dest_aces(&dest_deny_paths(policy), profile.sid())?);
     prepared.acl_guards.push(set_acl_entry(
         helper.path(),
         profile.sid(),
@@ -637,46 +611,19 @@ fn wrap_appcontainer_token(
 }
 
 fn current_primary_token() -> Result<CloseOnDrop, KernelError> {
-    let mut process_token = ptr::null_mut();
-    // SAFETY: current process handle is valid.
-    let opened =
-        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_PRIMARY_MASK, &mut process_token) };
-    if opened == 0 {
-        return Err(last_error("OpenProcessToken"));
-    }
-    let process_token = CloseOnDrop(process_token);
-    let mut primary = ptr::null_mut();
-    // SAFETY: process_token is an open process token.
-    let dup = unsafe {
-        DuplicateTokenEx(
-            process_token.0,
-            TOKEN_PRIMARY_MASK,
-            ptr::null_mut(),
-            SECURITY_IMPERSONATION,
-            TOKEN_PRIMARY,
-            &mut primary,
-        )
-    };
-    if dup == 0 {
-        return Err(last_error("DuplicateTokenEx"));
-    }
-    Ok(CloseOnDrop(primary))
+    let process_token = open_current_process_token()?;
+    duplicate_primary_token(process_token.0)
 }
 
-fn grant_package_tree(
+/// One inheritable GRANT on the ReadWrite root. Dest-deny files get an
+/// explicit package DENY after this so inherit cannot reopen them.
+fn grant_package_root(
     root: &Path,
     sid: Handle,
     guards: &mut Vec<AclRestore>,
-    remaining: &mut usize,
 ) -> Result<(), KernelError> {
-    if *remaining == 0 {
-        return Err(KernelError::Apply(
-            "package ACE walk exceeded 65536 entries".into(),
-        ));
-    }
-    *remaining -= 1;
     let meta = std::fs::symlink_metadata(root)
-        .map_err(|e| KernelError::Apply(format!("package ACE walk {}: {e}", root.display())))?;
+        .map_err(|e| KernelError::Apply(format!("package ACE {}: {e}", root.display())))?;
     let is_dir = meta.is_dir() && !meta.file_type().is_symlink();
     let inherit = if is_dir {
         SUB_CONTAINERS_AND_OBJECTS_INHERIT
@@ -690,16 +637,6 @@ fn grant_package_tree(
         GRANT_ACCESS,
         inherit,
     )?);
-    if !is_dir {
-        return Ok(());
-    }
-    let rd = std::fs::read_dir(root)
-        .map_err(|e| KernelError::Apply(format!("package ACE walk {}: {e}", root.display())))?;
-    for ent in rd {
-        let ent = ent
-            .map_err(|e| KernelError::Apply(format!("package ACE walk {}: {e}", root.display())))?;
-        grant_package_tree(&ent.path(), sid, guards, remaining)?;
-    }
     Ok(())
 }
 
@@ -763,7 +700,17 @@ fn open_nul(write: bool) -> Result<CloseOnDrop, KernelError> {
 }
 
 fn spawn_prepared(
-    prepared: Prepared,
+    mut prepared: Prepared,
+    cmd: &Command,
+    timeout: Option<Duration>,
+) -> Result<(KernelApply, ExitStatus), KernelError> {
+    let result = spawn_prepared_child(&mut prepared, cmd, timeout);
+    let restore = restore_guards(&mut prepared.acl_guards);
+    super::combine_spawn_restore(result, restore)
+}
+
+fn spawn_prepared_child(
+    prepared: &mut Prepared,
     cmd: &Command,
     timeout: Option<Duration>,
 ) -> Result<(KernelApply, ExitStatus), KernelError> {
@@ -849,7 +796,6 @@ fn spawn_prepared(
     };
     // SAFETY: process handle stays valid until we return.
     let wait = unsafe { WaitForSingleObject(process.0, wait_ms) };
-    let mut prepared = prepared;
     if wait == WAIT_TIMEOUT {
         drop(std::mem::replace(
             &mut prepared.job,
@@ -862,9 +808,6 @@ fn spawn_prepared(
                 TerminateProcess(process.0, 1);
             }
             reap = unsafe { WaitForSingleObject(process.0, 5_000) };
-        }
-        for guard in &mut prepared.acl_guards {
-            guard.restore()?;
         }
         if reap != WAIT_OBJECT_0 {
             return Err(KernelError::Apply(
@@ -881,9 +824,6 @@ fn spawn_prepared(
     let got = unsafe { GetExitCodeProcess(process.0, &mut code) };
     if got == 0 {
         return Err(last_error("GetExitCodeProcess"));
-    }
-    for guard in &mut prepared.acl_guards {
-        guard.restore()?;
     }
     Ok((KernelApply::Applied, ExitStatus::from_raw(code)))
 }
@@ -1018,7 +958,7 @@ fn set_acl_entry(
     })
 }
 
-fn create_write_restricted_token(sid: Handle) -> Result<CloseOnDrop, KernelError> {
+fn open_current_process_token() -> Result<CloseOnDrop, KernelError> {
     let mut process_token = ptr::null_mut();
     // SAFETY: current process handle is valid.
     let opened =
@@ -1026,13 +966,16 @@ fn create_write_restricted_token(sid: Handle) -> Result<CloseOnDrop, KernelError
     if opened == 0 {
         return Err(last_error("OpenProcessToken"));
     }
-    let process_token = CloseOnDrop(process_token);
+    Ok(CloseOnDrop(process_token))
+}
+
+fn create_restricted_token(process_token: Handle, sid: Handle) -> Result<CloseOnDrop, KernelError> {
     let restrict = SidAndAttributes { sid, attributes: 0 };
     let mut restricted = ptr::null_mut();
-    // SAFETY: `process_token` is open; `restrict` lives for the call.
+    // SAFETY: `process_token` is an open process token; `restrict` lives for the call.
     let ok = unsafe {
         CreateRestrictedToken(
-            process_token.0,
+            process_token,
             DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,
             0,
             ptr::null(),
@@ -1046,12 +989,15 @@ fn create_write_restricted_token(sid: Handle) -> Result<CloseOnDrop, KernelError
     if ok == 0 {
         return Err(last_error("CreateRestrictedToken"));
     }
-    let restricted = CloseOnDrop(restricted);
+    Ok(CloseOnDrop(restricted))
+}
+
+fn duplicate_primary_token(token: Handle) -> Result<CloseOnDrop, KernelError> {
     let mut primary = ptr::null_mut();
-    // SAFETY: `restricted` is the CreateRestrictedToken result.
+    // SAFETY: `token` is an open token; we request a primary token.
     let dup = unsafe {
         DuplicateTokenEx(
-            restricted.0,
+            token,
             TOKEN_PRIMARY_MASK,
             ptr::null_mut(),
             SECURITY_IMPERSONATION,
@@ -1063,6 +1009,12 @@ fn create_write_restricted_token(sid: Handle) -> Result<CloseOnDrop, KernelError
         return Err(last_error("DuplicateTokenEx"));
     }
     Ok(CloseOnDrop(primary))
+}
+
+fn create_write_restricted_token(sid: Handle) -> Result<CloseOnDrop, KernelError> {
+    let process_token = open_current_process_token()?;
+    let restricted = create_restricted_token(process_token.0, sid)?;
+    duplicate_primary_token(restricted.0)
 }
 
 fn create_kill_job() -> Result<CloseOnDrop, KernelError> {
