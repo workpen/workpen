@@ -803,6 +803,53 @@ fn run_child_timeout_fast_command_succeeds() {
     assert!(status.success(), "fast command must succeed: {status:?}");
 }
 
+#[cfg(windows)]
+#[test]
+fn run_child_windows_stdio_cmd_echo_does_not_hang() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("cmd.exe");
+    cmd.args(["/c", "echo hi"]).current_dir(dir.path());
+    match policy.run_child_timeout(cmd, Duration::from_secs(5)) {
+        Ok((applied, status)) => {
+            assert_eq!(applied, KernelApply::Applied);
+            assert!(status.success(), "cmd echo must succeed: {status:?}");
+        }
+        Err(KernelError::Timeout) => {
+            panic!("cmd.exe /c echo hi timed out (stdio hang)")
+        }
+        Err(err) => panic!("cmd.exe /c echo hi failed: {err}"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn run_child_windows_stdio_bash_does_not_hang() {
+    if !kernel_supported() {
+        return;
+    }
+    let Some(bash) = windows_bash_exe() else {
+        return;
+    };
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new(bash);
+    cmd.args(["-c", "echo hi"]).current_dir(dir.path());
+    match policy.run_child_timeout(cmd, Duration::from_secs(5)) {
+        Ok((applied, status)) => {
+            assert_eq!(applied, KernelApply::Applied);
+            assert!(status.success(), "bash echo must succeed: {status:?}");
+        }
+        Err(KernelError::Timeout) => {
+            panic!("bash.exe -c echo hi timed out (stdio hang)")
+        }
+        Err(err) => panic!("bash.exe -c echo hi failed: {err}"),
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn run_child_cannot_write_outside_workspace() {
@@ -946,6 +993,28 @@ fn inner_true_cmd() -> Command {
 #[cfg(windows)]
 fn windows_comspec() -> std::ffi::OsString {
     std::env::var_os("COMSPEC").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into())
+}
+
+#[cfg(windows)]
+fn windows_bash_exe() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PATH") {
+        if let Some(found) = std::env::split_paths(&path).find_map(|dir| {
+            let candidate = dir.join("bash.exe");
+            candidate.is_file().then_some(candidate)
+        }) {
+            return Some(found);
+        }
+    }
+    for candidate in [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+    ] {
+        let p = PathBuf::from(candidate);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 #[test]
