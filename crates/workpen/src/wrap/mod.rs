@@ -46,7 +46,8 @@ pub struct KernelGrant {
 /// Linux `run_child` bind-overs dest-deny paths in a private mount ns
 /// when unprivileged user namespaces are available. If `unshare` is
 /// denied, remount is skipped and Landlock still applies (in-tree
-/// dest-deny stays a hole). Windows read deny is a follow-up.
+/// dest-deny stays a hole). Windows `run_child` adds a DENY ACE on
+/// dest-deny paths for the Restricted SID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelPolicy {
     grants: Vec<KernelGrant>,

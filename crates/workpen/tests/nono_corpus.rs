@@ -701,6 +701,38 @@ fn run_child_can_write_inside_workspace() {
     assert!(body.contains("ok"), "inside body={body:?}");
 }
 
+#[cfg(windows)]
+#[test]
+fn run_child_cannot_read_workspace_env_windows() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut deny_cmd = Command::new(windows_comspec());
+    deny_cmd
+        .args(["/C", "type .env 1>env.out & echo %ERRORLEVEL% 1>env.code"])
+        .current_dir(dir.path());
+    let (applied, status) = policy.run_child(deny_cmd).expect("run_child env");
+    assert_eq!(applied, KernelApply::Applied);
+    assert!(status.success(), "wrapper must finish: {status:?}");
+    let leaked = fs::read_to_string(dir.path().join("env.out")).unwrap_or_default();
+    assert!(
+        !leaked.contains("SECRET"),
+        "jailed child must not read .env: {leaked:?}"
+    );
+    let mut allow_cmd = Command::new(windows_comspec());
+    allow_cmd
+        .args(["/C", "type readme.md 1>readme.out"])
+        .current_dir(dir.path());
+    let (_applied, status) = policy.run_child(allow_cmd).expect("readme");
+    assert!(status.success(), "readme wrapper must finish: {status:?}");
+    let body = fs::read_to_string(dir.path().join("readme.out")).expect("readme.out");
+    assert!(body.contains("ok"), "readme body={body:?}");
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn run_child_network_blocked_tcp_fails() {
