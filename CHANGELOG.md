@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.0](https://github.com/workpen/workpen/compare/v0.3.0...v0.4.0) (2026-09-14)
+
+
+### Features
+
+* **cli:** bound workpen run with --timeout ([#121](https://github.com/workpen/workpen/issues/121)) ([1a86223](https://github.com/workpen/workpen/commit/1a86223a22aa7e07846b38c0a9ea3c036360c7da))
+* **deny:** dest-deny PowerShell EncodedCommand bodies ([#111](https://github.com/workpen/workpen/issues/111)) ([7cde051](https://github.com/workpen/workpen/commit/7cde0513ec8969d780e194a23e32a99a35949b39)), closes [#109](https://github.com/workpen/workpen/issues/109)
+* **wrap:** add run_child_timeout ([#115](https://github.com/workpen/workpen/issues/115)) ([ddb60d3](https://github.com/workpen/workpen/commit/ddb60d394339b91d75361045ad71b43e289e7051)), closes [#110](https://github.com/workpen/workpen/issues/110)
+* **wrap:** deny Windows run_child sockets via helper and AppContainer ([#117](https://github.com/workpen/workpen/issues/117)) ([813f25c](https://github.com/workpen/workpen/commit/813f25cb1686ab671ff00af30efbae4429f7330f))
+* **wrap:** inherit or grant Windows run_child stdio ([#116](https://github.com/workpen/workpen/issues/116)) ([d76a756](https://github.com/workpen/workpen/commit/d76a756e813d1f7a8c9fd8ee14b5088cd7c9ba5d))
+* **wrap:** merge agent.lock into process_jail dest-deny ([#114](https://github.com/workpen/workpen/issues/114)) ([4b90657](https://github.com/workpen/workpen/commit/4b90657d9dd05ab3614054da5f8bd13fa38affd6)), closes [#108](https://github.com/workpen/workpen/issues/108)
+
+
+### Bug Fixes
+
+* **deny:** peel cmd/pwsh flags and keep Windows dest-deny ACEs ([#118](https://github.com/workpen/workpen/issues/118)) ([2a9b7f9](https://github.com/workpen/workpen/commit/2a9b7f993947e076545cdee6ca9d36849b0d69e8))
+* **deny:** peel pwsh -en, -File, --switch, -cwa, and EncodedArguments ([#119](https://github.com/workpen/workpen/issues/119)) ([26822b2](https://github.com/workpen/workpen/commit/26822b205e3ce23abb11fd999f86edb5bbdefa1c))
+* **gc:** do not let dry-run refresh last-used ([#120](https://github.com/workpen/workpen/issues/120)) ([c59241f](https://github.com/workpen/workpen/commit/c59241f5d428a56957b973c6b41200e0104e5f8d))
+
 ## [0.3.0](https://github.com/workpen/workpen/compare/v0.2.0...v0.3.0) (2026-09-14)
 
 
