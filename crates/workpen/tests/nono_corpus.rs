@@ -138,6 +138,51 @@ fn collect_workspace_dest_denies_honors_extra_glob() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn run_child_cannot_read_workspace_env_linux() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut deny_cmd = Command::new("/bin/sh");
+    deny_cmd
+        .args(["-c", "cat .env >env.out; echo $? >env.code"])
+        .current_dir(dir.path());
+    match policy.run_child(deny_cmd) {
+        Err(KernelError::Apply(msg)) => {
+            assert!(
+                msg.contains("not started") || msg.to_ascii_lowercase().contains("unshare"),
+                "fail closed if remount cannot apply: {msg}"
+            );
+            return;
+        }
+        Ok((applied, status)) => {
+            assert_eq!(applied, KernelApply::Applied);
+            assert!(status.success(), "wrapper must finish: {status:?}");
+        }
+        Err(other) => panic!("unexpected run_child err: {other}"),
+    }
+    let code = fs::read_to_string(dir.path().join("env.code")).expect("env.code");
+    assert_ne!(code.trim(), "0", "cat .env must fail after remount");
+    let leaked = fs::read_to_string(dir.path().join("env.out")).unwrap_or_default();
+    assert!(
+        !leaked.contains("SECRET"),
+        "jailed child must not read .env: {leaked:?}"
+    );
+    let mut allow_cmd = Command::new("/bin/sh");
+    allow_cmd
+        .args(["-c", "cat readme.md >readme.out; echo $? >readme.code"])
+        .current_dir(dir.path());
+    let (_applied, status) = policy.run_child(allow_cmd).expect("readme");
+    assert!(status.success(), "readme wrapper must finish: {status:?}");
+    let code = fs::read_to_string(dir.path().join("readme.code")).expect("readme.code");
+    assert_eq!(code.trim(), "0", "cat readme.md must succeed");
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn run_child_cannot_read_workspace_env() {

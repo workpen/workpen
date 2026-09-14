@@ -17,6 +17,8 @@ use std::process::{Command, ExitStatus};
 
 use crate::deny::{DenyPolicy, DestDeny, DestDenyKind, dest_deny_at};
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(windows)]
 mod windows;
 
@@ -41,7 +43,9 @@ pub struct KernelGrant {
 /// ([nono #1592](https://github.com/nolabs-ai/nono/discussions/1592)).
 /// macOS `run_child` applies Seatbelt `(deny file-read* / file-write*)`
 /// literals (and `subpath` for directories) via nono `add_platform_rule`.
-/// Linux remount and Windows read deny are follow-ups.
+/// Linux `run_child` bind-overs dest-deny paths in a private mount ns
+/// (Landlock cannot dest-deny inside an allowed tree). Windows read
+/// deny is a follow-up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelPolicy {
     grants: Vec<KernelGrant>,
@@ -191,11 +195,16 @@ impl KernelPolicy {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let caps = self.to_capability_set(nono::SignalMode::Isolated)?;
-            // Safety: the set is built in the parent; the hook only applies
-            // it and maps failure to io::Error. apply_auto may allocate.
+            let dests: Vec<PathBuf> = self.dest_denies.iter().map(|d| d.path.clone()).collect();
+            // Safety: the set and dest list are built in the parent; the hook
+            // only applies them and maps failure to io::Error.
             unsafe {
                 use std::os::unix::process::CommandExt;
                 cmd.pre_exec(move || {
+                    #[cfg(target_os = "linux")]
+                    linux::apply_dest_deny_remounts(&dests)?;
+                    #[cfg(not(target_os = "linux"))]
+                    let _ = &dests;
                     nono::Sandbox::apply_auto(&caps)
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
                     Ok(())
