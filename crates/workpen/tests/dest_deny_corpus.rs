@@ -547,6 +547,68 @@ fn check_command_argv_denies_env_split_string_and_file() {
 }
 
 #[test]
+fn check_command_argv_denies_env_flags_after_timeout_nohup_nice() {
+    let ws = tempfile::tempdir().expect("workspace");
+    std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("write readme");
+    let policy = DenyPolicy::default();
+    let denies: &[&[&str]] = &[
+        &["timeout", "30", "env", "--file=.env", "bash"],
+        &["timeout", "30", "env", "-S", "cat .env"],
+        &["/usr/bin/timeout", "30", "env", "--file=.env", "bash"],
+        &["timeout.exe", "30", "env", "-S", "cat .env"],
+        &[
+            "timeout",
+            "--foreground",
+            "30",
+            "env",
+            "--file=.env",
+            "bash",
+        ],
+        &["timeout", "-s", "TERM", "30", "env", "-S", "cat .env"],
+        &["nohup", "env", "-S", "--file=.env"],
+        &["/usr/bin/nohup", "env", "--file=.env", "bash"],
+        &["NOHUP.EXE", "env", "-S", "cat .env"],
+        &["nice", "env", "--file=.env", "bash"],
+        &["nice", "-n", "10", "env", "-S", "cat .env"],
+        &["/usr/bin/nice", "env", "-S", "--file=.env"],
+        &["timeout", "30", "env", "-S", "--file=.env"],
+        &["timeout", "30", "/usr/bin/env", "--file=.env", "bash"],
+    ];
+    for argv in denies {
+        let err = match check_command_argv(argv, ws.path(), &policy) {
+            Err(e) => e,
+            Ok(()) => panic!("wrapper then env {argv:?} must dest-deny"),
+        };
+        match err {
+            CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+                assert_eq!(
+                    d.kind,
+                    DestDenyKind::DenyGlob,
+                    "wrapper then env {argv:?} dest must be DenyGlob, got {:?}",
+                    d.kind
+                );
+            }
+            other => panic!("expected DestDeny DenyGlob for {argv:?}, got {other:?}"),
+        }
+    }
+    check_command_argv(
+        &["timeout", "30", "env", "-S", "cat readme.md"],
+        ws.path(),
+        &policy,
+    )
+    .expect("timeout 30 env -S cat readme.md must be allowed");
+    check_command_argv(&["timeout", "30", "cat", "readme.md"], ws.path(), &policy)
+        .expect("timeout 30 cat readme.md must be allowed");
+    check_command_argv(&["timeout", "30", "echo", "hi"], ws.path(), &policy)
+        .expect("timeout 30 echo hi must be allowed");
+    check_command_argv(&["nohup", "cat", "readme.md"], ws.path(), &policy)
+        .expect("nohup cat readme.md must be allowed");
+    check_command_argv(&["nice", "-n", "10", "echo", "hi"], ws.path(), &policy)
+        .expect("nice -n 10 echo hi must be allowed");
+}
+
+#[test]
 fn path_is_denied_table() {
     let deny = default_secret_denies();
     assert!(path_is_denied_glob(&deny, "/tmp/x/.env"));
