@@ -138,6 +138,99 @@ fn run_can_write_inside_workspace() {
 }
 
 #[cfg(unix)]
+#[test]
+fn run_timeout_kills_sleep() {
+    let dir = TempDir::new().expect("workspace");
+    let start = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--timeout", "1s", "--", "/bin/sleep", "30"])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "timeout must return in under 10s: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "timeout must exit 124, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("deadline"),
+        "timeout must name the deadline: {err}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn run_timeout_kills_sleeper() {
+    let dir = TempDir::new().expect("workspace");
+    let src = dir.path().join("sleep.rs");
+    std::fs::write(
+        &src,
+        "fn main() { std::thread::sleep(std::time::Duration::from_secs(30)); }\n",
+    )
+    .expect("sleep.rs");
+    let exe = dir.path().join("sleep.exe");
+    let rustc = Command::new("rustc")
+        .arg("-o")
+        .arg(&exe)
+        .arg(&src)
+        .status()
+        .expect("rustc");
+    assert!(rustc.success(), "rustc sleep.exe");
+    let start = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--timeout", "1s", "--"])
+        .arg(&exe)
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "timeout must return in under 10s: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "timeout must exit 124, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("deadline"),
+        "timeout must name the deadline: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_timeout_fast_command_succeeds() {
+    let dir = TempDir::new().expect("workspace");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--timeout", "5s", "--", "/bin/echo", "ok"])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        out.status.success(),
+        "fast command must succeed, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+}
+
+#[cfg(unix)]
 fn printenv_available() -> bool {
     std::path::Path::new("/usr/bin/printenv").is_file()
 }
