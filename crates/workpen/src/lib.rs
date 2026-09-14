@@ -15,6 +15,7 @@
 //! Leftover worktree GC is behind `feature = "gc"`. Hosts pass
 //! `leftover_dir` and `saved_ref_prefix` on `GcConfig`.
 
+mod agent_lock;
 mod deny;
 #[cfg(feature = "gc")]
 mod gc;
@@ -23,6 +24,7 @@ mod why;
 #[cfg(feature = "nono")]
 mod wrap;
 
+pub use agent_lock::{AGENT_LOCK_NAME, AgentLockError, load_agent_lock, load_agent_lock_file};
 pub use deny::{
     CheckDestError, DenyPolicy, DestDeny, DestDenyError, DestDenyKind, check_command_argv,
     check_command_dests, check_dest, classify_dest, default_secret_denies, deny_patch_dests,

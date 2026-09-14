@@ -10,10 +10,10 @@ use tempfile::TempDir;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use workpen::resolve_extra_root;
 use workpen::{
-    DenyPolicy, DestDenyKind, KernelAccess, KernelApply, KernelError, child_env_deny_names,
-    collect_workspace_dest_denies, is_denied_child_env, kernel_supported, process_jail,
-    process_jail_with_policy, require_applied, scrub_child_command, spawn_after_setup,
-    with_bash_noprofile,
+    AGENT_LOCK_NAME, DenyPolicy, DestDenyKind, KernelAccess, KernelApply, KernelError,
+    child_env_deny_names, collect_workspace_dest_denies, is_denied_child_env, kernel_supported,
+    load_agent_lock, process_jail, process_jail_with_policy, require_applied, scrub_child_command,
+    spawn_after_setup, with_bash_noprofile,
 };
 
 fn workspace() -> TempDir {
@@ -95,6 +95,24 @@ fn with_dest_deny_paths_records_host_path() {
             .any(|d| d.path == extra && d.kind == DestDenyKind::DenyGlob),
         "host dest-deny path must be on the list: {:?}",
         policy.dest_denies()
+    );
+}
+
+#[test]
+fn agent_lock_names_reach_kernel_dest_deny_list() {
+    let dir = workspace();
+    fs::write(dir.path().join("team.secret"), "x\n").expect("secret");
+    fs::write(dir.path().join(AGENT_LOCK_NAME), "**/*.secret\n").expect("lock");
+    let extra = load_agent_lock(dir.path()).expect("load");
+    let policy = DenyPolicy::with_extra(extra);
+    let jail =
+        process_jail_with_policy(dir.path(), std::iter::empty::<&Path>(), &policy).expect("jail");
+    assert!(
+        jail.dest_denies()
+            .iter()
+            .any(|d| d.path.file_name().is_some_and(|n| n == "team.secret")),
+        "agent.lock glob must reach KernelPolicy dest-denies: {:?}",
+        jail.dest_denies()
     );
 }
 
