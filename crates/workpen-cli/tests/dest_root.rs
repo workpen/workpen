@@ -156,6 +156,47 @@ fn run_allowed_dest_after_hardlink_dest_deny() {
 
 #[cfg(unix)]
 #[test]
+fn run_dest_denies_nested_env_split_string_before_spawn() {
+    let ws = TempDir::new().expect("workspace");
+    let cwd = TempDir::new().expect("other cwd");
+    std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("write readme");
+    let deny = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "env", "env", "-S", "cat .env"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !deny.status.success(),
+        "run env env -S cat .env must fail, stdout={} stderr={}",
+        String::from_utf8_lossy(&deny.stdout),
+        String::from_utf8_lossy(&deny.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&deny.stdout);
+    assert!(
+        !stdout.contains("SECRET"),
+        "nested env must dest-deny before spawn, stdout={stdout}"
+    );
+    let allow = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .args(["--", "env", "env", "-S", "cat readme.md"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        allow.status.success(),
+        "run env env -S cat readme.md must succeed, stdout={} stderr={}",
+        String::from_utf8_lossy(&allow.stdout),
+        String::from_utf8_lossy(&allow.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&allow.stdout).trim(), "ok");
+}
+
+#[cfg(unix)]
+#[test]
 fn run_dest_denies_spaced_hardlink_argv_under_root_before_spawn() {
     let ws = TempDir::new().expect("workspace");
     let cwd = TempDir::new().expect("other cwd");
@@ -581,6 +622,49 @@ fn why_extra_root_resolves_against_process_cwd_not_workspace() {
     assert!(
         !text.contains("does not exist"),
         "extra-root extra must resolve against process cwd, not --root: {text}"
+    );
+}
+
+#[test]
+fn why_extra_root_home_is_refused() {
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        return;
+    };
+    let Ok(home) = std::fs::canonicalize(&home) else {
+        return;
+    };
+    if !home.is_dir() {
+        return;
+    }
+    let ws = TempDir::new().expect("workspace");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("readme");
+    let dest = home.join(".gitconfig");
+    let out = workpen()
+        .args(["why", "--root"])
+        .arg(ws.path())
+        .arg("--extra-root")
+        .arg(&home)
+        .arg(&dest)
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "why --extra-root HOME must fail, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = combined(&out).to_ascii_lowercase();
+    assert!(
+        text.contains("home") || text.contains("subdirectory"),
+        "why --extra-root HOME must name home refuse: {}",
+        combined(&out)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout)
+            .to_ascii_lowercase()
+            .contains("allowed"),
+        "why --extra-root HOME must not print allowed: {}",
+        String::from_utf8_lossy(&out.stdout)
     );
 }
 

@@ -96,6 +96,8 @@ pub enum ExtraRootError {
         "extra write dir {requested} escaped after canonicalize to {resolved} (not an explicit extra)"
     )]
     EscapedToRoot { requested: String, resolved: String },
+    #[error("extra write dir is the home directory {0}; use a project subdirectory, not $HOME")]
+    Home(PathBuf),
 }
 
 /// Builder default policy is [`AbsolutePathPolicy::Reject`].
@@ -118,6 +120,9 @@ impl PathGuard {
         let mut roots = vec![workspace.clone()];
         for extra in extra {
             let extra = canonicalize_root(extra)?;
+            if is_user_home_dir(&extra) {
+                return Err(PathGuardError::Home(extra));
+            }
             if !roots.iter().any(|r| r == &extra) {
                 roots.push(extra);
             }
@@ -328,8 +333,10 @@ pub fn resolve_workspace_root(cwd: &Path, root: &str) -> Result<PathBuf, PathGua
 }
 
 /// Resolve one extra write dir against `cwd`. Fail closed on missing,
-/// not-a-dir, canonicalize failure, or implicit escape to `/` or host temp
-/// unless the caller named that root explicitly.
+/// not-a-dir, canonicalize failure, the current user's home directory,
+/// or implicit escape to `/` or host temp unless the caller named that
+/// root explicitly. A subdirectory of home (for example `~/.cache`) is
+/// still allowed.
 pub fn resolve_extra_root(cwd: &Path, extra: &str) -> Result<PathBuf, ExtraRootError> {
     resolve_extra_root_pair(cwd, extra).map(|(_, canon)| canon)
 }
@@ -377,6 +384,9 @@ pub fn resolve_extra_root_pair(
             requested: extra.to_owned(),
             resolved: canon.display().to_string(),
         });
+    }
+    if is_user_home_dir(&canon) {
+        return Err(ExtraRootError::Home(canon));
     }
     Ok((presented, canon))
 }

@@ -469,8 +469,11 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// When argv0 is `env`/`env.exe`, dest-denies the operand of
 /// `-S`/`--split-string` via [`check_command_dests`], then leftover
 /// tokens in that string as env flags (`--file=`, `-f`, `NAME=value`).
-/// After skipping a `timeout`/`nohup`/`nice` prefix (same skip as wrap),
-/// dest-denies those env flags when the remaining argv starts with env.
+/// After skipping stacked `timeout`/`nohup`/`nice` prefixes (same skip as
+/// wrap), dest-denies those env flags when the remaining argv starts with
+/// env. A nested `env` operand (or `env -- env …`) is walked the same way.
+/// `cmd /c` and `powershell -Command` bodies are dest-denied as command
+/// strings. Generic `/c` or `-Command` on another argv0 is not.
 /// Dest-denies argv `-f`/`--file` (including attached `--file=.env`) via
 /// [`check_dest`]. Does not dest-deny a flattened join of all argv. Does
 /// not peel generic `--flag=.env`.
@@ -479,6 +482,9 @@ pub fn check_command_argv(
     root: &Path,
     policy: &DenyPolicy,
 ) -> Result<(), CheckDestError> {
+    let argv0 = cmd.first().map(|t| t.as_ref()).unwrap_or("");
+    let argv0_is_cmd = is_cmd_program(argv0);
+    let argv0_is_powershell = is_powershell_program(argv0);
     for (i, token) in cmd.iter().enumerate() {
         let token = token.as_ref();
         if !token.is_empty() && !token.starts_with('-') {
@@ -488,25 +494,82 @@ pub fn check_command_argv(
         if let Some(body) = shell_c_body(token, cmd.get(i + 1).map(|s| s.as_ref())) {
             check_command_dests(body, root, policy)?;
         }
-    }
-    if cmd.first().is_some_and(|t| is_env_program(t.as_ref())) {
-        check_env_flag_dests(&cmd[1..], root, policy)?;
-    } else if let Some(kind) = cmd.first().and_then(|t| cmd_wrapper(t.as_ref())) {
-        let start = skip_wrapper_prefix(kind, &cmd[1..]);
-        if cmd
-            .get(1 + start)
-            .is_some_and(|t| is_env_program(t.as_ref()))
+        if argv0_is_cmd
+            && let Some(body) = cmd_script_body(token, cmd.get(i + 1).map(|s| s.as_ref()))
         {
-            check_env_flag_dests(&cmd[2 + start..], root, policy)?;
+            check_command_dests(body, root, policy)?;
         }
+        if argv0_is_powershell
+            && let Some(body) = powershell_command_body(token, cmd.get(i + 1).map(|s| s.as_ref()))
+        {
+            check_command_dests(body, root, policy)?;
+        }
+    }
+    let start = skip_all_wrappers(cmd);
+    if cmd.get(start).is_some_and(|t| is_env_program(t.as_ref())) {
+        check_env_flag_dests(&cmd[start + 1..], root, policy)?;
     }
     Ok(())
 }
 
 pub(crate) fn is_env_program(program: impl AsRef<OsStr>) -> bool {
     let raw = program.as_ref().to_string_lossy();
-    let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw.as_ref());
+    let name = program_basename(&raw);
     name.eq_ignore_ascii_case("env") || name.eq_ignore_ascii_case("env.exe")
+}
+
+fn program_basename(program: &str) -> &str {
+    program.rsplit(['/', '\\']).next().unwrap_or(program)
+}
+
+fn is_cmd_program(program: &str) -> bool {
+    let name = program_basename(program);
+    name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe")
+}
+
+fn is_powershell_program(program: &str) -> bool {
+    let name = program_basename(program);
+    name.eq_ignore_ascii_case("powershell")
+        || name.eq_ignore_ascii_case("powershell.exe")
+        || name.eq_ignore_ascii_case("pwsh")
+        || name.eq_ignore_ascii_case("pwsh.exe")
+}
+
+/// `cmd /c` / `/k` script body (`/c`, `/C`, `/kBODY`).
+fn cmd_script_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
+    let rest = token.strip_prefix('/')?;
+    let first = rest.chars().next()?;
+    if !matches!(first, 'c' | 'C' | 'k' | 'K') {
+        return None;
+    }
+    let after = rest.get(first.len_utf8()..)?;
+    if after.is_empty() {
+        return next;
+    }
+    Some(after)
+}
+
+/// PowerShell `-Command` / `-c` / `/C` script body. Not `-EncodedCommand`.
+fn powershell_command_body<'a>(token: &'a str, next: Option<&'a str>) -> Option<&'a str> {
+    let rest = token.strip_prefix(['-', '/'])?;
+    if rest.eq_ignore_ascii_case("command") || rest.eq_ignore_ascii_case("c") {
+        return next;
+    }
+    None
+}
+
+/// Skip stacked `timeout` / `nohup` / `nice` prefixes. Returns the index
+/// of the first remaining operand (env, the user command, or `cmd.len()`).
+fn skip_all_wrappers(cmd: &[impl AsRef<str>]) -> usize {
+    let mut i = 0;
+    while i < cmd.len() {
+        let Some(kind) = cmd_wrapper(cmd[i].as_ref()) else {
+            return i;
+        };
+        let start = skip_wrapper_prefix(kind, &cmd[i + 1..]);
+        i = i.saturating_add(1).saturating_add(start);
+    }
+    i
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -660,7 +723,7 @@ fn check_env_flag_dests_inner(
     while i < args.len() {
         let raw = args[i].as_ref();
         if raw == "--" || raw == "-" {
-            break;
+            return continue_env_after_operand(&args[i + 1..], root, policy);
         }
         if !raw.starts_with('-') {
             if raw.contains('=') {
@@ -673,7 +736,7 @@ fn check_env_flag_dests_inner(
                 i += 1;
                 continue;
             }
-            break;
+            return continue_env_after_operand(&args[i..], root, policy);
         }
         if let Some(long) = raw.strip_prefix("--") {
             if let Some((name, value)) = long.split_once('=') {
@@ -721,6 +784,18 @@ fn check_env_flag_dests_inner(
             }
             None => i += 1,
         }
+    }
+    Ok(())
+}
+
+fn continue_env_after_operand(
+    args: &[impl AsRef<str>],
+    root: &Path,
+    policy: &DenyPolicy,
+) -> Result<(), CheckDestError> {
+    let start = skip_all_wrappers(args);
+    if args.get(start).is_some_and(|t| is_env_program(t.as_ref())) {
+        return check_env_flag_dests(&args[start + 1..], root, policy);
     }
     Ok(())
 }
