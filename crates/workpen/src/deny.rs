@@ -115,6 +115,9 @@ pub enum DestDenyError {
     /// Argv token hit. Distinct wording from [`DestDeny::message`].
     #[error("command references path denied by sandbox profile: {token}")]
     CommandToken { token: String },
+    /// PowerShell `-EncodedCommand` payload is not UTF-16LE RFC 4648.
+    #[error("invalid -EncodedCommand payload (need UTF-16LE base64); child was not started")]
+    EncodedCommand,
     /// Post-open hardlink hit. Distinct wording from [`DestDeny::message`].
     #[error(
         "path denied: {path} is a hardlink of a denied name; unlink extra names or do not share the inode"
@@ -608,16 +611,13 @@ fn is_powershell_encoded_command_name(name: &str) -> bool {
 }
 
 /// Decode `-EncodedCommand` UTF-16LE base64 and dest-deny the script.
-/// Invalid payloads fail closed as [`DestDenyError::CommandToken`].
+/// Invalid payloads fail closed as [`DestDenyError::EncodedCommand`].
 fn check_powershell_encoded_dests(
     payload: &str,
     root: &Path,
     policy: &DenyPolicy,
 ) -> Result<(), CheckDestError> {
-    let script =
-        decode_powershell_encoded_command(payload).ok_or_else(|| DestDenyError::CommandToken {
-            token: payload.to_string(),
-        })?;
+    let script = decode_powershell_encoded_command(payload).ok_or(DestDenyError::EncodedCommand)?;
     check_command_dests(&script, root, policy)
 }
 

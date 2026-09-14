@@ -777,8 +777,6 @@ fn check_command_argv_denies_powershell_encoded_command_bodies() {
         &["powershell", "-ENCODEDCOMMAND", ENV_B64],
         &["timeout", "30", "pwsh", "-EncodedCommand", ENV_B64],
         &["env", "pwsh", "-enc", ENV_B64],
-        &["pwsh", "-EncodedCommand", "!!!not-base64!!!"],
-        &["pwsh", "-EncodedCommand", "YQ=="],
         &["pwsh", "-EncodedCommand", CAT_ENV_B64],
     ];
     for argv in denies {
@@ -786,6 +784,32 @@ fn check_command_argv_denies_powershell_encoded_command_bodies() {
             panic!("{argv:?} EncodedCommand body must dest-deny");
         }
     }
+    let junk = check_command_argv(
+        &["pwsh", "-EncodedCommand", "!!!not-base64!!!"],
+        ws.path(),
+        &policy,
+    )
+    .expect_err("invalid EncodedCommand must fail closed");
+    assert!(
+        matches!(
+            junk,
+            CheckDestError::DestDeny(DestDenyError::EncodedCommand)
+        ),
+        "invalid payload must not look like dest-deny, got {junk}"
+    );
+    assert!(
+        junk.to_string().contains("UTF-16LE base64"),
+        "invalid EncodedCommand must name the payload rule: {junk}"
+    );
+    let short = check_command_argv(&["pwsh", "-EncodedCommand", "YQ=="], ws.path(), &policy)
+        .expect_err("odd UTF-16LE EncodedCommand must fail closed");
+    assert!(
+        matches!(
+            short,
+            CheckDestError::DestDeny(DestDenyError::EncodedCommand)
+        ),
+        "odd-length payload must not look like dest-deny, got {short}"
+    );
     check_command_argv(&["pwsh", "-EncodedCommand", README_B64], ws.path(), &policy)
         .expect("pwsh -EncodedCommand Get-Content readme.md must be allowed");
     check_command_argv(&["tool", "-EncodedCommand", ENV_B64], ws.path(), &policy)
