@@ -726,6 +726,52 @@ fn check_command_argv_denies_cmd_and_powershell_script_bodies() {
 }
 
 #[test]
+fn check_command_argv_denies_powershell_encoded_command_bodies() {
+    let ws = tempfile::tempdir().expect("workspace");
+    std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("write readme");
+    let policy = DenyPolicy::default();
+    // UTF-16LE base64 of `Get-Content .env`
+    const ENV_B64: &str = "RwBlAHQALQBDAG8AbgB0AGUAbgB0ACAALgBlAG4AdgA=";
+    // UTF-16LE base64 of `Get-Content readme.md`
+    const README_B64: &str = "RwBlAHQALQBDAG8AbgB0AGUAbgB0ACAAcgBlAGEAZABtAGUALgBtAGQA";
+    // UTF-16LE base64 of `cat .env` (issue leftover)
+    const CAT_ENV_B64: &str = "YwBhAHQAIAAuAGUAbgB2AA==";
+    let denies: &[&[&str]] = &[
+        &["pwsh", "-EncodedCommand", ENV_B64],
+        &["powershell", "-enc", ENV_B64],
+        &["pwsh", "-ec", ENV_B64],
+        &["powershell", "-e", ENV_B64],
+        &[
+            "powershell",
+            "-EncodedCommand:RwBlAHQALQBDAG8AbgB0AGUAbgB0ACAALgBlAG4AdgA=",
+        ],
+        &["pwsh", "/EncodedCommand", ENV_B64],
+        &["powershell", "-ENCODEDCOMMAND", ENV_B64],
+        &["timeout", "30", "pwsh", "-EncodedCommand", ENV_B64],
+        &["env", "pwsh", "-enc", ENV_B64],
+        &["pwsh", "-EncodedCommand", "!!!not-base64!!!"],
+        &["pwsh", "-EncodedCommand", "YQ=="],
+        &["pwsh", "-EncodedCommand", CAT_ENV_B64],
+    ];
+    for argv in denies {
+        if check_command_argv(argv, ws.path(), &policy).is_ok() {
+            panic!("{argv:?} EncodedCommand body must dest-deny");
+        }
+    }
+    check_command_argv(&["pwsh", "-EncodedCommand", README_B64], ws.path(), &policy)
+        .expect("pwsh -EncodedCommand Get-Content readme.md must be allowed");
+    check_command_argv(&["tool", "-EncodedCommand", ENV_B64], ws.path(), &policy)
+        .expect("generic -EncodedCommand must not dest-deny");
+    check_command_argv(
+        &["powershell", "-ErrorAction", "Continue"],
+        ws.path(),
+        &policy,
+    )
+    .expect("powershell -ErrorAction Continue must not dest-deny");
+}
+
+#[test]
 fn check_command_argv_denies_env_flags_inside_shell_c_body() {
     let ws = tempfile::tempdir().expect("workspace");
     std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
