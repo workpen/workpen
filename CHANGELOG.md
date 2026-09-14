@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.0](https://github.com/workpen/workpen/compare/v0.2.0...v0.3.0) (2026-09-14)
+
+
+### Features
+
+* **deny:** dest-deny cmd/powershell bodies after wrappers ([#106](https://github.com/workpen/workpen/issues/106)) ([2ef2e4f](https://github.com/workpen/workpen/commit/2ef2e4f3e2640588d2e9504321ca9c5ed839f826))
+* **guard:** refuse HOME extra-root and dest-deny nested env ([#105](https://github.com/workpen/workpen/issues/105)) ([215daa7](https://github.com/workpen/workpen/commit/215daa711a6908886e1a96b186cc9c4993e1fda6))
+* optional agent.lock extra dest-deny names ([#101](https://github.com/workpen/workpen/issues/101)) ([e61dd68](https://github.com/workpen/workpen/commit/e61dd6832abe8a7b334dc8761a9b4b46e28db531)), closes [#96](https://github.com/workpen/workpen/issues/96)
+* **wrap:** dest-deny .env created after jail start ([#104](https://github.com/workpen/workpen/issues/104)) ([8bc48a5](https://github.com/workpen/workpen/commit/8bc48a5562817c76a2b71da5889d6c5cf908314c))
+* **wrap:** fail-closed run_child, refuse HOME, prove net ([#98](https://github.com/workpen/workpen/issues/98)) ([9856a97](https://github.com/workpen/workpen/commit/9856a9750ac92b4d38b3e9fc4f18c0a05c96bed6))
+* **wrap:** KernelPolicy dest-deny list for in-tree secrets ([#99](https://github.com/workpen/workpen/issues/99)) ([258685b](https://github.com/workpen/workpen/commit/258685b4e5f7b0f38d05864ef93a75e0cacff111)), closes [#91](https://github.com/workpen/workpen/issues/91)
+* **wrap:** Linux remount dest-deny of workspace secrets ([#102](https://github.com/workpen/workpen/issues/102)) ([2b140d0](https://github.com/workpen/workpen/commit/2b140d08c4cb6bdb54b441c7f9b2f535bf062d3b))
+* **wrap:** macOS Seatbelt dest-deny of workspace secrets ([#100](https://github.com/workpen/workpen/issues/100)) ([c4ebb1c](https://github.com/workpen/workpen/commit/c4ebb1ca57f48ae045cd9b93707ae6efbb7acc31)), closes [#93](https://github.com/workpen/workpen/issues/93)
+* **wrap:** Windows read dest-deny of workspace secrets ([#103](https://github.com/workpen/workpen/issues/103)) ([b13bfc4](https://github.com/workpen/workpen/commit/b13bfc453438c46cf738e3ff2b95f96d7ec77bee))
+
+
+### Bug Fixes
+
+* **cli:** resolve extra-root from cwd and dest-deny env leftovers ([#85](https://github.com/workpen/workpen/issues/85)) ([8f3007c](https://github.com/workpen/workpen/commit/8f3007ca7699dc6408aa2710c1bd6bc6f03573ca))
+* **wrap:** noprofile and dest-deny env after timeout and inside -c ([#87](https://github.com/workpen/workpen/issues/87)) ([36b29cf](https://github.com/workpen/workpen/commit/36b29cfd3b3d7b52894a467a34c1d3686a6fd389))
+
 ## [0.2.0](https://github.com/workpen/workpen/compare/v0.1.0...v0.2.0) (2026-09-13)
 
 
