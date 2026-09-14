@@ -197,6 +197,26 @@ fn run_equals_root_is_unknown_flag() {
 }
 
 #[test]
+fn run_timeout_missing_value_names_usage() {
+    let out = workpen()
+        .args(["run", "--timeout"])
+        .output()
+        .expect("spawn workpen");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "missing --timeout must exit 2, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--timeout"),
+        "missing --timeout must name the flag: {err}"
+    );
+}
+
+#[test]
 fn run_help_without_separator_is_unknown_flag() {
     let out = workpen()
         .args(["run", "--help"])

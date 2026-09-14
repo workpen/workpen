@@ -2,10 +2,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use workpen::{
-    CheckDestError, DenyPolicy, GcConfig, GcDecision, PathGuard, check_command_argv,
+    CheckDestError, DenyPolicy, GcConfig, GcDecision, KernelError, PathGuard, check_command_argv,
     dest_under_root, parse_max_age, resolve_extra_root_pair, resolve_workspace_root, run_gc,
 };
 
@@ -75,12 +75,14 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
+const RUN_USAGE: &str =
+    "usage: workpen run [--root DIR] [--extra-root DIR] [--timeout DUR] [--] CMD...";
+
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
+    let (timeout, rest) = peel_run_timeout(&rest)?;
     if let Some(flag) = rest.first().filter(|t| t.starts_with('-') && *t != "--") {
-        return Err(format!(
-            "unknown flag: {flag} (usage: workpen run [--root DIR] [--extra-root DIR] [--] CMD...)"
-        ));
+        return Err(format!("unknown flag: {flag} ({RUN_USAGE})"));
     }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = resolve_workspace_root(&cwd, &root.to_string_lossy()).map_err(|e| e.to_string())?;
@@ -88,10 +90,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let cmd = if rest.first().map(String::as_str) == Some("--") {
         &rest[1..]
     } else {
-        rest.as_slice()
+        rest
     };
     if cmd.is_empty() {
-        return Err("usage: workpen run [--root DIR] [--extra-root DIR] [--] CMD...".into());
+        return Err(RUN_USAGE.into());
     }
     let policy = DenyPolicy::from_workspace(&root).map_err(|e| e.to_string())?;
     let guard = PathGuard::with_extra_roots(&root, &extras).map_err(|e| e.to_string())?;
@@ -101,18 +103,41 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let (program, args) = workpen::with_bash_noprofile(&cmd[0], &cmd[1..]);
     let mut child = Command::new(program);
     child.args(args).current_dir(guard.canon_root());
-    let (_applied, status) = workpen::process_jail(guard.canon_root(), &presented)
-        .and_then(|policy| policy.run_child(child))
-        .map_err(|e| {
-            if e.to_string().contains("restore DACL") {
-                format!(
-                    "child finished but {e}; workspace ACL may still grant the write-restricted SID"
-                )
-            } else {
-                format!("failed to spawn {}: {e}", cmd[0])
-            }
-        })?;
+    let jail = workpen::process_jail(guard.canon_root(), &presented).map_err(|e| e.to_string())?;
+    let result = match timeout {
+        Some(limit) => jail.run_child_timeout(child, limit),
+        None => jail.run_child(child),
+    };
+    let (_applied, status) = match result {
+        Err(KernelError::Timeout) => {
+            eprintln!("child killed after the deadline");
+            return Ok(ExitCode::from(124));
+        }
+        Err(e) if e.to_string().contains("restore DACL") => {
+            return Err(format!(
+                "child finished but {e}; workspace ACL may still grant the write-restricted SID"
+            ));
+        }
+        Err(e) => return Err(format!("failed to spawn {}: {e}", cmd[0])),
+        Ok(ok) => ok,
+    };
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+}
+
+fn peel_run_timeout(rest: &[String]) -> Result<(Option<Duration>, &[String]), String> {
+    let mut timeout = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--timeout" => {
+                let raw = flag_value(rest, i, "--timeout")?;
+                timeout = Some(parse_max_age(raw).map_err(|e| e.to_string())?);
+                i += 2;
+            }
+            _ => break,
+        }
+    }
+    Ok((timeout, &rest[i..]))
 }
 
 fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
@@ -205,6 +230,8 @@ fn flag_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str, S
         Some(v) if !v.starts_with("--") => Ok(v.as_str()),
         _ => Err(if flag == "--root" || flag == "--extra-root" {
             format!("missing {flag} value")
+        } else if flag == "--timeout" {
+            RUN_USAGE.into()
         } else {
             gc_usage()
         }),
