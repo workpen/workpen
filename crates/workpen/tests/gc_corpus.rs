@@ -103,12 +103,17 @@ fn stamp_mtime_tree(root: &Path, when: SystemTime) {
             let path = ent.path();
             if path.is_dir() {
                 stamp_mtime_tree(&path, when);
-            } else if let Ok(file) = fs::File::open(&path) {
-                let _ = file.set_modified(when);
+            } else {
+                stamp_mtime(&path, when);
             }
         }
     }
-    if let Ok(file) = fs::File::open(root) {
+    stamp_mtime(root, when);
+}
+
+fn stamp_mtime(path: &Path, when: SystemTime) {
+    // Windows needs write access for set_modified. Do not truncate.
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
         let _ = file.set_modified(when);
     }
 }
@@ -866,12 +871,12 @@ fn dry_run_does_not_refresh_last_used() {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
-        .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00")
+        .env("GIT_COMMITTER_DATE", "2000-01-01 00:00:00 +0000")
         .args([
             "commit",
             "--amend",
             "--no-edit",
-            "--date=2000-01-01T00:00:00",
+            "--date=2000-01-01 00:00:00 +0000",
         ])
         .current_dir(&repo)
         .output()

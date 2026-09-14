@@ -581,7 +581,7 @@ fn restore_index_mtime(path: &Path, prev: SystemTime) {
     let Some(index) = index_file(path) else {
         return;
     };
-    if let Ok(file) = std::fs::File::open(index) {
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(index) {
         let _ = file.set_modified(prev);
     }
 }
