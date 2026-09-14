@@ -39,7 +39,9 @@ pub struct KernelGrant {
 /// Dest-deny names are a second list, not a grant of `/`. Linux Landlock
 /// cannot dest-deny a file inside an allowed tree
 /// ([nono #1592](https://github.com/nolabs-ai/nono/discussions/1592)).
-/// OS apply is the remount / Seatbelt / Windows-read follow-up.
+/// macOS `run_child` applies Seatbelt `(deny file-read* / file-write*)`
+/// literals (and `subpath` for directories) via nono `add_platform_rule`.
+/// Linux remount and Windows read deny are follow-ups.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelPolicy {
     grants: Vec<KernelGrant>,
@@ -264,6 +266,8 @@ impl KernelPolicy {
                 .allow_path(&grant.path, mode)
                 .map_err(|e| KernelError::Apply(e.to_string()))?;
         }
+        #[cfg(target_os = "macos")]
+        add_macos_dest_deny_rules(&mut caps, &self.dest_denies)?;
         Ok(caps.block_network().set_signal_mode(signal))
     }
 }
@@ -628,6 +632,54 @@ fn push_dest_deny(out: &mut Vec<DestDeny>, deny: DestDeny) {
         return;
     }
     out.push(deny);
+}
+
+/// Seatbelt dest-deny of workspace secrets. Platform rules emit last so
+/// they win over the workspace ReadWrite allow (nono last-rule-wins).
+/// Do not use `require-not` inside deny (invalid SBPL).
+#[cfg(target_os = "macos")]
+fn add_macos_dest_deny_rules(
+    caps: &mut nono::CapabilitySet,
+    denies: &[DestDeny],
+) -> Result<(), KernelError> {
+    for deny in denies {
+        for path in dest_deny_rule_paths(&deny.path) {
+            let Some(raw) = path.to_str() else {
+                return Err(KernelError::Apply(format!(
+                    "dest-deny path is not UTF-8: {}",
+                    path.display()
+                )));
+            };
+            let escaped = escape_sbpl_literal(raw);
+            let filter = if path.is_dir() {
+                format!("subpath \"{escaped}\"")
+            } else {
+                format!("literal \"{escaped}\"")
+            };
+            for action in ["file-read*", "file-write*"] {
+                let rule = format!("(deny {action} ({filter}))");
+                caps.add_platform_rule(&rule)
+                    .map_err(|e| KernelError::Apply(e.to_string()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn dest_deny_rule_paths(path: &Path) -> Vec<PathBuf> {
+    let mut out = vec![path.to_path_buf()];
+    if let Ok(canon) = dunce::canonicalize(path)
+        && canon != path
+    {
+        out.push(canon);
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn escape_sbpl_literal(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn refuse_home_workspace(workspace: &Path) -> Result<(), KernelError> {
