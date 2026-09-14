@@ -5,6 +5,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::agent_lock::{AgentLockError, load_agent_lock};
 use crate::guard::{PathGuard, PathGuardError};
 
 /// Portable dest-deny policy. Same globs on every OS.
@@ -51,6 +52,12 @@ impl DenyPolicy {
         Self {
             globs: Arc::new(globs),
         }
+    }
+
+    /// Defaults plus workspace `agent.lock` extras. Missing lock equals default.
+    /// Extras never replace defaults. Invalid lock is [`AgentLockError`].
+    pub fn from_workspace(path: impl AsRef<Path>) -> Result<Self, AgentLockError> {
+        Ok(Self::with_extra(load_agent_lock(path.as_ref())?))
     }
 
     pub fn globs(&self) -> &[String] {

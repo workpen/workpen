@@ -117,6 +117,41 @@ fn agent_lock_names_reach_kernel_dest_deny_list() {
 }
 
 #[test]
+fn process_jail_merges_agent_lock_dest_denies() {
+    let dir = workspace();
+    fs::write(dir.path().join("team.secret"), "x\n").expect("secret");
+    fs::write(dir.path().join(AGENT_LOCK_NAME), "**/*.secret\n").expect("lock");
+    let jail = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("jail");
+    assert!(
+        jail.dest_denies()
+            .iter()
+            .any(|d| d.path.file_name().is_some_and(|n| n == "team.secret")),
+        "process_jail must merge agent.lock dest-denies: {:?}",
+        jail.dest_denies()
+    );
+}
+
+#[test]
+fn process_jail_with_policy_default_does_not_read_agent_lock() {
+    let dir = workspace();
+    fs::write(dir.path().join("team.secret"), "x\n").expect("secret");
+    fs::write(dir.path().join(AGENT_LOCK_NAME), "**/*.secret\n").expect("lock");
+    let jail = process_jail_with_policy(
+        dir.path(),
+        std::iter::empty::<&Path>(),
+        &DenyPolicy::default(),
+    )
+    .expect("jail");
+    assert!(
+        jail.dest_denies()
+            .iter()
+            .all(|d| d.path.file_name().is_none_or(|n| n != "team.secret")),
+        "process_jail_with_policy default must not read agent.lock: {:?}",
+        jail.dest_denies()
+    );
+}
+
+#[test]
 fn collect_workspace_dest_denies_honors_extra_glob() {
     let dir = workspace();
     fs::write(dir.path().join("my.secret"), "x\n").expect("secret");

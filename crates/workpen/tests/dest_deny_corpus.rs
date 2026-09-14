@@ -4,11 +4,11 @@
 use std::path::Path;
 
 use workpen::{
-    CheckDestError, DenyPolicy, DestDeny, DestDenyError, DestDenyKind, PathGuard,
-    check_command_argv, check_command_dests, check_dest, classify_dest, default_secret_denies,
-    deny_patch_dests, deny_patch_dests_with_display, dest_deny_message, is_env_template_basename,
-    is_path_denied, open_verified_read, path_is_denied_glob, reject_command_secret_path_tokens,
-    verify_post_open,
+    AGENT_LOCK_NAME, AgentLockError, CheckDestError, DenyPolicy, DestDeny, DestDenyError,
+    DestDenyKind, PathGuard, check_command_argv, check_command_dests, check_dest, classify_dest,
+    default_secret_denies, deny_patch_dests, deny_patch_dests_with_display, dest_deny_message,
+    is_env_template_basename, is_path_denied, open_verified_read, path_is_denied_glob,
+    reject_command_secret_path_tokens, verify_post_open,
 };
 
 /// `matches deny glob **/.env` must not pass when wording only names `**/.env.*`.
@@ -126,6 +126,33 @@ fn extra_glob_can_dest_deny_env_template() {
     assert!(!is_path_denied(Path::new(".env.template"), &defaults));
     assert!(!is_path_denied(Path::new(".ENV.example"), &defaults));
     assert!(is_path_denied(Path::new(".env.local"), &defaults));
+}
+
+#[test]
+fn deny_policy_from_workspace_merges_agent_lock() {
+    let ws = tempfile::tempdir().expect("workspace");
+    assert_eq!(
+        DenyPolicy::from_workspace(ws.path()).expect("missing lock"),
+        DenyPolicy::default()
+    );
+
+    std::fs::write(ws.path().join(AGENT_LOCK_NAME), "**/*.secret\n").expect("lock");
+    std::fs::write(ws.path().join("team.secret"), "x\n").expect("secret");
+    let policy = DenyPolicy::from_workspace(ws.path()).expect("lock");
+    assert!(
+        is_path_denied(Path::new("team.secret"), &policy),
+        "agent.lock glob must dest-deny team.secret"
+    );
+    assert!(
+        is_path_denied(&ws.path().join("team.secret"), &policy),
+        "agent.lock glob must dest-deny workspace team.secret"
+    );
+
+    std::fs::write(ws.path().join(AGENT_LOCK_NAME), "key=value\n").expect("invalid");
+    match DenyPolicy::from_workspace(ws.path()) {
+        Err(AgentLockError::Invalid { .. }) => {}
+        other => panic!("expected Invalid, got {other:?}"),
+    }
 }
 
 #[test]
