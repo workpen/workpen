@@ -583,6 +583,17 @@ fn check_command_argv_denies_env_flags_after_timeout_nohup_nice() {
         &["/usr/bin/nice", "env", "-S", "--file=.env"],
         &["timeout", "30", "env", "-S", "--file=.env"],
         &["timeout", "30", "/usr/bin/env", "--file=.env", "bash"],
+        &["timeout", "30", "nohup", "env", "--file=.env", "true"],
+        &["nice", "timeout", "30", "env", "-S", "cat .env"],
+        &[
+            "env",
+            "timeout",
+            "30",
+            "nohup",
+            "env",
+            "--file=.env",
+            "true",
+        ],
     ];
     for argv in denies {
         let err = match check_command_argv(argv, ws.path(), &policy) {
@@ -615,6 +626,62 @@ fn check_command_argv_denies_env_flags_after_timeout_nohup_nice() {
         .expect("nohup cat readme.md must be allowed");
     check_command_argv(&["nice", "-n", "10", "echo", "hi"], ws.path(), &policy)
         .expect("nice -n 10 echo hi must be allowed");
+    check_command_argv(
+        &["timeout", "30", "nohup", "env", "-S", "cat readme.md"],
+        ws.path(),
+        &policy,
+    )
+    .expect("timeout 30 nohup env -S cat readme.md must be allowed");
+    check_command_argv(
+        &["timeout", "30", "nohup", "echo", "hello"],
+        ws.path(),
+        &policy,
+    )
+    .expect("timeout 30 nohup echo hello must be allowed");
+}
+
+#[test]
+fn check_command_argv_denies_cmd_and_powershell_script_bodies() {
+    let ws = tempfile::tempdir().expect("workspace");
+    std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("write readme");
+    let policy = DenyPolicy::default();
+    let denies: &[&[&str]] = &[
+        &["cmd.exe", "/c", "type .env"],
+        &["cmd", "/k", "type<.env"],
+        &["CMD.EXE", "/C", "type .env"],
+        &["powershell", "-Command", "Get-Content .env"],
+        &["pwsh", "-Command", "Get-Content .env"],
+        &["pwsh", "-C", "Get-Content .env"],
+        &["powershell.exe", "/Command", "Get-Content .env"],
+    ];
+    for argv in denies {
+        if check_command_argv(argv, ws.path(), &policy).is_ok() {
+            panic!("{argv:?} script body must dest-deny");
+        }
+    }
+    check_command_argv(&["cmd.exe", "/c", "type readme.md"], ws.path(), &policy)
+        .expect("cmd /c type readme.md must be allowed");
+    check_command_argv(
+        &["powershell", "-Command", "Get-Content readme.md"],
+        ws.path(),
+        &policy,
+    )
+    .expect("powershell -Command Get-Content readme.md must be allowed");
+    check_command_argv(
+        &["powershell", "-c", "Get-Content .env"],
+        ws.path(),
+        &policy,
+    )
+    .expect_err("powershell -c already dest-denies");
+    check_command_argv(&["tool", "/c", "type .env"], ws.path(), &policy)
+        .expect("generic /c must not dest-deny");
+    check_command_argv(
+        &["tool", "-Command", "Get-Content .env"],
+        ws.path(),
+        &policy,
+    )
+    .expect("generic -Command must not dest-deny");
 }
 
 #[test]
