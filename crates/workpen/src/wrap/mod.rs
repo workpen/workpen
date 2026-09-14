@@ -99,17 +99,26 @@ pub fn kernel_supported() -> bool {
 /// workspace or as an extra-root. Extra-roots may still be an explicit
 /// `/tmp` or a subdirectory of home.
 ///
-/// Dest-deny names default to [`crate::default_secret_denies()`] resolved
-/// under the workspace, including hardlink siblings. Hosts match
-/// [`crate::DestDenyKind`], not English.
+/// Dest-deny names default to [`crate::default_secret_denies()`] plus
+/// workspace `agent.lock` extras, resolved under the workspace,
+/// including hardlink siblings. Missing lock equals defaults. Invalid
+/// lock is [`KernelError::Apply`]. Hosts match [`crate::DestDenyKind`],
+/// not English.
 pub fn process_jail(
     workspace: impl AsRef<Path>,
     extra: impl IntoIterator<Item = impl AsRef<Path>>,
 ) -> Result<KernelPolicy, KernelError> {
-    process_jail_with_policy(workspace, extra, &DenyPolicy::default())
+    let workspace = workspace.as_ref();
+    let policy =
+        DenyPolicy::from_workspace(workspace).map_err(|err| KernelError::Apply(err.to_string()))?;
+    process_jail_with_policy(workspace, extra, &policy)
 }
 
 /// Same as [`process_jail`] with a host [`DenyPolicy`].
+///
+/// The host policy wins. Hosts that pass a policy own the merge,
+/// including whether to load workspace `agent.lock`. This function
+/// does not read the lock.
 pub fn process_jail_with_policy(
     workspace: impl AsRef<Path>,
     extra: impl IntoIterator<Item = impl AsRef<Path>>,
