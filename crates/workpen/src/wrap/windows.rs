@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::ptr;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use super::{
     KernelAccess, KernelApply, KernelError, KernelPolicy, is_denied_child_env, spawn_after_setup,
@@ -51,6 +52,7 @@ const TOKEN_PRIMARY: u32 = 1;
 const SECURITY_IMPERSONATION: u32 = 2;
 const INFINITE: Dword = 0xFFFF_FFFF;
 const WAIT_OBJECT_0: Dword = 0;
+const WAIT_TIMEOUT: Dword = 0x0000_0102;
 const WAIT_FAILED: Dword = 0xFFFF_FFFF;
 
 #[repr(C)]
@@ -478,9 +480,10 @@ struct Prepared {
 pub(super) fn spawn_write_restricted(
     policy: &KernelPolicy,
     cmd: &Command,
+    timeout: Option<Duration>,
 ) -> Result<(KernelApply, ExitStatus), KernelError> {
     spawn_after_setup(prepare_write_restricted(policy), |prepared| {
-        spawn_prepared(prepared, cmd)
+        spawn_prepared(prepared, cmd, timeout)
     })
 }
 
@@ -516,6 +519,7 @@ fn prefix_apply(kind: &'static str) -> impl FnOnce(KernelError) -> KernelError {
 fn spawn_prepared(
     prepared: Prepared,
     cmd: &Command,
+    timeout: Option<Duration>,
 ) -> Result<(KernelApply, ExitStatus), KernelError> {
     let (app, mut cmdline, cwd) = command_line(cmd)?;
     let mut env_block = environment_block(cmd);
@@ -585,8 +589,37 @@ fn spawn_prepared(
         }
         return Err(last_error("ResumeThread"));
     }
+    // INFINITE is 0xFFFF_FFFF. Cap finite waits one below that.
+    let wait_ms = match timeout {
+        None => INFINITE,
+        Some(d) => d.as_millis().min(u32::MAX as u128 - 1) as Dword,
+    };
     // SAFETY: process handle stays valid until we return.
-    let wait = unsafe { WaitForSingleObject(process.0, INFINITE) };
+    let wait = unsafe { WaitForSingleObject(process.0, wait_ms) };
+    let mut prepared = prepared;
+    if wait == WAIT_TIMEOUT {
+        drop(std::mem::replace(
+            &mut prepared.job,
+            CloseOnDrop(ptr::null_mut()),
+        ));
+        // SAFETY: job close requests KILL_ON_JOB_CLOSE.
+        let mut reap = unsafe { WaitForSingleObject(process.0, 5_000) };
+        if reap != WAIT_OBJECT_0 {
+            unsafe {
+                TerminateProcess(process.0, 1);
+            }
+            reap = unsafe { WaitForSingleObject(process.0, 5_000) };
+        }
+        for guard in &mut prepared.acl_guards {
+            guard.restore()?;
+        }
+        if reap != WAIT_OBJECT_0 {
+            return Err(KernelError::Apply(
+                "timeout kill left process still active".into(),
+            ));
+        }
+        return Err(KernelError::Timeout);
+    }
     if wait == WAIT_FAILED || wait != WAIT_OBJECT_0 {
         return Err(last_error("WaitForSingleObject"));
     }
@@ -596,7 +629,6 @@ fn spawn_prepared(
     if got == 0 {
         return Err(last_error("GetExitCodeProcess"));
     }
-    let mut prepared = prepared;
     for guard in &mut prepared.acl_guards {
         guard.restore()?;
     }
