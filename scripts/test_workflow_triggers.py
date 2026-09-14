@@ -118,6 +118,18 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertIn("crates-io-auth-action", text)
         self.assertNotIn("CARGO_REGISTRY_TOKEN: ${{ secrets.", text)
 
+    def test_publish_crates_refuses_before_oidc(self) -> None:
+        text = (WORKFLOWS / "publish-crates.yml").read_text(encoding="utf-8")
+        refuse_idx = text.index("name: Refuse while unpublished")
+        auth_idx = text.index("name: Authenticate with crates.io")
+        self.assertLess(refuse_idx, auth_idx)
+        refuse_block = text[refuse_idx:auth_idx]
+        self.assertNotIn("crates-io-auth-action", refuse_block)
+        self.assertIn("skip=true", refuse_block)
+        self.assertIn("id: unpublished", refuse_block)
+        auth_block = text[auth_idx:]
+        self.assertIn("steps.unpublished.outputs.skip != 'true'", auth_block)
+
     def test_msrv_is_1_95(self) -> None:
         toolchain = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
         self.assertIn('channel = "1.95"', toolchain)
