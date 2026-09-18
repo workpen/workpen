@@ -1113,10 +1113,11 @@ fn add_rw(grants: &mut Vec<KernelGrant>, path: &Path) -> Result<(), KernelError>
     }
     // CLI resolve_workspace_root returns canon only. On macOS, `/tmp/ws`
     // and `/var/folders/...` still appear on argv as the unprefixed form.
-    if let Some(alias) = macos_public_alias(&resolved) {
-        if !is_fs_root(&alias) && alias != resolved {
-            push_grant(grants, alias, KernelAccess::ReadWrite);
-        }
+    if let Some(alias) = macos_public_alias(&resolved)
+        && !is_fs_root(&alias)
+        && alias != resolved
+    {
+        push_grant(grants, alias, KernelAccess::ReadWrite);
     }
     push_grant(grants, resolved, KernelAccess::ReadWrite);
     Ok(())
