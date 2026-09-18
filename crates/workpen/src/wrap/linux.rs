@@ -2,62 +2,78 @@
 //!
 //! Landlock cannot dest-deny a file inside an allowed tree. This backend
 //! bind-overs existing dest-deny paths (and hardlink names collected by
-//! the list API). Fail closed if the namespace cannot be created.
+//! the list API). If unshare is denied, remount is skipped. Hide or
+//! bind-over errors after a successful unshare fail closed.
 
 use std::io;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-pub(super) fn apply_dest_deny_remounts(paths: &[std::path::PathBuf]) -> io::Result<()> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    match remount_all(paths) {
-        Err(e) if is_ns_denied(&e) => Ok(()),
-        other => other,
-    }
+#[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_ENTER: Cell<Option<bool>> = const { Cell::new(None) };
+    static TEST_HIDE_FAIL: Cell<bool> = const { Cell::new(false) };
+    static TEST_BIND_FAIL: Cell<bool> = const { Cell::new(false) };
 }
 
-fn remount_all(paths: &[std::path::PathBuf]) -> io::Result<()> {
-    if !enter_private_mount_ns()? {
-        return Ok(());
-    }
-    let hide_file = hide_node(false)?;
-    let hide_dir = hide_node(true)?;
-    for path in paths {
-        let hide = if path.is_dir() { &hide_dir } else { &hide_file };
-        bind_over(path, hide)?;
-    }
-    Ok(())
-}
-
-fn is_ns_denied(err: &io::Error) -> bool {
+fn is_ns_unavailable(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::PermissionDenied
         || err.raw_os_error() == Some(libc::ENOSYS)
         || err.raw_os_error() == Some(libc::EPERM)
         || err.raw_os_error() == Some(libc::EACCES)
 }
 
-/// Returns `Ok(false)` when unprivileged user namespaces are denied.
-/// Bind-over failure after a successful unshare is still an error.
+pub(super) fn apply_dest_deny_remounts(paths: &[PathBuf]) -> io::Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    // Create hide nodes before unshare so a planted shared temp path
+    // cannot make hide_node fail after the namespace exists.
+    let root = unique_hide_root()?;
+    let hide_file = hide_node(&root, false)?;
+    let hide_dir = hide_node(&root, true)?;
+    remount_all(paths, &hide_file, &hide_dir)
+}
+
+fn remount_all(paths: &[PathBuf], hide_file: &Path, hide_dir: &Path) -> io::Result<()> {
+    if !enter_private_mount_ns()? {
+        return Ok(());
+    }
+    for path in paths {
+        let hide = if path.is_dir() { hide_dir } else { hide_file };
+        bind_over(path, hide)?;
+    }
+    Ok(())
+}
+
+/// Returns `Ok(false)` when the private mount ns cannot be created.
+/// Hide or bind-over failure after a successful enter is still an error.
 fn enter_private_mount_ns() -> io::Result<bool> {
+    #[cfg(test)]
+    if let Some(entered) = TEST_ENTER.with(Cell::get) {
+        return Ok(entered);
+    }
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     // Safety: unshare only this thread, which is the forked child before exec.
     let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) };
     if rc != 0 {
         let err = io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::PermissionDenied
-            || err.raw_os_error() == Some(libc::ENOSYS)
-            || err.raw_os_error() == Some(libc::EPERM)
-        {
+        if is_ns_unavailable(&err) {
             return Ok(false);
         }
         return Err(err);
     }
-    std::fs::write("/proc/self/setgroups", "deny")?;
-    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))?;
-    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))?;
+    if let Err(err) = write_id_maps(uid, gid) {
+        if is_ns_unavailable(&err) {
+            return Ok(false);
+        }
+        return Err(err);
+    }
     let rc = unsafe {
         libc::mount(
             c"/".as_ptr(),
@@ -68,14 +84,44 @@ fn enter_private_mount_ns() -> io::Result<bool> {
         )
     };
     if rc != 0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        if is_ns_unavailable(&err) {
+            return Ok(false);
+        }
+        return Err(err);
     }
     Ok(true)
 }
 
-fn hide_node(dir: bool) -> io::Result<std::path::PathBuf> {
-    let root = std::env::temp_dir().join("workpen-dest-deny");
-    std::fs::create_dir_all(&root)?;
+fn write_id_maps(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
+    std::fs::write("/proc/self/setgroups", "deny")?;
+    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))?;
+    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))?;
+    Ok(())
+}
+
+/// Unique directory this process owns. A planted
+/// `temp_dir()/workpen-dest-deny/empty-file` cannot collide.
+fn unique_hide_root() -> io::Result<PathBuf> {
+    let mut template = std::env::temp_dir();
+    template.push("workpen-dest-deny-XXXXXX");
+    let mut buf = template.into_os_string().into_vec();
+    buf.push(0);
+    // Safety: `buf` is a NUL-terminated mkdtemp template; the pointer is
+    // valid for the call and we rebuild the path from the same bytes.
+    let ptr = unsafe { libc::mkdtemp(buf.as_mut_ptr().cast()) };
+    if ptr.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    buf.pop();
+    Ok(PathBuf::from(std::ffi::OsString::from_vec(buf)))
+}
+
+fn hide_node(root: &Path, dir: bool) -> io::Result<PathBuf> {
+    #[cfg(test)]
+    if TEST_HIDE_FAIL.with(Cell::get) {
+        return Err(io::Error::from_raw_os_error(libc::EACCES));
+    }
     let path = if dir {
         root.join("empty-dir")
     } else {
@@ -91,6 +137,10 @@ fn hide_node(dir: bool) -> io::Result<std::path::PathBuf> {
 }
 
 fn bind_over(dest: &Path, hide: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if TEST_BIND_FAIL.with(Cell::get) {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
     if !dest.exists() {
         return Ok(());
     }
@@ -111,4 +161,90 @@ fn bind_over(dest: &Path, hide: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TEST_BIND_FAIL, TEST_ENTER, TEST_HIDE_FAIL, apply_dest_deny_remounts};
+    use std::path::PathBuf;
+
+    struct Override {
+        reset_hide: bool,
+        reset_bind: bool,
+    }
+
+    impl Override {
+        fn enter(entered: bool) -> Self {
+            TEST_ENTER.with(|c| c.set(Some(entered)));
+            Self {
+                reset_hide: false,
+                reset_bind: false,
+            }
+        }
+
+        fn hide_fail() -> Self {
+            TEST_HIDE_FAIL.with(|c| c.set(true));
+            Self {
+                reset_hide: true,
+                reset_bind: false,
+            }
+        }
+
+        fn bind_fail_after_enter() -> Self {
+            TEST_ENTER.with(|c| c.set(Some(true)));
+            TEST_BIND_FAIL.with(|c| c.set(true));
+            Self {
+                reset_hide: false,
+                reset_bind: true,
+            }
+        }
+    }
+
+    impl Drop for Override {
+        fn drop(&mut self) {
+            TEST_ENTER.with(|c| c.set(None));
+            if self.reset_hide {
+                TEST_HIDE_FAIL.with(|c| c.set(false));
+            }
+            if self.reset_bind {
+                TEST_BIND_FAIL.with(|c| c.set(false));
+            }
+        }
+    }
+
+    #[test]
+    fn unshare_denied_skips_remount() {
+        let _guard = Override::enter(false);
+        let dest = PathBuf::from("/tmp/workpen-dest-deny-unshare-skip.env");
+        apply_dest_deny_remounts(&[dest])
+            .expect("unshare denied must stay Ok (issue #92 remount skip)");
+    }
+
+    #[test]
+    fn hide_failure_is_error() {
+        let _guard = Override::hide_fail();
+        let dest = PathBuf::from("/tmp/workpen-dest-deny-hide-fail.env");
+        let err = apply_dest_deny_remounts(&[dest]).expect_err("hide_node EACCES must propagate");
+        assert_eq!(err.raw_os_error(), Some(libc::EACCES));
+    }
+
+    #[test]
+    fn bind_failure_after_enter_is_error() {
+        let _guard = Override::bind_fail_after_enter();
+        let dest = PathBuf::from("/tmp/workpen-dest-deny-bind-fail.env");
+        let err = apply_dest_deny_remounts(&[dest])
+            .expect_err("bind_over EPERM after enter must propagate");
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[test]
+    fn hide_root_is_not_shared_workpen_dest_deny() {
+        let root = super::unique_hide_root().expect("mkdtemp");
+        assert_ne!(
+            root,
+            std::env::temp_dir().join("workpen-dest-deny"),
+            "hide dir must not be the planted shared path"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
