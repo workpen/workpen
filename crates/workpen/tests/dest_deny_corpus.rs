@@ -968,6 +968,10 @@ fn check_command_argv_refuses_powershell_stdin_dash() {
         &["pwsh", "-File:-"],
         &["pwsh", "--File", "-"],
         &["bash", "-lc", "pwsh -Command -"],
+        &["pwsh", "-"],
+        &["powershell", "-"],
+        &["pwsh", "-NoProfile", "-"],
+        &["bash", "-lc", "pwsh -"],
     ];
     for argv in refuses {
         let err = check_command_argv(argv, ws.path(), &policy)
@@ -989,6 +993,8 @@ fn check_command_argv_refuses_powershell_stdin_dash() {
         &policy,
     )
     .expect("pwsh -Command Get-Content readme.md must stay allowed");
+    check_command_argv(&["pwsh", "-File", "readme.md"], ws.path(), &policy)
+        .expect("pwsh -File readme.md must stay allowed");
 }
 
 #[test]

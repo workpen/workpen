@@ -118,7 +118,7 @@ pub enum DestDenyError {
     /// PowerShell `-EncodedCommand` payload is not UTF-16LE RFC 4648.
     #[error("invalid -EncodedCommand payload (need UTF-16LE base64); child was not started")]
     EncodedCommand,
-    /// PowerShell `-Command -` / `-File -` (and unique prefixes) read a script from stdin.
+    /// PowerShell `-Command -` / `-File -` (and unique prefixes), or positional `-`, read a script from stdin.
     #[error(
         "PowerShell stdin script (-Command - or -File -) cannot be dest-denied; child was not started"
     )]
@@ -497,8 +497,9 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// `-EncodedCommand`, `-EncodedArguments`, or `-File`. Unique prefixes
 /// (`-en`, `-comma`, `-cwa`) match. A second leading `-`/`/` is stripped
 /// (`--Command`, `--EncodedCommand`, `--File`). `-File` / `-f` / `/File`
-/// (and `-File:…`) dest-deny the script path. `pwsh -Command -` and
-/// `pwsh -File -` (including `--switch` and unique prefixes) are
+/// (and `-File:…`) dest-deny the script path. `pwsh -Command -`,
+/// `pwsh -File -` (including `--switch` and unique prefixes), and
+/// positional `pwsh -` / `powershell -` are
 /// [`DestDenyError::StdinScript`]: dest-deny does not read host stdin.
 /// `cmd /c -` is unchanged. Those bodies are also peeled
 /// inside a shell `-c` string. Generic `/c`, `-Command`, `-EncodedCommand`,
@@ -681,7 +682,8 @@ fn is_powershell_encoded_arguments_name(name: &str) -> bool {
 
 /// After `cmd` / `pwsh`, walk remaining tokens. First `/c`/`/k`,
 /// `-EncodedCommand`, `-EncodedArguments`, `-File`, or `-Command`
-/// (including `--switch` and unique prefixes) wins.
+/// (including `--switch` and unique prefixes) wins. A leftover
+/// operand that is exactly `-` is positional File-from-stdin.
 fn check_cmd_powershell_remaining_dests(
     program: &str,
     rest: &[impl AsRef<str>],
@@ -721,6 +723,12 @@ fn check_cmd_powershell_remaining_dests(
             {
                 refuse_powershell_stdin_dash(body)?;
                 return check_command_dests(body, root, policy);
+            }
+        }
+        // File is the default positional. `pwsh -` reads a script from stdin.
+        for token in rest {
+            if token.as_ref() == "-" {
+                return Err(DestDenyError::StdinScript.into());
             }
         }
     }
