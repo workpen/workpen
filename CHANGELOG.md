@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.1](https://github.com/workpen/workpen/compare/v0.4.0...v0.4.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* classify host dest-deny extras and resolve gc --root ([#128](https://github.com/workpen/workpen/issues/128)) ([21e2ae2](https://github.com/workpen/workpen/commit/21e2ae23942062051a635df44c032b88dcddc157))
+* honor agent.lock in gc and dest-deny pwsh stdin dash ([#129](https://github.com/workpen/workpen/issues/129)) ([bbd337f](https://github.com/workpen/workpen/commit/bbd337f800634b6b8b14a33c889ad372dcc4677c))
+* **wrap:** dest-deny extra-root /tmp dest names ([#131](https://github.com/workpen/workpen/issues/131)) ([45a0e8c](https://github.com/workpen/workpen/commit/45a0e8c070ded75d4d445ae1a632e7c118a6db98))
+* **wrap:** dest-deny extra-root dests in process_jail ([#130](https://github.com/workpen/workpen/issues/130)) ([fc16f82](https://github.com/workpen/workpen/commit/fc16f82e66b23e94add280f2c84a0a7a6300731e))
+* **wrap:** dest-deny run_child argv and skip WFP without admin ([#126](https://github.com/workpen/workpen/issues/126)) ([33e4c36](https://github.com/workpen/workpen/commit/33e4c363a74f5f6f3c13e247fce2b9f86d07b184)), closes [#122](https://github.com/workpen/workpen/issues/122) [#123](https://github.com/workpen/workpen/issues/123) [#124](https://github.com/workpen/workpen/issues/124)
+* **wrap:** fail closed on Linux dest-deny remount errors ([#125](https://github.com/workpen/workpen/issues/125)) ([d76d67a](https://github.com/workpen/workpen/commit/d76d67a5f87047dc3edba40c9f65b9165506d7e5))
+
 ## [0.4.0](https://github.com/workpen/workpen/compare/v0.3.0...v0.4.0) (2026-09-14)
 
 
