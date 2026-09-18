@@ -586,6 +586,56 @@ fn why_relative_parent_root_plain_file_is_allowed_not_escape() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn run_extra_root_constructed_env_is_dest_denied() {
+    let ws = TempDir::new().expect("workspace");
+    let extra = TempDir::new().expect("extra");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("readme");
+    let extra_env = extra.path().join(".env");
+    std::fs::write(&extra_env, "SECRET=1\n").expect("extra .env");
+    std::fs::write(extra.path().join("ok.txt"), "ok\n").expect("ok.txt");
+    // Construct `.env` at runtime so argv dest-deny does not peel the name.
+    let script = format!("n=.; cat {}/${{n}}env", extra.path().display());
+    let deny = workpen()
+        .arg("run")
+        .arg("--root")
+        .arg(ws.path())
+        .arg("--extra-root")
+        .arg(extra.path())
+        .args(["--", "/bin/sh", "-c", &script])
+        .output()
+        .expect("spawn workpen");
+    let stdout = String::from_utf8_lossy(&deny.stdout);
+    assert!(
+        !stdout.contains("SECRET"),
+        "constructed extra-root .env must not print SECRET, stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&deny.stderr)
+    );
+    assert!(
+        extra_env.exists(),
+        "extra-root .env must remain after dest-deny"
+    );
+    let allow = workpen()
+        .arg("run")
+        .arg("--root")
+        .arg(ws.path())
+        .arg("--extra-root")
+        .arg(extra.path())
+        .arg("--")
+        .arg("/bin/cat")
+        .arg(extra.path().join("ok.txt"))
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        allow.status.success(),
+        "extra-root ok.txt must be allowed after dest-deny, stdout={} stderr={}",
+        String::from_utf8_lossy(&allow.stdout),
+        String::from_utf8_lossy(&allow.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&allow.stdout).trim(), "ok");
+}
+
 #[test]
 fn why_extra_root_resolves_against_process_cwd_not_workspace() {
     let parent = TempDir::new().expect("parent");

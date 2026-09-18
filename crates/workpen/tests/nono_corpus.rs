@@ -593,6 +593,60 @@ fn extra_root_is_readwrite() {
     assert_eq!(grant.access, KernelAccess::ReadWrite);
 }
 
+#[test]
+fn process_jail_dest_denies_extra_root_env_and_not_ok_txt() {
+    let dir = workspace();
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    let extra = TempDir::new().expect("extra");
+    fs::write(extra.path().join(".env"), "SECRET=1\n").expect("extra .env");
+    fs::write(extra.path().join("ok.txt"), "ok\n").expect("ok.txt");
+    let policy = process_jail(dir.path(), [extra.path()]).expect("policy");
+    let extra_env = extra.path().join(".env");
+    assert!(
+        policy.dest_denies().iter().any(|d| d.path == extra_env
+            || (d.path.file_name().is_some_and(|n| n == ".env")
+                && d.path.starts_with(extra.path()))),
+        "process_jail must dest-deny extra-root .env: {:?}",
+        policy.dest_denies()
+    );
+    assert!(
+        policy
+            .dest_denies()
+            .iter()
+            .all(|d| d.path.file_name().is_none_or(|n| n != "ok.txt")),
+        "extra-root ok.txt must not be dest-denied: {:?}",
+        policy.dest_denies()
+    );
+}
+
+#[test]
+fn process_jail_dest_denies_extra_root_hardlink_sibling() {
+    let dir = workspace();
+    let extra = TempDir::new().expect("extra");
+    fs::write(extra.path().join(".env"), "SECRET=1\n").expect("extra .env");
+    fs::hard_link(extra.path().join(".env"), extra.path().join("notes.txt")).expect("hardlink");
+    for i in 0..32 {
+        fs::write(extra.path().join(format!("f{i}.txt")), "x\n").expect("bulk");
+    }
+    let policy = process_jail(dir.path(), [extra.path()]).expect("policy");
+    let notes = extra.path().join("notes.txt");
+    assert!(
+        policy.dest_denies().iter().any(|d| d.path == notes
+            || (d.path.file_name().is_some_and(|n| n == "notes.txt")
+                && d.path.starts_with(extra.path()))),
+        "process_jail must dest-deny extra-root hardlink sibling: {:?}",
+        policy.dest_denies()
+    );
+    assert!(
+        policy.dest_denies().iter().all(|d| d
+            .path
+            .file_name()
+            .is_none_or(|n| !n.to_string_lossy().starts_with('f'))),
+        "extra-root bulk files must not be dest-denied: {:?}",
+        policy.dest_denies()
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn extra_root_tmp_grants_presented_and_canonical() {
