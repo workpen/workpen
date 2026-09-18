@@ -1,6 +1,9 @@
 //! CLI parse errors name the legal surface and the spawn target.
 
+use std::fs::OpenOptions;
+use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 use tempfile::TempDir;
 
@@ -322,6 +325,118 @@ fn gc_leftover_flag_as_value_is_missing() {
         !err.contains("unknown") || !err.contains("7d"),
         "missing --leftover value must not call 7d unknown: {err}"
     );
+}
+
+#[test]
+fn gc_honors_workspace_agent_lock_cache_secret() {
+    let repo = init_git_repo();
+    std::fs::write(repo.path().join("agent.lock"), b"**/*.secret\n").expect("lock");
+
+    let old = SystemTime::now() - Duration::from_secs(2 * 3600);
+    let unix = old
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("unix")
+        .as_secs();
+    let date = unix.to_string();
+    let amend = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
+        .args(["commit", "--amend", "--no-edit", "--date"])
+        .arg(&date)
+        .current_dir(repo.path())
+        .output()
+        .expect("amend");
+    assert!(
+        amend.status.success(),
+        "amend: {}",
+        String::from_utf8_lossy(&amend.stderr)
+    );
+
+    let leftover_dir = repo.path().join(".workpen-worktrees");
+    std::fs::create_dir_all(&leftover_dir).expect("leftover dir");
+    let leftover = leftover_dir.join("extra-secret");
+    git_in(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            leftover.to_str().expect("utf8"),
+            "-b",
+            "extra-secret",
+        ],
+    );
+
+    let target = leftover.join("target");
+    std::fs::create_dir_all(&target).expect("target");
+    std::fs::write(target.join("team.secret"), b"host extra\n").expect("secret");
+    stamp_mtime_tree(&leftover, old);
+    stamp_mtime_tree(&repo.path().join(".git/worktrees"), old);
+
+    let out = workpen()
+        .args(["gc", "--root"])
+        .arg(repo.path())
+        .args(["--max-age", "1s", "--leftover"])
+        .arg(&leftover_dir)
+        .output()
+        .expect("spawn workpen");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        out.status.success(),
+        "gc leftover with agent.lock extra must succeed, stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        leftover.exists(),
+        "leftover with target/team.secret must stay: {combined}"
+    );
+    assert!(
+        combined.contains("keep") && combined.contains("unique untracked files"),
+        "gc must keep UniqueUntracked leftover: {combined}"
+    );
+    assert!(
+        !combined.to_ascii_lowercase().contains("reclaimed"),
+        "gc must not reclaim leftover with agent.lock extra: {combined}"
+    );
+}
+
+fn git_in(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn stamp_mtime_tree(root: &Path, when: SystemTime) {
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if path.is_dir() {
+                stamp_mtime_tree(&path, when);
+            } else {
+                stamp_mtime(&path, when);
+            }
+        }
+    }
+    stamp_mtime(root, when);
+}
+
+fn stamp_mtime(path: &Path, when: SystemTime) {
+    if let Ok(file) = OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(when);
+    }
 }
 
 fn init_git_repo() -> TempDir {

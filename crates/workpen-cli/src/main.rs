@@ -6,7 +6,8 @@ use std::time::{Duration, SystemTime};
 
 use workpen::{
     CheckDestError, DenyPolicy, GcConfig, GcDecision, KernelError, PathGuard, check_command_argv,
-    dest_under_root, parse_max_age, resolve_extra_root_pair, resolve_workspace_root, run_gc,
+    dest_under_root, parse_max_age, resolve_extra_root_pair, resolve_workspace_root,
+    run_gc_with_policy,
 };
 
 fn main() -> ExitCode {
@@ -174,6 +175,7 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
     let max_age = max_age.ok_or_else(gc_usage)?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = resolve_workspace_root(&cwd, &root.to_string_lossy()).map_err(|e| e.to_string())?;
+    let policy = DenyPolicy::from_workspace(&root).map_err(|e| e.to_string())?;
     let mut cfg = GcConfig::new(&root, max_age);
     cfg.now = SystemTime::now();
     cfg.dry_run = dry_run;
@@ -184,7 +186,7 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
             root.join(dir)
         };
     }
-    let rows = run_gc(&root, &cfg).map_err(|e| e.to_string())?;
+    let rows = run_gc_with_policy(&root, &cfg, &policy).map_err(|e| e.to_string())?;
     for (path, decision) in &rows {
         match decision {
             GcDecision::Keep { reason } => {
