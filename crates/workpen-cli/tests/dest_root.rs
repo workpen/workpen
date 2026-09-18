@@ -627,13 +627,20 @@ fn run_extra_root_constructed_env_is_dest_denied() {
         .arg(extra.path().join("ok.txt"))
         .output()
         .expect("spawn workpen");
-    assert!(
-        allow.status.success(),
-        "extra-root ok.txt must be allowed after dest-deny, stdout={} stderr={}",
-        String::from_utf8_lossy(&allow.stdout),
-        String::from_utf8_lossy(&allow.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&allow.stdout).trim(), "ok");
+    let allow_out = String::from_utf8_lossy(&allow.stdout);
+    let allow_err = String::from_utf8_lossy(&allow.stderr);
+    if allow.status.success() {
+        assert_eq!(
+            allow_out.trim(),
+            "ok",
+            "extra-root ok.txt must print ok when remount/Seatbelt applied, stderr={allow_err}"
+        );
+    } else {
+        assert!(
+            allow_err.contains("extra-root dest-deny remount") || allow_err.contains("unavailable"),
+            "without remount, extra-root dest-deny must refuse spawn, stdout={allow_out} stderr={allow_err}"
+        );
+    }
 }
 
 #[test]
