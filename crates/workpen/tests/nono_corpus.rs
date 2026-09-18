@@ -3,6 +3,8 @@
 //! is allowed: it only installs a child hook.
 
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -211,6 +213,89 @@ fn run_child_cannot_read_workspace_env_linux() {
     assert!(status.success(), "readme wrapper must finish: {status:?}");
     let code = fs::read_to_string(dir.path().join("readme.code")).expect("readme.code");
     assert_eq!(code.trim(), "0", "cat readme.md must succeed");
+}
+
+#[cfg(target_os = "linux")]
+fn linux_run_child_cat_env(
+    policy: &workpen::KernelPolicy,
+    dir: &Path,
+) -> Result<(bool, String), KernelError> {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "cat .env >env.out; echo $? >env.code"])
+        .current_dir(dir);
+    let (_applied, status) = policy.run_child(cmd)?;
+    assert!(status.success(), "wrapper must finish: {status:?}");
+    let leaked = fs::read_to_string(dir.join("env.out")).unwrap_or_default();
+    Ok((leaked.contains("SECRET"), leaked))
+}
+
+/// A planted `temp_dir()/workpen-dest-deny/empty-file` must not skip dest-deny.
+#[cfg(target_os = "linux")]
+#[test]
+fn run_child_planted_hide_path_does_not_skip_dest_deny() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    match linux_run_child_cat_env(&policy, dir.path()) {
+        Ok((true, _)) => {
+            // Unprivileged user ns denied (#92). Remount skip stays Ok.
+            return;
+        }
+        Ok((false, _)) => {}
+        Err(KernelError::Apply(_)) => {
+            let leaked = fs::read_to_string(dir.path().join("env.out")).unwrap_or_default();
+            assert!(
+                !leaked.contains("SECRET"),
+                "fail-closed remount must not start a child that reads .env: {leaked:?}"
+            );
+            return;
+        }
+        Err(other) => panic!("unexpected run_child error: {other}"),
+    }
+
+    let planted = std::env::temp_dir()
+        .join("workpen-dest-deny")
+        .join("empty-file");
+    if let Some(parent) = planted.parent() {
+        fs::create_dir_all(parent).expect("plant hide root");
+    }
+    fs::write(&planted, []).expect("plant empty-file");
+    let mut deny = fs::metadata(&planted).expect("plant meta").permissions();
+    deny.set_mode(0o000);
+    fs::set_permissions(&planted, deny).expect("plant chmod");
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Ok(meta) = fs::metadata(&self.0) {
+                let mut allow = meta.permissions();
+                allow.set_mode(0o644);
+                let _ = fs::set_permissions(&self.0, allow);
+            }
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let _restore = Restore(planted);
+
+    match linux_run_child_cat_env(&policy, dir.path()) {
+        Ok((leaked, body)) => {
+            assert!(
+                !leaked,
+                "planted hide path must not skip dest-deny remount: {body:?}"
+            );
+        }
+        Err(KernelError::Apply(_)) => {
+            let leaked = fs::read_to_string(dir.path().join("env.out")).unwrap_or_default();
+            assert!(
+                !leaked.contains("SECRET"),
+                "fail-closed remount must not start a child that reads .env: {leaked:?}"
+            );
+        }
+        Err(other) => panic!("unexpected run_child error: {other}"),
+    }
 }
 
 #[cfg(target_os = "macos")]
