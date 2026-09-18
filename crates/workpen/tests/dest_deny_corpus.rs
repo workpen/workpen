@@ -951,6 +951,47 @@ fn check_command_argv_denies_powershell_file_dests() {
 }
 
 #[test]
+fn check_command_argv_refuses_powershell_stdin_dash() {
+    let ws = tempfile::tempdir().expect("workspace");
+    std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("write readme");
+    let policy = DenyPolicy::default();
+    let refuses: &[&[&str]] = &[
+        &["pwsh", "-Command", "-"],
+        &["pwsh", "-c", "-"],
+        &["pwsh", "-NoProfile", "-Command", "-"],
+        &["pwsh", "--Command", "-"],
+        &["pwsh", "-Command:-"],
+        &["powershell", "-Command", "-"],
+        &["pwsh", "-File", "-"],
+        &["pwsh", "-f", "-"],
+        &["pwsh", "-File:-"],
+        &["pwsh", "--File", "-"],
+        &["bash", "-lc", "pwsh -Command -"],
+    ];
+    for argv in refuses {
+        let err = check_command_argv(argv, ws.path(), &policy)
+            .expect_err("PowerShell stdin dash must fail closed");
+        assert!(
+            matches!(err, CheckDestError::DestDeny(DestDenyError::StdinScript)),
+            "{argv:?} must name StdinScript, got {err}"
+        );
+    }
+    check_command_argv(&["cmd", "/c", "-"], ws.path(), &policy)
+        .expect("cmd /c - is not a stdin script");
+    check_command_argv(&["tool", "-Command", "-"], ws.path(), &policy)
+        .expect("generic -Command - must not dest-deny");
+    check_command_argv(&["tool", "-File", "-"], ws.path(), &policy)
+        .expect("generic -File - must not dest-deny");
+    check_command_argv(
+        &["pwsh", "-Command", "Get-Content readme.md"],
+        ws.path(),
+        &policy,
+    )
+    .expect("pwsh -Command Get-Content readme.md must stay allowed");
+}
+
+#[test]
 fn check_command_argv_denies_env_flags_inside_shell_c_body() {
     let ws = tempfile::tempdir().expect("workspace");
     std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");

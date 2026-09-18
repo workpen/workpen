@@ -118,6 +118,11 @@ pub enum DestDenyError {
     /// PowerShell `-EncodedCommand` payload is not UTF-16LE RFC 4648.
     #[error("invalid -EncodedCommand payload (need UTF-16LE base64); child was not started")]
     EncodedCommand,
+    /// PowerShell `-Command -` / `-File -` (and unique prefixes) read a script from stdin.
+    #[error(
+        "PowerShell stdin script (-Command - or -File -) cannot be dest-denied; child was not started"
+    )]
+    StdinScript,
     /// Post-open hardlink hit. Distinct wording from [`DestDeny::message`].
     #[error(
         "path denied: {path} is a hardlink of a denied name; unlink extra names or do not share the inode"
@@ -492,7 +497,10 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// `-EncodedCommand`, `-EncodedArguments`, or `-File`. Unique prefixes
 /// (`-en`, `-comma`, `-cwa`) match. A second leading `-`/`/` is stripped
 /// (`--Command`, `--EncodedCommand`, `--File`). `-File` / `-f` / `/File`
-/// (and `-File:…`) dest-deny the script path. Those bodies are also peeled
+/// (and `-File:…`) dest-deny the script path. `pwsh -Command -` and
+/// `pwsh -File -` (including `--switch` and unique prefixes) are
+/// [`DestDenyError::StdinScript`]: dest-deny does not read host stdin.
+/// `cmd /c -` is unchanged. Those bodies are also peeled
 /// inside a shell `-c` string. Generic `/c`, `-Command`, `-EncodedCommand`,
 /// `-cwa`, or `-File` on another argv0 is not.
 /// Dest-denies argv `-f`/`--file` (including attached `--file=.env`) via
@@ -704,15 +712,24 @@ fn check_cmd_powershell_remaining_dests(
             if let Some(path) =
                 powershell_file_dest(token.as_ref(), rest.get(j + 1).map(|s| s.as_ref()))
             {
+                refuse_powershell_stdin_dash(path)?;
                 let dest = dest_under_root(root, path);
                 return check_dest(&dest.to_string_lossy(), policy, None).map(|_| ());
             }
             if let Some(body) =
                 powershell_command_body(token.as_ref(), rest.get(j + 1).map(|s| s.as_ref()))
             {
+                refuse_powershell_stdin_dash(body)?;
                 return check_command_dests(body, root, policy);
             }
         }
+    }
+    Ok(())
+}
+
+fn refuse_powershell_stdin_dash(body: &str) -> Result<(), CheckDestError> {
+    if body == "-" {
+        return Err(DestDenyError::StdinScript.into());
     }
     Ok(())
 }

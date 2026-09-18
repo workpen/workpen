@@ -3,7 +3,10 @@
 //! Not a dest-parent-copy. Userspace WFP has no process-id condition, so
 //! a path-wide `cmd.exe` filter is out of scope. The helper is a unique
 //! PE; the AppContainer SID is unique per spawn; descendants inherit the
-//! package. WFP BLOCKs that package SID (and the helper APP_ID) only.
+//! package. WFP BLOCKs that package SID (and the helper APP_ID) only
+//! when the token can add filters. `ERROR_ACCESS_DENIED` (win32 5) is
+//! skipped: package WFP needs an elevated token. AppContainer with no
+//! network capabilities still applies.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -12,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::super::wfp_skip_access_denied;
 use super::{Bool, Dword, Handle, KernelError, last_error, wide_os, wide_path, win32_error};
 
 const HELPER_PE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/workpen-net-helper.exe"));
@@ -271,7 +275,12 @@ pub(super) struct WfpSession {
 }
 
 impl WfpSession {
-    pub(super) fn apply(package_sid: Handle, helper: &Path) -> Result<Self, KernelError> {
+    /// Open a dynamic WFP session and add package plus helper APP_ID blocks.
+    ///
+    /// Returns `Ok(None)` when engine open or filter add is
+    /// `ERROR_ACCESS_DENIED` (needs admin). Other WFP errors stay
+    /// [`KernelError::Apply`].
+    pub(super) fn apply(package_sid: Handle, helper: &Path) -> Result<Option<Self>, KernelError> {
         let mut name = wide_os(OsStr::new("workpen-net"));
         let mut session: FwpmSession0 = unsafe { mem::zeroed() };
         session.flags = FWPM_SESSION_FLAG_DYNAMIC;
@@ -288,12 +297,23 @@ impl WfpSession {
             )
         };
         if err != 0 || engine.is_null() {
+            if wfp_skip_access_denied(err) {
+                return Ok(None);
+            }
             return Err(win32_error("FwpmEngineOpen0", err));
         }
         let wfp = Self { engine };
-        add_sid_blocks(engine, package_sid, &mut name)?;
-        add_app_id_blocks(engine, helper, &mut name)?;
-        Ok(wfp)
+        match add_sid_blocks(engine, package_sid, &mut name) {
+            Ok(()) => {}
+            Err(WfpAddError::AccessDenied) => return Ok(None),
+            Err(WfpAddError::Other(err)) => return Err(err),
+        }
+        match add_app_id_blocks(engine, helper, &mut name) {
+            Ok(()) => {}
+            Err(WfpAddError::AccessDenied) => return Ok(None),
+            Err(WfpAddError::Other(err)) => return Err(err),
+        }
+        Ok(Some(wfp))
     }
 }
 
@@ -347,11 +367,26 @@ fn load_create_appcontainer_token() -> Result<CreateAppContainerTokenFn, KernelE
     Ok(unsafe { mem::transmute::<_, CreateAppContainerTokenFn>(proc) })
 }
 
+enum WfpAddError {
+    AccessDenied,
+    Other(KernelError),
+}
+
+fn wfp_add_status(op: &str, err: u32) -> Result<(), WfpAddError> {
+    if err == 0 {
+        return Ok(());
+    }
+    if wfp_skip_access_denied(err) {
+        return Err(WfpAddError::AccessDenied);
+    }
+    Err(WfpAddError::Other(win32_error(op, err)))
+}
+
 fn add_sid_blocks(
     engine: Handle,
     package_sid: Handle,
     name: &mut [u16],
-) -> Result<(), KernelError> {
+) -> Result<(), WfpAddError> {
     for layer in [
         FWPM_LAYER_ALE_AUTH_CONNECT_V4,
         FWPM_LAYER_ALE_AUTH_CONNECT_V6,
@@ -366,13 +401,24 @@ fn add_sid_blocks(
     Ok(())
 }
 
-fn add_app_id_blocks(engine: Handle, helper: &Path, name: &mut [u16]) -> Result<(), KernelError> {
+fn add_app_id_blocks(engine: Handle, helper: &Path, name: &mut [u16]) -> Result<(), WfpAddError> {
     let wide = wide_path(helper);
     let mut blob: *mut FwpByteBlob = ptr::null_mut();
     // SAFETY: wide is a NUL-terminated existing helper path.
     let err = unsafe { FwpmGetAppIdFromFileName0(wide.as_ptr(), &mut blob) };
     if err != 0 || blob.is_null() {
-        return Err(win32_error("FwpmGetAppIdFromFileName0", err));
+        if wfp_skip_access_denied(err) {
+            return Err(WfpAddError::AccessDenied);
+        }
+        if err == 0 {
+            return Err(WfpAddError::Other(KernelError::Apply(
+                "FwpmGetAppIdFromFileName0 returned a null blob".into(),
+            )));
+        }
+        return Err(WfpAddError::Other(win32_error(
+            "FwpmGetAppIdFromFileName0",
+            err,
+        )));
     }
     let result = (|| {
         for layer in [
@@ -401,7 +447,7 @@ fn add_block_filter(
     layer: Guid,
     cond: &mut FwpmFilterCondition0,
     name: &mut [u16],
-) -> Result<(), KernelError> {
+) -> Result<(), WfpAddError> {
     let mut filter: FwpmFilter0 = unsafe { mem::zeroed() };
     filter.display_data.name = name.as_mut_ptr();
     filter.layer_key = layer;
@@ -413,10 +459,7 @@ fn add_block_filter(
     let mut id = 0u64;
     // SAFETY: engine is open; filter/cond live for the call.
     let err = unsafe { FwpmFilterAdd0(engine, &filter, ptr::null_mut(), &mut id) };
-    if err != 0 {
-        return Err(win32_error("FwpmFilterAdd0", err));
-    }
-    Ok(())
+    wfp_add_status("FwpmFilterAdd0", err)
 }
 
 fn unique_suffix() -> String {
