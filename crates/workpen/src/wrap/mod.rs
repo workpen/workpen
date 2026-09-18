@@ -149,8 +149,9 @@ pub fn kernel_supported() -> bool {
 /// `/tmp` or a subdirectory of home.
 ///
 /// Dest-deny names default to [`crate::default_secret_denies()`] plus
-/// workspace `agent.lock` extras, resolved under the workspace,
-/// including hardlink siblings. Missing lock equals defaults. Invalid
+/// workspace `agent.lock` extras, resolved under the workspace and
+/// each extra-root (except `/tmp` / `/var/tmp`; those trees are too
+/// large to walk). Missing lock equals defaults. Invalid
 /// lock is [`KernelError::Apply`]. Hosts match [`crate::DestDenyKind`],
 /// not English.
 pub fn process_jail(
@@ -174,15 +175,32 @@ pub fn process_jail_with_policy(
     policy: &DenyPolicy,
 ) -> Result<KernelPolicy, KernelError> {
     refuse_home_workspace(workspace.as_ref())?;
+    let extras: Vec<PathBuf> = extra
+        .into_iter()
+        .map(|p| p.as_ref().to_path_buf())
+        .collect();
     let mut grants = Vec::new();
     add_rw(&mut grants, workspace.as_ref())?;
-    for extra in extra {
-        add_rw(&mut grants, extra.as_ref())?;
+    for extra in &extras {
+        add_rw(&mut grants, extra)?;
     }
     for dir in system_read_dirs() {
         add_read_if_dir(&mut grants, &dir);
     }
-    let dest_denies = collect_workspace_dest_denies(workspace.as_ref(), policy)?;
+    let mut dest_denies = collect_workspace_dest_denies(workspace.as_ref(), policy)?;
+    let mut remaining = DEST_DENY_WALK_LIMIT;
+    for extra in &extras {
+        if is_system_temp_root(extra) || is_system_read_extra(extra) {
+            continue;
+        }
+        walk_cache_dest_denies(
+            extra,
+            policy,
+            &mut dest_denies,
+            &mut remaining,
+            DEST_DENY_WALK_LIMIT,
+        )?;
+    }
     Ok(KernelPolicy {
         grants,
         dest_denies,
@@ -196,7 +214,8 @@ impl KernelPolicy {
         &self.grants
     }
 
-    /// Dest-deny paths collected under the workspace. Not a filesystem grant.
+    /// Dest-deny paths collected under the workspace and extra-roots.
+    /// Not a filesystem grant.
     pub fn dest_denies(&self) -> &[DestDeny] {
         &self.dest_denies
     }
@@ -266,15 +285,21 @@ impl KernelPolicy {
         {
             let caps = self.to_capability_set(nono::SignalMode::Isolated)?;
             let dests: Vec<PathBuf> = self.dest_denies.iter().map(|d| d.path.clone()).collect();
+            let workspace = self
+                .grants
+                .iter()
+                .find(|g| g.access == KernelAccess::ReadWrite)
+                .map(|g| g.path.clone())
+                .unwrap_or_default();
             // Safety: the set and dest list are built in the parent; the hook
             // only applies them and maps failure to io::Error.
             unsafe {
                 use std::os::unix::process::CommandExt;
                 cmd.pre_exec(move || {
                     #[cfg(target_os = "linux")]
-                    linux::apply_dest_deny_remounts(&dests)?;
+                    linux::apply_dest_deny_remounts(&dests, &workspace)?;
                     #[cfg(not(target_os = "linux"))]
-                    let _ = &dests;
+                    let _ = (&dests, &workspace);
                     nono::Sandbox::apply_auto(&caps)
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
                     Ok(())
@@ -431,12 +456,13 @@ impl KernelPolicy {
         }
         #[cfg(target_os = "macos")]
         {
-            let workspace = self
+            let rw: Vec<&Path> = self
                 .grants
                 .iter()
-                .find(|g| g.access == KernelAccess::ReadWrite)
-                .map(|g| g.path.as_path());
-            add_macos_dest_deny_rules(&mut caps, &self.dest_denies, workspace)?;
+                .filter(|g| g.access == KernelAccess::ReadWrite)
+                .map(|g| g.path.as_path())
+                .collect();
+            add_macos_dest_deny_rules(&mut caps, &self.dest_denies, &rw)?;
         }
         Ok(caps.block_network().set_signal_mode(signal))
     }
@@ -853,6 +879,28 @@ fn walk_dest_denies(
     Ok(())
 }
 
+fn is_system_read_extra(path: &Path) -> bool {
+    system_read_dirs()
+        .iter()
+        .any(|d| path == d || path.starts_with(d))
+}
+
+fn is_system_temp_root(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !name.eq_ignore_ascii_case("tmp") && !name.eq_ignore_ascii_case("temp") {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return true;
+    };
+    parent == Path::new("/")
+        || parent == Path::new("\\")
+        || parent.ends_with("private")
+        || parent.ends_with("var")
+}
+
 /// Walk a cache tree for dest-deny hits only. Non-deny files are not
 /// charged to the entry cap. Does not follow directory symlinks.
 fn walk_cache_dest_denies(
@@ -912,7 +960,7 @@ fn push_dest_deny(out: &mut Vec<DestDeny>, deny: DestDeny) {
 fn add_macos_dest_deny_rules(
     caps: &mut nono::CapabilitySet,
     denies: &[DestDeny],
-    workspace: Option<&Path>,
+    rw_roots: &[&Path],
 ) -> Result<(), KernelError> {
     for deny in denies {
         for path in dest_deny_rule_paths(&deny.path) {
@@ -935,8 +983,8 @@ fn add_macos_dest_deny_rules(
             }
         }
     }
-    if let Some(workspace) = workspace {
-        add_macos_post_create_rules(caps, workspace)?;
+    for root in rw_roots {
+        add_macos_post_create_rules(caps, root)?;
     }
     Ok(())
 }
@@ -1063,8 +1111,28 @@ fn add_rw(grants: &mut Vec<KernelGrant>, path: &Path) -> Result<(), KernelError>
     if !is_fs_root(path) && path != resolved.as_path() {
         push_grant(grants, path.to_path_buf(), KernelAccess::ReadWrite);
     }
+    // CLI resolve_workspace_root returns canon only. On macOS, `/tmp/ws`
+    // and `/var/folders/...` still appear on argv as the unprefixed form.
+    if let Some(alias) = macos_public_alias(&resolved)
+        && !is_fs_root(&alias)
+        && alias != resolved
+    {
+        push_grant(grants, alias, KernelAccess::ReadWrite);
+    }
     push_grant(grants, resolved, KernelAccess::ReadWrite);
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_public_alias(path: &Path) -> Option<PathBuf> {
+    let s = path.to_str()?;
+    s.strip_prefix("/private/")
+        .map(|rest| PathBuf::from(format!("/{rest}")))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_public_alias(_path: &Path) -> Option<PathBuf> {
+    None
 }
 
 fn add_read_if_dir(grants: &mut Vec<KernelGrant>, path: &Path) {

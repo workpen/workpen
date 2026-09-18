@@ -25,9 +25,12 @@ fn is_ns_unavailable(err: &io::Error) -> bool {
         || err.raw_os_error() == Some(libc::ENOSYS)
         || err.raw_os_error() == Some(libc::EPERM)
         || err.raw_os_error() == Some(libc::EACCES)
+        // ubuntu-latest unshare/MS_PRIVATE remount of / can return EINVAL
+        // (os error 22) when the runner cannot enter a private mount ns.
+        || err.raw_os_error() == Some(libc::EINVAL)
 }
 
-pub(super) fn apply_dest_deny_remounts(paths: &[PathBuf]) -> io::Result<()> {
+pub(super) fn apply_dest_deny_remounts(paths: &[PathBuf], workspace: &Path) -> io::Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -36,11 +39,21 @@ pub(super) fn apply_dest_deny_remounts(paths: &[PathBuf]) -> io::Result<()> {
     let root = unique_hide_root()?;
     let hide_file = hide_node(&root, false)?;
     let hide_dir = hide_node(&root, true)?;
-    remount_all(paths, &hide_file, &hide_dir)
+    remount_all(paths, workspace, &hide_file, &hide_dir)
 }
 
-fn remount_all(paths: &[PathBuf], hide_file: &Path, hide_dir: &Path) -> io::Result<()> {
+fn remount_all(
+    paths: &[PathBuf],
+    workspace: &Path,
+    hide_file: &Path,
+    hide_dir: &Path,
+) -> io::Result<()> {
     if !enter_private_mount_ns()? {
+        if paths.iter().any(|p| !p.starts_with(workspace)) {
+            return Err(io::Error::other(
+                "extra-root dest-deny remount unavailable; child was not started",
+            ));
+        }
         return Ok(());
     }
     for path in paths {
@@ -158,7 +171,10 @@ fn bind_over(dest: &Path, hide: &Path) -> io::Result<()> {
         )
     };
     if rc != 0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        return Err(io::Error::other(format!(
+            "dest-deny remount unavailable; child was not started ({err})"
+        )));
     }
     Ok(())
 }
@@ -166,7 +182,7 @@ fn bind_over(dest: &Path, hide: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{TEST_BIND_FAIL, TEST_ENTER, TEST_HIDE_FAIL, apply_dest_deny_remounts};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     struct Override {
         reset_hide: bool,
@@ -216,7 +232,7 @@ mod tests {
     fn unshare_denied_skips_remount() {
         let _guard = Override::enter(false);
         let dest = PathBuf::from("/tmp/workpen-dest-deny-unshare-skip.env");
-        apply_dest_deny_remounts(&[dest])
+        apply_dest_deny_remounts(&[dest], Path::new("/tmp"))
             .expect("unshare denied must stay Ok (issue #92 remount skip)");
     }
 
@@ -224,7 +240,8 @@ mod tests {
     fn hide_failure_is_error() {
         let _guard = Override::hide_fail();
         let dest = PathBuf::from("/tmp/workpen-dest-deny-hide-fail.env");
-        let err = apply_dest_deny_remounts(&[dest]).expect_err("hide_node EACCES must propagate");
+        let err = apply_dest_deny_remounts(&[dest], Path::new("/tmp"))
+            .expect_err("hide_node EACCES must propagate");
         assert_eq!(err.raw_os_error(), Some(libc::EACCES));
     }
 
@@ -232,9 +249,26 @@ mod tests {
     fn bind_failure_after_enter_is_error() {
         let _guard = Override::bind_fail_after_enter();
         let dest = PathBuf::from("/tmp/workpen-dest-deny-bind-fail.env");
-        let err = apply_dest_deny_remounts(&[dest])
+        let err = apply_dest_deny_remounts(&[dest], Path::new("/tmp"))
             .expect_err("bind_over EPERM after enter must propagate");
         assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[test]
+    fn unshare_denied_extra_root_dest_is_error() {
+        let _guard = Override::enter(false);
+        let dest = PathBuf::from("/tmp/workpen-dest-deny-extra.env");
+        apply_dest_deny_remounts(&[dest], Path::new("/workspace"))
+            .expect_err("extra-root dest-deny without remount must fail closed");
+    }
+
+    #[test]
+    fn einval_from_enter_is_ns_unavailable() {
+        let err = std::io::Error::from_raw_os_error(libc::EINVAL);
+        assert!(
+            super::is_ns_unavailable(&err),
+            "unshare/mount EINVAL is remount-skip (issue #92), not wrap apply failed"
+        );
     }
 
     #[test]

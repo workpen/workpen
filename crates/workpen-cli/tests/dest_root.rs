@@ -586,6 +586,97 @@ fn why_relative_parent_root_plain_file_is_allowed_not_escape() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn run_extra_root_constructed_env_is_dest_denied() {
+    let ws = TempDir::new().expect("workspace");
+    let extra = TempDir::new().expect("extra");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("readme");
+    let extra_env = extra.path().join(".env");
+    std::fs::write(&extra_env, "SECRET=1\n").expect("extra .env");
+    std::fs::write(extra.path().join("ok.txt"), "ok\n").expect("ok.txt");
+    // Construct `.env` at runtime so argv dest-deny does not peel the name.
+    let script = format!("n=.; cat {}/${{n}}env", extra.path().display());
+    let deny = workpen()
+        .arg("run")
+        .arg("--root")
+        .arg(ws.path())
+        .arg("--extra-root")
+        .arg(extra.path())
+        .args(["--", "/bin/sh", "-c", &script])
+        .output()
+        .expect("spawn workpen");
+    let stdout = String::from_utf8_lossy(&deny.stdout);
+    assert!(
+        !stdout.contains("SECRET"),
+        "constructed extra-root .env must not print SECRET, stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&deny.stderr)
+    );
+    assert!(
+        extra_env.exists(),
+        "extra-root .env must remain after dest-deny"
+    );
+    let allow = workpen()
+        .arg("run")
+        .arg("--root")
+        .arg(ws.path())
+        .arg("--extra-root")
+        .arg(extra.path())
+        .arg("--")
+        .arg("/bin/cat")
+        .arg(extra.path().join("ok.txt"))
+        .output()
+        .expect("spawn workpen");
+    let allow_out = String::from_utf8_lossy(&allow.stdout);
+    let allow_err = String::from_utf8_lossy(&allow.stderr);
+    if allow.status.success() {
+        assert_eq!(
+            allow_out.trim(),
+            "ok",
+            "extra-root ok.txt must print ok when remount/Seatbelt applied, stderr={allow_err}"
+        );
+    } else {
+        assert!(
+            allow_err.contains("dest-deny remount")
+                || allow_err.contains("unavailable")
+                || allow_err.contains("kernel wrap apply failed"),
+            "without remount, extra-root dest-deny must refuse spawn, stdout={allow_out} stderr={allow_err}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn run_allows_presented_workspace_path_not_only_canonical() {
+    let ws = TempDir::new().expect("workspace");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("readme");
+    let presented = ws.path().join("readme.md");
+    let canon = std::fs::canonicalize(&presented).expect("canon dest");
+    if presented == canon {
+        return;
+    }
+    let out = workpen()
+        .arg("run")
+        .arg("--root")
+        .arg(ws.path())
+        .arg("--")
+        .arg("/bin/cat")
+        .arg(&presented)
+        .output()
+        .expect("spawn workpen");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "run cat of presented workspace dest must be allowed, stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "ok",
+        "presented workspace dest must print ok, stderr={stderr}"
+    );
+}
+
 #[test]
 fn why_extra_root_resolves_against_process_cwd_not_workspace() {
     let parent = TempDir::new().expect("parent");
