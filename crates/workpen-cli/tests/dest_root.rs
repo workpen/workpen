@@ -765,3 +765,29 @@ fn run_missing_root_is_clear_error_not_escape() {
         "missing --root must be a clear root error: {text}"
     );
 }
+
+#[test]
+fn gc_missing_root_is_clear_error_not_registry() {
+    let cwd = TempDir::new().expect("cwd");
+    let out = workpen()
+        .args(["gc", "--root", "../no-such-workpen-ws", "--max-age", "7d"])
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "missing --root must fail, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = combined(&out);
+    let lower = text.to_ascii_lowercase();
+    assert!(
+        !lower.contains("registry unreadable"),
+        "missing --root must not be a git registry error: {text}"
+    );
+    assert!(
+        lower.contains("does not exist"),
+        "missing --root must say workspace root does not exist: {text}"
+    );
+}
