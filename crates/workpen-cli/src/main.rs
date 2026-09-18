@@ -113,7 +113,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
             eprintln!("child killed after the deadline");
             return Ok(ExitCode::from(124));
         }
-        Err(e) if e.to_string().contains("restore DACL") => {
+        Err(KernelError::Restore(e)) => {
             return Err(format!(
                 "child finished but {e}; workspace ACL may still grant the write-restricted SID"
             ));

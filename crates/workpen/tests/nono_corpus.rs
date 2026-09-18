@@ -192,6 +192,31 @@ fn with_dest_deny_paths_records_host_path() {
 }
 
 #[test]
+fn with_dest_deny_paths_classifies_extra_glob_hardlink() {
+    let dir = workspace();
+    let policy = DenyPolicy::with_extra(["**/*.secret".into()]);
+    let host = workspace();
+    let secret = host.path().join("team.secret");
+    let notes = host.path().join("notes.txt");
+    fs::write(&secret, "x\n").expect("secret");
+    fs::hard_link(&secret, &notes).expect("hardlink");
+    let jail = process_jail_with_policy(dir.path(), std::iter::empty::<&Path>(), &policy)
+        .expect("jail")
+        .with_dest_deny_paths([&notes]);
+    let notes_entry = jail
+        .dest_denies()
+        .iter()
+        .find(|d| d.path == notes)
+        .expect("host notes dest-deny");
+    assert_eq!(
+        notes_entry.kind,
+        DestDenyKind::HardlinkSibling,
+        "extra-glob hardlink must be HardlinkSibling, got {:?}",
+        notes_entry.kind
+    );
+}
+
+#[test]
 fn agent_lock_names_reach_kernel_dest_deny_list() {
     let dir = workspace();
     fs::write(dir.path().join("team.secret"), "x\n").expect("secret");
