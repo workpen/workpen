@@ -176,7 +176,7 @@ fn bind_over(dest: &Path, hide: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{TEST_BIND_FAIL, TEST_ENTER, TEST_HIDE_FAIL, apply_dest_deny_remounts};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     struct Override {
         reset_hide: bool,
