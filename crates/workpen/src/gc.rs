@@ -87,7 +87,7 @@ pub fn parse_max_age(raw: &str) -> Result<Duration, GcError> {
     let s = raw.trim();
     if s.chars().count() < 2 {
         return Err(GcError::InvalidDuration(format!(
-            "{s} (use e.g. 7d, 24h, 60m)"
+            "{s} (use e.g. 30s, 60m, 24h, 7d)"
         )));
     }
     let unit_start = s.char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
@@ -941,7 +941,12 @@ mod parse_tests {
 
     #[test]
     fn parse_max_age_rejects_bare_number() {
-        assert!(parse_max_age("7").is_err());
+        match parse_max_age("7") {
+            Err(GcError::InvalidDuration(msg)) => {
+                assert!(msg.contains("30s"), "bare number must hint 30s: {msg}");
+            }
+            other => panic!("bare number must stay InvalidDuration, got {other:?}"),
+        }
     }
 
     #[test]

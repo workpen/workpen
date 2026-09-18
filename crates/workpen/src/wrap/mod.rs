@@ -83,10 +83,13 @@ pub enum KernelError {
     /// The child was killed after the deadline.
     #[error("kernel wrap child was killed after the deadline")]
     Timeout,
+    /// Child finished; DACL restore failed. Hosts match this, not English.
+    #[error("kernel wrap restore failed: {0}")]
+    Restore(String),
 }
 
 /// Merge spawn and DACL-restore results. Timeout stays Timeout.
-/// A successful child plus restore failure is Apply that names the exit.
+/// A successful child plus restore failure is Restore that names the exit.
 #[cfg(any(windows, test))]
 pub(crate) fn combine_spawn_restore(
     result: Result<(KernelApply, ExitStatus), KernelError>,
@@ -105,7 +108,7 @@ pub(crate) fn combine_spawn_restore(
                 .code()
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "signal".into());
-            Err(KernelError::Apply(format!(
+            Err(KernelError::Restore(format!(
                 "child exited {code}; {}",
                 apply_detail(&restore_err)
             )))
@@ -116,7 +119,7 @@ pub(crate) fn combine_spawn_restore(
 #[cfg(any(windows, test))]
 fn apply_detail(err: &KernelError) -> String {
     match err {
-        KernelError::Apply(msg) => msg.clone(),
+        KernelError::Apply(msg) | KernelError::Restore(msg) => msg.clone(),
         KernelError::DestDeny(err) => err.to_string(),
         other => other.to_string(),
     }
@@ -205,7 +208,10 @@ impl KernelPolicy {
         paths: impl IntoIterator<Item = impl AsRef<Path>>,
     ) -> Self {
         for path in paths {
-            push_dest_deny(&mut self.dest_denies, dest_deny_from_path(path.as_ref()));
+            push_dest_deny(
+                &mut self.dest_denies,
+                dest_deny_from_path(path.as_ref(), &self.deny_policy),
+            );
         }
         self
     }
@@ -880,8 +886,8 @@ fn walk_cache_dest_denies(
     Ok(())
 }
 
-fn dest_deny_from_path(path: &Path) -> DestDeny {
-    dest_deny_at(path, path.display().to_string(), &DenyPolicy::default()).unwrap_or(DestDeny {
+fn dest_deny_from_path(path: &Path, policy: &DenyPolicy) -> DestDeny {
+    dest_deny_at(path, path.display().to_string(), policy).unwrap_or(DestDeny {
         kind: DestDenyKind::DenyGlob,
         path: path.to_path_buf(),
         display: path.display().to_string(),
@@ -1176,8 +1182,8 @@ mod combine_spawn_restore_tests {
             Err(KernelError::Apply("restore DACL failed (win32 5)".into())),
         )
         .expect_err("restore after success");
-        let KernelError::Apply(msg) = err else {
-            panic!("expected Apply, got {err}");
+        let KernelError::Restore(msg) = err else {
+            panic!("expected Restore, got {err}");
         };
         assert!(
             msg.contains("child exited 0"),

@@ -113,7 +113,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
             eprintln!("child killed after the deadline");
             return Ok(ExitCode::from(124));
         }
-        Err(e) if e.to_string().contains("restore DACL") => {
+        Err(KernelError::Restore(e)) => {
             return Err(format!(
                 "child finished but {e}; workspace ACL may still grant the write-restricted SID"
             ));
@@ -172,6 +172,8 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
         }
     }
     let max_age = max_age.ok_or_else(gc_usage)?;
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root = resolve_workspace_root(&cwd, &root.to_string_lossy()).map_err(|e| e.to_string())?;
     let mut cfg = GcConfig::new(&root, max_age);
     cfg.now = SystemTime::now();
     cfg.dry_run = dry_run;
