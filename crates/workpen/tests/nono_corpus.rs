@@ -649,6 +649,34 @@ fn process_jail_dest_denies_extra_root_hardlink_sibling() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn process_jail_canonical_workspace_also_grants_unprefixed() {
+    let dir = workspace();
+    let presented = dir.path().to_path_buf();
+    let canon = fs::canonicalize(&presented).expect("canon workspace");
+    if presented == canon {
+        return;
+    }
+    let policy = process_jail(&canon, [] as [&Path; 0]).expect("policy");
+    assert!(
+        policy
+            .grants()
+            .iter()
+            .any(|g| g.path == canon && g.access == KernelAccess::ReadWrite),
+        "canonical workspace must stay ReadWrite: {:?}",
+        policy.grants()
+    );
+    assert!(
+        policy
+            .grants()
+            .iter()
+            .any(|g| g.path == presented && g.access == KernelAccess::ReadWrite),
+        "presented workspace alias must be ReadWrite after canon-only jail: {:?}",
+        policy.grants()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn extra_root_tmp_grants_presented_and_canonical() {
     let tmp = Path::new("/tmp");
     if !tmp.is_dir() {

@@ -1111,8 +1111,27 @@ fn add_rw(grants: &mut Vec<KernelGrant>, path: &Path) -> Result<(), KernelError>
     if !is_fs_root(path) && path != resolved.as_path() {
         push_grant(grants, path.to_path_buf(), KernelAccess::ReadWrite);
     }
+    // CLI resolve_workspace_root returns canon only. On macOS, `/tmp/ws`
+    // and `/var/folders/...` still appear on argv as the unprefixed form.
+    if let Some(alias) = macos_public_alias(&resolved) {
+        if !is_fs_root(&alias) && alias != resolved {
+            push_grant(grants, alias, KernelAccess::ReadWrite);
+        }
+    }
     push_grant(grants, resolved, KernelAccess::ReadWrite);
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_public_alias(path: &Path) -> Option<PathBuf> {
+    let s = path.to_str()?;
+    s.strip_prefix("/private/")
+        .map(|rest| PathBuf::from(format!("/{rest}")))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_public_alias(_path: &Path) -> Option<PathBuf> {
+    None
 }
 
 fn add_read_if_dir(grants: &mut Vec<KernelGrant>, path: &Path) {

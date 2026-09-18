@@ -643,6 +643,38 @@ fn run_extra_root_constructed_env_is_dest_denied() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn run_allows_presented_workspace_path_not_only_canonical() {
+    let ws = TempDir::new().expect("workspace");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("readme");
+    let presented = ws.path().join("readme.md");
+    let canon = std::fs::canonicalize(&presented).expect("canon dest");
+    if presented == canon {
+        return;
+    }
+    let out = workpen()
+        .arg("run")
+        .arg("--root")
+        .arg(ws.path())
+        .arg("--")
+        .arg("/bin/cat")
+        .arg(&presented)
+        .output()
+        .expect("spawn workpen");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "run cat of presented workspace dest must be allowed, stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(
+        stdout.trim(),
+        "ok",
+        "presented workspace dest must print ok, stderr={stderr}"
+    );
+}
+
 #[test]
 fn why_extra_root_resolves_against_process_cwd_not_workspace() {
     let parent = TempDir::new().expect("parent");
