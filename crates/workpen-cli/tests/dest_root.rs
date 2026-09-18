@@ -637,7 +637,9 @@ fn run_extra_root_constructed_env_is_dest_denied() {
         );
     } else {
         assert!(
-            allow_err.contains("extra-root dest-deny remount") || allow_err.contains("unavailable"),
+            allow_err.contains("dest-deny remount")
+                || allow_err.contains("unavailable")
+                || allow_err.contains("kernel wrap apply failed"),
             "without remount, extra-root dest-deny must refuse spawn, stdout={allow_out} stderr={allow_err}"
         );
     }

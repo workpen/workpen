@@ -171,7 +171,10 @@ fn bind_over(dest: &Path, hide: &Path) -> io::Result<()> {
         )
     };
     if rc != 0 {
-        return Err(io::Error::last_os_error());
+        let err = io::Error::last_os_error();
+        return Err(io::Error::other(format!(
+            "dest-deny remount unavailable; child was not started ({err})"
+        )));
     }
     Ok(())
 }
