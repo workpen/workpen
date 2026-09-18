@@ -25,6 +25,9 @@ fn is_ns_unavailable(err: &io::Error) -> bool {
         || err.raw_os_error() == Some(libc::ENOSYS)
         || err.raw_os_error() == Some(libc::EPERM)
         || err.raw_os_error() == Some(libc::EACCES)
+        // ubuntu-latest unshare/MS_PRIVATE remount of / can return EINVAL
+        // (os error 22) when the runner cannot enter a private mount ns.
+        || err.raw_os_error() == Some(libc::EINVAL)
 }
 
 pub(super) fn apply_dest_deny_remounts(paths: &[PathBuf], workspace: &Path) -> io::Result<()> {
@@ -254,6 +257,15 @@ mod tests {
         let dest = PathBuf::from("/tmp/workpen-dest-deny-extra.env");
         apply_dest_deny_remounts(&[dest], Path::new("/workspace"))
             .expect_err("extra-root dest-deny without remount must fail closed");
+    }
+
+    #[test]
+    fn einval_from_enter_is_ns_unavailable() {
+        let err = std::io::Error::from_raw_os_error(libc::EINVAL);
+        assert!(
+            super::is_ns_unavailable(&err),
+            "unshare/mount EINVAL is remount-skip (issue #92), not wrap apply failed"
+        );
     }
 
     #[test]
