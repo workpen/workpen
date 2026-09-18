@@ -507,7 +507,7 @@ struct Prepared {
 struct NetGuards {
     _profile: windows_net::AppContainerProfile,
     _helper: windows_net::HelperFile,
-    _wfp: windows_net::WfpSession,
+    _wfp: Option<windows_net::WfpSession>,
 }
 
 pub(super) fn spawn_write_restricted(

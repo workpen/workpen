@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::Duration;
 
-use crate::deny::{DenyPolicy, DestDeny, DestDenyKind, dest_deny_at};
+use crate::deny::{CheckDestError, DenyPolicy, DestDeny, DestDenyKind, dest_deny_at};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -53,6 +53,7 @@ pub struct KernelGrant {
 pub struct KernelPolicy {
     grants: Vec<KernelGrant>,
     dest_denies: Vec<DestDeny>,
+    deny_policy: DenyPolicy,
     network_blocked: bool,
 }
 
@@ -75,6 +76,10 @@ pub enum KernelError {
     Home(PathBuf),
     #[error("kernel wrap apply failed: {0}")]
     Apply(String),
+    /// Argv dest-deny before spawn. Hosts match [`CheckDestError`] /
+    /// [`crate::DestDenyError`], not English.
+    #[error("kernel wrap dest-deny: {0}")]
+    DestDeny(#[from] CheckDestError),
     /// The child was killed after the deadline.
     #[error("kernel wrap child was killed after the deadline")]
     Timeout,
@@ -112,6 +117,7 @@ pub(crate) fn combine_spawn_restore(
 fn apply_detail(err: &KernelError) -> String {
     match err {
         KernelError::Apply(msg) => msg.clone(),
+        KernelError::DestDeny(err) => err.to_string(),
         other => other.to_string(),
     }
 }
@@ -177,6 +183,7 @@ pub fn process_jail_with_policy(
     Ok(KernelPolicy {
         grants,
         dest_denies,
+        deny_policy: policy.clone(),
         network_blocked: true,
     })
 }
@@ -209,7 +216,10 @@ impl KernelPolicy {
     /// `run_child` wraps the command in a unique helper PE, launches
     /// that helper in an AppContainer with no network capabilities, and
     /// adds a dynamic WFP BLOCK on the package SID (and the helper
-    /// APP_ID). Fail closed if AppContainer or WFP cannot apply.
+    /// APP_ID) when the token can add filters. Fail closed if
+    /// AppContainer cannot apply. WFP `ERROR_ACCESS_DENIED` (win32 5)
+    /// is skipped: package filters need an elevated token. The child
+    /// still starts with AppContainer network deny.
     pub fn network_blocked(&self) -> bool {
         self.network_blocked
     }
@@ -275,12 +285,19 @@ impl KernelPolicy {
 
     /// Spawn `cmd` under the kernel jail and wait for it.
     ///
+    /// Dest-denies the `Command` program plus args with
+    /// [`crate::check_command_argv`] (same rules as `workpen run`)
+    /// before spawn. Invalid `-EncodedCommand` is
+    /// [`crate::DestDenyError::EncodedCommand`] via
+    /// [`KernelError::DestDeny`]. The child is not started.
+    ///
     /// Unix installs `pre_exec` then `status`. Windows creates a
     /// write-restricted token and `CreateProcessAsUserW`. When
     /// [`Self::network_blocked`] is set, Windows also wraps the command
     /// through a unique helper PE in an AppContainer and a package-SID
-    /// WFP BLOCK. If the kernel cannot apply, this returns
-    /// [`KernelError::Apply`] and does not start the child.
+    /// WFP BLOCK when the token can add filters. WFP win32 5 is skipped
+    /// (needs admin). If AppContainer or the kernel cannot apply, this
+    /// returns [`KernelError::Apply`] and does not start the child.
     /// [`KernelApply::UserspaceOnly`] stays on [`Self::apply`] /
     /// [`Self::apply_pre_exec`] inspect paths only.
     ///
@@ -292,6 +309,7 @@ impl KernelPolicy {
     /// Blocking wait has no host-visible kill; use
     /// [`Self::run_child_timeout`].
     pub fn run_child(&self, cmd: Command) -> Result<(KernelApply, ExitStatus), KernelError> {
+        self.dest_deny_command(&cmd)?;
         #[cfg(unix)]
         {
             if !kernel_supported() {
@@ -336,6 +354,7 @@ impl KernelPolicy {
         cmd: Command,
         timeout: Duration,
     ) -> Result<(KernelApply, ExitStatus), KernelError> {
+        self.dest_deny_command(&cmd)?;
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -415,6 +434,36 @@ impl KernelPolicy {
         }
         Ok(caps.block_network().set_signal_mode(signal))
     }
+
+    /// Dest-deny `cmd` argv with the jail [`DenyPolicy`] before spawn.
+    fn dest_deny_command(&self, cmd: &Command) -> Result<(), KernelError> {
+        let workspace = self
+            .grants
+            .iter()
+            .find(|g| g.access == KernelAccess::ReadWrite)
+            .map(|g| g.path.as_path())
+            .ok_or_else(|| KernelError::Apply("dest-deny argv needs a ReadWrite grant".into()))?;
+        let argv = command_argv(cmd);
+        crate::check_command_argv(&argv, workspace, &self.deny_policy)?;
+        Ok(())
+    }
+}
+
+fn command_argv(cmd: &Command) -> Vec<String> {
+    let mut out = vec![cmd.get_program().to_string_lossy().into_owned()];
+    out.extend(cmd.get_args().map(|a| a.to_string_lossy().into_owned()));
+    out
+}
+
+/// Win32 `ERROR_ACCESS_DENIED`. Package WFP filters need an elevated token.
+#[cfg(any(windows, test))]
+pub(crate) const WFP_ERROR_ACCESS_DENIED: u32 = 5;
+
+/// True when a WFP engine or filter call returned access denied.
+#[cfg(any(windows, test))]
+#[must_use]
+pub(crate) fn wfp_skip_access_denied(code: u32) -> bool {
+    code == WFP_ERROR_ACCESS_DENIED
 }
 
 /// Names `run_child` strips from the child environment.
@@ -1066,7 +1115,10 @@ fn is_fs_root(path: &Path) -> bool {
 
 #[cfg(test)]
 mod combine_spawn_restore_tests {
-    use super::{KernelApply, KernelError, combine_spawn_restore};
+    use super::{
+        KernelApply, KernelError, WFP_ERROR_ACCESS_DENIED, combine_spawn_restore,
+        wfp_skip_access_denied,
+    };
     use std::process::ExitStatus;
 
     fn status(code: i32) -> ExitStatus {
@@ -1135,5 +1187,14 @@ mod combine_spawn_restore_tests {
             msg.contains("restore DACL"),
             "restore failure must be named: {msg}"
         );
+    }
+
+    #[test]
+    fn wfp_access_denied_is_skip_and_other_codes_are_not() {
+        assert!(wfp_skip_access_denied(WFP_ERROR_ACCESS_DENIED));
+        assert!(wfp_skip_access_denied(5));
+        assert!(!wfp_skip_access_denied(0));
+        assert!(!wfp_skip_access_denied(2));
+        assert!(!wfp_skip_access_denied(87));
     }
 }

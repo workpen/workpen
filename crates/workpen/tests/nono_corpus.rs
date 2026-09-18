@@ -13,15 +13,30 @@ use tempfile::TempDir;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use workpen::resolve_extra_root;
 use workpen::{
-    AGENT_LOCK_NAME, DenyPolicy, DestDenyKind, KernelAccess, KernelApply, KernelError,
-    child_env_deny_names, collect_workspace_dest_denies, collect_workspace_dest_denies_limited,
-    is_denied_child_env, kernel_supported, load_agent_lock, process_jail, process_jail_with_policy,
-    require_applied, scrub_child_command, spawn_after_setup, with_bash_noprofile,
+    AGENT_LOCK_NAME, CheckDestError, DenyPolicy, DestDenyError, DestDenyKind, KernelAccess,
+    KernelApply, KernelError, child_env_deny_names, collect_workspace_dest_denies,
+    collect_workspace_dest_denies_limited, is_denied_child_env, kernel_supported, load_agent_lock,
+    process_jail, process_jail_with_policy, require_applied, scrub_child_command,
+    spawn_after_setup, with_bash_noprofile,
 };
 
 fn workspace() -> TempDir {
     TempDir::new().expect("temp workspace")
 }
+
+/// Construct `.env` at runtime so argv dest-deny does not peel the name.
+#[cfg(unix)]
+const SH_READ_DOTENV: &str = "n=.; cat ${n}env >env.out; echo $? >env.code";
+/// Construct `notes.txt` at runtime so argv dest-deny does not peel the sibling.
+#[cfg(target_os = "macos")]
+const SH_READ_NOTES: &str = "n=notes; cat ${n}.txt >notes.out; echo $? >notes.code";
+/// Create then read `.env` without a dest-deny token in argv.
+#[cfg(target_os = "macos")]
+const SH_POST_CREATE_DOTENV: &str =
+    "n=.; printf 'SECRET=1\\n' >${n}env; echo $? >w.code; cat ${n}env >r.out; echo $? >r.code";
+/// Construct `.env` at runtime for `cmd /c`.
+#[cfg(windows)]
+const CMD_READ_DOTENV: &str = "set n=.& type %n%env 1>env.out & echo %ERRORLEVEL% 1>env.code";
 
 #[test]
 fn kernel_access_is_read_or_readwrite_only() {
@@ -65,6 +80,81 @@ fn process_jail_dest_denies_env_and_not_readme() {
             .iter()
             .all(|d| d.path.file_name().is_none_or(|n| n != "readme.md")),
         "readme.md must not be dest-denied"
+    );
+}
+
+#[test]
+fn run_child_dest_denies_encoded_command_argv() {
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("pwsh");
+    cmd.args(["-NoProfile", "-EncodedCommand", "!!!not-base64!!!"]);
+    let err = policy
+        .run_child(cmd)
+        .expect_err("invalid EncodedCommand must fail before spawn");
+    assert!(
+        matches!(
+            err,
+            KernelError::DestDeny(CheckDestError::DestDeny(DestDenyError::EncodedCommand))
+        ),
+        "library spawn must name EncodedCommand, got {err}"
+    );
+}
+
+#[test]
+fn run_child_timeout_dest_denies_encoded_command_argv() {
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("pwsh");
+    cmd.args(["-EncodedCommand", "!!!not-base64!!!"]);
+    let err = policy
+        .run_child_timeout(cmd, Duration::from_secs(1))
+        .expect_err("timeout path must dest-deny argv");
+    assert!(
+        matches!(
+            err,
+            KernelError::DestDeny(CheckDestError::DestDeny(DestDenyError::EncodedCommand))
+        ),
+        "run_child_timeout must name EncodedCommand, got {err}"
+    );
+}
+
+#[test]
+fn run_child_dest_denies_pwsh_stdin_dash() {
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("pwsh");
+    cmd.args(["-NoProfile", "-Command", "-"]);
+    let err = policy
+        .run_child(cmd)
+        .expect_err("pwsh -Command - must fail before spawn");
+    assert!(
+        matches!(
+            err,
+            KernelError::DestDeny(CheckDestError::DestDeny(DestDenyError::StdinScript))
+        ),
+        "library spawn must name StdinScript, got {err}"
+    );
+}
+
+#[test]
+fn run_child_dest_denies_named_env_in_shell_c() {
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "cat .env"]).current_dir(dir.path());
+    let err = policy
+        .run_child(cmd)
+        .expect_err("named .env in -c must dest-deny before spawn");
+    assert!(
+        matches!(
+            err,
+            KernelError::DestDeny(CheckDestError::DestDeny(DestDenyError::Denied(_)))
+        ),
+        "library spawn must dest-deny named .env, got {err}"
     );
 }
 
@@ -188,7 +278,7 @@ fn run_child_cannot_read_workspace_env_linux() {
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
     let mut deny_cmd = Command::new("/bin/sh");
     deny_cmd
-        .args(["-c", "cat .env >env.out; echo $? >env.code"])
+        .args(["-c", SH_READ_DOTENV])
         .current_dir(dir.path());
     let (applied, status) = policy.run_child(deny_cmd).expect("run_child env");
     assert_eq!(applied, KernelApply::Applied);
@@ -221,8 +311,7 @@ fn linux_run_child_cat_env(
     dir: &Path,
 ) -> Result<(bool, String), KernelError> {
     let mut cmd = Command::new("/bin/sh");
-    cmd.args(["-c", "cat .env >env.out; echo $? >env.code"])
-        .current_dir(dir);
+    cmd.args(["-c", SH_READ_DOTENV]).current_dir(dir);
     let (_applied, status) = policy.run_child(cmd)?;
     assert!(status.success(), "wrapper must finish: {status:?}");
     let leaked = fs::read_to_string(dir.join("env.out")).unwrap_or_default();
@@ -308,11 +397,8 @@ fn run_child_cannot_read_env_created_after_spawn() {
     fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
     let mut cmd = Command::new("/bin/sh");
-    cmd.args([
-        "-c",
-        "printf 'SECRET=1\\n' > .env; echo $? >w.code; cat .env >r.out; echo $? >r.code",
-    ])
-    .current_dir(dir.path());
+    cmd.args(["-c", SH_POST_CREATE_DOTENV])
+        .current_dir(dir.path());
     let (applied, status) = policy.run_child(cmd).expect("run_child");
     assert_eq!(applied, KernelApply::Applied);
     assert!(status.success(), "wrapper must finish: {status:?}");
@@ -348,7 +434,7 @@ fn run_child_cannot_read_workspace_env() {
     );
     let mut deny_cmd = Command::new("/bin/sh");
     deny_cmd
-        .args(["-c", "cat .env >env.out; echo $? >env.code"])
+        .args(["-c", SH_READ_DOTENV])
         .current_dir(dir.path());
     let (applied, status) = policy.run_child(deny_cmd).expect("run_child env");
     assert_eq!(applied, KernelApply::Applied);
@@ -384,8 +470,7 @@ fn run_child_cannot_read_env_hardlink_sibling() {
     fs::hard_link(dir.path().join(".env"), dir.path().join("notes.txt")).expect("hardlink");
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
     let mut cmd = Command::new("/bin/sh");
-    cmd.args(["-c", "cat notes.txt >notes.out; echo $? >notes.code"])
-        .current_dir(dir.path());
+    cmd.args(["-c", SH_READ_NOTES]).current_dir(dir.path());
     let (applied, status) = policy.run_child(cmd).expect("run_child notes");
     assert_eq!(applied, KernelApply::Applied);
     assert!(status.success(), "wrapper must finish: {status:?}");
@@ -1063,7 +1148,7 @@ fn run_child_cannot_read_workspace_env_windows() {
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
     let mut deny_cmd = Command::new(windows_comspec());
     deny_cmd
-        .args(["/C", "type .env 1>env.out & echo %ERRORLEVEL% 1>env.code"])
+        .args(["/C", CMD_READ_DOTENV])
         .current_dir(dir.path());
     let (applied, status) = policy.run_child(deny_cmd).expect("run_child env");
     assert_eq!(applied, KernelApply::Applied);
