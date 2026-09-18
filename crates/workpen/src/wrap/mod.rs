@@ -285,15 +285,21 @@ impl KernelPolicy {
         {
             let caps = self.to_capability_set(nono::SignalMode::Isolated)?;
             let dests: Vec<PathBuf> = self.dest_denies.iter().map(|d| d.path.clone()).collect();
+            let workspace = self
+                .grants
+                .iter()
+                .find(|g| g.access == KernelAccess::ReadWrite)
+                .map(|g| g.path.clone())
+                .unwrap_or_default();
             // Safety: the set and dest list are built in the parent; the hook
             // only applies them and maps failure to io::Error.
             unsafe {
                 use std::os::unix::process::CommandExt;
                 cmd.pre_exec(move || {
                     #[cfg(target_os = "linux")]
-                    linux::apply_dest_deny_remounts(&dests)?;
+                    linux::apply_dest_deny_remounts(&dests, &workspace)?;
                     #[cfg(not(target_os = "linux"))]
-                    let _ = &dests;
+                    let _ = (&dests, &workspace);
                     nono::Sandbox::apply_auto(&caps)
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
                     Ok(())

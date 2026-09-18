@@ -27,7 +27,7 @@ fn is_ns_unavailable(err: &io::Error) -> bool {
         || err.raw_os_error() == Some(libc::EACCES)
 }
 
-pub(super) fn apply_dest_deny_remounts(paths: &[PathBuf]) -> io::Result<()> {
+pub(super) fn apply_dest_deny_remounts(paths: &[PathBuf], workspace: &Path) -> io::Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -36,11 +36,21 @@ pub(super) fn apply_dest_deny_remounts(paths: &[PathBuf]) -> io::Result<()> {
     let root = unique_hide_root()?;
     let hide_file = hide_node(&root, false)?;
     let hide_dir = hide_node(&root, true)?;
-    remount_all(paths, &hide_file, &hide_dir)
+    remount_all(paths, workspace, &hide_file, &hide_dir)
 }
 
-fn remount_all(paths: &[PathBuf], hide_file: &Path, hide_dir: &Path) -> io::Result<()> {
+fn remount_all(
+    paths: &[PathBuf],
+    workspace: &Path,
+    hide_file: &Path,
+    hide_dir: &Path,
+) -> io::Result<()> {
     if !enter_private_mount_ns()? {
+        if paths.iter().any(|p| !p.starts_with(workspace)) {
+            return Err(io::Error::other(
+                "extra-root dest-deny remount unavailable; child was not started",
+            ));
+        }
         return Ok(());
     }
     for path in paths {
@@ -216,7 +226,7 @@ mod tests {
     fn unshare_denied_skips_remount() {
         let _guard = Override::enter(false);
         let dest = PathBuf::from("/tmp/workpen-dest-deny-unshare-skip.env");
-        apply_dest_deny_remounts(&[dest])
+        apply_dest_deny_remounts(&[dest], Path::new("/tmp"))
             .expect("unshare denied must stay Ok (issue #92 remount skip)");
     }
 
@@ -224,7 +234,8 @@ mod tests {
     fn hide_failure_is_error() {
         let _guard = Override::hide_fail();
         let dest = PathBuf::from("/tmp/workpen-dest-deny-hide-fail.env");
-        let err = apply_dest_deny_remounts(&[dest]).expect_err("hide_node EACCES must propagate");
+        let err = apply_dest_deny_remounts(&[dest], Path::new("/tmp"))
+            .expect_err("hide_node EACCES must propagate");
         assert_eq!(err.raw_os_error(), Some(libc::EACCES));
     }
 
@@ -232,9 +243,17 @@ mod tests {
     fn bind_failure_after_enter_is_error() {
         let _guard = Override::bind_fail_after_enter();
         let dest = PathBuf::from("/tmp/workpen-dest-deny-bind-fail.env");
-        let err = apply_dest_deny_remounts(&[dest])
+        let err = apply_dest_deny_remounts(&[dest], Path::new("/tmp"))
             .expect_err("bind_over EPERM after enter must propagate");
         assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[test]
+    fn unshare_denied_extra_root_dest_is_error() {
+        let _guard = Override::enter(false);
+        let dest = PathBuf::from("/tmp/workpen-dest-deny-extra.env");
+        apply_dest_deny_remounts(&[dest], Path::new("/workspace"))
+            .expect_err("extra-root dest-deny without remount must fail closed");
     }
 
     #[test]
