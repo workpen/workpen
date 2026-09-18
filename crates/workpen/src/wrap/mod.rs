@@ -190,7 +190,17 @@ pub fn process_jail_with_policy(
     let mut dest_denies = collect_workspace_dest_denies(workspace.as_ref(), policy)?;
     let mut remaining = DEST_DENY_WALK_LIMIT;
     for extra in &extras {
-        if is_system_temp_root(extra) || is_system_read_extra(extra) {
+        if is_system_read_extra(extra) {
+            continue;
+        }
+        if is_system_temp_root(extra) {
+            collect_system_temp_dest_denies(
+                extra,
+                policy,
+                &mut dest_denies,
+                &mut remaining,
+                DEST_DENY_WALK_LIMIT,
+            )?;
             continue;
         }
         walk_cache_dest_denies(
@@ -462,7 +472,7 @@ impl KernelPolicy {
                 .filter(|g| g.access == KernelAccess::ReadWrite)
                 .map(|g| g.path.as_path())
                 .collect();
-            add_macos_dest_deny_rules(&mut caps, &self.dest_denies, &rw)?;
+            add_macos_dest_deny_rules(&mut caps, &self.dest_denies, &rw, self.deny_policy.globs())?;
         }
         Ok(caps.block_network().set_signal_mode(signal))
     }
@@ -885,6 +895,46 @@ fn is_system_read_extra(path: &Path) -> bool {
         .any(|d| path == d || path.starts_with(d))
 }
 
+/// One-level dest-deny scan of `/tmp` (and host temp). Do not recurse
+/// the whole tree. Recurse only dest-deny directory names.
+fn collect_system_temp_dest_denies(
+    extra: &Path,
+    policy: &DenyPolicy,
+    out: &mut Vec<DestDeny>,
+    remaining: &mut usize,
+    limit: usize,
+) -> Result<(), KernelError> {
+    let rd = std::fs::read_dir(extra).map_err(|e| dest_deny_walk_io(extra, e))?;
+    for ent in rd {
+        let ent = ent.map_err(|e| dest_deny_walk_io(extra, e))?;
+        let path = ent.path();
+        let name = entry_file_name(&path);
+        if is_git_dir_name(name) {
+            continue;
+        }
+        let ft = ent.file_type().map_err(|e| dest_deny_walk_io(&path, e))?;
+        if ft.is_dir() && !ft.is_symlink() && is_dest_deny_dir_name(name) {
+            walk_cache_dest_denies(&path, policy, out, remaining, limit)?;
+            continue;
+        }
+        if let Some(deny) = dest_deny_at(&path, path.display().to_string(), policy) {
+            if *remaining == 0 {
+                return Err(dest_deny_walk_cap(extra, limit));
+            }
+            *remaining -= 1;
+            push_dest_deny(out, deny);
+        }
+    }
+    Ok(())
+}
+
+fn is_dest_deny_dir_name(name: &str) -> bool {
+    matches!(
+        name,
+        ".ssh" | ".aws" | ".kube" | ".gnupg" | ".docker" | "secrets" | "credentials" | "gateway"
+    )
+}
+
 fn is_system_temp_root(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -961,6 +1011,7 @@ fn add_macos_dest_deny_rules(
     caps: &mut nono::CapabilitySet,
     denies: &[DestDeny],
     rw_roots: &[&Path],
+    globs: &[String],
 ) -> Result<(), KernelError> {
     for deny in denies {
         for path in dest_deny_rule_paths(&deny.path) {
@@ -984,7 +1035,7 @@ fn add_macos_dest_deny_rules(
         }
     }
     for root in rw_roots {
-        add_macos_post_create_rules(caps, root)?;
+        add_macos_post_create_rules(caps, root, globs)?;
     }
     Ok(())
 }
@@ -994,6 +1045,7 @@ fn add_macos_dest_deny_rules(
 fn add_macos_post_create_rules(
     caps: &mut nono::CapabilitySet,
     workspace: &Path,
+    globs: &[String],
 ) -> Result<(), KernelError> {
     for workspace in dest_deny_rule_paths(workspace) {
         let Some(raw) = workspace.to_str() else {
@@ -1004,12 +1056,18 @@ fn add_macos_post_create_rules(
         };
         let prefix = escape_regex_literal(raw);
         // One filter only. Combined (subpath)(regex) denied the whole tree.
-        for regex in [
+        let mut regexes = vec![
             format!("^{prefix}/[.]env$"),
             format!("^{prefix}/.*/[.]env$"),
             format!("^{prefix}/[.]env[.].*$"),
             format!("^{prefix}/.*/[.]env[.].*$"),
-        ] {
+        ];
+        for glob in globs {
+            if let Some(re) = dest_deny_glob_regex(&prefix, glob) {
+                regexes.push(re);
+            }
+        }
+        for regex in regexes {
             let regex = escape_sbpl_literal(&regex);
             for action in ["file-read*", "file-write*"] {
                 let rule = format!("(deny {action} (regex \"{regex}\"))");
@@ -1050,6 +1108,52 @@ fn escape_regex_literal(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// Seatbelt regex for one dest-deny glob under an RW prefix.
+#[cfg(target_os = "macos")]
+fn dest_deny_glob_regex(prefix: &str, glob: &str) -> Option<String> {
+    let mut glob = glob.trim();
+    if glob.is_empty() {
+        return None;
+    }
+    let nested = glob.starts_with("**/");
+    if nested {
+        glob = glob.strip_prefix("**/")?;
+    }
+    let trailing_dir = glob.ends_with("/**");
+    if trailing_dir {
+        glob = glob.strip_suffix("/**")?;
+    }
+    if glob.is_empty() {
+        return None;
+    }
+    let mut body = String::new();
+    let chars: Vec<char> = glob.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '*' {
+            body.push_str("[^/]*");
+            i += 1;
+            continue;
+        }
+        if matches!(
+            chars[i],
+            '\\' | '.' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$'
+        ) {
+            body.push('\\');
+        }
+        body.push(chars[i]);
+        i += 1;
+    }
+    if trailing_dir {
+        body.push_str("(/.*)?");
+    }
+    if nested {
+        Some(format!("^{prefix}/(.*/)?{body}$"))
+    } else {
+        Some(format!("^{prefix}/{body}$"))
+    }
 }
 
 fn refuse_home_workspace(workspace: &Path) -> Result<(), KernelError> {

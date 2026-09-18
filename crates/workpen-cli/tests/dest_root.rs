@@ -2,6 +2,8 @@
 
 #[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::process::Command;
 
 use tempfile::TempDir;
@@ -674,6 +676,46 @@ fn run_allows_presented_workspace_path_not_only_canonical() {
         stdout.trim(),
         "ok",
         "presented workspace dest must print ok, stderr={stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_extra_root_tmp_constructed_auth_json_is_dest_denied() {
+    let tmp = std::env::temp_dir();
+    let extra = if tmp.ends_with("tmp") || tmp.ends_with("temp") {
+        tmp
+    } else {
+        PathBuf::from("/tmp")
+    };
+    if !extra.is_dir() {
+        return;
+    }
+    let ws = TempDir::new().expect("workspace");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("readme");
+    let name = format!("auth-wp-mpi-{}.json", std::process::id());
+    let dest = extra.join(&name);
+    std::fs::write(&dest, "SECRET=1\n").expect("auth dest");
+    let stem = dest
+        .file_stem()
+        .expect("stem")
+        .to_string_lossy()
+        .into_owned();
+    let script = format!("n={stem}; cat {}/${{n}}.json", extra.display());
+    let deny = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .arg("--extra-root")
+        .arg(&extra)
+        .args(["--", "/bin/sh", "-c", &script])
+        .output()
+        .expect("spawn workpen");
+    let deny_out = String::from_utf8_lossy(&deny.stdout);
+    let deny_err = String::from_utf8_lossy(&deny.stderr);
+    let _ = std::fs::remove_file(&dest);
+    assert!(
+        !deny_out.contains("SECRET"),
+        "extra-root /tmp constructed auth-*.json must not print SECRET, stdout={deny_out} stderr={deny_err}"
     );
 }
 
