@@ -535,16 +535,20 @@ pub(super) fn spawn_write_restricted(
     cmd: &Command,
     timeout: Option<Duration>,
 ) -> Result<(KernelApply, ExitStatus), KernelError> {
-    spawn_write_restricted_io(policy, cmd, timeout, false)
-        .map(|(applied, status, _)| (applied, status))
+    let (applied, status, _, timed_out) = spawn_write_restricted_io(policy, cmd, timeout, false)?;
+    if timed_out {
+        return Err(KernelError::Timeout);
+    }
+    Ok((applied, status))
 }
 
 pub(super) fn spawn_write_restricted_output(
     policy: &KernelPolicy,
     cmd: &Command,
     timeout: Option<Duration>,
-) -> Result<(KernelApply, std::process::Output), KernelError> {
-    let (applied, status, output) = spawn_write_restricted_io(policy, cmd, timeout, true)?;
+) -> Result<(KernelApply, std::process::Output, bool), KernelError> {
+    let (applied, status, output, timed_out) =
+        spawn_write_restricted_io(policy, cmd, timeout, true)?;
     Ok((
         applied,
         output.unwrap_or_else(|| std::process::Output {
@@ -552,6 +556,7 @@ pub(super) fn spawn_write_restricted_output(
             stdout: Vec::new(),
             stderr: Vec::new(),
         }),
+        timed_out,
     ))
 }
 
@@ -560,7 +565,7 @@ fn spawn_write_restricted_io(
     cmd: &Command,
     timeout: Option<Duration>,
     capture: bool,
-) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>), KernelError> {
+) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>, bool), KernelError> {
     let prepared = if policy.network_blocked() {
         prepare_network_blocked(policy)?
     } else {
@@ -750,16 +755,21 @@ fn spawn_prepared(
     cmd: &Command,
     timeout: Option<Duration>,
     capture: bool,
-) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>), KernelError> {
+) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>, bool), KernelError> {
     let result = spawn_prepared_child(&mut prepared, cmd, timeout, capture);
     let restore = restore_guards(&mut prepared.acl_guards);
     match (result, restore) {
-        (Ok((applied, status, output)), Ok(())) => Ok((applied, status, output)),
+        (Ok((applied, status, output, timed_out)), Ok(())) => {
+            Ok((applied, status, output, timed_out))
+        }
+        // Deadline plus restore failure must stay Timeout (unit variant).
+        (Ok((_, _, _, true)), restore) => combine_spawn_restore(Err(KernelError::Timeout), restore)
+            .map(|(applied, status)| (applied, status, None, true)),
         (result, restore) => combine_spawn_restore(
-            result.map(|(applied, status, _)| (applied, status)),
+            result.map(|(applied, status, _, _)| (applied, status)),
             restore,
         )
-        .map(|(applied, status)| (applied, status, None)),
+        .map(|(applied, status)| (applied, status, None, false)),
     }
 }
 
@@ -768,7 +778,7 @@ fn spawn_prepared_child(
     cmd: &Command,
     timeout: Option<Duration>,
     capture: bool,
-) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>), KernelError> {
+) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>, bool), KernelError> {
     let (app, mut cmdline, cwd) = match prepared.helper.as_deref() {
         Some(helper) => wrap_command_line(helper, cmd)?,
         None => command_line(cmd)?,
@@ -867,7 +877,8 @@ fn spawn_prepared_child(
     };
     // SAFETY: process handle stays valid until we return.
     let wait = unsafe { WaitForSingleObject(process.0, wait_ms) };
-    if wait == WAIT_TIMEOUT {
+    let timed_out = wait == WAIT_TIMEOUT;
+    if timed_out {
         drop(std::mem::replace(
             &mut prepared.job,
             CloseOnDrop(ptr::null_mut()),
@@ -885,11 +896,7 @@ fn spawn_prepared_child(
                 "timeout kill left process still active".into(),
             ));
         }
-        let _ = join_drain(stdout_drain);
-        let _ = join_drain(stderr_drain);
-        return Err(KernelError::Timeout);
-    }
-    if wait == WAIT_FAILED || wait != WAIT_OBJECT_0 {
+    } else if wait == WAIT_FAILED || wait != WAIT_OBJECT_0 {
         return Err(last_error("WaitForSingleObject"));
     }
     let mut code: Dword = 1;
@@ -915,7 +922,7 @@ fn spawn_prepared_child(
         drop((stdout_drain, stderr_drain));
         None
     };
-    Ok((applied, ExitStatus::from_raw(code), output))
+    Ok((applied, ExitStatus::from_raw(code), output, timed_out))
 }
 
 fn inheritable_pipe(

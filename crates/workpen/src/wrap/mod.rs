@@ -143,42 +143,49 @@ fn apply_detail(err: &KernelError) -> String {
 
 /// Drain stdout/stderr on helper threads while waiting so a chatty child
 /// cannot fill the pipe (~64KiB) and block until the deadline.
+///
+/// The bool is `timed_out`. Deadline still returns the drained bytes so
+/// callers can write them before GNU timeout 124. [`KernelError::Timeout`]
+/// stays a unit variant on [`KernelPolicy::run_child_timeout`].
 #[cfg(unix)]
 fn wait_child_timeout_output(
     mut child: std::process::Child,
     timeout: Duration,
-) -> Result<std::process::Output, KernelError> {
+) -> Result<(std::process::Output, bool), KernelError> {
     use std::thread;
     use std::time::Instant;
 
     let stdout = child.stdout.take().map(drain_pipe);
     let stderr = child.stderr.take().map(drain_pipe);
     let deadline = Instant::now() + timeout;
-    let status = loop {
+    let (status, timed_out) = loop {
         match child
             .try_wait()
             .map_err(|e| KernelError::Apply(e.to_string()))?
         {
-            Some(status) => break status,
+            Some(status) => break (status, false),
             None if Instant::now() >= deadline => {
                 let pid = child.id() as libc::pid_t;
                 // SAFETY: pid is the child's process group (process_group(0)).
                 unsafe {
                     libc::killpg(pid, libc::SIGKILL);
                 }
-                let _ = child.wait();
-                let _ = join_drain(stdout);
-                let _ = join_drain(stderr);
-                return Err(KernelError::Timeout);
+                let status = child
+                    .wait()
+                    .map_err(|e| KernelError::Apply(e.to_string()))?;
+                break (status, true);
             }
             None => thread::sleep(Duration::from_millis(10)),
         }
     };
-    Ok(std::process::Output {
-        status,
-        stdout: join_drain(stdout),
-        stderr: join_drain(stderr),
-    })
+    Ok((
+        std::process::Output {
+            status,
+            stdout: join_drain(stdout),
+            stderr: join_drain(stderr),
+        },
+        timed_out,
+    ))
 }
 
 #[cfg(unix)]
@@ -505,7 +512,7 @@ impl KernelPolicy {
                     "write-restricted token is not available".into(),
                 ));
             }
-            windows::spawn_write_restricted_output(self, &cmd, None)
+            windows::spawn_write_restricted_output(self, &cmd, None).map(|(a, o, _)| (a, o))
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -520,11 +527,15 @@ impl KernelPolicy {
     ///
     /// Stdout and stderr are drained while waiting so a chatty child
     /// cannot fill the pipe and block until this deadline.
+    ///
+    /// Returns `(applied, output, timed_out)`. When `timed_out` is true,
+    /// `output` still holds drained stdout/stderr. [`KernelError::Timeout`]
+    /// stays a unit variant on [`Self::run_child_timeout`].
     pub fn run_child_timeout_output(
         &self,
         cmd: Command,
         timeout: Duration,
-    ) -> Result<(KernelApply, std::process::Output), KernelError> {
+    ) -> Result<(KernelApply, std::process::Output, bool), KernelError> {
         self.dest_deny_command(&cmd)?;
         #[cfg(unix)]
         {
@@ -542,7 +553,8 @@ impl KernelPolicy {
             cmd.stderr(std::process::Stdio::piped());
             cmd.process_group(0);
             let child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
-            Ok((applied, wait_child_timeout_output(child, timeout)?))
+            let (output, timed_out) = wait_child_timeout_output(child, timeout)?;
+            Ok((applied, output, timed_out))
         }
         #[cfg(windows)]
         {

@@ -109,9 +109,11 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     // stdout to a file outside --root is a Seatbelt/DACL dest write.
     let result = match timeout {
         Some(limit) => jail.run_child_timeout_output(child, limit),
-        None => jail.run_child_output(child),
+        None => jail
+            .run_child_output(child)
+            .map(|(applied, output)| (applied, output, false)),
     };
-    let (_applied, output) = match result {
+    let (_applied, output, timed_out) = match result {
         Err(KernelError::Timeout) => {
             eprintln!("child killed after the deadline");
             return Ok(ExitCode::from(124));
@@ -128,6 +130,10 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         use std::io::Write;
         let _ = std::io::stdout().write_all(&output.stdout);
         let _ = std::io::stderr().write_all(&output.stderr);
+    }
+    if timed_out {
+        eprintln!("child killed after the deadline");
+        return Ok(ExitCode::from(124));
     }
     Ok(ExitCode::from(output.status.code().unwrap_or(1) as u8))
 }
