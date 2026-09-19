@@ -2316,12 +2316,18 @@ fn run_child_marker_e2e() {
 fn run_child_namespace_lockdown_and_dumpable() {
     if std::env::var_os("WORKPEN_E2E_CHILD").as_deref() == Some(std::ffi::OsStr::new("dumpable")) {
         // /proc/self/status is not readable under Landlock; use PR_GET_DUMPABLE.
+        // Write a workspace file: piped stdout is fully buffered and exit skips flush.
         // SAFETY: PR_GET_DUMPABLE on this thread, the e2e child.
         let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
-        print!("dumpable:{dumpable}\n");
         // SAFETY: unshare only this thread, which is the e2e child after jail apply.
         let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) };
-        print!("unshare:{}\n", if rc == 0 { 0 } else { 1 });
+        let _ = fs::write(
+            "e2e-dumpable.out",
+            format!(
+                "dumpable:{dumpable}\nunshare:{}\n",
+                if rc == 0 { 0 } else { 1 }
+            ),
+        );
         std::process::exit(0);
     }
     if !kernel_supported() {
@@ -2347,13 +2353,15 @@ fn run_child_namespace_lockdown_and_dumpable() {
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     if applied == KernelApply::Applied {
+        let body = fs::read_to_string(dir.path().join("e2e-dumpable.out"))
+            .unwrap_or_else(|e| panic!("e2e child output missing: {e}; stdout={stdout:?}"));
         assert!(
-            stdout.lines().any(|line| line.trim() == "dumpable:0"),
-            "child must not be dumpable: {stdout:?}"
+            body.lines().any(|line| line.trim() == "dumpable:0"),
+            "child must not be dumpable: {body:?} stdout={stdout:?}"
         );
         assert!(
-            stdout.contains("unshare:1"),
-            "nested unshare must not succeed after remount: {stdout:?}"
+            body.contains("unshare:1"),
+            "nested unshare must not succeed after remount: {body:?} stdout={stdout:?}"
         );
     }
 }
