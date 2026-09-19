@@ -488,9 +488,10 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// When argv0 is `env`/`env.exe`, dest-denies the operand of
 /// `-S`/`--split-string` via [`check_command_dests`], then leftover
 /// tokens in that string as env flags (`--file=`, `-f`, `NAME=value`).
-/// After skipping stacked `timeout`/`nohup`/`nice` prefixes (same skip as
-/// wrap), dest-denies those env flags when the remaining argv starts with
-/// env. A nested `env` operand (or `env -- env …`) is walked the same way.
+/// After skipping stacked `timeout`/`nohup`/`nice`/`time`/`stdbuf`
+/// prefixes (same skip as wrap), dest-denies those env flags when the
+/// remaining argv starts with env. A nested `env` operand (or
+/// `env -- env …`) is walked the same way.
 /// `cmd /c` and `powershell -Command` / `-EncodedCommand` bodies are
 /// dest-denied as command strings. After `cmd` / `pwsh`, remaining
 /// argv is walked so `/s` / `-NoProfile` cannot hide `/c`,
@@ -505,8 +506,11 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// inside a shell `-c` string. Generic `/c`, `-Command`, `-EncodedCommand`,
 /// `-cwa`, or `-File` on another argv0 is not.
 /// Dest-denies argv `-f`/`--file` (including attached `--file=.env`) via
-/// [`check_dest`]. Does not dest-deny a flattened join of all argv. Does
-/// not peel generic `--flag=.env`.
+/// [`check_dest`]. Also dest-denies the suffix after `=` on any `--*` /
+/// `-*=` token (`tool --config=.env`). `--color=always` and `--jobs=4`
+/// stay allowed when the suffix is not a dest-deny name. Does not
+/// dest-deny a flattened join of all argv. Does not dest-deny a
+/// following separate token unless that token is already a raw dest.
 pub fn check_command_argv(
     cmd: &[impl AsRef<str>],
     root: &Path,
@@ -516,6 +520,10 @@ pub fn check_command_argv(
         let token = token.as_ref();
         if !token.is_empty() && !token.starts_with('-') {
             let dest = dest_under_root(root, token);
+            check_dest(&dest.to_string_lossy(), policy, None)?;
+        }
+        if let Some(value) = attached_flag_dest(token) {
+            let dest = dest_under_root(root, value);
             check_dest(&dest.to_string_lossy(), policy, None)?;
         }
         if let Some(body) = shell_c_body(token, cmd.get(i + 1).map(|s| s.as_ref())) {
@@ -821,8 +829,22 @@ fn decode_rfc4648_base64(input: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Skip stacked `timeout` / `nohup` / `nice` prefixes. Returns the index
-/// of the first remaining operand (env, the user command, or `cmd.len()`).
+/// Suffix after `=` on a flag token (`--config=.env`, `-f=.env`).
+/// Not `NAME=value` (no leading `-`). Empty values are ignored.
+fn attached_flag_dest(token: &str) -> Option<&str> {
+    if !token.starts_with('-') || token == "-" || token == "--" {
+        return None;
+    }
+    let (_, value) = token.split_once('=')?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(value)
+}
+
+/// Skip stacked `timeout` / `nohup` / `nice` / `time` / `stdbuf` prefixes.
+/// Returns the index of the first remaining operand (env, the user
+/// command, or `cmd.len()`).
 fn skip_all_wrappers(cmd: &[impl AsRef<str>]) -> usize {
     let mut i = 0;
     while i < cmd.len() {
@@ -840,6 +862,8 @@ pub(crate) enum CmdWrapper {
     Timeout,
     Nohup,
     Nice,
+    Time,
+    Stdbuf,
 }
 
 pub(crate) fn cmd_wrapper(program: impl AsRef<OsStr>) -> Option<CmdWrapper> {
@@ -851,13 +875,17 @@ pub(crate) fn cmd_wrapper(program: impl AsRef<OsStr>) -> Option<CmdWrapper> {
         Some(CmdWrapper::Nohup)
     } else if name.eq_ignore_ascii_case("nice") || name.eq_ignore_ascii_case("nice.exe") {
         Some(CmdWrapper::Nice)
+    } else if name.eq_ignore_ascii_case("time") || name.eq_ignore_ascii_case("time.exe") {
+        Some(CmdWrapper::Time)
+    } else if name.eq_ignore_ascii_case("stdbuf") || name.eq_ignore_ascii_case("stdbuf.exe") {
+        Some(CmdWrapper::Stdbuf)
     } else {
         None
     }
 }
 
-/// Skip timeout/nohup/nice flags plus the timeout duration. Returns the
-/// index of the first remaining command operand.
+/// Skip wrapper flags plus the timeout duration. Returns the index of
+/// the first remaining command operand.
 pub(crate) fn skip_wrapper_prefix(kind: CmdWrapper, args: &[impl AsRef<str>]) -> usize {
     let mut i = 0;
     let mut options_done = false;
@@ -889,7 +917,8 @@ fn wrapper_takes_value(kind: CmdWrapper, flag: char) -> bool {
     match kind {
         CmdWrapper::Timeout => matches!(flag, 's' | 'k'),
         CmdWrapper::Nice => flag == 'n',
-        CmdWrapper::Nohup => false,
+        CmdWrapper::Nohup | CmdWrapper::Time => false,
+        CmdWrapper::Stdbuf => matches!(flag, 'o' | 'e' | 'i'),
     }
 }
 
@@ -897,7 +926,8 @@ fn wrapper_long_takes_value(kind: CmdWrapper, long: &str) -> bool {
     match kind {
         CmdWrapper::Timeout => matches!(long, "signal" | "kill-after"),
         CmdWrapper::Nice => long == "adjustment",
-        CmdWrapper::Nohup => false,
+        CmdWrapper::Nohup | CmdWrapper::Time => false,
+        CmdWrapper::Stdbuf => matches!(long, "output" | "error" | "input"),
     }
 }
 
@@ -1083,10 +1113,11 @@ fn check_env_file_dest(path: &str, root: &Path, policy: &DenyPolicy) -> Result<(
 
 /// Join extracted command dests under `root` and dest-deny each.
 ///
-/// Absolute dests stay as given. Empty and flag-looking peeled tokens
-/// are skipped. After peeling, an `env`/`env.exe` token dest-denies
-/// the following tokens with the same env-flag dest check used for
-/// argv0 env. Does not peel `--flag=.env`.
+/// Absolute dests stay as given. Empty tokens are skipped. Flag-looking
+/// peeled tokens are skipped except an attached `--flag=.env` /
+/// `-f=.env` suffix, which is dest-denied via [`check_dest`]. After
+/// peeling, an `env`/`env.exe` token dest-denies the following tokens
+/// with the same env-flag dest check used for argv0 env.
 pub fn check_command_dests(
     command: &str,
     root: &Path,
@@ -1094,7 +1125,15 @@ pub fn check_command_dests(
 ) -> Result<(), CheckDestError> {
     for (_display, candidate) in command_path_tokens(command) {
         for peeled in peel_shell_parts(&candidate) {
-            if peeled.is_empty() || peeled.starts_with('-') {
+            if peeled.is_empty() {
+                continue;
+            }
+            if let Some(value) = attached_flag_dest(peeled) {
+                let dest = dest_under_root(root, value);
+                check_dest(&dest.to_string_lossy(), policy, None)?;
+                continue;
+            }
+            if peeled.starts_with('-') {
                 continue;
             }
             let dest = dest_under_root(root, peeled);
@@ -1109,7 +1148,8 @@ pub fn check_command_dests(
 /// Recurses into a shell `-c` body. Also peels `cmd` / `pwsh` `/c`,
 /// `-Command`, `-CommandWithArgs`, `-EncodedCommand`, `-EncodedArguments`,
 /// and `-File` (including `--switch` and unique prefixes) from remaining
-/// string tokens. Does not peel generic `--flag=.env`.
+/// string tokens. Attached `--flag=.env` is dest-denied via
+/// [`check_command_dests`].
 fn check_command_string_env_dests(
     command: &str,
     root: &Path,
@@ -1173,6 +1213,82 @@ pub fn is_env_template_basename(name: &str) -> bool {
         .to_ascii_lowercase();
     base.starts_with(".env.")
         && (base.ends_with(".example") || base.ends_with(".sample") || base.ends_with(".template"))
+}
+
+/// Gitignore-style dest-deny glob subset.
+///
+/// Rejects brace alternation, backslash escapes, empty path segments,
+/// and `.` / `..` segments. Default [`default_secret_denies`] rows pass.
+/// Hosts match [`AgentLockError`] when an `agent.lock` extra fails.
+pub fn validate_deny_glob(glob: &str) -> Result<(), &'static str> {
+    let glob = glob.trim();
+    if glob.is_empty() {
+        return Err("empty dest-deny glob");
+    }
+    if glob.contains('{') || glob.contains('}') {
+        return Err("brace alternation is not supported");
+    }
+    if glob.contains('\\') {
+        return Err("backslash escapes are not supported");
+    }
+    let normalized = normalize_glob_text(glob);
+    let segs: Vec<&str> = normalized.split('/').collect();
+    if segs.iter().any(|s| s.is_empty()) {
+        return Err("empty path segment");
+    }
+    if segs.iter().any(|s| *s == "." || *s == "..") {
+        return Err("'.' / '..' path segment");
+    }
+    Ok(())
+}
+
+/// Seatbelt regex for one dest-deny glob under an RW prefix.
+///
+/// `**/.env` matches `prefix/.env` and `prefix/sub/.env`. Used by macOS
+/// wrap and by the dialect table test on every OS.
+pub fn dest_deny_glob_regex(prefix: &str, glob: &str) -> Option<String> {
+    validate_deny_glob(glob).ok()?;
+    let mut glob = glob.trim();
+    if glob.is_empty() {
+        return None;
+    }
+    let nested = glob.starts_with("**/");
+    if nested {
+        glob = glob.strip_prefix("**/")?;
+    }
+    let trailing_dir = glob.ends_with("/**");
+    if trailing_dir {
+        glob = glob.strip_suffix("/**")?;
+    }
+    if glob.is_empty() {
+        return None;
+    }
+    let mut body = String::new();
+    let chars: Vec<char> = glob.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '*' {
+            body.push_str("[^/]*");
+            i += 1;
+            continue;
+        }
+        if matches!(
+            chars[i],
+            '.' | '+' | '?' | '(' | ')' | '[' | ']' | '|' | '^' | '$'
+        ) {
+            body.push('\\');
+        }
+        body.push(chars[i]);
+        i += 1;
+    }
+    if trailing_dir {
+        body.push_str("(/.*)?");
+    }
+    if nested {
+        Some(format!("^{prefix}/(.*/)?{body}$"))
+    } else {
+        Some(format!("^{prefix}/{body}$"))
+    }
 }
 
 pub fn path_matches_deny_glob(pattern: &str, path: &str) -> bool {

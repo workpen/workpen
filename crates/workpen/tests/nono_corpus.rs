@@ -46,8 +46,13 @@ fn kernel_access_is_read_or_readwrite_only() {
 
 #[test]
 fn kernel_apply_is_applied_or_userspace_only() {
-    let kinds = [KernelApply::Applied, KernelApply::UserspaceOnly];
-    assert_eq!(kinds.len(), 2);
+    let kinds = [
+        KernelApply::Applied,
+        KernelApply::RemountSkipped,
+        KernelApply::WfpSkipped,
+        KernelApply::UserspaceOnly,
+    ];
+    assert_eq!(kinds.len(), 4);
 }
 
 #[test]
@@ -306,13 +311,17 @@ fn run_child_cannot_read_workspace_env_linux() {
         .args(["-c", SH_READ_DOTENV])
         .current_dir(dir.path());
     let (applied, status) = policy.run_child(deny_cmd).expect("run_child env");
-    assert_eq!(applied, KernelApply::Applied);
     assert!(status.success(), "wrapper must finish: {status:?}");
     let leaked = fs::read_to_string(dir.path().join("env.out")).unwrap_or_default();
     if leaked.contains("SECRET") {
-        // Unprivileged user ns denied; remount skipped, Landlock still applied.
+        assert_eq!(
+            applied,
+            KernelApply::RemountSkipped,
+            "SECRET leak must be RemountSkipped, not Applied: {applied:?}"
+        );
         return;
     }
+    assert_eq!(applied, KernelApply::Applied);
     let code = fs::read_to_string(dir.path().join("env.code")).expect("env.code");
     assert_ne!(code.trim(), "0", "cat .env must fail after remount");
     let leaked = fs::read_to_string(dir.path().join("env.out")).unwrap_or_default();
@@ -1972,18 +1981,16 @@ fn child_env_deny_names_include_loader_and_keys() {
             "denylist must include {required}: {names:?}"
         );
     }
-    for keep in [
-        "PATH",
-        "HOME",
-        "USERPROFILE",
-        "SystemRoot",
-        "COMSPEC",
-        "TMPDIR",
-        "TEMP",
-    ] {
+    for keep in ["PATH", "HOME", "USERPROFILE", "SystemRoot", "COMSPEC"] {
         assert!(
             !names.contains(&keep),
             "denylist must not strip {keep}: {names:?}"
+        );
+    }
+    for temp in ["TMPDIR", "TEMP", "TMP"] {
+        assert!(
+            names.contains(&temp),
+            "denylist must scrub {temp}: {names:?}"
         );
     }
 }
@@ -2148,6 +2155,261 @@ fn require_applied_keeps_applied() {
     assert_eq!(
         require_applied(KernelApply::Applied).expect("Applied"),
         KernelApply::Applied
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn apply_pre_exec_dest_denies_shell_c_env() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut deny = Command::new("/bin/sh");
+    deny.args(["-c", "cat .env"]).current_dir(dir.path());
+    let err = policy.apply_pre_exec(&mut deny).expect_err("dest-deny");
+    assert!(
+        matches!(err, KernelError::DestDeny(_)),
+        "apply_pre_exec must dest-deny argv: {err}"
+    );
+    let mut allow = Command::new("/bin/echo");
+    allow.arg("ok");
+    let applied = policy.apply_pre_exec(&mut allow).expect("echo");
+    assert!(
+        matches!(applied, KernelApply::Applied | KernelApply::RemountSkipped),
+        "echo stays applied or remount-skipped: {applied:?}"
+    );
+}
+
+#[test]
+fn dest_deny_command_is_public_and_matches_run_child() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "cat .env"]).current_dir(dir.path());
+    let err = policy
+        .dest_deny_command(&cmd)
+        .expect_err("public dest_deny");
+    assert!(
+        matches!(err, KernelError::DestDeny(_)),
+        "dest_deny_command must be DestDeny: {err}"
+    );
+}
+
+#[test]
+fn run_child_scrubs_tmpdir() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    #[cfg(unix)]
+    let mut cmd = Command::new("/bin/sh");
+    #[cfg(unix)]
+    cmd.args(["-c", r#"printf %s "$TMPDIR""#]);
+    #[cfg(windows)]
+    let mut cmd = Command::new("cmd");
+    #[cfg(windows)]
+    cmd.args(["/c", "echo %TMPDIR%"]);
+    cmd.env("TMPDIR", "/tmp/host-secret-scratch");
+    cmd.current_dir(dir.path());
+    let (applied, output) = policy.run_child_output(cmd).expect("output");
+    assert!(
+        matches!(
+            applied,
+            KernelApply::Applied | KernelApply::RemountSkipped | KernelApply::WfpSkipped
+        ),
+        "scrub spawn must start: {applied:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("host-secret-scratch"),
+        "child must not print inherited TMPDIR: {stdout:?}"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn run_child_output_echoes_hello() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("/bin/echo");
+    cmd.arg("hello");
+    let (_applied, output) = policy.run_child_output(cmd).expect("output");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
+    let mut cmd = Command::new("/bin/echo");
+    cmd.arg("hello");
+    let (_applied, output) = policy
+        .run_child_timeout_output(cmd, Duration::from_secs(5))
+        .expect("timeout output");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
+}
+
+/// `WORKPEN_E2E_REQUIRE` panics if remount/Seatbelt cannot apply.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn run_child_marker_e2e() {
+    if std::env::var_os("WORKPEN_E2E_CHILD").is_some() {
+        let path = std::env::var("WORKPEN_E2E_PATH").expect("path");
+        match fs::read_to_string(&path) {
+            Ok(body) => {
+                print!("{body}");
+                std::process::exit(0);
+            }
+            Err(_) => std::process::exit(2),
+        }
+    }
+    if !kernel_supported() {
+        if std::env::var_os("WORKPEN_E2E_REQUIRE").is_some() {
+            panic!("WORKPEN_E2E_REQUIRE set but kernel jail is unavailable");
+        }
+        return;
+    }
+    let dir = workspace();
+    let dest = dir.path().join(".env");
+    fs::write(&dest, "MARKER-SECRET=1\n").expect("marker");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut cmd = Command::new(&exe);
+    cmd.env("WORKPEN_E2E_CHILD", "1")
+        .env("WORKPEN_E2E_PATH", &dest)
+        .arg("run_child_marker_e2e")
+        .arg("--exact")
+        .current_dir(dir.path());
+    let (applied, output) = match policy.run_child_output(cmd) {
+        Ok(v) => v,
+        Err(err) => {
+            if std::env::var_os("WORKPEN_E2E_REQUIRE").is_some() {
+                panic!("WORKPEN_E2E_REQUIRE: run_child_output failed: {err}");
+            }
+            return;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match applied {
+        KernelApply::Applied => {
+            assert!(
+                !stdout.contains("MARKER-SECRET"),
+                "MARKER must be absent when remount/Seatbelt applied: {stdout:?}"
+            );
+        }
+        KernelApply::RemountSkipped => {
+            if std::env::var_os("WORKPEN_E2E_REQUIRE").is_some() {
+                panic!("WORKPEN_E2E_REQUIRE: remount skipped");
+            }
+        }
+        other => panic!("unexpected apply: {other:?} stdout={stdout:?}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn run_child_namespace_lockdown_and_dumpable() {
+    if std::env::var_os("WORKPEN_E2E_CHILD").as_deref() == Some(std::ffi::OsStr::new("dumpable")) {
+        // Write a workspace file: piped stdout is fully buffered and exit skips flush.
+        let mut core = libc::rlimit {
+            rlim_cur: 99,
+            rlim_max: 99,
+        };
+        // SAFETY: getrlimit on this thread, the e2e child after exec.
+        let _ = unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut core) };
+        // SAFETY: unshare only this thread, which is the e2e child after jail apply.
+        let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) };
+        let _ = fs::write(
+            "e2e-dumpable.out",
+            format!(
+                "core:{}\nunshare:{}\n",
+                core.rlim_cur,
+                if rc == 0 { 0 } else { 1 }
+            ),
+        );
+        std::process::exit(0);
+    }
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    let exe = std::env::current_exe().expect("current_exe");
+    let child = dir.path().join("e2e-dumpable");
+    fs::copy(&exe, &child).expect("copy e2e child into workspace");
+    let mut perms = fs::metadata(&child).expect("child meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&child, perms).expect("chmod e2e child");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new(&child);
+    cmd.env("WORKPEN_E2E_CHILD", "dumpable")
+        .arg("run_child_namespace_lockdown_and_dumpable")
+        .arg("--exact")
+        .current_dir(dir.path());
+    let (applied, output) = match policy.run_child_output(cmd) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if applied == KernelApply::Applied {
+        let body = fs::read_to_string(dir.path().join("e2e-dumpable.out"))
+            .unwrap_or_else(|e| panic!("e2e child output missing: {e}; stdout={stdout:?}"));
+        assert!(
+            body.lines().any(|line| line.trim() == "core:0"),
+            "child RLIMIT_CORE must be 0 after exec: {body:?} stdout={stdout:?}"
+        );
+        assert!(
+            body.contains("unshare:1"),
+            "nested unshare must not succeed after remount: {body:?} stdout={stdout:?}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn run_child_mv_env_does_not_print_secret() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "mv .env leaked && cat leaked"])
+        .current_dir(dir.path());
+    match policy.run_child_output(cmd) {
+        Ok((KernelApply::Applied, output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                !stdout.contains("SECRET"),
+                "mv .env leaked must not print SECRET: {stdout:?}"
+            );
+        }
+        Ok((other, _)) => panic!("expected Applied, got {other:?}"),
+        Err(KernelError::DestDeny(_)) => {}
+        Err(other) => panic!("unexpected: {other}"),
+    }
+}
+
+#[test]
+fn with_bash_noprofile_time_and_stdbuf_insert_after_bash() {
+    let (_got, args) = with_bash_noprofile("time", ["bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["bash", "--noprofile", "--norc", "-c", "true"],
+        "time bash -c must insert noprofile"
+    );
+    let (_got, args) = with_bash_noprofile("stdbuf", ["-o0", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["-o0", "bash", "--noprofile", "--norc", "-c", "true"],
+        "stdbuf -o0 bash -c must insert noprofile"
     );
 }
 

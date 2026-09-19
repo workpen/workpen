@@ -20,6 +20,7 @@ mod deny;
 #[cfg(feature = "gc")]
 mod gc;
 mod guard;
+pub mod threat_model;
 mod why;
 #[cfg(feature = "nono")]
 mod wrap;
@@ -28,9 +29,10 @@ pub use agent_lock::{AGENT_LOCK_NAME, AgentLockError, load_agent_lock, load_agen
 pub use deny::{
     CheckDestError, DenyPolicy, DestDeny, DestDenyError, DestDenyKind, check_command_argv,
     check_command_dests, check_dest, classify_dest, default_secret_denies, deny_patch_dests,
-    deny_patch_dests_with_display, dest_deny_message, dest_under_root, is_env_template_basename,
-    is_path_denied, open_verified_read, path_is_denied_glob, path_matches_deny_glob,
-    reject_command_secret_path_tokens, verify_post_open,
+    deny_patch_dests_with_display, dest_deny_glob_regex, dest_deny_message, dest_under_root,
+    is_env_template_basename, is_path_denied, open_verified_read, path_is_denied_glob,
+    path_matches_deny_glob, reject_command_secret_path_tokens, validate_deny_glob,
+    verify_post_open,
 };
 #[cfg(feature = "gc")]
 pub use gc::{
