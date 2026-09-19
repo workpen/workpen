@@ -987,7 +987,10 @@ unsafe impl Send for SendHandle {}
 
 fn drain_pipe(handle: CloseOnDrop) -> std::thread::JoinHandle<Vec<u8>> {
     let raw = SendHandle(handle.into_raw());
-    std::thread::spawn(move || read_all(CloseOnDrop(raw.0)))
+    std::thread::spawn(move || {
+        let SendHandle(ptr) = raw;
+        read_all(CloseOnDrop(ptr))
+    })
 }
 
 fn join_drain(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
