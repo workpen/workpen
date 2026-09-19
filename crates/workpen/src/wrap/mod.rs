@@ -704,7 +704,8 @@ pub fn scrub_child_command(cmd: &mut Command) {
 /// skip wrapper flags plus the timeout duration or `nice -n N`. If the
 /// remaining argv starts with env, drop denylist assignments on that env
 /// argv, then insert after the first bash operand (wrapper bash or env
-/// bash). Non-bash commands (`timeout 30 echo hi`) stay unchanged.
+/// bash). An `env`/`env.exe` token after any other prefix is walked the
+/// same way. Non-bash commands (`timeout 30 echo hi`) stay unchanged.
 #[must_use]
 pub fn with_bash_noprofile(
     program: impl AsRef<OsStr>,
@@ -717,11 +718,8 @@ pub fn with_bash_noprofile(
         .collect();
     if is_env_argv0(&program) {
         drop_denied_env_assignments(&mut args, 0);
-    } else if let Some(kind) = cmd_wrapper(&program) {
-        let start = skip_wrapper_os(kind, &args);
-        if args.get(start).is_some_and(|a| is_env_argv0(a.as_os_str())) {
-            drop_denied_env_assignments(&mut args, start + 1);
-        }
+    } else if let Some(i) = first_env_arg(&args) {
+        drop_denied_env_assignments(&mut args, i + 1);
     }
     if is_bash_argv0(&program) {
         insert_bash_noprofile(&mut args, 0);
@@ -733,6 +731,10 @@ pub fn with_bash_noprofile(
         && let Some(idx) = first_wrapper_bash_operand(kind, &args)
     {
         insert_bash_noprofile(&mut args, idx + 1);
+    } else if let Some(env_i) = first_env_arg(&args)
+        && let Some(idx) = first_env_bash_operand(&args[env_i + 1..])
+    {
+        insert_bash_noprofile(&mut args, env_i + 1 + idx + 1);
     }
     (program, args)
 }
@@ -870,6 +872,10 @@ fn is_bash_argv0(program: &OsStr) -> bool {
 
 fn is_env_argv0(program: &OsStr) -> bool {
     crate::deny::is_env_program(program)
+}
+
+fn first_env_arg(args: &[OsString]) -> Option<usize> {
+    args.iter().position(|a| is_env_argv0(a.as_os_str()))
 }
 
 fn first_env_bash_operand(args: &[OsString]) -> Option<usize> {
@@ -1595,6 +1601,26 @@ fn is_fs_root(path: &Path) -> bool {
     match path.parent() {
         None => true,
         Some(parent) => parent.as_os_str().is_empty(),
+    }
+}
+
+#[cfg(test)]
+mod noprofile_tests {
+    use super::with_bash_noprofile;
+
+    #[test]
+    fn env_after_unknown_prefix_inserts_after_bash() {
+        let (_got, args) = with_bash_noprofile("watch", ["env", "bash", "-c", "true"]);
+        assert_eq!(args, ["env", "bash", "--noprofile", "--norc", "-c", "true"]);
+        let (_got, args) =
+            with_bash_noprofile("watch", ["env", "BASH_ENV=.env", "bash", "-c", "true"]);
+        assert_eq!(args, ["env", "bash", "--noprofile", "--norc", "-c", "true"]);
+        let (_got, args) = with_bash_noprofile("watch", ["bash", "-c", "true"]);
+        assert_eq!(
+            args,
+            ["bash", "-c", "true"],
+            "watch bash without env must not invent noprofile"
+        );
     }
 }
 
