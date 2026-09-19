@@ -42,6 +42,8 @@ The parent is trusted. The child is not.
 - The child inherits `TMPDIR`. Those names are scrubbed.
 - Windows `Stdio::piped` on `run_child` is a host-readable pipe. Use
   `run_child_output`.
+- Linux `PR_SET_DUMPABLE=0` in `pre_exec` lasts until `execve`. A
+  readable program starts dumpable again. `RLIMIT_CORE=0` survives.
 
 ## Hosts
 

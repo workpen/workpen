@@ -48,10 +48,18 @@
 //!
 //! # Process hardening
 //!
-//! Unix `run_child` sets `RLIMIT_CORE=0` on the child. Linux also sets
-//! `PR_SET_DUMPABLE=0`. macOS also sets `PT_DENY_ATTACH`. Failure is
+//! Unix `run_child` sets `RLIMIT_CORE=0` in `pre_exec`. That rlimit
+//! survives `execve`. Linux also sets `PR_SET_DUMPABLE=0` and macOS
+//! `PT_DENY_ATTACH` in the same hook. Failure is
 //! [`crate::KernelError::Apply`]. The parent is not hardened. Windows
 //! has no equivalent in this crate.
+//!
+//! Linux `execve` of a readable program sets dumpable to
+//! `SUID_DUMP_USER` (`1`). `PR_SET_DUMPABLE=0` therefore covers only
+//! the window between `pre_exec` and exec. The surviving child
+//! contract is `RLIMIT_CORE=0` plus Landlock / remount / seccomp.
+//! Do not inject a constructor or `LD_PRELOAD` to reset dumpable
+//! after exec.
 //!
 //! # 1.0
 //!

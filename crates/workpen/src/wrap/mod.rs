@@ -1380,7 +1380,8 @@ fn macos_dest_deny_actions() -> &'static [&'static str] {
     ]
 }
 
-/// Child-only hardening after remount/Landlock. Do not call on the parent.
+/// Child-only hardening after remount, before Landlock and exec.
+/// `RLIMIT_CORE=0` survives exec. Linux dumpable does not.
 #[cfg(unix)]
 fn apply_child_hardening() -> std::io::Result<()> {
     #[cfg(unix)]

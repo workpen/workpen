@@ -2315,16 +2315,20 @@ fn run_child_marker_e2e() {
 #[test]
 fn run_child_namespace_lockdown_and_dumpable() {
     if std::env::var_os("WORKPEN_E2E_CHILD").as_deref() == Some(std::ffi::OsStr::new("dumpable")) {
-        // /proc/self/status is not readable under Landlock; use PR_GET_DUMPABLE.
         // Write a workspace file: piped stdout is fully buffered and exit skips flush.
-        // SAFETY: PR_GET_DUMPABLE on this thread, the e2e child.
-        let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+        let mut core = libc::rlimit {
+            rlim_cur: 99,
+            rlim_max: 99,
+        };
+        // SAFETY: getrlimit on this thread, the e2e child after exec.
+        let _ = unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut core) };
         // SAFETY: unshare only this thread, which is the e2e child after jail apply.
         let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) };
         let _ = fs::write(
             "e2e-dumpable.out",
             format!(
-                "dumpable:{dumpable}\nunshare:{}\n",
+                "core:{}\nunshare:{}\n",
+                core.rlim_cur,
                 if rc == 0 { 0 } else { 1 }
             ),
         );
@@ -2356,8 +2360,8 @@ fn run_child_namespace_lockdown_and_dumpable() {
         let body = fs::read_to_string(dir.path().join("e2e-dumpable.out"))
             .unwrap_or_else(|e| panic!("e2e child output missing: {e}; stdout={stdout:?}"));
         assert!(
-            body.lines().any(|line| line.trim() == "dumpable:0"),
-            "child must not be dumpable: {body:?} stdout={stdout:?}"
+            body.lines().any(|line| line.trim() == "core:0"),
+            "child RLIMIT_CORE must be 0 after exec: {body:?} stdout={stdout:?}"
         );
         assert!(
             body.contains("unshare:1"),
