@@ -34,6 +34,9 @@ const SH_READ_NOTES: &str = "n=notes; cat ${n}.txt >notes.out; echo $? >notes.co
 #[cfg(target_os = "macos")]
 const SH_POST_CREATE_DOTENV: &str =
     "n=.; printf 'SECRET=1\\n' >${n}env; echo $? >w.code; cat ${n}env >r.out; echo $? >r.code";
+/// `mv .env` at runtime so argv dest-deny does not fire before Seatbelt.
+#[cfg(target_os = "macos")]
+const SH_MV_DOTENV: &str = "n=.; mv ${n}env leaked && cat leaked";
 /// Construct `.env` at runtime for `cmd /c`.
 #[cfg(windows)]
 const CMD_READ_DOTENV: &str = "set n=.& type %n%env 1>env.out & echo %ERRORLEVEL% 1>env.code";
@@ -2324,10 +2327,14 @@ fn run_child_namespace_lockdown_and_dumpable() {
         let _ = unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut core) };
         // SAFETY: unshare only this thread, which is the e2e child after jail apply.
         let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) };
+        let readme_line = match fs::read_to_string("readme.md") {
+            Ok(body) if body == "ok\n" => "readme-ok\n",
+            _ => "",
+        };
         let _ = fs::write(
             "e2e-dumpable.out",
             format!(
-                "core:{}\nunshare:{}\n",
+                "core:{}\nunshare:{}\n{readme_line}",
                 core.rlim_cur,
                 if rc == 0 { 0 } else { 1 }
             ),
@@ -2353,16 +2360,25 @@ fn run_child_namespace_lockdown_and_dumpable() {
         .current_dir(dir.path());
     let (applied, output) = match policy.run_child_output(cmd) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(err) => {
+            if std::env::var_os("WORKPEN_E2E_REQUIRE").is_some() {
+                panic!("WORKPEN_E2E_REQUIRE: run_child_output failed: {err}");
+            }
+            return;
+        }
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let body = fs::read_to_string(dir.path().join("e2e-dumpable.out"))
+        .unwrap_or_else(|e| panic!("e2e child output missing: {e}; stdout={stdout:?}"));
+    assert!(
+        body.lines().any(|line| line.trim() == "core:0"),
+        "child RLIMIT_CORE must be 0 after exec: {body:?} stdout={stdout:?}"
+    );
+    assert!(
+        body.lines().any(|line| line.trim() == "readme-ok"),
+        "child must read allowed dest readme.md: {body:?} stdout={stdout:?}"
+    );
     if applied == KernelApply::Applied {
-        let body = fs::read_to_string(dir.path().join("e2e-dumpable.out"))
-            .unwrap_or_else(|e| panic!("e2e child output missing: {e}; stdout={stdout:?}"));
-        assert!(
-            body.lines().any(|line| line.trim() == "core:0"),
-            "child RLIMIT_CORE must be 0 after exec: {body:?} stdout={stdout:?}"
-        );
         assert!(
             body.contains("unshare:1"),
             "nested unshare must not succeed after remount: {body:?} stdout={stdout:?}"
@@ -2381,8 +2397,7 @@ fn run_child_mv_env_does_not_print_secret() {
     fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
     let mut cmd = Command::new("/bin/sh");
-    cmd.args(["-c", "mv .env leaked && cat leaked"])
-        .current_dir(dir.path());
+    cmd.args(["-c", SH_MV_DOTENV]).current_dir(dir.path());
     match policy.run_child_output(cmd) {
         Ok((KernelApply::Applied, output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2391,10 +2406,24 @@ fn run_child_mv_env_does_not_print_secret() {
                 "mv .env leaked must not print SECRET: {stdout:?}"
             );
         }
+        Ok((KernelApply::RemountSkipped | KernelApply::UserspaceOnly, _)) => return,
         Ok((other, _)) => panic!("expected Applied, got {other:?}"),
-        Err(KernelError::DestDeny(_)) => {}
+        Err(KernelError::DestDeny(_)) => {
+            panic!("mv constructed at runtime must reach the jail, not argv dest-deny")
+        }
         Err(other) => panic!("unexpected: {other}"),
     }
+
+    let mut allow_cmd = Command::new("/bin/sh");
+    allow_cmd
+        .args(["-c", "cat readme.md >readme.out; echo $? >readme.code"])
+        .current_dir(dir.path());
+    let (_applied, status) = policy.run_child(allow_cmd).expect("run_child readme");
+    assert!(status.success(), "readme wrapper must finish: {status:?}");
+    let code = fs::read_to_string(dir.path().join("readme.code")).expect("readme.code");
+    assert_eq!(code.trim(), "0", "cat readme.md must succeed");
+    let body = fs::read_to_string(dir.path().join("readme.out")).expect("readme.out");
+    assert!(body.contains("ok"), "readme body={body:?}");
 }
 
 #[test]
