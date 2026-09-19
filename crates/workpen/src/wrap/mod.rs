@@ -1495,6 +1495,8 @@ fn system_read_dirs() -> Vec<PathBuf> {
             "/etc",
             "/opt/homebrew",
             "/usr/local",
+            "/var/select",
+            "/private/var/select",
         ]
         .into_iter()
         .map(PathBuf::from)

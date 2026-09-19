@@ -1043,7 +1043,14 @@ fn kernel_supported_matches_os_backends() {
 fn extra_system_read_dirs_are_granted_when_present() {
     let dir = workspace();
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
-    for candidate in ["/dev", "/etc", "/opt/homebrew", "/usr/local"] {
+    for candidate in [
+        "/dev",
+        "/etc",
+        "/opt/homebrew",
+        "/usr/local",
+        "/var/select",
+        "/private/var/select",
+    ] {
         let path = Path::new(candidate);
         if !path.is_dir() {
             continue;

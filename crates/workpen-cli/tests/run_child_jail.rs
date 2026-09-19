@@ -23,6 +23,26 @@ fn run_echo_succeeds_without_bash_rewrite() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn run_sh_c_echo_does_not_warn_var_select() {
+    let dir = TempDir::new().expect("workspace");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .arg("run")
+        .arg("--root")
+        .arg(dir.path())
+        .args(["--", "/bin/sh", "-c", "echo ok"])
+        .output()
+        .expect("spawn workpen");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr={err}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+    assert!(
+        !err.contains("var/select"),
+        "sh -c must not warn on /var/select: {err}"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn run_echo_succeeds_under_child_jail() {
