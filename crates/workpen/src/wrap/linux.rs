@@ -2,7 +2,8 @@
 //!
 //! Landlock cannot dest-deny a file inside an allowed tree. This backend
 //! bind-overs existing dest-deny paths (and hardlink names collected by
-//! the list API). If unshare is denied, remount is skipped. Hide or
+//! the list API). If unshare is denied, remount is skipped unless the
+//! parent probe already returned Applied (`require_remount`). Hide or
 //! bind-over errors after a successful unshare fail closed.
 
 use std::io;
@@ -75,7 +76,11 @@ fn probe_private_mount_ns() -> bool {
     waited == pid && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
 }
 
-pub(super) fn apply_dest_deny_remounts(paths: &[PathBuf], workspace: &Path) -> io::Result<()> {
+pub(super) fn apply_dest_deny_remounts(
+    paths: &[PathBuf],
+    workspace: &Path,
+    require_remount: bool,
+) -> io::Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -88,7 +93,14 @@ pub(super) fn apply_dest_deny_remounts(paths: &[PathBuf], workspace: &Path) -> i
     let root = unique_hide_root()?;
     let hide_file = hide_node(&root, false)?;
     let hide_dir = hide_node(&root, true)?;
-    remount_all(paths, &expanded, workspace, &hide_file, &hide_dir)
+    remount_all(
+        paths,
+        &expanded,
+        workspace,
+        &hide_file,
+        &hide_dir,
+        require_remount,
+    )
 }
 
 fn remount_all(
@@ -97,8 +109,14 @@ fn remount_all(
     workspace: &Path,
     hide_file: &Path,
     hide_dir: &Path,
+    require_remount: bool,
 ) -> io::Result<()> {
     if !enter_private_mount_ns()? {
+        if require_remount {
+            return Err(io::Error::other(
+                "dest-deny remount unavailable; child was not started",
+            ));
+        }
         if original.iter().any(|p| !p.starts_with(workspace)) {
             return Err(io::Error::other(
                 "extra-root dest-deny remount unavailable; child was not started",
@@ -384,8 +402,24 @@ mod tests {
     fn unshare_denied_skips_remount() {
         let _guard = Override::enter(false);
         let dest = PathBuf::from("/tmp/workpen-dest-deny-unshare-skip.env");
-        apply_dest_deny_remounts(&[dest], Path::new("/tmp"))
+        apply_dest_deny_remounts(&[dest], Path::new("/tmp"), false)
             .expect("unshare denied must stay Ok (issue #92 remount skip)");
+    }
+
+    #[test]
+    fn require_remount_errors_when_enter_denied_even_for_workspace() {
+        let _guard = Override::enter(false);
+        let dest = PathBuf::from("/tmp/workpen-dest-deny-require.env");
+        apply_dest_deny_remounts(&[dest], Path::new("/tmp"), true)
+            .expect_err("parent Applied must fail closed when child cannot enter");
+    }
+
+    #[test]
+    fn require_remount_false_skips_workspace_only_dests() {
+        let _guard = Override::enter(false);
+        let dest = PathBuf::from("/tmp/workpen-dest-deny-skip.env");
+        apply_dest_deny_remounts(&[dest], Path::new("/tmp"), false)
+            .expect("RemountSkipped keeps workspace skip");
     }
 
     #[test]
@@ -414,7 +448,7 @@ mod tests {
     fn hide_failure_is_error() {
         let _guard = Override::hide_fail();
         let dest = PathBuf::from("/tmp/workpen-dest-deny-hide-fail.env");
-        let err = apply_dest_deny_remounts(&[dest], Path::new("/tmp"))
+        let err = apply_dest_deny_remounts(&[dest], Path::new("/tmp"), true)
             .expect_err("hide_node EACCES must propagate");
         assert_eq!(err.raw_os_error(), Some(libc::EACCES));
     }
@@ -423,7 +457,7 @@ mod tests {
     fn bind_failure_after_enter_is_error() {
         let _guard = Override::bind_fail_after_enter();
         let dest = PathBuf::from("/tmp/workpen-dest-deny-bind-fail.env");
-        let err = apply_dest_deny_remounts(&[dest], Path::new("/tmp"))
+        let err = apply_dest_deny_remounts(&[dest], Path::new("/tmp"), true)
             .expect_err("bind_over EPERM after enter must propagate");
         assert_eq!(err.raw_os_error(), Some(libc::EPERM));
     }
@@ -432,7 +466,7 @@ mod tests {
     fn unshare_denied_extra_root_dest_is_error() {
         let _guard = Override::enter(false);
         let dest = PathBuf::from("/tmp/workpen-dest-deny-extra.env");
-        apply_dest_deny_remounts(&[dest], Path::new("/workspace"))
+        apply_dest_deny_remounts(&[dest], Path::new("/workspace"), false)
             .expect_err("extra-root dest-deny without remount must fail closed");
     }
 

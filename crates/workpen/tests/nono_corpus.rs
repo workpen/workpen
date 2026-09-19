@@ -578,6 +578,91 @@ fn dest_deny_walk_skips_directory_symlink() {
 }
 
 #[test]
+fn collect_workspace_dest_denies_includes_empty_ssh_directory() {
+    let dir = workspace();
+    let ssh = dir.path().join(".ssh");
+    fs::create_dir_all(&ssh).expect(".ssh");
+    let found = collect_workspace_dest_denies(dir.path(), &DenyPolicy::default()).expect("collect");
+    assert!(
+        found
+            .iter()
+            .any(|d| d.path == ssh && d.kind == DestDenyKind::DenyGlob),
+        "empty .ssh directory must be on dest_denies: {found:?}"
+    );
+    let jail = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("jail");
+    assert!(
+        jail.dest_denies().iter().any(|d| d.path == ssh),
+        "process_jail dest_denies must include .ssh: {:?}",
+        jail.dest_denies()
+    );
+}
+
+#[test]
+fn collect_workspace_dest_denies_includes_ssh_dir_and_nested_file() {
+    let dir = workspace();
+    let ssh = dir.path().join(".ssh");
+    fs::create_dir_all(&ssh).expect(".ssh");
+    let key = ssh.join("id_ed25519");
+    fs::write(&key, "SECRET=1\n").expect("key");
+    let found = collect_workspace_dest_denies(dir.path(), &DenyPolicy::default()).expect("collect");
+    assert!(
+        found
+            .iter()
+            .any(|d| d.path == ssh && d.kind == DestDenyKind::DenyGlob),
+        ".ssh directory must dest-deny: {found:?}"
+    );
+    assert!(
+        found.iter().any(|d| d.path == key),
+        "nested .ssh file must still dest-deny: {found:?}"
+    );
+    let jail = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("jail");
+    assert!(
+        jail.dest_denies().iter().any(|d| d.path == ssh),
+        "process_jail dest_denies must include .ssh: {:?}",
+        jail.dest_denies()
+    );
+    assert!(
+        jail.dest_denies().iter().any(|d| d.path == key),
+        "process_jail dest_denies must keep nested .ssh file: {:?}",
+        jail.dest_denies()
+    );
+}
+
+#[test]
+fn collect_workspace_dest_denies_includes_cache_ssh_directory() {
+    let dir = workspace();
+    let ssh = dir.path().join("target").join(".ssh");
+    fs::create_dir_all(&ssh).expect("target/.ssh");
+    let key = ssh.join("id_ed25519");
+    fs::write(&key, "SECRET=1\n").expect("key");
+    let found = collect_workspace_dest_denies(dir.path(), &DenyPolicy::default()).expect("collect");
+    assert!(
+        found
+            .iter()
+            .any(|d| d.path == ssh && d.kind == DestDenyKind::DenyGlob),
+        "cache-tree .ssh directory must dest-deny: {found:?}"
+    );
+    assert!(
+        found.iter().any(|d| d.path == key),
+        "nested cache .ssh file must still dest-deny: {found:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dest_deny_walk_does_not_follow_ssh_directory_symlink() {
+    let dir = workspace();
+    let outside = TempDir::new().expect("outside");
+    fs::write(outside.path().join("id_ed25519"), "SECRET=1\n").expect("outside key");
+    std::os::unix::fs::symlink(outside.path(), dir.path().join(".ssh")).expect("symlink");
+    let found = collect_workspace_dest_denies(dir.path(), &DenyPolicy::default()).expect("walk");
+    assert!(
+        found.iter().all(|d| !d.path.starts_with(outside.path())),
+        "must not follow .ssh dir symlink: {found:?}"
+    );
+}
+
+#[test]
 fn workspace_is_readwrite() {
     let dir = workspace();
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");

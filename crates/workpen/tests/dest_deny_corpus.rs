@@ -1166,6 +1166,44 @@ fn validate_deny_glob_rejects_brace_backslash_empty_segment() {
 }
 
 #[test]
+fn dest_deny_glob_regex_interior_double_star_matches_nested_and_zero_segments() {
+    let glob = "src/**/*.pem";
+    assert!(
+        path_matches_deny_glob(glob, "src/x.pem"),
+        "interior ** matches zero extra segments"
+    );
+    assert!(
+        path_matches_deny_glob(glob, "src/a/b.pem"),
+        "interior ** matches one extra segment"
+    );
+    assert!(
+        path_matches_deny_glob(glob, "src/a/b/c.pem"),
+        "interior ** matches nested segments"
+    );
+    assert!(
+        !path_matches_deny_glob(glob, "lib/x.pem"),
+        "interior ** stays under src/"
+    );
+    let re = dest_deny_glob_regex("/ws", glob).expect("src/**/*.pem must compile");
+    assert!(
+        regex_full_match(&re, "/ws/src/x.pem"),
+        "Seatbelt regex must match src/x.pem: {re}"
+    );
+    assert!(
+        regex_full_match(&re, "/ws/src/a/b.pem"),
+        "Seatbelt regex must match src/a/b.pem: {re}"
+    );
+    assert!(
+        regex_full_match(&re, "/ws/src/a/b/c.pem"),
+        "Seatbelt regex must match src/a/b/c.pem: {re}"
+    );
+    assert!(
+        !regex_full_match(&re, "/ws/lib/x.pem"),
+        "Seatbelt regex must not match lib/x.pem: {re}"
+    );
+}
+
+#[test]
 fn dest_deny_glob_regex_agrees_with_path_matches_on_default_corpus() {
     let prefix = "/ws";
     let corpus = [

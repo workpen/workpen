@@ -1244,8 +1244,9 @@ pub fn validate_deny_glob(glob: &str) -> Result<(), &'static str> {
 
 /// Seatbelt regex for one dest-deny glob under an RW prefix.
 ///
-/// `**/.env` matches `prefix/.env` and `prefix/sub/.env`. Used by macOS
-/// wrap and by the dialect table test on every OS.
+/// `**/.env` matches `prefix/.env` and `prefix/sub/.env`. Interior `**`
+/// is recursive (`src/**/*.pem` matches `src/x.pem` and `src/a/b.pem`).
+/// Used by macOS wrap and by the dialect table test on every OS.
 pub fn dest_deny_glob_regex(prefix: &str, glob: &str) -> Option<String> {
     validate_deny_glob(glob).ok()?;
     let mut glob = glob.trim();
@@ -1268,6 +1269,14 @@ pub fn dest_deny_glob_regex(prefix: &str, glob: &str) -> Option<String> {
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '*' {
+            if i + 1 < chars.len() && chars[i + 1] == '*' {
+                body.push_str("(.*/)?");
+                i += 2;
+                if i < chars.len() && chars[i] == '/' {
+                    i += 1;
+                }
+                continue;
+            }
             body.push_str("[^/]*");
             i += 1;
             continue;
