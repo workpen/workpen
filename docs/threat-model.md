@@ -31,7 +31,7 @@ The parent is trusted. The child is not.
 - `apply_pre_exec` skipped argv dest-deny. It dest-denies the same way
   `run_child` does. Hosts that spawn themselves can also call
   `dest_deny_command`.
-- Generic `--flag=.env` is ignored. Attached `--flag=.env` is dest-denied.
+- Attached `--flag=.env` and GNU glued shorts (`-a.env`) are dest-denied.
 - Wrapper skip is only `timeout` / `nohup` / `nice`. `time` and
   `stdbuf` are wrappers too.
 - Extra-root `/tmp` is one dest-deny name level. A hardlink under a

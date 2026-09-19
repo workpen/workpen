@@ -1126,6 +1126,41 @@ fn check_command_argv_denies_generic_attached_flag_dests() {
 }
 
 #[test]
+fn check_command_argv_denies_gnu_glued_short_dests() {
+    let ws = tempfile::tempdir().expect("workspace");
+    std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("write readme");
+    let policy = DenyPolicy::default();
+    let err = check_command_argv(&["xargs", "-a.env", "echo"], ws.path(), &policy)
+        .expect_err("xargs -a.env echo must dest-deny");
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(d.kind, DestDenyKind::DenyGlob);
+            assert_eq!(d.matched.as_deref(), Some("**/.env"));
+        }
+        other => panic!("expected DenyGlob **/.env, got {other:?}"),
+    }
+    check_command_argv(&["sudo", "-D.env", "true"], ws.path(), &policy)
+        .expect_err("sudo -D.env true must dest-deny");
+    check_command_argv(&["doas", "-C.env", "true"], ws.path(), &policy)
+        .expect_err("doas -C.env true must dest-deny");
+    check_command_argv(&["tool", "-a/.env", "true"], ws.path(), &policy)
+        .expect_err("glued short dest starting with / must dest-deny");
+    check_command_argv(&["tool", "-a~/.env", "true"], ws.path(), &policy)
+        .expect_err("glued short dest starting with ~ must dest-deny");
+    check_command_argv(&["xargs", "echo", "hi"], ws.path(), &policy)
+        .expect("xargs echo hi must be allowed");
+    check_command_argv(&["xargs", "-areadme.md", "echo"], ws.path(), &policy)
+        .expect("xargs -areadme.md echo must be allowed");
+    check_command_argv(&["tool", "-color"], ws.path(), &policy)
+        .expect("-color without dest must be allowed");
+    check_command_argv(&["tool", "--flag"], ws.path(), &policy)
+        .expect("--flag without dest must be allowed");
+    check_command_argv(&["watch", "env", "-S", "cat readme.md"], ws.path(), &policy)
+        .expect("watch env -S cat readme.md must be allowed");
+}
+
+#[test]
 fn check_command_argv_denies_env_flags_after_time_stdbuf() {
     let ws = tempfile::tempdir().expect("workspace");
     std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
