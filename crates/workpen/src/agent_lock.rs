@@ -70,6 +70,13 @@ fn parse_agent_lock(path: &Path, raw: &str) -> Result<Vec<String>, AgentLockErro
                 reason: "expected one dest-deny glob per line".into(),
             });
         }
+        if let Err(reason) = crate::deny::validate_deny_glob(trimmed) {
+            return Err(AgentLockError::Invalid {
+                path: path.to_path_buf(),
+                line: line_no,
+                reason: reason.into(),
+            });
+        }
         if !globs.iter().any(|g| g == trimmed) {
             globs.push(trimmed.to_string());
         }
@@ -99,6 +106,21 @@ mod tests {
         .expect("write");
         let got = load_agent_lock(dir.path()).expect("parse");
         assert_eq!(got, ["**/*.secret", "**/token.local"]);
+    }
+
+    #[test]
+    fn invalid_brace_glob_is_error() {
+        let dir = TempDir::new().expect("tmp");
+        std::fs::write(dir.path().join(AGENT_LOCK_NAME), "**/{.env,.secret}\n").expect("write");
+        match load_agent_lock(dir.path()) {
+            Err(AgentLockError::Invalid { reason, .. }) => {
+                assert!(
+                    reason.contains("brace"),
+                    "brace glob must name brace: {reason}"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]

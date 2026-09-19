@@ -57,15 +57,31 @@ pub struct KernelPolicy {
     network_blocked: bool,
 }
 
-/// Result of applying the jail. Hosts branch on this.
+/// Result of applying the jail. Hosts match the variant, not English.
+///
+/// New variants are breaking for exhaustive hosts even in 0.x. See
+/// [`crate::threat_model`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelApply {
     /// Kernel jail is active in this process, or hooked/spawned for the child.
+    /// Linux remount ran when dest-deny paths existed. Windows WFP ran
+    /// when [`KernelPolicy::network_blocked`] and the token could add
+    /// filters.
     Applied,
+    /// Landlock/Seatbelt applied. Dest-deny remount was skipped
+    /// (unshare / maps / `MS_PRIVATE` denied). In-tree dest-deny is
+    /// userspace argv only. Extra-root dests still fail-closed.
+    RemountSkipped,
+    /// Write-restricted token and AppContainer applied. WFP filters
+    /// were skipped (`ERROR_ACCESS_DENIED`, win32 5). AppContainer
+    /// network deny is still on.
+    WfpSkipped,
     /// Platform has no kernel backend. Userspace dest-deny + PathGuard only.
     UserspaceOnly,
 }
 
+/// Hosts match the variant, not English. New variants are breaking
+/// for exhaustive hosts even in 0.x.
 #[derive(Debug, thiserror::Error)]
 pub enum KernelError {
     #[error("kernel wrap root is not usable: {0}")]
@@ -282,13 +298,19 @@ impl KernelPolicy {
 
     /// Install Landlock/Seatbelt in the child `pre_exec` hook.
     ///
-    /// Builds the capability set in the parent (allocation is not safe after
-    /// fork). Uses `SignalMode::Isolated` so the child cannot signal the parent.
+    /// Dest-denies `cmd` argv first ([`Self::dest_deny_command`]), same
+    /// rules as [`Self::run_child`]. Builds the capability set in the
+    /// parent (allocation is not safe after fork). Uses
+    /// `SignalMode::Isolated` so the child cannot signal the parent.
     /// Does not jail this process. Windows has no `pre_exec`; this stays
     /// [`KernelApply::UserspaceOnly`]. Use [`Self::run_child`] to jail a child.
+    ///
+    /// On Linux, dest-deny remount skip is [`KernelApply::RemountSkipped`]
+    /// when dest-deny paths exist and a private mount ns cannot be
+    /// entered. Extra-root dests still fail-closed.
     pub fn apply_pre_exec(&self, cmd: &mut Command) -> Result<KernelApply, KernelError> {
+        self.dest_deny_command(cmd)?;
         if !kernel_supported() {
-            let _ = cmd;
             return Ok(KernelApply::UserspaceOnly);
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -301,6 +323,10 @@ impl KernelPolicy {
                 .find(|g| g.access == KernelAccess::ReadWrite)
                 .map(|g| g.path.clone())
                 .unwrap_or_default();
+            #[cfg(target_os = "linux")]
+            let remount = linux::remount_status(&dests, &workspace)?;
+            #[cfg(not(target_os = "linux"))]
+            let remount = KernelApply::Applied;
             // Safety: the set and dest list are built in the parent; the hook
             // only applies them and maps failure to io::Error.
             unsafe {
@@ -310,16 +336,16 @@ impl KernelPolicy {
                     linux::apply_dest_deny_remounts(&dests, &workspace)?;
                     #[cfg(not(target_os = "linux"))]
                     let _ = (&dests, &workspace);
+                    apply_child_hardening()?;
                     nono::Sandbox::apply_auto(&caps)
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
                     Ok(())
                 });
             }
-            Ok(KernelApply::Applied)
+            Ok(remount)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            let _ = cmd;
             Ok(KernelApply::UserspaceOnly)
         }
     }
@@ -344,11 +370,12 @@ impl KernelPolicy {
     ///
     /// Windows spawn inherits parent stdio or grants NUL so console
     /// children do not block on null handles. [`Command`]
-    /// [`std::process::Stdio::piped`] is still not plumbed (file
-    /// redirect or parent pipes only).
+    /// [`std::process::Stdio::piped`] is not readable after this wait.
+    /// Hosts that need captured stdout call [`Self::run_child_output`].
     ///
     /// Blocking wait has no host-visible kill; use
-    /// [`Self::run_child_timeout`].
+    /// [`Self::run_child_timeout`]. Hosts that need captured stdout use
+    /// [`Self::run_child_output`].
     pub fn run_child(&self, cmd: Command) -> Result<(KernelApply, ExitStatus), KernelError> {
         self.dest_deny_command(&cmd)?;
         #[cfg(unix)]
@@ -378,6 +405,115 @@ impl KernelPolicy {
         #[cfg(not(any(unix, windows)))]
         {
             let _ = cmd;
+            Err(KernelError::Apply(
+                "no kernel backend on this platform".into(),
+            ))
+        }
+    }
+
+    /// Spawn `cmd` under the kernel jail and collect stdout/stderr.
+    ///
+    /// Same dest-deny and fail-closed setup as [`Self::run_child`].
+    /// Windows creates anonymous pipes. Unix uses [`Command::output`].
+    pub fn run_child_output(
+        &self,
+        cmd: Command,
+    ) -> Result<(KernelApply, std::process::Output), KernelError> {
+        self.dest_deny_command(&cmd)?;
+        #[cfg(unix)]
+        {
+            if !kernel_supported() {
+                return Err(KernelError::Apply(
+                    "kernel jail is not available; child was not started".into(),
+                ));
+            }
+            let mut cmd = cmd;
+            scrub_child_command(&mut cmd);
+            let applied = require_applied(self.apply_pre_exec(&mut cmd)?)?;
+            let output = cmd
+                .output()
+                .map_err(|e| KernelError::Apply(e.to_string()))?;
+            Ok((applied, output))
+        }
+        #[cfg(windows)]
+        {
+            if !kernel_supported() {
+                return Err(KernelError::Apply(
+                    "write-restricted token is not available".into(),
+                ));
+            }
+            windows::spawn_write_restricted_output(self, &cmd, None)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = cmd;
+            Err(KernelError::Apply(
+                "no kernel backend on this platform".into(),
+            ))
+        }
+    }
+
+    /// Same as [`Self::run_child_output`] with a deadline.
+    pub fn run_child_timeout_output(
+        &self,
+        cmd: Command,
+        timeout: Duration,
+    ) -> Result<(KernelApply, std::process::Output), KernelError> {
+        self.dest_deny_command(&cmd)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            use std::time::Instant;
+
+            if !kernel_supported() {
+                return Err(KernelError::Apply(
+                    "kernel jail is not available; child was not started".into(),
+                ));
+            }
+            let mut cmd = cmd;
+            scrub_child_command(&mut cmd);
+            let applied = require_applied(self.apply_pre_exec(&mut cmd)?)?;
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd.process_group(0);
+            let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            let deadline = Instant::now() + timeout;
+            loop {
+                match child
+                    .try_wait()
+                    .map_err(|e| KernelError::Apply(e.to_string()))?
+                {
+                    Some(_status) => {
+                        let output = child
+                            .wait_with_output()
+                            .map_err(|e| KernelError::Apply(e.to_string()))?;
+                        return Ok((applied, output));
+                    }
+                    None if Instant::now() >= deadline => {
+                        let pid = child.id() as libc::pid_t;
+                        // SAFETY: pid is the child's process group (process_group(0)).
+                        unsafe {
+                            libc::killpg(pid, libc::SIGKILL);
+                        }
+                        let _ = child.wait();
+                        return Err(KernelError::Timeout);
+                    }
+                    None => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            if !kernel_supported() {
+                return Err(KernelError::Apply(
+                    "write-restricted token is not available".into(),
+                ));
+            }
+            windows::spawn_write_restricted_output(self, &cmd, Some(timeout))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (cmd, timeout);
             Err(KernelError::Apply(
                 "no kernel backend on this platform".into(),
             ))
@@ -478,7 +614,12 @@ impl KernelPolicy {
     }
 
     /// Dest-deny `cmd` argv with the jail [`DenyPolicy`] before spawn.
-    fn dest_deny_command(&self, cmd: &Command) -> Result<(), KernelError> {
+    ///
+    /// Same rules as [`crate::check_command_argv`] on program plus args.
+    /// Hosts that cannot use [`Self::run_child`] call this, then
+    /// [`Self::apply_pre_exec`] (which also calls it) or their own spawn.
+    /// Hosts match [`KernelError::DestDeny`], not English.
+    pub fn dest_deny_command(&self, cmd: &Command) -> Result<(), KernelError> {
         let workspace = self
             .grants
             .iter()
@@ -525,6 +666,9 @@ pub fn child_env_deny_names() -> &'static [&'static str] {
         "OPENAI_API_KEY",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_ACCESS_KEY_ID",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
     ]
 }
 
@@ -552,11 +696,11 @@ pub fn scrub_child_command(cmd: &mut Command) {
 /// that is bash. Walks clustered shorts (`-iC /tmp`) and value flags
 /// (`-u NAME`, `-f FILE`, `--file FILE`). Attached forms stay one token.
 ///
-/// When argv0 is `timeout`/`nohup`/`nice` (or `.exe`), skip wrapper flags
-/// plus the timeout duration or `nice -n N`. If the remaining argv starts
-/// with env, drop denylist assignments on that env argv, then insert after
-/// the first bash operand (wrapper bash or env bash). Non-bash commands
-/// (`timeout 30 echo hi`) stay unchanged.
+/// When argv0 is `timeout`/`nohup`/`nice`/`time`/`stdbuf` (or `.exe`),
+/// skip wrapper flags plus the timeout duration or `nice -n N`. If the
+/// remaining argv starts with env, drop denylist assignments on that env
+/// argv, then insert after the first bash operand (wrapper bash or env
+/// bash). Non-bash commands (`timeout 30 echo hi`) stay unchanged.
 #[must_use]
 pub fn with_bash_noprofile(
     program: impl AsRef<OsStr>,
@@ -787,9 +931,13 @@ pub fn spawn_after_setup<T>(
 }
 
 /// Refuse a userspace-only inspect result on the spawn path.
+///
+/// [`KernelApply::RemountSkipped`] and [`KernelApply::WfpSkipped`] still
+/// start the child. Hosts that require remount or WFP match those
+/// variants themselves.
 pub fn require_applied(applied: KernelApply) -> Result<KernelApply, KernelError> {
     match applied {
-        KernelApply::Applied => Ok(applied),
+        KernelApply::Applied | KernelApply::RemountSkipped | KernelApply::WfpSkipped => Ok(applied),
         KernelApply::UserspaceOnly => Err(KernelError::Apply(
             "kernel jail did not apply; child was not started".into(),
         )),
@@ -895,8 +1043,10 @@ fn is_system_read_extra(path: &Path) -> bool {
         .any(|d| path == d || path.starts_with(d))
 }
 
-/// One-level dest-deny scan of `/tmp` (and host temp). Do not recurse
-/// the whole tree. Recurse only dest-deny directory names.
+/// Dest-deny scan of `/tmp` (and host temp). Immediate dest-deny names
+/// plus dest-deny directory names. Ordinary subdirectories are walked
+/// for dest-deny names only (same as cache walk). Do not follow
+/// directory symlinks. Do not walk every file under `/tmp`.
 fn collect_system_temp_dest_denies(
     extra: &Path,
     policy: &DenyPolicy,
@@ -914,7 +1064,11 @@ fn collect_system_temp_dest_denies(
         }
         let ft = ent.file_type().map_err(|e| dest_deny_walk_io(&path, e))?;
         if ft.is_dir() && !ft.is_symlink() && is_dest_deny_dir_name(name) {
-            walk_cache_dest_denies(&path, policy, out, remaining, limit)?;
+            walk_temp_dest_denies(&path, policy, out, remaining, limit)?;
+            continue;
+        }
+        if ft.is_dir() && !ft.is_symlink() {
+            collect_temp_dir_dest_names(&path, policy, out, remaining, limit)?;
             continue;
         }
         if let Some(deny) = dest_deny_at(&path, path.display().to_string(), policy) {
@@ -949,6 +1103,94 @@ fn is_system_temp_root(path: &Path) -> bool {
         || parent == Path::new("\\")
         || parent.ends_with("private")
         || parent.ends_with("var")
+}
+
+/// One extra level under an ordinary `/tmp` subdirectory. Catches
+/// `/tmp/proj/.env` without walking `/tmp/proj/node_modules`. Dest-deny
+/// directory names still recurse. Skip unreadable entries.
+fn collect_temp_dir_dest_names(
+    dir: &Path,
+    policy: &DenyPolicy,
+    out: &mut Vec<DestDeny>,
+    remaining: &mut usize,
+    limit: usize,
+) -> Result<(), KernelError> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(()),
+    };
+    for ent in rd {
+        let ent = match ent {
+            Ok(ent) => ent,
+            Err(_) => continue,
+        };
+        let path = ent.path();
+        let name = entry_file_name(&path);
+        if is_git_dir_name(name) {
+            continue;
+        }
+        let ft = match ent.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if ft.is_dir() && !ft.is_symlink() && is_dest_deny_dir_name(name) {
+            walk_temp_dest_denies(&path, policy, out, remaining, limit)?;
+            continue;
+        }
+        if ft.is_dir() {
+            continue;
+        }
+        if let Some(deny) = dest_deny_at(&path, path.display().to_string(), policy) {
+            if *remaining == 0 {
+                return Err(dest_deny_walk_cap(dir, limit));
+            }
+            *remaining -= 1;
+            push_dest_deny(out, deny);
+        }
+    }
+    Ok(())
+}
+
+/// Like [`walk_cache_dest_denies`], but skip unreadable dirs. `/tmp`
+/// has other-user 0700 trees; those are not a dest-deny walk failure.
+fn walk_temp_dest_denies(
+    dir: &Path,
+    policy: &DenyPolicy,
+    out: &mut Vec<DestDeny>,
+    remaining: &mut usize,
+    limit: usize,
+) -> Result<(), KernelError> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(()),
+    };
+    for ent in rd {
+        let ent = match ent {
+            Ok(ent) => ent,
+            Err(_) => continue,
+        };
+        let path = ent.path();
+        let name = entry_file_name(&path);
+        if is_git_dir_name(name) {
+            continue;
+        }
+        let ft = match ent.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if ft.is_dir() && !ft.is_symlink() {
+            walk_temp_dest_denies(&path, policy, out, remaining, limit)?;
+            continue;
+        }
+        if let Some(deny) = dest_deny_at(&path, path.display().to_string(), policy) {
+            if *remaining == 0 {
+                return Err(dest_deny_walk_cap(dir, limit));
+            }
+            *remaining -= 1;
+            push_dest_deny(out, deny);
+        }
+    }
+    Ok(())
 }
 
 /// Walk a cache tree for dest-deny hits only. Non-deny files are not
@@ -1027,7 +1269,7 @@ fn add_macos_dest_deny_rules(
             } else {
                 format!("literal \"{escaped}\"")
             };
-            for action in ["file-read*", "file-write*"] {
+            for action in macos_dest_deny_actions() {
                 let rule = format!("(deny {action} ({filter}))");
                 caps.add_platform_rule(&rule)
                     .map_err(|e| KernelError::Apply(e.to_string()))?;
@@ -1063,13 +1305,13 @@ fn add_macos_post_create_rules(
             format!("^{prefix}/.*/[.]env[.].*$"),
         ];
         for glob in globs {
-            if let Some(re) = dest_deny_glob_regex(&prefix, glob) {
+            if let Some(re) = crate::dest_deny_glob_regex(&prefix, glob) {
                 regexes.push(re);
             }
         }
         for regex in regexes {
             let regex = escape_sbpl_literal(&regex);
-            for action in ["file-read*", "file-write*"] {
+            for action in macos_dest_deny_actions() {
                 let rule = format!("(deny {action} (regex \"{regex}\"))");
                 caps.add_platform_rule(&rule)
                     .map_err(|e| KernelError::Apply(e.to_string()))?;
@@ -1079,7 +1321,9 @@ fn add_macos_post_create_rules(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+/// As-given path, canonicalize, and `/private` firmlink aliases.
+/// Used for Seatbelt literals and Linux remount dests under `/tmp` /
+/// `/var` / `/etc`.
 fn dest_deny_rule_paths(path: &Path) -> Vec<PathBuf> {
     let mut out = vec![path.to_path_buf()];
     if let Ok(canon) = dunce::canonicalize(path)
@@ -1087,7 +1331,82 @@ fn dest_deny_rule_paths(path: &Path) -> Vec<PathBuf> {
     {
         out.push(canon);
     }
+    let aliases: Vec<PathBuf> = out.iter().filter_map(|p| firmlink_alias(p)).collect();
+    for alias in aliases {
+        if !out.iter().any(|p| p == &alias) {
+            out.push(alias);
+        }
+    }
     out
+}
+
+/// `/tmp` ↔ `/private/tmp`, `/var` ↔ `/private/var`, `/etc` ↔ `/private/etc`.
+fn firmlink_alias(path: &Path) -> Option<PathBuf> {
+    let raw = path.to_str()?;
+    const PAIRS: [(&str, &str); 3] = [
+        ("/tmp", "/private/tmp"),
+        ("/var", "/private/var"),
+        ("/etc", "/private/etc"),
+    ];
+    for (public, private) in PAIRS {
+        if raw == public || raw.starts_with(&format!("{public}/")) {
+            return Some(PathBuf::from(format!(
+                "{private}{}",
+                raw.strip_prefix(public).unwrap_or("")
+            )));
+        }
+        if raw == private || raw.starts_with(&format!("{private}/")) {
+            return Some(PathBuf::from(format!(
+                "{public}{}",
+                raw.strip_prefix(private).unwrap_or("")
+            )));
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_dest_deny_actions() -> &'static [&'static str] {
+    &[
+        "file-read*",
+        "file-write*",
+        "file-write-data",
+        "file-write-create",
+        "file-write-unlink",
+        "file-write-mode",
+        "file-write-owner",
+    ]
+}
+
+/// Child-only hardening after remount/Landlock. Do not call on the parent.
+fn apply_child_hardening() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let zero = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: RLIMIT_CORE on this thread, which is the forked child.
+        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: PR_SET_DUMPABLE on this thread, the forked child.
+        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        const PT_DENY_ATTACH: libc::c_int = 31;
+        // SAFETY: ptrace PT_DENY_ATTACH on this process, the forked child.
+        if unsafe { libc::ptrace(PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1108,52 +1427,6 @@ fn escape_regex_literal(s: &str) -> String {
         out.push(c);
     }
     out
-}
-
-/// Seatbelt regex for one dest-deny glob under an RW prefix.
-#[cfg(target_os = "macos")]
-fn dest_deny_glob_regex(prefix: &str, glob: &str) -> Option<String> {
-    let mut glob = glob.trim();
-    if glob.is_empty() {
-        return None;
-    }
-    let nested = glob.starts_with("**/");
-    if nested {
-        glob = glob.strip_prefix("**/")?;
-    }
-    let trailing_dir = glob.ends_with("/**");
-    if trailing_dir {
-        glob = glob.strip_suffix("/**")?;
-    }
-    if glob.is_empty() {
-        return None;
-    }
-    let mut body = String::new();
-    let chars: Vec<char> = glob.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '*' {
-            body.push_str("[^/]*");
-            i += 1;
-            continue;
-        }
-        if matches!(
-            chars[i],
-            '\\' | '.' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$'
-        ) {
-            body.push('\\');
-        }
-        body.push(chars[i]);
-        i += 1;
-    }
-    if trailing_dir {
-        body.push_str("(/.*)?");
-    }
-    if nested {
-        Some(format!("^{prefix}/(.*/)?{body}$"))
-    } else {
-        Some(format!("^{prefix}/{body}$"))
-    }
 }
 
 fn refuse_home_workspace(workspace: &Path) -> Result<(), KernelError> {
@@ -1295,8 +1568,9 @@ fn is_fs_root(path: &Path) -> bool {
 mod combine_spawn_restore_tests {
     use super::{
         KernelApply, KernelError, WFP_ERROR_ACCESS_DENIED, combine_spawn_restore,
-        wfp_skip_access_denied,
+        dest_deny_rule_paths, process_jail, require_applied, wfp_skip_access_denied,
     };
+    use std::path::Path;
     use std::process::ExitStatus;
 
     fn status(code: i32) -> ExitStatus {
@@ -1374,5 +1648,69 @@ mod combine_spawn_restore_tests {
         assert!(!wfp_skip_access_denied(0));
         assert!(!wfp_skip_access_denied(2));
         assert!(!wfp_skip_access_denied(87));
+    }
+
+    #[test]
+    fn dest_deny_rule_paths_emits_firmlink_aliases() {
+        let got = dest_deny_rule_paths(Path::new("/tmp/.env"));
+        assert!(
+            got.iter().any(|p| p == Path::new("/tmp/.env")),
+            "as-given /tmp/.env must stay: {got:?}"
+        );
+        assert!(
+            got.iter().any(|p| p == Path::new("/private/tmp/.env")),
+            "/tmp/.env must also deny /private/tmp/.env: {got:?}"
+        );
+        let got = dest_deny_rule_paths(Path::new("/private/var/folders/x/.env"));
+        assert!(
+            got.iter().any(|p| p == Path::new("/var/folders/x/.env")),
+            "/private/var must also deny /var: {got:?}"
+        );
+        let got = dest_deny_rule_paths(Path::new("/etc/ssh/ssh_host_rsa_key"));
+        assert!(
+            got.iter()
+                .any(|p| p == Path::new("/private/etc/ssh/ssh_host_rsa_key")),
+            "/etc must also deny /private/etc: {got:?}"
+        );
+    }
+
+    #[test]
+    fn require_applied_accepts_remount_and_wfp_skip() {
+        assert_eq!(
+            require_applied(KernelApply::RemountSkipped).expect("remount skip"),
+            KernelApply::RemountSkipped
+        );
+        assert_eq!(
+            require_applied(KernelApply::WfpSkipped).expect("wfp skip"),
+            KernelApply::WfpSkipped
+        );
+    }
+
+    #[test]
+    fn extra_root_temp_collects_nested_dest_deny_names() {
+        let ws = tempfile::TempDir::new().expect("ws");
+        let extra = tempfile::TempDir::new().expect("extra");
+        let tmp = extra.path().join("private").join("tmp");
+        let proj = tmp.join("proj");
+        std::fs::create_dir_all(&proj).expect("proj");
+        std::fs::write(proj.join(".env"), "SECRET=1\n").expect(".env");
+        std::fs::write(tmp.join("readme.md"), "ok\n").expect("readme");
+        let policy = process_jail(ws.path(), [tmp.as_path()]).expect("jail");
+        assert!(
+            policy
+                .dest_denies()
+                .iter()
+                .any(|d| d.path.ends_with(Path::new("proj/.env"))
+                    || d.path.ends_with(Path::new("proj\\.env"))),
+            "nested extra-root /tmp dest-deny name must be collected: {:?}",
+            policy.dest_denies()
+        );
+        assert!(
+            !policy
+                .dest_denies()
+                .iter()
+                .any(|d| d.path.ends_with("readme.md")),
+            "non-deny extra-root file must not be collected"
+        );
     }
 }

@@ -212,7 +212,23 @@ unsafe extern "system" {
     ) -> Handle;
     fn GetModuleHandleW(lp_module_name: *const u16) -> Handle;
     fn GetProcAddress(h_module: Handle, lp_proc_name: *const u8) -> *mut core::ffi::c_void;
+    fn CreatePipe(
+        h_read_pipe: *mut Handle,
+        h_write_pipe: *mut Handle,
+        lp_pipe_attributes: *mut SecurityAttributes,
+        n_size: Dword,
+    ) -> Bool;
+    fn ReadFile(
+        h_file: Handle,
+        lp_buffer: *mut u8,
+        n_number_of_bytes_to_read: Dword,
+        lp_number_of_bytes_read: *mut Dword,
+        lp_overlapped: *mut core::ffi::c_void,
+    ) -> Bool;
+    fn SetHandleInformation(h_object: Handle, dw_mask: Dword, dw_flags: Dword) -> Bool;
 }
+
+const HANDLE_FLAG_INHERIT: Dword = 0x0000_0001;
 
 #[link(name = "advapi32")]
 unsafe extern "system" {
@@ -502,6 +518,7 @@ struct Prepared {
     _world: WorldSid,
     helper: Option<PathBuf>,
     _net: Option<NetGuards>,
+    wfp_skipped: bool,
 }
 
 struct NetGuards {
@@ -515,13 +532,39 @@ pub(super) fn spawn_write_restricted(
     cmd: &Command,
     timeout: Option<Duration>,
 ) -> Result<(KernelApply, ExitStatus), KernelError> {
+    spawn_write_restricted_io(policy, cmd, timeout, false)
+        .map(|(applied, status, _)| (applied, status))
+}
+
+pub(super) fn spawn_write_restricted_output(
+    policy: &KernelPolicy,
+    cmd: &Command,
+    timeout: Option<Duration>,
+) -> Result<(KernelApply, std::process::Output), KernelError> {
+    let (applied, status, output) = spawn_write_restricted_io(policy, cmd, timeout, true)?;
+    Ok((
+        applied,
+        output.unwrap_or_else(|| std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }),
+    ))
+}
+
+fn spawn_write_restricted_io(
+    policy: &KernelPolicy,
+    cmd: &Command,
+    timeout: Option<Duration>,
+    capture: bool,
+) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>), KernelError> {
     if policy.network_blocked() {
         return spawn_after_setup(prepare_network_blocked(policy), |prepared| {
-            spawn_prepared(prepared, cmd, timeout)
+            spawn_prepared(prepared, cmd, timeout, capture)
         });
     }
     spawn_after_setup(prepare_write_restricted(policy), |prepared| {
-        spawn_prepared(prepared, cmd, timeout)
+        spawn_prepared(prepared, cmd, timeout, capture)
     })
 }
 
@@ -546,6 +589,7 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
         _world: world,
         helper: None,
         _net: None,
+        wfp_skipped: false,
     })
 }
 
@@ -576,6 +620,7 @@ fn prepare_network_blocked(policy: &KernelPolicy) -> Result<Prepared, KernelErro
     )?);
     let wfp = windows_net::WfpSession::apply(profile.sid(), helper.path())
         .map_err(prefix_apply("WFP package filter"))?;
+    prepared.wfp_skipped = wfp.is_none();
     prepared.token = wrap_appcontainer_token(prepared.token, profile.sid())?;
     prepared.helper = Some(helper.path().to_path_buf());
     prepared._net = Some(NetGuards {
@@ -703,25 +748,51 @@ fn spawn_prepared(
     mut prepared: Prepared,
     cmd: &Command,
     timeout: Option<Duration>,
-) -> Result<(KernelApply, ExitStatus), KernelError> {
-    let result = spawn_prepared_child(&mut prepared, cmd, timeout);
+    capture: bool,
+) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>), KernelError> {
+    let result = spawn_prepared_child(&mut prepared, cmd, timeout, capture);
     let restore = restore_guards(&mut prepared.acl_guards);
-    super::combine_spawn_restore(result, restore)
+    match (result, restore) {
+        (Ok((applied, status, output)), Ok(())) => Ok((applied, status, output)),
+        (Err(KernelError::Timeout), Err(_)) => Err(KernelError::Timeout),
+        (Err(spawn), Err(restore_err)) => {
+            Err(KernelError::Apply(format!("{spawn}; {restore_err}")))
+        }
+        (Ok((_, status, _)), Err(restore_err)) => {
+            let code = status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into());
+            Err(KernelError::Restore(format!(
+                "child exited {code}; {restore_err}"
+            )))
+        }
+        (Err(spawn), Ok(())) => Err(spawn),
+    }
 }
 
 fn spawn_prepared_child(
     prepared: &mut Prepared,
     cmd: &Command,
     timeout: Option<Duration>,
-) -> Result<(KernelApply, ExitStatus), KernelError> {
+    capture: bool,
+) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>), KernelError> {
     let (app, mut cmdline, cwd) = match prepared.helper.as_deref() {
         Some(helper) => wrap_command_line(helper, cmd)?,
         None => command_line(cmd)?,
     };
     let mut env_block = environment_block(cmd);
     let std_in = inheritable_std_handle(STD_INPUT_HANDLE, false)?;
-    let std_out = inheritable_std_handle(STD_OUTPUT_HANDLE, true)?;
-    let std_err = inheritable_std_handle(STD_ERROR_HANDLE, true)?;
+    let (std_out, stdout_read) = if capture {
+        inheritable_pipe(true)?
+    } else {
+        (inheritable_std_handle(STD_OUTPUT_HANDLE, true)?, None)
+    };
+    let (std_err, stderr_read) = if capture {
+        inheritable_pipe(true)?
+    } else {
+        (inheritable_std_handle(STD_ERROR_HANDLE, true)?, None)
+    };
     let mut startup = StartupInfoW {
         cb: std::mem::size_of::<StartupInfoW>() as Dword,
         lp_reserved: ptr::null_mut(),
@@ -825,7 +896,79 @@ fn spawn_prepared_child(
     if got == 0 {
         return Err(last_error("GetExitCodeProcess"));
     }
-    Ok((KernelApply::Applied, ExitStatus::from_raw(code)))
+    let applied = if prepared.wfp_skipped {
+        KernelApply::WfpSkipped
+    } else {
+        KernelApply::Applied
+    };
+    let output = if capture {
+        Some(std::process::Output {
+            status: ExitStatus::from_raw(code),
+            stdout: stdout_read.map(read_all).unwrap_or_default(),
+            stderr: stderr_read.map(read_all).unwrap_or_default(),
+        })
+    } else {
+        drop((stdout_read, stderr_read));
+        None
+    };
+    Ok((applied, ExitStatus::from_raw(code), output))
+}
+
+fn inheritable_pipe(
+    write_for_child: bool,
+) -> Result<(CloseOnDrop, Option<CloseOnDrop>), KernelError> {
+    let mut sa = SecurityAttributes {
+        n_length: std::mem::size_of::<SecurityAttributes>() as Dword,
+        lp_security_descriptor: ptr::null_mut(),
+        b_inherit_handle: 1,
+    };
+    let mut read = ptr::null_mut();
+    let mut write = ptr::null_mut();
+    // SAFETY: sa lives for the call; out handles are written by CreatePipe.
+    let ok = unsafe { CreatePipe(&mut read, &mut write, &mut sa, 0) };
+    if ok == 0 {
+        return Err(last_error("CreatePipe"));
+    }
+    let read = CloseOnDrop(read);
+    let write = CloseOnDrop(write);
+    if write_for_child {
+        // Parent keeps the read end; do not inherit it into the child.
+        // SAFETY: read is a live pipe handle we own.
+        let cleared = unsafe { SetHandleInformation(read.0, HANDLE_FLAG_INHERIT, 0) };
+        if cleared == 0 {
+            return Err(last_error("SetHandleInformation"));
+        }
+        Ok((write, Some(read)))
+    } else {
+        let cleared = unsafe { SetHandleInformation(write.0, HANDLE_FLAG_INHERIT, 0) };
+        if cleared == 0 {
+            return Err(last_error("SetHandleInformation"));
+        }
+        Ok((read, Some(write)))
+    }
+}
+
+fn read_all(handle: CloseOnDrop) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let mut n: Dword = 0;
+        // SAFETY: handle is a readable pipe; buf is valid.
+        let ok = unsafe {
+            ReadFile(
+                handle.0,
+                buf.as_mut_ptr(),
+                buf.len() as Dword,
+                &mut n,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 || n == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..n as usize]);
+    }
+    out
 }
 
 fn dest_deny_paths(policy: &KernelPolicy) -> Vec<PathBuf> {
@@ -844,12 +987,35 @@ fn deny_dest_aces(paths: &[PathBuf], sid: Handle) -> Result<Vec<AclRestore>, Ker
         if !path.exists() {
             continue;
         }
-        guards.push(deny_dest_ace(path, sid)?);
+        match deny_dest_ace(path, sid) {
+            Ok(guard) => guards.push(guard),
+            Err(err) => {
+                let _ = restore_guards(&mut guards);
+                return Err(err);
+            }
+        }
     }
     Ok(guards)
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_ACE_FAIL_ON: std::cell::Cell<Option<PathBuf>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_ace_on(path: PathBuf) {
+    TEST_ACE_FAIL_ON.with(|c| c.set(Some(path)));
+}
+
 fn deny_dest_ace(path: &Path, sid: Handle) -> Result<AclRestore, KernelError> {
+    #[cfg(test)]
+    if TEST_ACE_FAIL_ON
+        .with(|c| c.take())
+        .is_some_and(|p| p == path)
+    {
+        return Err(KernelError::Apply("test dest-deny ACE fail".into()));
+    }
     let inherit = if path.is_dir() {
         SUB_CONTAINERS_AND_OBJECTS_INHERIT
     } else {
@@ -871,7 +1037,13 @@ fn rw_grant_paths(policy: &KernelPolicy) -> Vec<PathBuf> {
 fn grant_write_aces(paths: &[PathBuf], sid: Handle) -> Result<Vec<AclRestore>, KernelError> {
     let mut guards = Vec::with_capacity(paths.len());
     for path in paths {
-        guards.push(grant_write_ace(path, sid)?);
+        match grant_write_ace(path, sid) {
+            Ok(guard) => guards.push(guard),
+            Err(err) => {
+                let _ = restore_guards(&mut guards);
+                return Err(err);
+            }
+        }
     }
     Ok(guards)
 }
@@ -1190,4 +1362,36 @@ fn append_quoted(out: &mut Vec<u16>, arg: &OsStr) {
     }
     out.extend(std::iter::repeat_n(0x5c, slashes * 2));
     out.push(0x22);
+}
+
+#[cfg(test)]
+mod ace_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn deny_dest_aces_rolls_back_on_second_path_error() {
+        let dir = tempfile::TempDir::new().expect("ws");
+        let first = dir.path().join("a.env");
+        let second = dir.path().join("b.env");
+        std::fs::write(&first, "1").expect("first");
+        std::fs::write(&second, "2").expect("second");
+        let sid = RestrictedSid::new().expect("sid");
+        fail_next_ace_on(second.clone());
+        let err = deny_dest_aces(&[first.clone(), second], sid.0).expect_err("second ACE");
+        assert!(
+            matches!(err, KernelError::Apply(_)),
+            "mid-loop ACE fail is Apply: {err}"
+        );
+        let again = deny_dest_ace(&first, sid.0);
+        assert!(
+            again.is_ok(),
+            "first dest must not keep a leftover DENY ACE after rollback: {again:?}"
+        );
+        if let Ok(mut guard) = again {
+            let _ = guard.restore();
+        }
+        let _ = PathBuf::from("keep-sid-alive");
+        drop(sid);
+    }
 }

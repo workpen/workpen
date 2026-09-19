@@ -6,9 +6,10 @@ use std::path::Path;
 use workpen::{
     AGENT_LOCK_NAME, AgentLockError, CheckDestError, DenyPolicy, DestDeny, DestDenyError,
     DestDenyKind, PathGuard, check_command_argv, check_command_dests, check_dest, classify_dest,
-    default_secret_denies, deny_patch_dests, deny_patch_dests_with_display, dest_deny_message,
-    is_env_template_basename, is_path_denied, open_verified_read, path_is_denied_glob,
-    reject_command_secret_path_tokens, verify_post_open,
+    default_secret_denies, deny_patch_dests, deny_patch_dests_with_display, dest_deny_glob_regex,
+    dest_deny_message, is_env_template_basename, is_path_denied, open_verified_read,
+    path_is_denied_glob, path_matches_deny_glob, reject_command_secret_path_tokens,
+    validate_deny_glob, verify_post_open,
 };
 
 /// `matches deny glob **/.env` must not pass when wording only names `**/.env.*`.
@@ -546,15 +547,21 @@ fn check_command_argv_denies_env_split_string_and_file() {
     check_command_argv(&["env", "env", "-S", "cat readme.md"], ws.path(), &policy)
         .expect("nested env env -S cat readme.md must be allowed");
     check_command_argv(&["env", "echo", "--file=.env"], ws.path(), &policy)
-        .expect("env echo --file=.env must not dest-deny");
+        .expect_err("env echo --file=.env is a generic attached dest");
     check_command_argv(&["env", "-S", "cat readme.md"], ws.path(), &policy)
         .expect("env -S cat readme.md must be allowed");
     check_command_argv(&["env", "--file=readme.md", "bash"], ws.path(), &policy)
         .expect("env --file=readme.md must be allowed");
     check_command_argv(&["env", "-S", "--file=readme.md"], ws.path(), &policy)
         .expect("env -S --file=readme.md must be allowed");
-    check_command_argv(&["tool", "--file=.env", "bash"], ws.path(), &policy)
-        .expect("generic --file=.env must not dest-deny");
+    let err = check_command_argv(&["tool", "--file=.env", "bash"], ws.path(), &policy)
+        .expect_err("generic --file=.env must dest-deny");
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(d.kind, DestDenyKind::DenyGlob);
+        }
+        other => panic!("expected DestDeny DenyGlob for tool --file=.env, got {other:?}"),
+    }
     let leftover_denies: &[&[&str]] = &[
         &["env", "-S", "--file=.env"],
         &["env", "-S", "--file=.env", "bash"],
@@ -1075,16 +1082,164 @@ fn check_command_argv_denies_env_flags_inside_shell_c_body() {
         ws.path(),
         &policy,
     )
-    .expect("bash -lc generic --file=.env must not dest-deny");
+    .expect_err("bash -lc generic --file=.env must dest-deny");
     check_command_argv(&["bash", "-lc", "cat --file=.env"], ws.path(), &policy)
-        .expect("bash -lc cat --file=.env must not dest-deny");
+        .expect_err("bash -lc cat --file=.env must dest-deny");
     check_command_dests("env --file=readme.md true", ws.path(), &policy)
         .expect("env --file=readme.md true must be allowed");
     check_command_dests("echo hello", ws.path(), &policy).expect("echo hello must be allowed");
     check_command_dests("cat readme.md", ws.path(), &policy)
         .expect("cat readme.md must be allowed");
     check_command_dests("tool --file=.env true", ws.path(), &policy)
-        .expect("generic --file=.env must not dest-deny");
+        .expect_err("generic --file=.env must dest-deny");
+}
+
+#[test]
+fn check_command_argv_denies_generic_attached_flag_dests() {
+    let ws = tempfile::tempdir().expect("workspace");
+    std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("write readme");
+    let policy = DenyPolicy::default();
+    let err = check_command_argv(&["tool", "--config=.env"], ws.path(), &policy)
+        .expect_err("tool --config=.env must dest-deny");
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(d.kind, DestDenyKind::DenyGlob);
+            assert_eq!(d.matched.as_deref(), Some("**/.env"));
+        }
+        other => panic!("expected DenyGlob **/.env, got {other:?}"),
+    }
+    check_command_argv(&["tool", "--config=./.env"], ws.path(), &policy)
+        .expect_err("tool --config=./.env must dest-deny");
+    check_command_argv(&["tool", "--out=subdir/.env"], ws.path(), &policy)
+        .expect_err("tool --out=subdir/.env must dest-deny");
+    check_command_argv(&["env", "--file=.env"], ws.path(), &policy)
+        .expect_err("env --file=.env must still dest-deny");
+    check_command_argv(&["tool", "--color=always"], ws.path(), &policy)
+        .expect("tool --color=always must be allowed");
+    check_command_argv(&["tool", "--jobs=4"], ws.path(), &policy)
+        .expect("tool --jobs=4 must be allowed");
+    check_command_argv(&["tool", "--flag=.env.example"], ws.path(), &policy)
+        .expect("tool --flag=.env.example must be allowed");
+    check_command_argv(&["tool", "--config", ".env"], ws.path(), &policy)
+        .expect_err("separate .env token is already a raw dest");
+}
+
+#[test]
+fn check_command_argv_denies_env_flags_after_time_stdbuf() {
+    let ws = tempfile::tempdir().expect("workspace");
+    std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("write readme");
+    let policy = DenyPolicy::default();
+    let denies: &[&[&str]] = &[
+        &["time", "env", "-S", "cat .env"],
+        &["/usr/bin/time", "env", "--file=.env", "bash"],
+        &["time.exe", "env", "-S", "cat .env"],
+        &["stdbuf", "-o0", "env", "--file", ".env"],
+        &["stdbuf", "-o", "0", "env", "-S", "cat .env"],
+        &["/usr/bin/stdbuf", "--output=0", "env", "--file=.env"],
+        &["time", "timeout", "30", "env", "-S", "cat .env"],
+        &["stdbuf", "-o0", "time", "env", "--file=.env", "true"],
+    ];
+    for argv in denies {
+        check_command_argv(argv, ws.path(), &policy)
+            .expect_err(&format!("time/stdbuf then env {argv:?} must dest-deny"));
+    }
+    check_command_argv(&["time", "echo", "hi"], ws.path(), &policy)
+        .expect("time echo hi must be allowed");
+    check_command_argv(&["stdbuf", "-o0", "echo", "hi"], ws.path(), &policy)
+        .expect("stdbuf -o0 echo hi must be allowed");
+    check_command_argv(&["time", "env", "-S", "cat readme.md"], ws.path(), &policy)
+        .expect("time env -S cat readme.md must be allowed");
+}
+
+#[test]
+fn validate_deny_glob_rejects_brace_backslash_empty_segment() {
+    assert!(validate_deny_glob("**/.env").is_ok());
+    assert!(validate_deny_glob("**/.ssh/**").is_ok());
+    assert!(validate_deny_glob("{.env,.secret}").is_err());
+    assert!(validate_deny_glob("foo\\bar").is_err());
+    assert!(validate_deny_glob("foo//bar").is_err());
+    assert!(validate_deny_glob("foo/./bar").is_err());
+    assert!(validate_deny_glob("foo/../bar").is_err());
+    assert!(validate_deny_glob("").is_err());
+}
+
+#[test]
+fn dest_deny_glob_regex_agrees_with_path_matches_on_default_corpus() {
+    let prefix = "/ws";
+    let corpus = [
+        "/.env",
+        "sub/.env",
+        "sub/.env.local",
+        "readme.md",
+        ".environment",
+    ];
+    for glob in default_secret_denies() {
+        let Some(re) = dest_deny_glob_regex(prefix, &glob) else {
+            panic!("default glob {glob} must compile to a Seatbelt regex");
+        };
+        for rel in corpus {
+            let path = format!("/ws/{rel}").replace("//", "/");
+            let userspace = path_matches_deny_glob(&glob, rel)
+                || path_matches_deny_glob(&glob, path.trim_start_matches('/'));
+            let seatbelt = regex_full_match(&re, &path);
+            assert_eq!(
+                userspace, seatbelt,
+                "glob {glob} path {path} userspace={userspace} regex={re} seatbelt={seatbelt}"
+            );
+        }
+    }
+}
+
+/// Matcher for the dest-deny Seatbelt dialect (`^…$`, `(.*/)?`, `[^/]*`, `\x`).
+fn regex_full_match(re: &str, path: &str) -> bool {
+    let re = re
+        .strip_prefix('^')
+        .and_then(|s| s.strip_suffix('$'))
+        .unwrap_or(re);
+    match_seatbelt(re.as_bytes(), path.as_bytes())
+}
+
+fn match_seatbelt(pat: &[u8], text: &[u8]) -> bool {
+    if pat.starts_with(b"(.*/)?") {
+        let rest = &pat[b"(.*/)?".len()..];
+        if match_seatbelt(rest, text) {
+            return true;
+        }
+        for i in 0..=text.len() {
+            if text
+                .get(..i)
+                .is_some_and(|p| p.is_empty() || p.ends_with(b"/"))
+                && match_seatbelt(rest, &text[i..])
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+    if pat.starts_with(b"[^/]*") {
+        let rest = &pat[b"[^/]*".len()..];
+        let max = text.iter().position(|&c| c == b'/').unwrap_or(text.len());
+        for i in 0..=max {
+            if match_seatbelt(rest, &text[i..]) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if pat.starts_with(b"(/.*)?") {
+        let rest = &pat[b"(/.*)?".len()..];
+        return match_seatbelt(rest, text) || (text.starts_with(b"/") && match_seatbelt(rest, &[]));
+    }
+    match pat.split_first() {
+        None => text.is_empty(),
+        Some((&b'\\', rest)) => match rest.split_first() {
+            Some((esc, rest)) => text.first() == Some(esc) && match_seatbelt(rest, &text[1..]),
+            None => false,
+        },
+        Some((p, rest)) => text.first() == Some(p) && match_seatbelt(rest, &text[1..]),
+    }
 }
 
 #[test]
