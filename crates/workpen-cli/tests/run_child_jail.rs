@@ -397,6 +397,82 @@ fn run_timeout_streaming_stdout_is_captured() {
     );
 }
 
+/// 32MiB then sleep. Streaming copy must not keep a 32MiB Vec in the parent.
+/// Do not use unbounded `yes` (issue #161).
+#[cfg(unix)]
+#[test]
+fn run_timeout_stream_rss_stays_below_payload() {
+    if !python3_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let dest = dir.path().join("out.bin");
+    let file = std::fs::File::create(&dest).expect("out");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args([
+            "--timeout",
+            "3s",
+            "--",
+            "python3",
+            "-c",
+            "import sys,time; sys.stdout.buffer.write(b'x'*32*1024*1024); sys.stdout.buffer.flush(); time.sleep(30)",
+        ])
+        .stdout(file)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn workpen");
+    let pid = child.id();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sampler = {
+        let stop = stop.clone();
+        let peak = peak.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(kb) = rss_kb(pid) {
+                    peak.fetch_max(kb, std::sync::atomic::Ordering::Relaxed);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+    };
+    let status = child.wait().expect("wait workpen");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = sampler.join();
+    let peak = peak.load(std::sync::atomic::Ordering::Relaxed);
+    let mut err = Vec::new();
+    if let Some(mut s) = child.stderr.take() {
+        use std::io::Read;
+        let _ = s.read_to_end(&mut err);
+    }
+    assert_eq!(
+        status.code(),
+        Some(124),
+        "32MiB then sleep must hit --timeout 3s, stderr={}",
+        String::from_utf8_lossy(&err)
+    );
+    let n = std::fs::metadata(&dest).expect("meta").len();
+    assert!(
+        n >= 32 * 1024 * 1024,
+        "redirected file must get the 32MiB payload, got {n}"
+    );
+    assert!(
+        peak > 0 && peak < 40_000,
+        "workpen RSS must stay under 40MiB while streaming 32MiB (buffered Vec would add ~32MiB), peak_kb={peak}"
+    );
+}
+
+#[cfg(unix)]
+fn rss_kb(pid: u32) -> Option<u64> {
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
 #[cfg(windows)]
 #[test]
 fn run_timeout_streaming_stdout_is_captured() {

@@ -148,22 +148,20 @@ fn apply_detail(err: &KernelError) -> String {
 /// callers can write them before GNU timeout 124. [`KernelError::Timeout`]
 /// stays a unit variant on [`KernelPolicy::run_child_timeout`].
 #[cfg(unix)]
-fn wait_child_timeout_output(
-    mut child: std::process::Child,
+fn wait_until_deadline(
+    child: &mut std::process::Child,
     timeout: Duration,
-) -> Result<(std::process::Output, bool), KernelError> {
+) -> Result<(std::process::ExitStatus, bool), KernelError> {
     use std::thread;
     use std::time::Instant;
 
-    let stdout = child.stdout.take().map(drain_pipe);
-    let stderr = child.stderr.take().map(drain_pipe);
     let deadline = Instant::now() + timeout;
-    let (status, timed_out) = loop {
+    loop {
         match child
             .try_wait()
             .map_err(|e| KernelError::Apply(e.to_string()))?
         {
-            Some(status) => break (status, false),
+            Some(status) => return Ok((status, false)),
             None if Instant::now() >= deadline => {
                 let pid = child.id() as libc::pid_t;
                 // SAFETY: pid is the child's process group (process_group(0)).
@@ -173,11 +171,21 @@ fn wait_child_timeout_output(
                 let status = child
                     .wait()
                     .map_err(|e| KernelError::Apply(e.to_string()))?;
-                break (status, true);
+                return Ok((status, true));
             }
             None => thread::sleep(Duration::from_millis(10)),
         }
-    };
+    }
+}
+
+#[cfg(unix)]
+fn wait_child_timeout_output(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Result<(std::process::Output, bool), KernelError> {
+    let stdout = child.stdout.take().map(drain_pipe);
+    let stderr = child.stderr.take().map(drain_pipe);
+    let (status, timed_out) = wait_until_deadline(&mut child, timeout)?;
     Ok((
         std::process::Output {
             status,
@@ -186,6 +194,20 @@ fn wait_child_timeout_output(
         },
         timed_out,
     ))
+}
+
+/// Copy child pipes to this process as bytes arrive. No unbounded `Vec`.
+#[cfg(unix)]
+fn wait_child_timeout_forward(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, bool), KernelError> {
+    let stdout = child.stdout.take().map(|p| copy_pipe(p, std::io::stdout()));
+    let stderr = child.stderr.take().map(|p| copy_pipe(p, std::io::stderr()));
+    let (status, timed_out) = wait_until_deadline(&mut child, timeout)?;
+    join_copy(stdout);
+    join_copy(stderr);
+    Ok((status, timed_out))
 }
 
 #[cfg(unix)]
@@ -198,8 +220,37 @@ fn drain_pipe(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::Joi
 }
 
 #[cfg(unix)]
+fn copy_pipe(
+    mut src: impl std::io::Read + Send + 'static,
+    mut dst: impl std::io::Write + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match std::io::Read::read(&mut src, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if std::io::Write::write_all(&mut dst, &buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = std::io::Write::flush(&mut dst);
+    })
+}
+
+#[cfg(unix)]
 fn join_drain(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
     handle.and_then(|h| h.join().ok()).unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn join_copy(handle: Option<std::thread::JoinHandle<()>>) {
+    if let Some(h) = handle {
+        let _ = h.join();
+    }
 }
 
 /// Whether this OS can apply a kernel jail.
@@ -564,6 +615,107 @@ impl KernelPolicy {
                 ));
             }
             windows::spawn_write_restricted_output(self, &cmd, Some(timeout))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (cmd, timeout);
+            Err(KernelError::Apply(
+                "no kernel backend on this platform".into(),
+            ))
+        }
+    }
+
+    /// Spawn `cmd` and copy stdout/stderr to this process as they arrive.
+    ///
+    /// Unlike [`Self::run_child_output`], this does not buffer the whole
+    /// stream in a `Vec`. The CLI uses it so a chatty child cannot grow
+    /// parent RSS without bound. Redirects outside `--root` stay parent
+    /// writes (Seatbelt/DACL).
+    pub fn run_child_forward(
+        &self,
+        cmd: Command,
+    ) -> Result<(KernelApply, ExitStatus), KernelError> {
+        self.dest_deny_command(&cmd)?;
+        #[cfg(unix)]
+        {
+            if !kernel_supported() {
+                return Err(KernelError::Apply(
+                    "kernel jail is not available; child was not started".into(),
+                ));
+            }
+            let mut cmd = cmd;
+            scrub_child_command(&mut cmd);
+            let applied = require_applied(self.apply_pre_exec(&mut cmd)?)?;
+            cmd.stdin(std::process::Stdio::inherit());
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            let stdout = child.stdout.take().map(|p| copy_pipe(p, std::io::stdout()));
+            let stderr = child.stderr.take().map(|p| copy_pipe(p, std::io::stderr()));
+            let status = child
+                .wait()
+                .map_err(|e| KernelError::Apply(e.to_string()))?;
+            join_copy(stdout);
+            join_copy(stderr);
+            Ok((applied, status))
+        }
+        #[cfg(windows)]
+        {
+            if !kernel_supported() {
+                return Err(KernelError::Apply(
+                    "write-restricted token is not available".into(),
+                ));
+            }
+            windows::spawn_write_restricted_forward(self, &cmd, None).map(|(a, s, _)| (a, s))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = cmd;
+            Err(KernelError::Apply(
+                "no kernel backend on this platform".into(),
+            ))
+        }
+    }
+
+    /// Same as [`Self::run_child_forward`] with a deadline.
+    ///
+    /// Returns `(applied, status, timed_out)`. Bytes are copied to this
+    /// process as they arrive. [`KernelError::Timeout`] stays a unit
+    /// variant on [`Self::run_child_timeout`].
+    pub fn run_child_timeout_forward(
+        &self,
+        cmd: Command,
+        timeout: Duration,
+    ) -> Result<(KernelApply, ExitStatus, bool), KernelError> {
+        self.dest_deny_command(&cmd)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+
+            if !kernel_supported() {
+                return Err(KernelError::Apply(
+                    "kernel jail is not available; child was not started".into(),
+                ));
+            }
+            let mut cmd = cmd;
+            scrub_child_command(&mut cmd);
+            let applied = require_applied(self.apply_pre_exec(&mut cmd)?)?;
+            cmd.stdin(std::process::Stdio::inherit());
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd.process_group(0);
+            let child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            let (status, timed_out) = wait_child_timeout_forward(child, timeout)?;
+            Ok((applied, status, timed_out))
+        }
+        #[cfg(windows)]
+        {
+            if !kernel_supported() {
+                return Err(KernelError::Apply(
+                    "write-restricted token is not available".into(),
+                ));
+            }
+            windows::spawn_write_restricted_forward(self, &cmd, Some(timeout))
         }
         #[cfg(not(any(unix, windows)))]
         {

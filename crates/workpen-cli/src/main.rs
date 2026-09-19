@@ -105,15 +105,16 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let mut child = Command::new(program);
     child.args(args).current_dir(guard.canon_root());
     let jail = workpen::process_jail(guard.canon_root(), &presented).map_err(|e| e.to_string())?;
-    // Capture in the child (pipes), write from this process. Inherited
-    // stdout to a file outside --root is a Seatbelt/DACL dest write.
+    // Copy child pipes to this process as bytes arrive. A Vec of the whole
+    // stream would grow without bound (`yes` under --timeout). Inherited
+    // child stdout to a file outside --root is a Seatbelt/DACL dest write.
     let result = match timeout {
-        Some(limit) => jail.run_child_timeout_output(child, limit),
+        Some(limit) => jail.run_child_timeout_forward(child, limit),
         None => jail
-            .run_child_output(child)
-            .map(|(applied, output)| (applied, output, false)),
+            .run_child_forward(child)
+            .map(|(applied, status)| (applied, status, false)),
     };
-    let (_applied, output, timed_out) = match result {
+    let (_applied, status, timed_out) = match result {
         Err(KernelError::Timeout) => {
             eprintln!("child killed after the deadline");
             return Ok(ExitCode::from(124));
@@ -126,16 +127,11 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         Err(e) => return Err(format!("failed to spawn {}: {e}", cmd[0])),
         Ok(ok) => ok,
     };
-    {
-        use std::io::Write;
-        let _ = std::io::stdout().write_all(&output.stdout);
-        let _ = std::io::stderr().write_all(&output.stderr);
-    }
     if timed_out {
         eprintln!("child killed after the deadline");
         return Ok(ExitCode::from(124));
     }
-    Ok(ExitCode::from(output.status.code().unwrap_or(1) as u8))
+    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
 fn peel_run_timeout(rest: &[String]) -> Result<(Option<Duration>, &[String]), String> {
