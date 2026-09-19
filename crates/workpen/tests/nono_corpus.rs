@@ -2332,10 +2332,11 @@ fn run_child_namespace_lockdown_and_dumpable() {
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     if applied == KernelApply::Applied {
-        assert!(
-            stdout.contains("Dumpable:\t0") || stdout.contains("Dumpable:	0"),
-            "child must not be dumpable: {stdout:?}"
-        );
+        let dumpable0 = stdout.lines().any(|line| {
+            let rest = line.strip_prefix("Dumpable:").map(str::trim).unwrap_or("");
+            rest == "0"
+        });
+        assert!(dumpable0, "child must not be dumpable: {stdout:?}");
         assert!(
             !stdout.contains("unshare:0"),
             "nested unshare must not succeed after remount: {stdout:?}"

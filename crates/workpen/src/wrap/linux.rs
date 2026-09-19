@@ -88,17 +88,18 @@ pub(super) fn apply_dest_deny_remounts(paths: &[PathBuf], workspace: &Path) -> i
     let root = unique_hide_root()?;
     let hide_file = hide_node(&root, false)?;
     let hide_dir = hide_node(&root, true)?;
-    remount_all(&expanded, workspace, &hide_file, &hide_dir)
+    remount_all(paths, &expanded, workspace, &hide_file, &hide_dir)
 }
 
 fn remount_all(
+    original: &[PathBuf],
     paths: &[PathBuf],
     workspace: &Path,
     hide_file: &Path,
     hide_dir: &Path,
 ) -> io::Result<()> {
     if !enter_private_mount_ns()? {
-        if paths.iter().any(|p| !p.starts_with(workspace)) {
+        if original.iter().any(|p| !p.starts_with(workspace)) {
             return Err(io::Error::other(
                 "extra-root dest-deny remount unavailable; child was not started",
             ));

@@ -1452,6 +1452,7 @@ fn system_read_dirs() -> Vec<PathBuf> {
             "/System",
             "/Library",
             "/dev",
+            "/proc",
             "/etc",
             "/opt/homebrew",
             "/usr/local",

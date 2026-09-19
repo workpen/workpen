@@ -996,20 +996,24 @@ fn deny_dest_aces(paths: &[PathBuf], sid: Handle) -> Result<Vec<AclRestore>, Ker
 
 #[cfg(test)]
 thread_local! {
-    static TEST_ACE_FAIL_ON: std::cell::Cell<Option<PathBuf>> = const { std::cell::Cell::new(None) };
+    static TEST_ACE_FAIL_ON: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 pub(super) fn fail_next_ace_on(path: PathBuf) {
-    TEST_ACE_FAIL_ON.with(|c| c.set(Some(path)));
+    TEST_ACE_FAIL_ON.with(|c| *c.borrow_mut() = Some(path));
 }
 
 fn deny_dest_ace(path: &Path, sid: Handle) -> Result<AclRestore, KernelError> {
     #[cfg(test)]
-    if TEST_ACE_FAIL_ON
-        .with(|c| c.take())
-        .is_some_and(|p| p == path)
-    {
+    if TEST_ACE_FAIL_ON.with(|c| {
+        let hit = c.borrow().as_ref() == Some(path);
+        if hit {
+            *c.borrow_mut() = None;
+        }
+        hit
+    }) {
         return Err(KernelError::Apply("test dest-deny ACE fail".into()));
     }
     let inherit = if path.is_dir() {
