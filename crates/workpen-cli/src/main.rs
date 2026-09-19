@@ -105,11 +105,13 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let mut child = Command::new(program);
     child.args(args).current_dir(guard.canon_root());
     let jail = workpen::process_jail(guard.canon_root(), &presented).map_err(|e| e.to_string())?;
+    // Capture in the child (pipes), write from this process. Inherited
+    // stdout to a file outside --root is a Seatbelt/DACL dest write.
     let result = match timeout {
-        Some(limit) => jail.run_child_timeout(child, limit),
-        None => jail.run_child(child),
+        Some(limit) => jail.run_child_timeout_output(child, limit),
+        None => jail.run_child_output(child),
     };
-    let (_applied, status) = match result {
+    let (_applied, output) = match result {
         Err(KernelError::Timeout) => {
             eprintln!("child killed after the deadline");
             return Ok(ExitCode::from(124));
@@ -122,7 +124,12 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         Err(e) => return Err(format!("failed to spawn {}: {e}", cmd[0])),
         Ok(ok) => ok,
     };
-    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+    {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(&output.stdout);
+        let _ = std::io::stderr().write_all(&output.stderr);
+    }
+    Ok(ExitCode::from(output.status.code().unwrap_or(1) as u8))
 }
 
 fn peel_run_timeout(rest: &[String]) -> Result<(Option<Duration>, &[String]), String> {
