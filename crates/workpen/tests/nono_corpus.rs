@@ -2373,9 +2373,10 @@ fn run_child_output_echoes_hello() {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
     let mut cmd = Command::new("/bin/echo");
     cmd.arg("hello");
-    let (_applied, output) = policy
+    let (_applied, output, timed_out) = policy
         .run_child_timeout_output(cmd, Duration::from_secs(5))
         .expect("timeout output");
+    assert!(!timed_out, "echo must finish before the deadline");
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
 }
 
@@ -2391,7 +2392,7 @@ fn python3_available() -> bool {
 }
 
 /// A 1MiB print fills the ~64KiB pipe. Timeout wait must drain or the
-/// child blocks and the deadline returns [`KernelError::Timeout`].
+/// child blocks on write until the deadline.
 #[cfg(unix)]
 #[test]
 fn run_child_timeout_output_drains_large_stdout() {
@@ -2403,9 +2404,10 @@ fn run_child_timeout_output_drains_large_stdout() {
     let mut cmd = Command::new("python3");
     cmd.args(["-c", r#"print("x"*10**6)"#])
         .current_dir(dir.path());
-    let (_applied, output) = policy
+    let (_applied, output, timed_out) = policy
         .run_child_timeout_output(cmd, Duration::from_secs(5))
         .expect("1MiB print under timeout");
+    assert!(!timed_out, "1MiB print must finish before the deadline");
     assert!(
         output.status.success(),
         "1MiB print must finish under timeout, status={:?} stdout_len={} stderr={}",
@@ -2416,6 +2418,32 @@ fn run_child_timeout_output_drains_large_stdout() {
     assert!(
         output.stdout.len() >= 1_000_000,
         "stdout must be at least 1MiB, got {}",
+        output.stdout.len()
+    );
+}
+
+/// Timeout kill must still return drained stdout (CLI writes it, then 124).
+#[cfg(unix)]
+#[test]
+fn run_child_timeout_output_keeps_streaming_stdout() {
+    if !kernel_supported() || !python3_available() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("python3");
+    cmd.args([
+        "-c",
+        "import sys\nwhile True:\n    sys.stdout.write('y\\n')\n    sys.stdout.flush()\n",
+    ])
+    .current_dir(dir.path());
+    let (_applied, output, timed_out) = policy
+        .run_child_timeout_output(cmd, Duration::from_secs(1))
+        .expect("streaming timeout");
+    assert!(timed_out, "deadline must fire for an infinite writer");
+    assert!(
+        output.stdout.len() >= 64,
+        "drained stdout must be kept on timeout, got {}",
         output.stdout.len()
     );
 }
@@ -2435,9 +2463,10 @@ fn run_child_timeout_output_drains_large_stdout() {
     );
     let mut cmd = Command::new(&printer);
     cmd.current_dir(dir.path());
-    let (_applied, output) = policy
+    let (_applied, output, timed_out) = policy
         .run_child_timeout_output(cmd, Duration::from_secs(5))
         .expect("1MiB print under timeout");
+    assert!(!timed_out, "1MiB print must finish before the deadline");
     assert!(
         output.status.success(),
         "1MiB print must finish under timeout, status={:?} stdout_len={} stderr={}",
@@ -2448,6 +2477,32 @@ fn run_child_timeout_output_drains_large_stdout() {
     assert!(
         output.stdout.len() >= 1_000_000,
         "stdout must be at least 1MiB, got {}",
+        output.stdout.len()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn run_child_timeout_output_keeps_streaming_stdout() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let streamer = rustc_windows_probe(
+        dir.path(),
+        "stream_stdout",
+        "fn main() { loop { use std::io::Write; let _ = std::io::stdout().write_all(b\"y\\n\"); let _ = std::io::stdout().flush(); } }\n",
+    );
+    let mut cmd = Command::new(&streamer);
+    cmd.current_dir(dir.path());
+    let (_applied, output, timed_out) = policy
+        .run_child_timeout_output(cmd, Duration::from_secs(1))
+        .expect("streaming timeout");
+    assert!(timed_out, "deadline must fire for an infinite writer");
+    assert!(
+        output.stdout.len() >= 64,
+        "drained stdout must be kept on timeout, got {}",
         output.stdout.len()
     );
 }

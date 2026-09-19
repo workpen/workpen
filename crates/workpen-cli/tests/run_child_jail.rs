@@ -356,6 +356,91 @@ fn run_timeout_large_stdout_is_captured() {
     );
 }
 
+/// A child that prints until the deadline must not lose the drained
+/// bytes when the CLI maps timeout to exit 124.
+#[cfg(unix)]
+#[test]
+fn run_timeout_streaming_stdout_is_captured() {
+    if !python3_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args([
+            "--timeout",
+            "1s",
+            "--",
+            "python3",
+            "-c",
+            "import sys\nwhile True:\n    sys.stdout.write('y\\n')\n    sys.stdout.flush()\n",
+        ])
+        .output()
+        .expect("spawn workpen");
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "streaming timeout must exit 124, stdout_len={} stderr={}",
+        out.stdout.len(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("deadline"),
+        "timeout must name the deadline: {err}"
+    );
+    assert!(
+        out.stdout.len() >= 64,
+        "drained stdout must be kept on timeout, got {} bytes",
+        out.stdout.len()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn run_timeout_streaming_stdout_is_captured() {
+    let dir = TempDir::new().expect("workspace");
+    let src = dir.path().join("stream.rs");
+    std::fs::write(
+        &src,
+        "fn main() { loop { use std::io::Write; let _ = std::io::stdout().write_all(b\"y\\n\"); let _ = std::io::stdout().flush(); } }\n",
+    )
+    .expect("stream.rs");
+    let exe = dir.path().join("stream.exe");
+    let rustc = Command::new("rustc")
+        .arg("-o")
+        .arg(&exe)
+        .arg(&src)
+        .status()
+        .expect("rustc");
+    assert!(rustc.success(), "rustc stream.exe");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--timeout", "1s", "--"])
+        .arg(&exe)
+        .output()
+        .expect("spawn workpen");
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "streaming timeout must exit 124, stdout_len={} stderr={}",
+        out.stdout.len(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("deadline"),
+        "timeout must name the deadline: {err}"
+    );
+    assert!(
+        out.stdout.len() >= 64,
+        "drained stdout must be kept on timeout, got {} bytes",
+        out.stdout.len()
+    );
+}
+
 #[cfg(unix)]
 fn printenv_available() -> bool {
     std::path::Path::new("/usr/bin/printenv").is_file()
