@@ -2314,31 +2314,45 @@ fn run_child_marker_e2e() {
 #[cfg(target_os = "linux")]
 #[test]
 fn run_child_namespace_lockdown_and_dumpable() {
+    if std::env::var_os("WORKPEN_E2E_CHILD").as_deref() == Some(std::ffi::OsStr::new("dumpable")) {
+        // /proc/self/status is not readable under Landlock; use PR_GET_DUMPABLE.
+        // SAFETY: PR_GET_DUMPABLE on this thread, the e2e child.
+        let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+        print!("dumpable:{dumpable}\n");
+        // SAFETY: unshare only this thread, which is the e2e child after jail apply.
+        let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) };
+        print!("unshare:{}\n", if rc == 0 { 0 } else { 1 });
+        std::process::exit(0);
+    }
     if !kernel_supported() {
         return;
     }
     let dir = workspace();
     fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    let exe = std::env::current_exe().expect("current_exe");
+    let child = dir.path().join("e2e-dumpable");
+    fs::copy(&exe, &child).expect("copy e2e child into workspace");
+    let mut perms = fs::metadata(&child).expect("child meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&child, perms).expect("chmod e2e child");
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
-    let mut cmd = Command::new("/bin/sh");
-    cmd.args([
-        "-c",
-        "grep '^Dumpable:' /proc/self/status; unshare -Ur -m true; echo unshare:$?",
-    ])
-    .current_dir(dir.path());
+    let mut cmd = Command::new(&child);
+    cmd.env("WORKPEN_E2E_CHILD", "dumpable")
+        .arg("run_child_namespace_lockdown_and_dumpable")
+        .arg("--exact")
+        .current_dir(dir.path());
     let (applied, output) = match policy.run_child_output(cmd) {
         Ok(v) => v,
         Err(_) => return,
     };
     let stdout = String::from_utf8_lossy(&output.stdout);
     if applied == KernelApply::Applied {
-        let dumpable0 = stdout.lines().any(|line| {
-            let rest = line.strip_prefix("Dumpable:").map(str::trim).unwrap_or("");
-            rest == "0"
-        });
-        assert!(dumpable0, "child must not be dumpable: {stdout:?}");
         assert!(
-            !stdout.contains("unshare:0"),
+            stdout.lines().any(|line| line.trim() == "dumpable:0"),
+            "child must not be dumpable: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("unshare:1"),
             "nested unshare must not succeed after remount: {stdout:?}"
         );
     }

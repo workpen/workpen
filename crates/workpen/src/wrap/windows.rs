@@ -9,7 +9,10 @@ use std::ptr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use super::{KernelAccess, KernelApply, KernelError, KernelPolicy, is_denied_child_env};
+use super::{
+    KernelAccess, KernelApply, KernelError, KernelPolicy, combine_spawn_restore,
+    is_denied_child_env,
+};
 
 #[path = "windows_net.rs"]
 mod windows_net;
@@ -750,20 +753,11 @@ fn spawn_prepared(
     let restore = restore_guards(&mut prepared.acl_guards);
     match (result, restore) {
         (Ok((applied, status, output)), Ok(())) => Ok((applied, status, output)),
-        (Err(KernelError::Timeout), Err(_)) => Err(KernelError::Timeout),
-        (Err(spawn), Err(restore_err)) => {
-            Err(KernelError::Apply(format!("{spawn}; {restore_err}")))
-        }
-        (Ok((_, status, _)), Err(restore_err)) => {
-            let code = status
-                .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "signal".into());
-            Err(KernelError::Restore(format!(
-                "child exited {code}; {restore_err}"
-            )))
-        }
-        (Err(spawn), Ok(())) => Err(spawn),
+        (result, restore) => combine_spawn_restore(
+            result.map(|(applied, status, _)| (applied, status)),
+            restore,
+        )
+        .map(|(applied, status)| (applied, status, None)),
     }
 }
 
@@ -1008,7 +1002,7 @@ pub(super) fn fail_next_ace_on(path: PathBuf) {
 fn deny_dest_ace(path: &Path, sid: Handle) -> Result<AclRestore, KernelError> {
     #[cfg(test)]
     if TEST_ACE_FAIL_ON.with(|c| {
-        let hit = c.borrow().as_ref() == Some(path);
+        let hit = c.borrow().as_ref().is_some_and(|p| p.as_path() == path);
         if hit {
             *c.borrow_mut() = None;
         }
@@ -1378,7 +1372,10 @@ mod ace_tests {
         std::fs::write(&second, "2").expect("second");
         let sid = RestrictedSid::new().expect("sid");
         fail_next_ace_on(second.clone());
-        let err = deny_dest_aces(&[first.clone(), second], sid.0).expect_err("second ACE");
+        let err = match deny_dest_aces(&[first.clone(), second], sid.0) {
+            Err(err) => err,
+            Ok(_) => panic!("second ACE must fail"),
+        };
         assert!(
             matches!(err, KernelError::Apply(_)),
             "mid-loop ACE fail is Apply: {err}"

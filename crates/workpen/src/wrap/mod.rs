@@ -1324,6 +1324,7 @@ fn add_macos_post_create_rules(
 /// As-given path, canonicalize, and `/private` firmlink aliases.
 /// Used for Seatbelt literals and Linux remount dests under `/tmp` /
 /// `/var` / `/etc`.
+#[cfg(any(unix, test))]
 fn dest_deny_rule_paths(path: &Path) -> Vec<PathBuf> {
     let mut out = vec![path.to_path_buf()];
     if let Ok(canon) = dunce::canonicalize(path)
@@ -1341,6 +1342,7 @@ fn dest_deny_rule_paths(path: &Path) -> Vec<PathBuf> {
 }
 
 /// `/tmp` ↔ `/private/tmp`, `/var` ↔ `/private/var`, `/etc` ↔ `/private/etc`.
+#[cfg(any(unix, test))]
 fn firmlink_alias(path: &Path) -> Option<PathBuf> {
     let raw = path.to_str()?;
     const PAIRS: [(&str, &str); 3] = [
@@ -1379,6 +1381,7 @@ fn macos_dest_deny_actions() -> &'static [&'static str] {
 }
 
 /// Child-only hardening after remount/Landlock. Do not call on the parent.
+#[cfg(unix)]
 fn apply_child_hardening() -> std::io::Result<()> {
     #[cfg(unix)]
     {
