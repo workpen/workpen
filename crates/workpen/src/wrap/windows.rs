@@ -317,13 +317,8 @@ unsafe extern "system" {
 }
 
 struct CloseOnDrop(Handle);
-impl CloseOnDrop {
-    fn into_raw(self) -> Handle {
-        let handle = self.0;
-        std::mem::forget(self);
-        handle
-    }
-}
+// SAFETY: exclusive kernel HANDLE; drain threads take ownership.
+unsafe impl Send for CloseOnDrop {}
 impl Drop for CloseOnDrop {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
@@ -980,17 +975,8 @@ fn read_all(handle: CloseOnDrop) -> Vec<u8> {
     out
 }
 
-/// HANDLE is a kernel object; exclusive ownership moves to the drain thread.
-struct SendHandle(Handle);
-// SAFETY: only the drain thread uses and closes this HANDLE.
-unsafe impl Send for SendHandle {}
-
 fn drain_pipe(handle: CloseOnDrop) -> std::thread::JoinHandle<Vec<u8>> {
-    let raw = SendHandle(handle.into_raw());
-    std::thread::spawn(move || {
-        let SendHandle(ptr) = raw;
-        read_all(CloseOnDrop(ptr))
-    })
+    std::thread::spawn(move || read_all(handle))
 }
 
 fn join_drain(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
