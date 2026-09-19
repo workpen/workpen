@@ -1154,6 +1154,31 @@ fn check_command_argv_denies_env_flags_after_time_stdbuf() {
 }
 
 #[test]
+fn check_command_argv_denies_env_flags_after_unknown_prefix() {
+    let ws = tempfile::tempdir().expect("workspace");
+    std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("write readme");
+    let policy = DenyPolicy::default();
+    let denies: &[&[&str]] = &[
+        &["watch", "env", "-S", "cat .env"],
+        &["watch", "env", "--file=.env", "bash"],
+        &["/usr/bin/watch", "env", "-S", "cat .env"],
+        &["watch", "/usr/bin/env", "--file=.env", "bash"],
+        &["watch", "env.exe", "-S", "cat .env"],
+        &["watch", "env", "env", "-S", "cat .env"],
+        &["watch", "env", "--", "env", "-S", "cat .env"],
+    ];
+    for argv in denies {
+        check_command_argv(argv, ws.path(), &policy)
+            .expect_err(&format!("unknown prefix then env {argv:?} must dest-deny"));
+    }
+    check_command_argv(&["watch", "echo", "hi"], ws.path(), &policy)
+        .expect("watch echo hi must be allowed");
+    check_command_argv(&["watch", "env", "-S", "cat readme.md"], ws.path(), &policy)
+        .expect("watch env -S cat readme.md must be allowed");
+}
+
+#[test]
 fn validate_deny_glob_rejects_brace_backslash_empty_segment() {
     assert!(validate_deny_glob("**/.env").is_ok());
     assert!(validate_deny_glob("**/.ssh/**").is_ok());

@@ -2014,6 +2014,36 @@ fn with_bash_noprofile_wrapper_then_env_bash() {
 }
 
 #[test]
+fn with_bash_noprofile_env_after_unknown_prefix() {
+    let (_got, args) = with_bash_noprofile("watch", ["env", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["env", "bash", "--noprofile", "--norc", "-c", "true"],
+        "watch env bash must insert noprofile after bash"
+    );
+    let (_got, args) = with_bash_noprofile("watch", ["env", "BASH_ENV=.env", "bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["env", "bash", "--noprofile", "--norc", "-c", "true"],
+        "watch env BASH_ENV=.env bash must drop BASH_ENV then noprofile"
+    );
+    let (_got, args) = with_bash_noprofile("watch", ["env", "-S", "BASH_ENV=.env bash -c true"]);
+    assert_eq!(
+        args,
+        ["env", "-S", "bash -c true"],
+        "watch env -S denylist assignment must drop inside split-string"
+    );
+    let (_got, args) = with_bash_noprofile("watch", ["echo", "hi"]);
+    assert_eq!(args, ["echo", "hi"], "watch echo hi must stay unchanged");
+    let (_got, args) = with_bash_noprofile("watch", ["bash", "-c", "true"]);
+    assert_eq!(
+        args,
+        ["bash", "-c", "true"],
+        "watch bash without env must not invent noprofile"
+    );
+}
+
+#[test]
 fn run_does_not_duplicate_existing_noprofile() {
     let (_got, args) = with_bash_noprofile("bash", ["--noprofile", "--norc", "-c", "true"]);
     assert_eq!(args, ["--noprofile", "--norc", "-c", "true"]);

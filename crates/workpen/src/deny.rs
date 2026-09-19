@@ -488,10 +488,10 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// When argv0 is `env`/`env.exe`, dest-denies the operand of
 /// `-S`/`--split-string` via [`check_command_dests`], then leftover
 /// tokens in that string as env flags (`--file=`, `-f`, `NAME=value`).
-/// After skipping stacked `timeout`/`nohup`/`nice`/`time`/`stdbuf`
-/// prefixes (same skip as wrap), dest-denies those env flags when the
-/// remaining argv starts with env. A nested `env` operand (or
-/// `env -- env …`) is walked the same way.
+/// An `env`/`env.exe` token in any argv slot is walked the same way, so
+/// a prefix that is not `timeout`/`nohup`/`nice`/`time`/`stdbuf` cannot
+/// hide `-S`/`--file`. A nested `env` operand (or `env -- env …`) is
+/// walked the same way.
 /// `cmd /c` and `powershell -Command` / `-EncodedCommand` bodies are
 /// dest-denied as command strings. After `cmd` / `pwsh`, remaining
 /// argv is walked so `/s` / `-NoProfile` cannot hide `/c`,
@@ -532,10 +532,9 @@ pub fn check_command_argv(
         if is_cmd_program(token) || is_powershell_program(token) {
             check_cmd_powershell_remaining_dests(token, &cmd[i + 1..], root, policy)?;
         }
-    }
-    let start = skip_all_wrappers(cmd);
-    if cmd.get(start).is_some_and(|t| is_env_program(t.as_ref())) {
-        check_env_flag_dests(&cmd[start + 1..], root, policy)?;
+        if is_env_program(token) {
+            check_env_flag_dests(&cmd[i + 1..], root, policy)?;
+        }
     }
     Ok(())
 }
@@ -842,21 +841,7 @@ fn attached_flag_dest(token: &str) -> Option<&str> {
     Some(value)
 }
 
-/// Skip stacked `timeout` / `nohup` / `nice` / `time` / `stdbuf` prefixes.
-/// Returns the index of the first remaining operand (env, the user
-/// command, or `cmd.len()`).
-fn skip_all_wrappers(cmd: &[impl AsRef<str>]) -> usize {
-    let mut i = 0;
-    while i < cmd.len() {
-        let Some(kind) = cmd_wrapper(cmd[i].as_ref()) else {
-            return i;
-        };
-        let start = skip_wrapper_prefix(kind, &cmd[i + 1..]);
-        i = i.saturating_add(1).saturating_add(start);
-    }
-    i
-}
-
+#[cfg(feature = "nono")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CmdWrapper {
     Timeout,
@@ -866,6 +851,7 @@ pub(crate) enum CmdWrapper {
     Stdbuf,
 }
 
+#[cfg(feature = "nono")]
 pub(crate) fn cmd_wrapper(program: impl AsRef<OsStr>) -> Option<CmdWrapper> {
     let raw = program.as_ref().to_string_lossy();
     let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw.as_ref());
@@ -886,6 +872,7 @@ pub(crate) fn cmd_wrapper(program: impl AsRef<OsStr>) -> Option<CmdWrapper> {
 
 /// Skip wrapper flags plus the timeout duration. Returns the index of
 /// the first remaining command operand.
+#[cfg(feature = "nono")]
 pub(crate) fn skip_wrapper_prefix(kind: CmdWrapper, args: &[impl AsRef<str>]) -> usize {
     let mut i = 0;
     let mut options_done = false;
@@ -913,6 +900,7 @@ pub(crate) fn skip_wrapper_prefix(kind: CmdWrapper, args: &[impl AsRef<str>]) ->
     i
 }
 
+#[cfg(feature = "nono")]
 fn wrapper_takes_value(kind: CmdWrapper, flag: char) -> bool {
     match kind {
         CmdWrapper::Timeout => matches!(flag, 's' | 'k'),
@@ -922,6 +910,7 @@ fn wrapper_takes_value(kind: CmdWrapper, flag: char) -> bool {
     }
 }
 
+#[cfg(feature = "nono")]
 fn wrapper_long_takes_value(kind: CmdWrapper, long: &str) -> bool {
     match kind {
         CmdWrapper::Timeout => matches!(long, "signal" | "kill-after"),
@@ -931,6 +920,7 @@ fn wrapper_long_takes_value(kind: CmdWrapper, long: &str) -> bool {
     }
 }
 
+#[cfg(feature = "nono")]
 fn wrapper_flag_skip(kind: CmdWrapper, arg: &str) -> Option<usize> {
     if arg == "-" {
         return Some(1);
@@ -1086,9 +1076,10 @@ fn continue_env_after_operand(
     root: &Path,
     policy: &DenyPolicy,
 ) -> Result<(), CheckDestError> {
-    let start = skip_all_wrappers(args);
-    if args.get(start).is_some_and(|t| is_env_program(t.as_ref())) {
-        return check_env_flag_dests(&args[start + 1..], root, policy);
+    for (i, token) in args.iter().enumerate() {
+        if is_env_program(token.as_ref()) {
+            return check_env_flag_dests(&args[i + 1..], root, policy);
+        }
     }
     Ok(())
 }
