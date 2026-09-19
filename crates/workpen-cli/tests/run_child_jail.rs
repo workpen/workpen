@@ -47,6 +47,43 @@ fn run_stdout_redirect_outside_workspace_is_readable() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn run_forwards_stdin_without_timeout() {
+    let dir = TempDir::new().expect("workspace");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .arg("run")
+        .arg("--root")
+        .arg(dir.path())
+        .args(["--", "/bin/cat"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn workpen");
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(b"hi\n")
+            .expect("write stdin");
+    }
+    let out = child.wait_with_output().expect("wait");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "hi\n",
+        "no-timeout run must forward stdin: stdout={:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn run_sh_c_echo_does_not_warn_var_select() {
