@@ -472,7 +472,8 @@ impl KernelPolicy {
     /// Spawn `cmd` under the kernel jail and collect stdout/stderr.
     ///
     /// Same dest-deny and fail-closed setup as [`Self::run_child`].
-    /// Windows creates anonymous pipes. Unix uses [`Command::output`].
+    /// Windows creates anonymous pipes. Unix inherits stdin and pipes
+    /// stdout/stderr (`Command::output` would close stdin).
     pub fn run_child_output(
         &self,
         cmd: Command,
@@ -488,8 +489,12 @@ impl KernelPolicy {
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
             let applied = require_applied(self.apply_pre_exec(&mut cmd)?)?;
+            cmd.stdin(std::process::Stdio::inherit());
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
             let output = cmd
-                .output()
+                .spawn()
+                .and_then(|c| c.wait_with_output())
                 .map_err(|e| KernelError::Apply(e.to_string()))?;
             Ok((applied, output))
         }
