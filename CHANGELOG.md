@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.2](https://github.com/workpen/workpen/compare/v0.4.1...v0.4.2) (2026-09-19)
+
+
+### Bug Fixes
+
+* **cli:** capture run child stdio so redirects outside --root work ([#157](https://github.com/workpen/workpen/issues/157)) ([56ea7a3](https://github.com/workpen/workpen/commit/56ea7a3619741bdd27f0ea43091b00515e99b66b))
+* **deny:** dest-deny GNU glued short dests ([#155](https://github.com/workpen/workpen/issues/155)) ([41cc45e](https://github.com/workpen/workpen/commit/41cc45e32a5c5247ffe486a5cb09557ae0102b21))
+* **deny:** peel env -S after any argv prefix ([#154](https://github.com/workpen/workpen/issues/154)) ([419513d](https://github.com/workpen/workpen/commit/419513dfbc70c8e7e8a6e82f0c7dfd38fc37732e))
+* **wrap:** dest-deny directories, remount stickiness, and e2e honesty ([#153](https://github.com/workpen/workpen/issues/153)) ([749308b](https://github.com/workpen/workpen/commit/749308bf85062804a3ad2475bfd5c4476991ecbd))
+* **wrap:** dest-deny peel, remount/WFP apply signals, and jail leftovers ([#151](https://github.com/workpen/workpen/issues/151)) ([3779c83](https://github.com/workpen/workpen/commit/3779c836d234775b24f9b9e72bb83f644d1a1d33))
+* **wrap:** drain capture pipes while waiting on run timeout ([#158](https://github.com/workpen/workpen/issues/158)) ([7a63171](https://github.com/workpen/workpen/commit/7a6317150e0f8dc7385500432b5c6bf2b43a3930))
+* **wrap:** grant /var/select so macOS sh -c is quiet ([#156](https://github.com/workpen/workpen/issues/156)) ([02093c8](https://github.com/workpen/workpen/commit/02093c8425835e9a604e8eb6d5a4f151b2255376))
+* **wrap:** inherit stdin on Unix run_child_output ([#159](https://github.com/workpen/workpen/issues/159)) ([a51747a](https://github.com/workpen/workpen/commit/a51747afe132cf3a07dc40e7b10576b0453e3b43))
+
 ## [0.4.1](https://github.com/workpen/workpen/compare/v0.4.0...v0.4.1) (2026-09-18)
 
 
