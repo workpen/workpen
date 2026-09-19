@@ -34,8 +34,10 @@ The parent is trusted. The child is not.
 - Generic `--flag=.env` is ignored. Attached `--flag=.env` is dest-denied.
 - Wrapper skip is only `timeout` / `nohup` / `nice`. `time` and
   `stdbuf` are wrappers too.
-- Extra-root `/tmp` is one-level only. Ordinary subdirectories are
-  walked for dest-deny names (not every file).
+- Extra-root `/tmp` is one dest-deny name level. A hardlink under a
+  deeper ordinary dir is not remounted. `check_dest` still dest-denies
+  hardlink siblings when the host calls it. In-child open of a planted
+  `/tmp/proj/sub/leaked` is the same class as post-create.
 - Windows WFP ran. Win32 5 is `WfpSkipped`. AppContainer is still on.
 - Renaming the dest-deny parent unmasks nothing. Parent-rename is out
   of scope. Leaf `mv .env leaked` is a macOS last-match contract.

@@ -307,7 +307,9 @@ impl KernelPolicy {
     ///
     /// On Linux, dest-deny remount skip is [`KernelApply::RemountSkipped`]
     /// when dest-deny paths exist and a private mount ns cannot be
-    /// entered. Extra-root dests still fail-closed.
+    /// entered. Extra-root dests still fail-closed. If the parent probe
+    /// returned [`KernelApply::Applied`], the child fail-closes when
+    /// enter fails.
     pub fn apply_pre_exec(&self, cmd: &mut Command) -> Result<KernelApply, KernelError> {
         self.dest_deny_command(cmd)?;
         if !kernel_supported() {
@@ -327,13 +329,15 @@ impl KernelPolicy {
             let remount = linux::remount_status(&dests, &workspace)?;
             #[cfg(not(target_os = "linux"))]
             let remount = KernelApply::Applied;
+            #[cfg(target_os = "linux")]
+            let require_remount = remount == KernelApply::Applied;
             // Safety: the set and dest list are built in the parent; the hook
             // only applies them and maps failure to io::Error.
             unsafe {
                 use std::os::unix::process::CommandExt;
                 cmd.pre_exec(move || {
                     #[cfg(target_os = "linux")]
-                    linux::apply_dest_deny_remounts(&dests, &workspace)?;
+                    linux::apply_dest_deny_remounts(&dests, &workspace, require_remount)?;
                     #[cfg(not(target_os = "linux"))]
                     let _ = (&dests, &workspace);
                     apply_child_hardening()?;
@@ -949,7 +953,8 @@ const DEST_DENY_WALK_LIMIT: usize = 65_536;
 const DEST_DENY_CACHE_DIR_NAMES: &[&str] =
     &["target", "node_modules", ".venv", "dist", "__pycache__"];
 
-/// Existing dest-deny files under `workspace`, including hardlink siblings.
+/// Existing dest-deny files and glob directories under `workspace`,
+/// including hardlink siblings.
 ///
 /// Does not apply the jail. Does not follow directory symlinks. Does
 /// not descend `.git`. Cache trees are walked for dest-deny names
@@ -999,6 +1004,23 @@ fn is_dest_deny_cache_dir_name(name: &str) -> bool {
         .any(|n| name.eq_ignore_ascii_case(n))
 }
 
+/// Dest-deny a real directory. Directory symlinks are not followed
+/// (`false`). Shared so every walk dest-denies the dir before recurse.
+fn dest_deny_if_real_dir(
+    path: &Path,
+    ft: std::fs::FileType,
+    policy: &DenyPolicy,
+    out: &mut Vec<DestDeny>,
+) -> bool {
+    if !ft.is_dir() || ft.is_symlink() {
+        return false;
+    }
+    if let Some(deny) = dest_deny_at(path, path.display().to_string(), policy) {
+        push_dest_deny(out, deny);
+    }
+    true
+}
+
 fn walk_dest_denies(
     dir: &Path,
     policy: &DenyPolicy,
@@ -1026,7 +1048,7 @@ fn walk_dest_denies(
             return Err(dest_deny_walk_cap(dir, limit));
         }
         *remaining -= 1;
-        if ft.is_dir() && !ft.is_symlink() {
+        if dest_deny_if_real_dir(&path, ft, policy, out) {
             walk_dest_denies(&path, policy, out, remaining, limit)?;
             continue;
         }
@@ -1063,12 +1085,12 @@ fn collect_system_temp_dest_denies(
             continue;
         }
         let ft = ent.file_type().map_err(|e| dest_deny_walk_io(&path, e))?;
-        if ft.is_dir() && !ft.is_symlink() && is_dest_deny_dir_name(name) {
-            walk_temp_dest_denies(&path, policy, out, remaining, limit)?;
-            continue;
-        }
-        if ft.is_dir() && !ft.is_symlink() {
-            collect_temp_dir_dest_names(&path, policy, out, remaining, limit)?;
+        if dest_deny_if_real_dir(&path, ft, policy, out) {
+            if is_dest_deny_dir_name(name) {
+                walk_temp_dest_denies(&path, policy, out, remaining, limit)?;
+            } else {
+                collect_temp_dir_dest_names(&path, policy, out, remaining, limit)?;
+            }
             continue;
         }
         if let Some(deny) = dest_deny_at(&path, path.display().to_string(), policy) {
@@ -1133,8 +1155,10 @@ fn collect_temp_dir_dest_names(
             Ok(ft) => ft,
             Err(_) => continue,
         };
-        if ft.is_dir() && !ft.is_symlink() && is_dest_deny_dir_name(name) {
-            walk_temp_dest_denies(&path, policy, out, remaining, limit)?;
+        if dest_deny_if_real_dir(&path, ft, policy, out) {
+            if is_dest_deny_dir_name(name) {
+                walk_temp_dest_denies(&path, policy, out, remaining, limit)?;
+            }
             continue;
         }
         if ft.is_dir() {
@@ -1178,7 +1202,7 @@ fn walk_temp_dest_denies(
             Ok(ft) => ft,
             Err(_) => continue,
         };
-        if ft.is_dir() && !ft.is_symlink() {
+        if dest_deny_if_real_dir(&path, ft, policy, out) {
             walk_temp_dest_denies(&path, policy, out, remaining, limit)?;
             continue;
         }
@@ -1211,7 +1235,7 @@ fn walk_cache_dest_denies(
             continue;
         }
         let ft = ent.file_type().map_err(|e| dest_deny_walk_io(&path, e))?;
-        if ft.is_dir() && !ft.is_symlink() {
+        if dest_deny_if_real_dir(&path, ft, policy, out) {
             walk_cache_dest_denies(&path, policy, out, remaining, limit)?;
             continue;
         }
@@ -1298,12 +1322,7 @@ fn add_macos_post_create_rules(
         };
         let prefix = escape_regex_literal(raw);
         // One filter only. Combined (subpath)(regex) denied the whole tree.
-        let mut regexes = vec![
-            format!("^{prefix}/[.]env$"),
-            format!("^{prefix}/.*/[.]env$"),
-            format!("^{prefix}/[.]env[.].*$"),
-            format!("^{prefix}/.*/[.]env[.].*$"),
-        ];
+        let mut regexes = macos_post_create_env_regexes(&prefix);
         for glob in globs {
             if let Some(re) = crate::dest_deny_glob_regex(&prefix, glob) {
                 regexes.push(re);
@@ -1365,6 +1384,16 @@ fn firmlink_alias(path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_post_create_env_regexes(prefix: &str) -> Vec<String> {
+    vec![
+        format!("^{prefix}/[.][Ee][Nn][Vv]$"),
+        format!("^{prefix}/.*/[.][Ee][Nn][Vv]$"),
+        format!("^{prefix}/[.][Ee][Nn][Vv][.].*$"),
+        format!("^{prefix}/.*/[.][Ee][Nn][Vv][.].*$"),
+    ]
 }
 
 #[cfg(target_os = "macos")]
@@ -1571,6 +1600,8 @@ fn is_fs_root(path: &Path) -> bool {
 
 #[cfg(test)]
 mod combine_spawn_restore_tests {
+    #[cfg(target_os = "macos")]
+    use super::macos_post_create_env_regexes;
     use super::{
         KernelApply, KernelError, WFP_ERROR_ACCESS_DENIED, combine_spawn_restore,
         dest_deny_rule_paths, process_jail, require_applied, wfp_skip_access_denied,
@@ -1655,6 +1686,22 @@ mod combine_spawn_restore_tests {
         assert!(!wfp_skip_access_denied(87));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_post_create_env_regexes_match_dot_env_any_case() {
+        let got = macos_post_create_env_regexes("/ws");
+        assert_eq!(
+            got,
+            [
+                "^/ws/[.][Ee][Nn][Vv]$",
+                "^/ws/.*/[.][Ee][Nn][Vv]$",
+                "^/ws/[.][Ee][Nn][Vv][.].*$",
+                "^/ws/.*/[.][Ee][Nn][Vv][.].*$",
+            ]
+            .map(str::to_string)
+        );
+    }
+
     #[test]
     fn dest_deny_rule_paths_emits_firmlink_aliases() {
         let got = dest_deny_rule_paths(Path::new("/tmp/.env"));
@@ -1716,6 +1763,31 @@ mod combine_spawn_restore_tests {
                 .iter()
                 .any(|d| d.path.ends_with("readme.md")),
             "non-deny extra-root file must not be collected"
+        );
+    }
+
+    #[test]
+    fn extra_root_temp_collects_ssh_directory() {
+        let ws = tempfile::TempDir::new().expect("ws");
+        let extra = tempfile::TempDir::new().expect("extra");
+        let tmp = extra.path().join("private").join("tmp");
+        let proj = tmp.join("proj");
+        let ssh = proj.join(".ssh");
+        std::fs::create_dir_all(&ssh).expect("proj/.ssh");
+        std::fs::write(ssh.join("id_ed25519"), "SECRET=1\n").expect("key");
+        let policy = process_jail(ws.path(), [tmp.as_path()]).expect("jail");
+        assert!(
+            policy.dest_denies().iter().any(|d| d.path == ssh),
+            "extra-root /tmp proj/.ssh directory must dest-deny: {:?}",
+            policy.dest_denies()
+        );
+        assert!(
+            policy
+                .dest_denies()
+                .iter()
+                .any(|d| d.path == ssh.join("id_ed25519")),
+            "nested extra-root .ssh file must still dest-deny: {:?}",
+            policy.dest_denies()
         );
     }
 }

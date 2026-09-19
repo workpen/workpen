@@ -1361,7 +1361,107 @@ fn append_quoted(out: &mut Vec<u16>, arg: &OsStr) {
 #[cfg(test)]
 mod ace_tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::Path;
+
+    const ACCESS_DENIED_ACE_TYPE: u8 = 0x01;
+    const ACL_SIZE_INFORMATION: u32 = 2;
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct AceHeader {
+        ace_type: u8,
+        ace_flags: u8,
+        ace_size: u16,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct AccessDeniedAce {
+        header: AceHeader,
+        mask: Dword,
+        sid_start: Dword,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct AclSizeInformation {
+        ace_count: Dword,
+        acl_bytes_in_use: Dword,
+        acl_bytes_free: Dword,
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn GetAclInformation(
+            p_acl: Handle,
+            p_acl_information: *mut core::ffi::c_void,
+            n_acl_information_length: Dword,
+            dw_acl_information_class: u32,
+        ) -> Bool;
+        fn GetAce(p_acl: Handle, dw_ace_index: Dword, p_ace: *mut Handle) -> Bool;
+        fn EqualSid(p_sid1: Handle, p_sid2: Handle) -> Bool;
+    }
+
+    fn dacl_has_deny_ace(path: &Path, sid: Handle) -> bool {
+        let wide = wide_path(path);
+        let mut owner = ptr::null_mut();
+        let mut group = ptr::null_mut();
+        let mut dacl = ptr::null_mut();
+        let mut sacl = ptr::null_mut();
+        let mut sd = ptr::null_mut();
+        // SAFETY: `wide` is a NUL-terminated path; out pointers are written by the API.
+        let got = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                &mut owner,
+                &mut group,
+                &mut dacl,
+                &mut sacl,
+                &mut sd,
+            )
+        };
+        assert_eq!(got, 0, "GetNamedSecurityInfoW first dest failed ({got})");
+        let _sd = LocalMem(sd);
+        if dacl.is_null() {
+            return false;
+        }
+        let mut info = AclSizeInformation {
+            ace_count: 0,
+            acl_bytes_in_use: 0,
+            acl_bytes_free: 0,
+        };
+        // SAFETY: `dacl` is the DACL inside `_sd`; `info` matches AclSizeInformation.
+        let queried = unsafe {
+            GetAclInformation(
+                dacl,
+                (&raw mut info).cast(),
+                std::mem::size_of::<AclSizeInformation>() as Dword,
+                ACL_SIZE_INFORMATION,
+            )
+        };
+        assert_ne!(queried, 0, "GetAclInformation first dest");
+        for i in 0..info.ace_count {
+            let mut ace = ptr::null_mut();
+            // SAFETY: `dacl` is valid for AceCount entries; `ace` is written by GetAce.
+            let found = unsafe { GetAce(dacl, i, &mut ace) };
+            assert_ne!(found, 0, "GetAce {i}");
+            // SAFETY: GetAce returned a pointer into `dacl`.
+            let header = unsafe { &*ace.cast::<AceHeader>() };
+            if header.ace_type != ACCESS_DENIED_ACE_TYPE {
+                continue;
+            }
+            // SAFETY: ACCESS_DENIED_ACE layout; SidStart is the SID bytes.
+            let ace_sid =
+                unsafe { (&raw const (*ace.cast::<AccessDeniedAce>()).sid_start) as Handle };
+            // SAFETY: both pointers are SIDs (ACE SidStart and RestrictedSid).
+            if unsafe { EqualSid(ace_sid, sid) } != 0 {
+                return true;
+            }
+        }
+        false
+    }
 
     #[test]
     fn deny_dest_aces_rolls_back_on_second_path_error() {
@@ -1380,15 +1480,10 @@ mod ace_tests {
             matches!(err, KernelError::Apply(_)),
             "mid-loop ACE fail is Apply: {err}"
         );
-        let again = deny_dest_ace(&first, sid.0);
         assert!(
-            again.is_ok(),
+            !dacl_has_deny_ace(&first, sid.0),
             "first dest must not keep a leftover DENY ACE after rollback"
         );
-        if let Ok(mut guard) = again {
-            let _ = guard.restore();
-        }
-        let _ = PathBuf::from("keep-sid-alive");
         drop(sid);
     }
 }

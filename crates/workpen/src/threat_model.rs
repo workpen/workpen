@@ -34,8 +34,12 @@
 //! * Argv dest-deny peels attached `--flag=.env`. It does not parse
 //!   unknown script languages. Wrapper skip is
 //!   `timeout` / `nohup` / `nice` / `time` / `stdbuf`.
-//! * Extra-root `/tmp` walks dest-deny names under ordinary
-//!   subdirectories. It does not walk every file under `/tmp`.
+//! * Extra-root `/tmp` is one extra dest-deny name level. A hardlink
+//!   under a deeper ordinary dir is not remounted. Path remount does
+//!   not hide other hardlinks to the same inode. Userspace
+//!   [`crate::check_dest`] still dest-denies hardlink siblings when
+//!   the host calls it. In-child open of a planted
+//!   `/tmp/proj/sub/leaked` is the same class as post-create.
 //! * Windows WFP win32 5 is `WfpSkipped`. AppContainer is still the
 //!   net deny. Do not revert that skip.
 //! * Parent-rename of a dest-deny ancestor (`mv workspace out`) is
