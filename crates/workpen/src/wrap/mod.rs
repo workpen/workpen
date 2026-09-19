@@ -141,6 +141,60 @@ fn apply_detail(err: &KernelError) -> String {
     }
 }
 
+/// Drain stdout/stderr on helper threads while waiting so a chatty child
+/// cannot fill the pipe (~64KiB) and block until the deadline.
+#[cfg(unix)]
+fn wait_child_timeout_output(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Result<std::process::Output, KernelError> {
+    use std::thread;
+    use std::time::Instant;
+
+    let stdout = child.stdout.take().map(drain_pipe);
+    let stderr = child.stderr.take().map(drain_pipe);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child
+            .try_wait()
+            .map_err(|e| KernelError::Apply(e.to_string()))?
+        {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let pid = child.id() as libc::pid_t;
+                // SAFETY: pid is the child's process group (process_group(0)).
+                unsafe {
+                    libc::killpg(pid, libc::SIGKILL);
+                }
+                let _ = child.wait();
+                let _ = join_drain(stdout);
+                let _ = join_drain(stderr);
+                return Err(KernelError::Timeout);
+            }
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: join_drain(stdout),
+        stderr: join_drain(stderr),
+    })
+}
+
+#[cfg(unix)]
+fn drain_pipe(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+        buf
+    })
+}
+
+#[cfg(unix)]
+fn join_drain(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    handle.and_then(|h| h.join().ok()).unwrap_or_default()
+}
+
 /// Whether this OS can apply a kernel jail.
 #[must_use]
 pub fn kernel_supported() -> bool {
@@ -458,6 +512,9 @@ impl KernelPolicy {
     }
 
     /// Same as [`Self::run_child_output`] with a deadline.
+    ///
+    /// Stdout and stderr are drained while waiting so a chatty child
+    /// cannot fill the pipe and block until this deadline.
     pub fn run_child_timeout_output(
         &self,
         cmd: Command,
@@ -467,7 +524,6 @@ impl KernelPolicy {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            use std::time::Instant;
 
             if !kernel_supported() {
                 return Err(KernelError::Apply(
@@ -480,31 +536,8 @@ impl KernelPolicy {
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
             cmd.process_group(0);
-            let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
-            let deadline = Instant::now() + timeout;
-            loop {
-                match child
-                    .try_wait()
-                    .map_err(|e| KernelError::Apply(e.to_string()))?
-                {
-                    Some(_status) => {
-                        let output = child
-                            .wait_with_output()
-                            .map_err(|e| KernelError::Apply(e.to_string()))?;
-                        return Ok((applied, output));
-                    }
-                    None if Instant::now() >= deadline => {
-                        let pid = child.id() as libc::pid_t;
-                        // SAFETY: pid is the child's process group (process_group(0)).
-                        unsafe {
-                            libc::killpg(pid, libc::SIGKILL);
-                        }
-                        let _ = child.wait();
-                        return Err(KernelError::Timeout);
-                    }
-                    None => std::thread::sleep(Duration::from_millis(10)),
-                }
-            }
+            let child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            Ok((applied, wait_child_timeout_output(child, timeout)?))
         }
         #[cfg(windows)]
         {

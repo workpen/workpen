@@ -317,6 +317,8 @@ unsafe extern "system" {
 }
 
 struct CloseOnDrop(Handle);
+// SAFETY: exclusive kernel HANDLE; drain threads take ownership.
+unsafe impl Send for CloseOnDrop {}
 impl Drop for CloseOnDrop {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
@@ -833,6 +835,10 @@ fn spawn_prepared_child(
     drop((std_in, std_out, std_err));
     let process = CloseOnDrop(info.h_process);
     let thread = CloseOnDrop(info.h_thread);
+    // Drain capture pipes before the child runs so a large write cannot
+    // fill the pipe and block WaitForSingleObject.
+    let stdout_drain = stdout_read.map(drain_pipe);
+    let stderr_drain = stderr_read.map(drain_pipe);
     // SAFETY: `job` is our job object; `process` is the new suspended process.
     let assigned = unsafe { AssignProcessToJobObject(prepared.job.0, process.0) };
     if assigned == 0 {
@@ -840,6 +846,8 @@ fn spawn_prepared_child(
         unsafe {
             TerminateProcess(process.0, 1);
         }
+        let _ = join_drain(stdout_drain);
+        let _ = join_drain(stderr_drain);
         return Err(last_error("AssignProcessToJobObject"));
     }
     // SAFETY: thread is the primary thread of the suspended process.
@@ -848,6 +856,8 @@ fn spawn_prepared_child(
         unsafe {
             TerminateProcess(process.0, 1);
         }
+        let _ = join_drain(stdout_drain);
+        let _ = join_drain(stderr_drain);
         return Err(last_error("ResumeThread"));
     }
     // INFINITE is 0xFFFF_FFFF. Cap finite waits one below that.
@@ -875,6 +885,8 @@ fn spawn_prepared_child(
                 "timeout kill left process still active".into(),
             ));
         }
+        let _ = join_drain(stdout_drain);
+        let _ = join_drain(stderr_drain);
         return Err(KernelError::Timeout);
     }
     if wait == WAIT_FAILED || wait != WAIT_OBJECT_0 {
@@ -884,6 +896,8 @@ fn spawn_prepared_child(
     // SAFETY: process has exited; exit code pointer is valid.
     let got = unsafe { GetExitCodeProcess(process.0, &mut code) };
     if got == 0 {
+        let _ = join_drain(stdout_drain);
+        let _ = join_drain(stderr_drain);
         return Err(last_error("GetExitCodeProcess"));
     }
     let applied = if prepared.wfp_skipped {
@@ -894,11 +908,11 @@ fn spawn_prepared_child(
     let output = if capture {
         Some(std::process::Output {
             status: ExitStatus::from_raw(code),
-            stdout: stdout_read.map(read_all).unwrap_or_default(),
-            stderr: stderr_read.map(read_all).unwrap_or_default(),
+            stdout: join_drain(stdout_drain),
+            stderr: join_drain(stderr_drain),
         })
     } else {
-        drop((stdout_read, stderr_read));
+        drop((stdout_drain, stderr_drain));
         None
     };
     Ok((applied, ExitStatus::from_raw(code), output))
@@ -959,6 +973,14 @@ fn read_all(handle: CloseOnDrop) -> Vec<u8> {
         out.extend_from_slice(&buf[..n as usize]);
     }
     out
+}
+
+fn drain_pipe(handle: CloseOnDrop) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || read_all(handle))
+}
+
+fn join_drain(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    handle.and_then(|h| h.join().ok()).unwrap_or_default()
 }
 
 fn dest_deny_paths(policy: &KernelPolicy) -> Vec<PathBuf> {

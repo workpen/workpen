@@ -2379,6 +2379,79 @@ fn run_child_output_echoes_hello() {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
 }
 
+#[cfg(unix)]
+fn python3_available() -> bool {
+    Command::new("python3")
+        .args(["-c", "print(1)"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// A 1MiB print fills the ~64KiB pipe. Timeout wait must drain or the
+/// child blocks and the deadline returns [`KernelError::Timeout`].
+#[cfg(unix)]
+#[test]
+fn run_child_timeout_output_drains_large_stdout() {
+    if !kernel_supported() || !python3_available() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("python3");
+    cmd.args(["-c", r#"print("x"*10**6)"#])
+        .current_dir(dir.path());
+    let (_applied, output) = policy
+        .run_child_timeout_output(cmd, Duration::from_secs(5))
+        .expect("1MiB print under timeout");
+    assert!(
+        output.status.success(),
+        "1MiB print must finish under timeout, status={:?} stdout_len={} stderr={}",
+        output.status.code(),
+        output.stdout.len(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.len() >= 1_000_000,
+        "stdout must be at least 1MiB, got {}",
+        output.stdout.len()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn run_child_timeout_output_drains_large_stdout() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let printer = rustc_windows_probe(
+        dir.path(),
+        "large_stdout",
+        "fn main() { let x = vec![b'x'; 1_000_000]; use std::io::Write; let _ = std::io::stdout().write_all(&x); let _ = std::io::stdout().write_all(b\"\\n\"); }\n",
+    );
+    let mut cmd = Command::new(&printer);
+    cmd.current_dir(dir.path());
+    let (_applied, output) = policy
+        .run_child_timeout_output(cmd, Duration::from_secs(5))
+        .expect("1MiB print under timeout");
+    assert!(
+        output.status.success(),
+        "1MiB print must finish under timeout, status={:?} stdout_len={} stderr={}",
+        output.status.code(),
+        output.stdout.len(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.len() >= 1_000_000,
+        "stdout must be at least 1MiB, got {}",
+        output.stdout.len()
+    );
+}
+
 /// `WORKPEN_E2E_REQUIRE` panics if remount/Seatbelt cannot apply.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]

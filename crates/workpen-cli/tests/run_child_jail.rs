@@ -275,6 +275,51 @@ fn run_timeout_fast_command_succeeds() {
 }
 
 #[cfg(unix)]
+fn python3_available() -> bool {
+    Command::new("python3")
+        .args(["-c", "print(1)"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+#[test]
+fn run_timeout_large_stdout_is_captured() {
+    if !python3_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args([
+            "--timeout",
+            "5s",
+            "--",
+            "python3",
+            "-c",
+            r#"print("x"*10**6)"#,
+        ])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        out.status.success(),
+        "1MiB print must finish under --timeout 5s, status={:?} stdout_len={} stderr={}",
+        out.status.code(),
+        out.stdout.len(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.len() >= 1_000_000,
+        "stdout must be at least 1MiB, got {}",
+        out.stdout.len()
+    );
+}
+
+#[cfg(unix)]
 fn printenv_available() -> bool {
     std::path::Path::new("/usr/bin/printenv").is_file()
 }
