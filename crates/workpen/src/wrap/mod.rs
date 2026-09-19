@@ -1322,12 +1322,7 @@ fn add_macos_post_create_rules(
         };
         let prefix = escape_regex_literal(raw);
         // One filter only. Combined (subpath)(regex) denied the whole tree.
-        let mut regexes = vec![
-            format!("^{prefix}/[.]env$"),
-            format!("^{prefix}/.*/[.]env$"),
-            format!("^{prefix}/[.]env[.].*$"),
-            format!("^{prefix}/.*/[.]env[.].*$"),
-        ];
+        let mut regexes = macos_post_create_env_regexes(&prefix);
         for glob in globs {
             if let Some(re) = crate::dest_deny_glob_regex(&prefix, glob) {
                 regexes.push(re);
@@ -1389,6 +1384,16 @@ fn firmlink_alias(path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_post_create_env_regexes(prefix: &str) -> Vec<String> {
+    vec![
+        format!("^{prefix}/[.][Ee][Nn][Vv]$"),
+        format!("^{prefix}/.*/[.][Ee][Nn][Vv]$"),
+        format!("^{prefix}/[.][Ee][Nn][Vv][.].*$"),
+        format!("^{prefix}/.*/[.][Ee][Nn][Vv][.].*$"),
+    ]
 }
 
 #[cfg(target_os = "macos")]
@@ -1595,6 +1600,8 @@ fn is_fs_root(path: &Path) -> bool {
 
 #[cfg(test)]
 mod combine_spawn_restore_tests {
+    #[cfg(target_os = "macos")]
+    use super::macos_post_create_env_regexes;
     use super::{
         KernelApply, KernelError, WFP_ERROR_ACCESS_DENIED, combine_spawn_restore,
         dest_deny_rule_paths, process_jail, require_applied, wfp_skip_access_denied,
@@ -1677,6 +1684,22 @@ mod combine_spawn_restore_tests {
         assert!(!wfp_skip_access_denied(0));
         assert!(!wfp_skip_access_denied(2));
         assert!(!wfp_skip_access_denied(87));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_post_create_env_regexes_match_dot_env_any_case() {
+        let got = macos_post_create_env_regexes("/ws");
+        assert_eq!(
+            got,
+            [
+                "^/ws/[.][Ee][Nn][Vv]$",
+                "^/ws/.*/[.][Ee][Nn][Vv]$",
+                "^/ws/[.][Ee][Nn][Vv][.].*$",
+                "^/ws/.*/[.][Ee][Nn][Vv][.].*$",
+            ]
+            .map(str::to_string)
+        );
     }
 
     #[test]

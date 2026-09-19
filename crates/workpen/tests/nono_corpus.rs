@@ -2412,6 +2412,19 @@ fn run_child_namespace_lockdown_and_dumpable() {
         let _ = unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut core) };
         // SAFETY: unshare only this thread, which is the e2e child after jail apply.
         let rc = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) };
+        let dest = format!("{}env", ".");
+        let dest_c = std::ffi::CString::new(dest).expect("dest");
+        // SAFETY: dest_c is a C string; umount2/mount on this thread after jail apply.
+        let umount_rc = unsafe { libc::umount2(dest_c.as_ptr(), 0) };
+        let mount_rc = unsafe {
+            libc::mount(
+                c"/".as_ptr(),
+                dest_c.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        };
         let readme_line = match fs::read_to_string("readme.md") {
             Ok(body) if body == "ok\n" => "readme-ok\n",
             _ => "",
@@ -2419,9 +2432,14 @@ fn run_child_namespace_lockdown_and_dumpable() {
         let _ = fs::write(
             "e2e-dumpable.out",
             format!(
-                "core:{}\nunshare:{}\n{readme_line}",
+                "core:{}\nunshare:{}\nmount:{}\n{readme_line}",
                 core.rlim_cur,
-                if rc == 0 { 0 } else { 1 }
+                if rc == 0 { 0 } else { 1 },
+                if umount_rc != 0 && mount_rc != 0 {
+                    1
+                } else {
+                    0
+                }
             ),
         );
         std::process::exit(0);
@@ -2431,6 +2449,7 @@ fn run_child_namespace_lockdown_and_dumpable() {
     }
     let dir = workspace();
     fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
     let exe = std::env::current_exe().expect("current_exe");
     let child = dir.path().join("e2e-dumpable");
     fs::copy(&exe, &child).expect("copy e2e child into workspace");
@@ -2467,6 +2486,10 @@ fn run_child_namespace_lockdown_and_dumpable() {
         assert!(
             body.contains("unshare:1"),
             "nested unshare must not succeed after remount: {body:?} stdout={stdout:?}"
+        );
+        assert!(
+            body.lines().any(|line| line.trim() == "mount:1"),
+            "umount/mount of dest-deny must fail after remount: {body:?} stdout={stdout:?}"
         );
     }
 }

@@ -1246,6 +1246,8 @@ pub fn validate_deny_glob(glob: &str) -> Result<(), &'static str> {
 ///
 /// `**/.env` matches `prefix/.env` and `prefix/sub/.env`. Interior `**`
 /// is recursive (`src/**/*.pem` matches `src/x.pem` and `src/a/b.pem`).
+/// ASCII letters become `[Aa]` so Seatbelt matches the case-insensitive
+/// userspace glob dialect. SBPL has no in-tree `(?i)` support.
 /// Used by macOS wrap and by the dialect table test on every OS.
 pub fn dest_deny_glob_regex(prefix: &str, glob: &str) -> Option<String> {
     validate_deny_glob(glob).ok()?;
@@ -1286,18 +1288,52 @@ pub fn dest_deny_glob_regex(prefix: &str, glob: &str) -> Option<String> {
             '.' | '+' | '?' | '(' | ')' | '[' | ']' | '|' | '^' | '$'
         ) {
             body.push('\\');
+            body.push(chars[i]);
+            i += 1;
+            continue;
         }
-        body.push(chars[i]);
+        push_ascii_letter_class(&mut body, chars[i]);
         i += 1;
     }
     if trailing_dir {
         body.push_str("(/.*)?");
     }
+    let prefix = case_fold_regex_letters(prefix);
     if nested {
         Some(format!("^{prefix}/(.*/)?{body}$"))
     } else {
         Some(format!("^{prefix}/{body}$"))
     }
+}
+
+fn push_ascii_letter_class(out: &mut String, c: char) {
+    if c.is_ascii_alphabetic() {
+        out.push('[');
+        out.push(c.to_ascii_uppercase());
+        out.push(c.to_ascii_lowercase());
+        out.push(']');
+    } else {
+        out.push(c);
+    }
+}
+
+fn case_fold_regex_letters(s: &str) -> String {
+    let mut out = String::new();
+    let mut escaped = false;
+    for c in s.chars() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            out.push('\\');
+            escaped = true;
+            continue;
+        }
+        push_ascii_letter_class(&mut out, c);
+    }
+    out
 }
 
 pub fn path_matches_deny_glob(pattern: &str, path: &str) -> bool {

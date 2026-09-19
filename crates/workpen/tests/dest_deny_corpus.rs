@@ -1212,6 +1212,8 @@ fn dest_deny_glob_regex_agrees_with_path_matches_on_default_corpus() {
         "sub/.env.local",
         "readme.md",
         ".environment",
+        ".ENV",
+        "ID_RSA",
     ];
     for glob in default_secret_denies() {
         let Some(re) = dest_deny_glob_regex(prefix, &glob) else {
@@ -1230,7 +1232,25 @@ fn dest_deny_glob_regex_agrees_with_path_matches_on_default_corpus() {
     }
 }
 
-/// Matcher for the dest-deny Seatbelt dialect (`^…$`, `(.*/)?`, `[^/]*`, `\x`).
+#[test]
+fn dest_deny_glob_regex_matches_env_and_id_rsa_any_case() {
+    let env = dest_deny_glob_regex("/ws", "**/.env").expect("**/.env must compile");
+    assert!(
+        regex_full_match(&env, "/ws/.ENV"),
+        "Seatbelt regex for **/.env must match .ENV: {env}"
+    );
+    assert!(
+        regex_full_match(&env, "/ws/sub/.Env"),
+        "Seatbelt regex for **/.env must match nested .Env: {env}"
+    );
+    let rsa = dest_deny_glob_regex("/ws", "**/*_rsa").expect("**/*_rsa must compile");
+    assert!(
+        regex_full_match(&rsa, "/ws/ID_RSA"),
+        "Seatbelt regex for **/*_rsa must match ID_RSA: {rsa}"
+    );
+}
+
+/// Matcher for the dest-deny Seatbelt dialect (`^…$`, `(.*/)?`, `[^/]*`, `[Aa]`, `\x`).
 fn regex_full_match(re: &str, path: &str) -> bool {
     let re = re
         .strip_prefix('^')
@@ -1265,6 +1285,17 @@ fn match_seatbelt(pat: &[u8], text: &[u8]) -> bool {
             }
         }
         return false;
+    }
+    if pat.first() == Some(&b'[')
+        && pat.get(3) == Some(&b']')
+        && pat.get(1).is_some_and(u8::is_ascii_alphabetic)
+        && pat.get(2).is_some_and(u8::is_ascii_alphabetic)
+    {
+        let a = pat[1];
+        let b = pat[2];
+        let rest = &pat[4..];
+        return text.first().is_some_and(|t| *t == a || *t == b)
+            && match_seatbelt(rest, &text[1..]);
     }
     if pat.starts_with(b"(/.*)?") {
         let rest = &pat[b"(/.*)?".len()..];

@@ -124,18 +124,73 @@ fn remount_all(
         }
         return Ok(());
     }
-    lock_namespaces()?;
     for path in paths {
         let hide = if path.is_dir() { hide_dir } else { hide_file };
         bind_over(path, hide)?;
     }
+    lock_namespaces()?;
     Ok(())
 }
 
-/// After a successful remount enter, block nested userns/mount ns.
-/// Fail-closed if the filter cannot be installed.
-fn lock_namespaces() -> io::Result<()> {
-    // BPF: load syscall nr; unshare/setns -> EPERM; clone3 -> ENOSYS; else allow.
+fn sys_umount_nr() -> Option<u32> {
+    // SYS_umount (not umount2) exists on some 32-bit and ppc/s390x libc
+    // targets. x86_64/aarch64/riscv64 expose SYS_umount2 only.
+    #[cfg(any(
+        target_arch = "x86",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "s390x",
+        target_arch = "sparc",
+        target_arch = "sparc64",
+        target_arch = "m68k",
+        target_arch = "mips",
+        target_arch = "mips32r6",
+    ))]
+    {
+        Some(libc::SYS_umount as u32)
+    }
+    #[cfg(not(any(
+        target_arch = "x86",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "s390x",
+        target_arch = "sparc",
+        target_arch = "sparc64",
+        target_arch = "m68k",
+        target_arch = "mips",
+        target_arch = "mips32r6",
+    )))]
+    {
+        None
+    }
+}
+
+fn eperm_syscall_nrs() -> Vec<u32> {
+    let mut nrs = vec![
+        libc::SYS_unshare as u32,
+        libc::SYS_setns as u32,
+        libc::SYS_mount as u32,
+        libc::SYS_umount2 as u32,
+        libc::SYS_pivot_root as u32,
+        libc::SYS_fsopen as u32,
+        libc::SYS_fsconfig as u32,
+        libc::SYS_fsmount as u32,
+        libc::SYS_move_mount as u32,
+        libc::SYS_open_tree as u32,
+        libc::SYS_mount_setattr as u32,
+    ];
+    nrs.extend(sys_umount_nr());
+    nrs
+}
+
+fn ret_errno(errno: u32) -> u32 {
+    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    SECCOMP_RET_ERRNO | errno
+}
+
+fn namespace_lock_filter() -> Vec<libc::sock_filter> {
+    // BPF: load syscall nr; listed nrs -> EPERM; clone3 -> ENOSYS; else allow.
+    // clone stays allowed so threads still work.
     const BPF_LD: u16 = 0x00;
     const BPF_W: u16 = 0x00;
     const BPF_ABS: u16 = 0x20;
@@ -144,70 +199,61 @@ fn lock_namespaces() -> io::Result<()> {
     const BPF_K: u16 = 0x00;
     const BPF_RET: u16 = 0x06;
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
-    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    let eperm = libc::EPERM as u32;
+    let enosys = libc::ENOSYS as u32;
+    let mut filter = vec![libc::sock_filter {
+        code: BPF_LD | BPF_W | BPF_ABS,
+        jt: 0,
+        jf: 0,
+        k: 0,
+    }];
+    for nr in eperm_syscall_nrs() {
+        filter.push(libc::sock_filter {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 0,
+            jf: 1,
+            k: nr,
+        });
+        filter.push(libc::sock_filter {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: ret_errno(eperm),
+        });
+    }
+    filter.push(libc::sock_filter {
+        code: BPF_JMP | BPF_JEQ | BPF_K,
+        jt: 0,
+        jf: 1,
+        k: libc::SYS_clone3 as u32,
+    });
+    filter.push(libc::sock_filter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: ret_errno(enosys),
+    });
+    filter.push(libc::sock_filter {
+        code: BPF_RET | BPF_K,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_ALLOW,
+    });
+    filter
+}
+
+/// After a successful remount enter and dest bind-over, block nested
+/// userns/mount ns and remount of dest-deny binds. Fail-closed if the
+/// filter cannot be installed.
+fn lock_namespaces() -> io::Result<()> {
     const SECCOMP_SET_MODE_FILTER: u32 = 1;
     const SECCOMP_FILTER_FLAG_TSYNC: u32 = 1;
     const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
 
-    let unshare = libc::SYS_unshare as u32;
-    let setns = libc::SYS_setns as u32;
-    let clone3 = libc::SYS_clone3 as u32;
-    let eperm = libc::EPERM as u32;
-    let enosys = libc::ENOSYS as u32;
-
-    let filter = [
-        libc::sock_filter {
-            code: BPF_LD | BPF_W | BPF_ABS,
-            jt: 0,
-            jf: 0,
-            k: 0,
-        },
-        libc::sock_filter {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 0,
-            jf: 1,
-            k: unshare,
-        },
-        libc::sock_filter {
-            code: BPF_RET | BPF_K,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_RET_ERRNO | eperm,
-        },
-        libc::sock_filter {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 0,
-            jf: 1,
-            k: setns,
-        },
-        libc::sock_filter {
-            code: BPF_RET | BPF_K,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_RET_ERRNO | eperm,
-        },
-        libc::sock_filter {
-            code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 0,
-            jf: 1,
-            k: clone3,
-        },
-        libc::sock_filter {
-            code: BPF_RET | BPF_K,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_RET_ERRNO | enosys,
-        },
-        libc::sock_filter {
-            code: BPF_RET | BPF_K,
-            jt: 0,
-            jf: 0,
-            k: SECCOMP_RET_ALLOW,
-        },
-    ];
+    let mut filter = namespace_lock_filter();
     let prog = libc::sock_fprog {
         len: filter.len() as u16,
-        filter: filter.as_ptr().cast_mut(),
+        filter: filter.as_mut_ptr(),
     };
     // SAFETY: child thread after fork; no_new_privs then TSYNC filter.
     let nnp = unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
@@ -488,5 +534,52 @@ mod tests {
             "hide dir must not be the planted shared path"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn namespace_lock_eperm_includes_mount_family_not_clone() {
+        let nrs = super::eperm_syscall_nrs();
+        for nr in [
+            libc::SYS_unshare as u32,
+            libc::SYS_setns as u32,
+            libc::SYS_mount as u32,
+            libc::SYS_umount2 as u32,
+            libc::SYS_pivot_root as u32,
+            libc::SYS_fsopen as u32,
+            libc::SYS_fsconfig as u32,
+            libc::SYS_fsmount as u32,
+            libc::SYS_move_mount as u32,
+            libc::SYS_open_tree as u32,
+            libc::SYS_mount_setattr as u32,
+        ] {
+            assert!(nrs.contains(&nr), "EPERM list must include syscall {nr}");
+        }
+        assert!(
+            !nrs.contains(&(libc::SYS_clone as u32)),
+            "clone must stay allowed for threads"
+        );
+        assert!(
+            !nrs.contains(&(libc::SYS_clone3 as u32)),
+            "clone3 is ENOSYS, not EPERM"
+        );
+        let filter = super::namespace_lock_filter();
+        let enosys = super::ret_errno(libc::ENOSYS as u32);
+        assert!(
+            filter.iter().any(|ins| ins.k == libc::SYS_clone3 as u32),
+            "filter must test clone3"
+        );
+        assert!(
+            filter.iter().any(|ins| ins.k == enosys),
+            "clone3 must return ENOSYS"
+        );
+        let eperm = super::ret_errno(libc::EPERM as u32);
+        assert!(
+            filter.iter().any(|ins| ins.k == libc::SYS_mount as u32),
+            "filter must test mount"
+        );
+        assert!(
+            filter.iter().any(|ins| ins.k == eperm),
+            "mount family must return EPERM"
+        );
     }
 }
