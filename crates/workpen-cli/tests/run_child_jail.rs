@@ -23,6 +23,30 @@ fn run_echo_succeeds_without_bash_rewrite() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
 }
 
+#[cfg(unix)]
+#[test]
+fn run_stdout_redirect_outside_workspace_is_readable() {
+    let dir = TempDir::new().expect("workspace");
+    let outside = TempDir::new().expect("outside");
+    let dest = outside.path().join("out.txt");
+    let file = std::fs::File::create(&dest).expect("create");
+    let status = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .arg("run")
+        .arg("--root")
+        .arg(dir.path())
+        .args(["--", "/bin/echo", "ok"])
+        .stdout(file)
+        .status()
+        .expect("spawn workpen");
+    assert!(status.success(), "run with stdout outside --root");
+    let body = std::fs::read_to_string(&dest).expect("read outside");
+    assert_eq!(
+        body.trim(),
+        "ok",
+        "parent must write captured stdout outside --root: {body:?}"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn run_sh_c_echo_does_not_warn_var_select() {
