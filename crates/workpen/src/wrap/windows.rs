@@ -226,6 +226,13 @@ unsafe extern "system" {
         lp_number_of_bytes_read: *mut Dword,
         lp_overlapped: *mut core::ffi::c_void,
     ) -> Bool;
+    fn WriteFile(
+        h_file: Handle,
+        lp_buffer: *const u8,
+        n_number_of_bytes_to_write: Dword,
+        lp_number_of_bytes_written: *mut Dword,
+        lp_overlapped: *mut core::ffi::c_void,
+    ) -> Bool;
     fn SetHandleInformation(h_object: Handle, dw_mask: Dword, dw_flags: Dword) -> Bool;
 }
 
@@ -530,12 +537,20 @@ struct NetGuards {
     _wfp: Option<windows_net::WfpSession>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StdioCapture {
+    Inherit,
+    Collect,
+    Forward,
+}
+
 pub(super) fn spawn_write_restricted(
     policy: &KernelPolicy,
     cmd: &Command,
     timeout: Option<Duration>,
 ) -> Result<(KernelApply, ExitStatus), KernelError> {
-    let (applied, status, _, timed_out) = spawn_write_restricted_io(policy, cmd, timeout, false)?;
+    let (applied, status, _, timed_out) =
+        spawn_write_restricted_io(policy, cmd, timeout, StdioCapture::Inherit)?;
     if timed_out {
         return Err(KernelError::Timeout);
     }
@@ -548,7 +563,7 @@ pub(super) fn spawn_write_restricted_output(
     timeout: Option<Duration>,
 ) -> Result<(KernelApply, std::process::Output, bool), KernelError> {
     let (applied, status, output, timed_out) =
-        spawn_write_restricted_io(policy, cmd, timeout, true)?;
+        spawn_write_restricted_io(policy, cmd, timeout, StdioCapture::Collect)?;
     Ok((
         applied,
         output.unwrap_or_else(|| std::process::Output {
@@ -560,11 +575,21 @@ pub(super) fn spawn_write_restricted_output(
     ))
 }
 
+pub(super) fn spawn_write_restricted_forward(
+    policy: &KernelPolicy,
+    cmd: &Command,
+    timeout: Option<Duration>,
+) -> Result<(KernelApply, ExitStatus, bool), KernelError> {
+    let (applied, status, _, timed_out) =
+        spawn_write_restricted_io(policy, cmd, timeout, StdioCapture::Forward)?;
+    Ok((applied, status, timed_out))
+}
+
 fn spawn_write_restricted_io(
     policy: &KernelPolicy,
     cmd: &Command,
     timeout: Option<Duration>,
-    capture: bool,
+    capture: StdioCapture,
 ) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>, bool), KernelError> {
     let prepared = if policy.network_blocked() {
         prepare_network_blocked(policy)?
@@ -754,7 +779,7 @@ fn spawn_prepared(
     mut prepared: Prepared,
     cmd: &Command,
     timeout: Option<Duration>,
-    capture: bool,
+    capture: StdioCapture,
 ) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>, bool), KernelError> {
     let result = spawn_prepared_child(&mut prepared, cmd, timeout, capture);
     let restore = restore_guards(&mut prepared.acl_guards);
@@ -777,7 +802,7 @@ fn spawn_prepared_child(
     prepared: &mut Prepared,
     cmd: &Command,
     timeout: Option<Duration>,
-    capture: bool,
+    capture: StdioCapture,
 ) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>, bool), KernelError> {
     let (app, mut cmdline, cwd) = match prepared.helper.as_deref() {
         Some(helper) => wrap_command_line(helper, cmd)?,
@@ -785,15 +810,24 @@ fn spawn_prepared_child(
     };
     let mut env_block = environment_block(cmd);
     let std_in = inheritable_std_handle(STD_INPUT_HANDLE, false)?;
-    let (std_out, stdout_read) = if capture {
+    let piped = matches!(capture, StdioCapture::Collect | StdioCapture::Forward);
+    let (std_out, stdout_read) = if piped {
         inheritable_pipe(true)?
     } else {
         (inheritable_std_handle(STD_OUTPUT_HANDLE, true)?, None)
     };
-    let (std_err, stderr_read) = if capture {
+    let (std_err, stderr_read) = if piped {
         inheritable_pipe(true)?
     } else {
         (inheritable_std_handle(STD_ERROR_HANDLE, true)?, None)
+    };
+    let forward_dst = if capture == StdioCapture::Forward {
+        Some((
+            duplicate_std_handle(STD_OUTPUT_HANDLE, true)?,
+            duplicate_std_handle(STD_ERROR_HANDLE, true)?,
+        ))
+    } else {
+        None
     };
     let mut startup = StartupInfoW {
         cb: std::mem::size_of::<StartupInfoW>() as Dword,
@@ -847,8 +881,21 @@ fn spawn_prepared_child(
     let thread = CloseOnDrop(info.h_thread);
     // Drain capture pipes before the child runs so a large write cannot
     // fill the pipe and block WaitForSingleObject.
-    let stdout_drain = stdout_read.map(drain_pipe);
-    let stderr_drain = stderr_read.map(drain_pipe);
+    let (stdout_drain, stderr_drain, stdout_fwd, stderr_fwd) = match (capture, forward_dst) {
+        (StdioCapture::Collect, _) => (
+            stdout_read.map(drain_pipe),
+            stderr_read.map(drain_pipe),
+            None,
+            None,
+        ),
+        (StdioCapture::Forward, Some((parent_out, parent_err))) => (
+            None,
+            None,
+            stdout_read.map(|h| drain_forward(h, parent_out)),
+            stderr_read.map(|h| drain_forward(h, parent_err)),
+        ),
+        (StdioCapture::Forward, None) | (StdioCapture::Inherit, _) => (None, None, None, None),
+    };
     // SAFETY: `job` is our job object; `process` is the new suspended process.
     let assigned = unsafe { AssignProcessToJobObject(prepared.job.0, process.0) };
     if assigned == 0 {
@@ -858,6 +905,8 @@ fn spawn_prepared_child(
         }
         let _ = join_drain(stdout_drain);
         let _ = join_drain(stderr_drain);
+        join_copy(stdout_fwd);
+        join_copy(stderr_fwd);
         return Err(last_error("AssignProcessToJobObject"));
     }
     // SAFETY: thread is the primary thread of the suspended process.
@@ -868,6 +917,8 @@ fn spawn_prepared_child(
         }
         let _ = join_drain(stdout_drain);
         let _ = join_drain(stderr_drain);
+        join_copy(stdout_fwd);
+        join_copy(stderr_fwd);
         return Err(last_error("ResumeThread"));
     }
     // INFINITE is 0xFFFF_FFFF. Cap finite waits one below that.
@@ -905,6 +956,8 @@ fn spawn_prepared_child(
     if got == 0 {
         let _ = join_drain(stdout_drain);
         let _ = join_drain(stderr_drain);
+        join_copy(stdout_fwd);
+        join_copy(stderr_fwd);
         return Err(last_error("GetExitCodeProcess"));
     }
     let applied = if prepared.wfp_skipped {
@@ -912,7 +965,7 @@ fn spawn_prepared_child(
     } else {
         KernelApply::Applied
     };
-    let output = if capture {
+    let output = if capture == StdioCapture::Collect {
         Some(std::process::Output {
             status: ExitStatus::from_raw(code),
             stdout: join_drain(stdout_drain),
@@ -920,6 +973,8 @@ fn spawn_prepared_child(
         })
     } else {
         drop((stdout_drain, stderr_drain));
+        join_copy(stdout_fwd);
+        join_copy(stderr_fwd);
         None
     };
     Ok((applied, ExitStatus::from_raw(code), output, timed_out))
@@ -986,8 +1041,71 @@ fn drain_pipe(handle: CloseOnDrop) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || read_all(handle))
 }
 
+fn drain_forward(src: CloseOnDrop, dst: CloseOnDrop) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || copy_pipe(src, dst))
+}
+
 fn join_drain(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
     handle.and_then(|h| h.join().ok()).unwrap_or_default()
+}
+
+fn join_copy(handle: Option<std::thread::JoinHandle<()>>) {
+    if let Some(h) = handle {
+        let _ = h.join();
+    }
+}
+
+fn duplicate_std_handle(std_id: Dword, write: bool) -> Result<CloseOnDrop, KernelError> {
+    // SAFETY: GetStdHandle is always valid to call.
+    let parent = unsafe { GetStdHandle(std_id) };
+    if parent.is_null() || parent == INVALID_HANDLE_VALUE {
+        return open_nul(write);
+    }
+    let current = unsafe { GetCurrentProcess() };
+    let mut dup = ptr::null_mut();
+    // SAFETY: parent is this process's std handle; inherit=0 so the child
+    // does not also get this copy (it has the pipe write end).
+    let ok = unsafe {
+        DuplicateHandle(
+            current,
+            parent,
+            current,
+            &mut dup,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok == 0 {
+        return open_nul(write);
+    }
+    Ok(CloseOnDrop(dup))
+}
+
+fn copy_pipe(src: CloseOnDrop, dst: CloseOnDrop) {
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let mut n: Dword = 0;
+        // SAFETY: src is a readable pipe we own.
+        let ok = unsafe {
+            ReadFile(
+                src.0,
+                buf.as_mut_ptr(),
+                buf.len() as Dword,
+                &mut n,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 || n == 0 {
+            break;
+        }
+        let mut wrote: Dword = 0;
+        // SAFETY: dst is a duplicated parent std handle we own.
+        let ok = unsafe { WriteFile(dst.0, buf.as_ptr(), n, &mut wrote, ptr::null_mut()) };
+        if ok == 0 {
+            break;
+        }
+    }
 }
 
 fn dest_deny_paths(policy: &KernelPolicy) -> Vec<PathBuf> {
