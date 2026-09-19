@@ -392,7 +392,7 @@ mod tests {
         let _guard = Override::enter(false);
         let dest = PathBuf::from("/ws/.env");
         let got = remount_status(&[dest], Path::new("/ws")).expect("workspace skip");
-        assert_eq!(got, super::KernelApply::RemountSkipped);
+        assert_eq!(got, crate::KernelApply::RemountSkipped);
     }
 
     #[test]
@@ -406,7 +406,7 @@ mod tests {
     fn remount_status_applied_when_no_dests() {
         let _guard = Override::enter(false);
         let got = remount_status(&[], Path::new("/ws")).expect("empty dests");
-        assert_eq!(got, super::KernelApply::Applied);
+        assert_eq!(got, crate::KernelApply::Applied);
     }
 
     #[test]

@@ -9,9 +9,7 @@ use std::ptr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use super::{
-    KernelAccess, KernelApply, KernelError, KernelPolicy, is_denied_child_env, spawn_after_setup,
-};
+use super::{KernelAccess, KernelApply, KernelError, KernelPolicy, is_denied_child_env};
 
 #[path = "windows_net.rs"]
 mod windows_net;
@@ -558,14 +556,12 @@ fn spawn_write_restricted_io(
     timeout: Option<Duration>,
     capture: bool,
 ) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>), KernelError> {
-    if policy.network_blocked() {
-        return spawn_after_setup(prepare_network_blocked(policy), |prepared| {
-            spawn_prepared(prepared, cmd, timeout, capture)
-        });
-    }
-    spawn_after_setup(prepare_write_restricted(policy), |prepared| {
-        spawn_prepared(prepared, cmd, timeout, capture)
-    })
+    let prepared = if policy.network_blocked() {
+        prepare_network_blocked(policy)?
+    } else {
+        prepare_write_restricted(policy)?
+    };
+    spawn_prepared(prepared, cmd, timeout, capture)
 }
 
 fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelError> {
@@ -1386,7 +1382,7 @@ mod ace_tests {
         let again = deny_dest_ace(&first, sid.0);
         assert!(
             again.is_ok(),
-            "first dest must not keep a leftover DENY ACE after rollback: {again:?}"
+            "first dest must not keep a leftover DENY ACE after rollback"
         );
         if let Ok(mut guard) = again {
             let _ = guard.restore();
