@@ -12,9 +12,9 @@ This is a near-term map, not a promise. Hosts should read
 
 ## Medium
 
-- crates.io after a human launch yes (`publish = true`, Trusted
-  Publishing already wired).
-- Drop stealth (README, GitHub About, topics) only after that yes.
+- crates.io via Trusted Publishing on the 0.5.0 tag.
+- Keep the public README and GitHub About current. Do not re-enable
+  stealth.
 
 ## Long
 

@@ -11,4 +11,6 @@ Immutable until a human-labeled PR amends this file.
 7. Do not fold this crate into canact or craftbag.
 8. Default crate is dest-deny plus PathGuard. Feature-gate `gc` and `nono`.
 9. Keep dest-deny and PathGuard as separate types.
-10. Stealth-public until a human says launch: empty About, no topics, README is "Not ready."
+10. Public after a human launch yes. README, GitHub About, topics, and
+    crates.io metadata may describe the crate. Do not re-enable stealth
+    without a constitution amendment.

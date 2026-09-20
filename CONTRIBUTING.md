@@ -19,8 +19,7 @@ make check
 ```
 
 That runs fmt, clippy (`-D warnings`), rustdoc, tests with features
-`gc,nono`, `cargo deny`, workflow-trigger lock, and the stealth
-assert.
+`gc,nono`, `cargo deny`, and the workflow-trigger lock.
 
 ## DCO
 

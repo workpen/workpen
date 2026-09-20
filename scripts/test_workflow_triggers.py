@@ -129,6 +129,14 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertIn("id: unpublished", refuse_block)
         auth_block = text[auth_idx:]
         self.assertIn("steps.unpublished.outputs.skip != 'true'", auth_block)
+        self.assertIn("cargo publish -p workpen", text)
+        self.assertIn("cargo publish -p workpen-cli", text)
+
+    def test_stealth_job_is_launch_standin(self) -> None:
+        text = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("name: Stealth", text)
+        self.assertIn("Stealth assert retired after launch", text)
+        self.assertNotIn("assert-stealth.sh", text)
 
     def test_msrv_is_1_95(self) -> None:
         toolchain = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
