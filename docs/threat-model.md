@@ -29,8 +29,11 @@ The parent is trusted. The child is not.
   the kernel jail still apply.
 - Extra-root dests are readable when remount is unavailable. Those
   still fail closed.
-- Linux remount covers files created after spawn. It does not. macOS
-  has name regexes. Windows denies existing dests only.
+- Linux remount occupies missing dest-deny basenames at the workspace
+  root when remount applies (`touch .env && cat .env`). Nested
+  `mkdir x && touch x/.env` is still a launch snapshot. macOS has
+  name regexes. Windows denies existing dests only. Do not vendor
+  bwrap. Do not `create_dir_all` on a nested deny path.
 - `apply_pre_exec` skipped argv dest-deny. It dest-denies the same way
   `run_child` does. Hosts that spawn themselves can also call
   `dest_deny_command`.

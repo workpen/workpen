@@ -433,6 +433,106 @@ fn bind_over(dest: &Path, hide: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Empty dest-deny names created so bind-over has a mount point.
+/// Dropped after the child exits so the host is not left with plants.
+#[derive(Default)]
+pub(super) struct OccupiedDests {
+    paths: Vec<PathBuf>,
+}
+
+impl OccupiedDests {
+    pub(super) fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+}
+
+impl Drop for OccupiedDests {
+    fn drop(&mut self) {
+        for path in self.paths.drain(..) {
+            if path.is_dir() {
+                let _ = std::fs::remove_dir(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+/// Literal dest-deny basenames (`**/.env`, `**/.ssh/**`). Globs in the
+/// last component (`**/.env.*`, `**/*.pem`) are not occupied.
+pub(super) fn occupy_basenames(globs: &[String]) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    for glob in globs {
+        let rest = glob.strip_prefix("**/").unwrap_or(glob.as_str());
+        if let Some(dir) = rest.strip_suffix("/**") {
+            if !dir.contains('/') && is_occupy_name(dir) {
+                push_occupy_name(&mut out, dir, true);
+            }
+            continue;
+        }
+        if !rest.contains('/') && is_occupy_name(rest) {
+            push_occupy_name(&mut out, rest, false);
+        }
+    }
+    out
+}
+
+fn is_occupy_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('*')
+        && !name.contains('?')
+        && !name.contains('[')
+}
+
+fn push_occupy_name(out: &mut Vec<(String, bool)>, name: &str, is_dir: bool) {
+    if let Some((_, dir)) = out.iter_mut().find(|(n, _)| n == name) {
+        *dir |= is_dir;
+        return;
+    }
+    out.push((name.to_string(), is_dir));
+}
+
+/// Create missing dest-deny basenames at `roots` when remount can apply.
+/// Not `create_dir_all` on a nested deny path.
+pub(super) fn occupy_missing(roots: &[PathBuf], globs: &[String]) -> io::Result<OccupiedDests> {
+    if !remount_available() {
+        return Ok(OccupiedDests::default());
+    }
+    let names = occupy_basenames(globs);
+    let mut occupied = OccupiedDests::default();
+    for root in roots {
+        for (name, is_dir) in &names {
+            let path = root.join(name);
+            if path.exists() {
+                continue;
+            }
+            let created = if *is_dir {
+                match std::fs::create_dir(&path) {
+                    Ok(()) => true,
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => false,
+                    Err(err) => return Err(err),
+                }
+            } else {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(_) => true,
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => false,
+                    Err(err) => return Err(err),
+                }
+            };
+            if created {
+                occupied.paths.push(path);
+            }
+        }
+    }
+    Ok(occupied)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -563,6 +663,69 @@ mod tests {
             super::is_ns_unavailable(&err),
             "unshare/mount EINVAL is remount-skip (issue #92), not wrap apply failed"
         );
+    }
+
+    #[test]
+    fn occupy_basenames_takes_literal_files_and_dirs() {
+        let got = super::occupy_basenames(&[
+            "**/.env".into(),
+            "**/.env.*".into(),
+            "**/*.pem".into(),
+            "**/id_rsa".into(),
+            "**/.ssh/**".into(),
+            "**/.aws/credentials".into(),
+            "**/secrets/**".into(),
+        ]);
+        assert!(got.contains(&(".env".into(), false)));
+        assert!(got.contains(&("id_rsa".into(), false)));
+        assert!(got.contains(&(".ssh".into(), true)));
+        assert!(got.contains(&("secrets".into(), true)));
+        assert!(!got.iter().any(|(n, _)| n.contains('*') || n == ".env.*"));
+        assert!(!got.iter().any(|(n, _)| n == "credentials" || n == ".aws"));
+    }
+
+    #[test]
+    fn occupy_missing_creates_then_drop_unlinks() {
+        let _guard = Override::enter(true);
+        let dir = tempfile::TempDir::new().expect("dir");
+        let occupied = super::occupy_missing(
+            &[dir.path().to_path_buf()],
+            &["**/.env".into(), "**/.ssh/**".into()],
+        )
+        .expect("occupy");
+        assert!(dir.path().join(".env").is_file());
+        assert!(dir.path().join(".ssh").is_dir());
+        drop(occupied);
+        assert!(!dir.path().join(".env").exists());
+        assert!(!dir.path().join(".ssh").exists());
+    }
+
+    #[test]
+    fn occupy_missing_real_probe_creates_dotenv_when_remount_available() {
+        let dir = tempfile::TempDir::new().expect("dir");
+        let occupied = super::occupy_missing(&[dir.path().to_path_buf()], &["**/.env".into()])
+            .expect("occupy");
+        if super::remount_available() {
+            assert!(
+                dir.path().join(".env").is_file(),
+                "remount available must occupy missing .env"
+            );
+        } else {
+            assert!(
+                occupied.paths().is_empty(),
+                "remount unavailable must not plant .env"
+            );
+        }
+    }
+
+    #[test]
+    fn occupy_missing_is_noop_when_remount_unavailable() {
+        let _guard = Override::enter(false);
+        let dir = tempfile::TempDir::new().expect("dir");
+        let occupied = super::occupy_missing(&[dir.path().to_path_buf()], &["**/.env".into()])
+            .expect("occupy");
+        assert!(occupied.paths().is_empty());
+        assert!(!dir.path().join(".env").exists());
     }
 
     #[test]

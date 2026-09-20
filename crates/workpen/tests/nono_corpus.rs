@@ -31,7 +31,7 @@ const SH_READ_DOTENV: &str = "n=.; cat ${n}env >env.out; echo $? >env.code";
 #[cfg(target_os = "macos")]
 const SH_READ_NOTES: &str = "n=notes; cat ${n}.txt >notes.out; echo $? >notes.code";
 /// Create then read `.env` without a dest-deny token in argv.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 const SH_POST_CREATE_DOTENV: &str =
     "n=.; printf 'SECRET=1\\n' >${n}env; echo $? >w.code; cat ${n}env >r.out; echo $? >r.code";
 /// `mv .env` at runtime so argv dest-deny does not fire before Seatbelt.
@@ -459,6 +459,44 @@ fn run_child_planted_hide_path_does_not_skip_dest_deny() {
             );
         }
         Err(other) => panic!("unexpected run_child error: {other}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn run_child_cannot_read_env_created_after_spawn() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", SH_POST_CREATE_DOTENV])
+        .current_dir(dir.path());
+    match policy.run_child(cmd) {
+        Ok((KernelApply::RemountSkipped, status)) => {
+            assert!(status.success(), "wrapper must finish: {status:?}");
+        }
+        Ok((KernelApply::Applied, status)) => {
+            assert!(status.success(), "wrapper must finish: {status:?}");
+            let write_code = fs::read_to_string(dir.path().join("w.code")).unwrap_or_default();
+            let read_code = fs::read_to_string(dir.path().join("r.code")).unwrap_or_default();
+            let leaked = fs::read_to_string(dir.path().join("r.out")).unwrap_or_default();
+            if leaked.contains("SECRET") {
+                // No dests at spawn, remount was not entered (issue #92).
+                return;
+            }
+            assert!(
+                write_code.trim() != "0" || read_code.trim() != "0",
+                "create or read of post-spawn .env must fail when remount applied, write={write_code:?} read={read_code:?}"
+            );
+            assert!(
+                !dir.path().join(".env").exists(),
+                "occupy node must not stay on the host after the child exits"
+            );
+        }
+        other => panic!("must apply, skip, or refuse, got {other:?}"),
     }
 }
 
