@@ -10,13 +10,13 @@ child is not. This is not a VM.
 Library (git pin until crates.io has the same tag):
 
 ```toml
-workpen = { git = "https://github.com/workpen/workpen", tag = "v0.4.1", features = ["gc", "nono"] }
+workpen = { git = "https://github.com/workpen/workpen", tag = "v0.5.0", features = ["gc", "nono"] }
 ```
 
 CLI:
 
 ```bash
-cargo install --git https://github.com/workpen/workpen --tag v0.4.1 --locked workpen-cli
+cargo install --git https://github.com/workpen/workpen --tag v0.5.0 --locked workpen-cli
 ```
 
 MSRV is 1.95.
