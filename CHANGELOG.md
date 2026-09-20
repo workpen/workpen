@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.5.0](https://github.com/workpen/workpen/compare/v0.4.1...v0.5.0) (2026-09-20)
+
+
+### Features
+
+* **cli:** give workpen run --tty a Unix PTY ([#168](https://github.com/workpen/workpen/issues/168)) ([125cb69](https://github.com/workpen/workpen/commit/125cb69638219b8132fec7d1df83cef14a8f79dc))
+
+
+### Bug Fixes
+
+* **cli:** capture run child stdio so redirects outside --root work ([#157](https://github.com/workpen/workpen/issues/157)) ([56ea7a3](https://github.com/workpen/workpen/commit/56ea7a3619741bdd27f0ea43091b00515e99b66b))
+* **cli:** EOF piped stdin on workpen run --tty ([#169](https://github.com/workpen/workpen/issues/169)) ([a4576c8](https://github.com/workpen/workpen/commit/a4576c84f783617d282ac8707357bccf1a81535a))
+* **cli:** refuse run when Linux dest-deny remount is skipped ([#167](https://github.com/workpen/workpen/issues/167)) ([f8e08aa](https://github.com/workpen/workpen/commit/f8e08aa49c6bf5f6bae86788b7e29a77dd806e0e))
+* **deny:** dest-deny clustered GNU glued short dests ([#166](https://github.com/workpen/workpen/issues/166)) ([5947a31](https://github.com/workpen/workpen/commit/5947a31ffc2a29a66a27bf62bb36c5daf3dfe736))
+* **deny:** dest-deny GNU glued short dests ([#155](https://github.com/workpen/workpen/issues/155)) ([41cc45e](https://github.com/workpen/workpen/commit/41cc45e32a5c5247ffe486a5cb09557ae0102b21))
+* **deny:** peel env -S after any argv prefix ([#154](https://github.com/workpen/workpen/issues/154)) ([419513d](https://github.com/workpen/workpen/commit/419513dfbc70c8e7e8a6e82f0c7dfd38fc37732e))
+* **wrap:** dest-deny directories, remount stickiness, and e2e honesty ([#153](https://github.com/workpen/workpen/issues/153)) ([749308b](https://github.com/workpen/workpen/commit/749308bf85062804a3ad2475bfd5c4476991ecbd))
+* **wrap:** dest-deny peel, remount/WFP apply signals, and jail leftovers ([#151](https://github.com/workpen/workpen/issues/151)) ([3779c83](https://github.com/workpen/workpen/commit/3779c836d234775b24f9b9e72bb83f644d1a1d33))
+* **wrap:** drain capture pipes while waiting on run timeout ([#158](https://github.com/workpen/workpen/issues/158)) ([7a63171](https://github.com/workpen/workpen/commit/7a6317150e0f8dc7385500432b5c6bf2b43a3930))
+* **wrap:** glob-only dest-deny walk for extra-root cache dirs ([#164](https://github.com/workpen/workpen/issues/164)) ([375c0fb](https://github.com/workpen/workpen/commit/375c0fbec516325d66b99364a7d91200ce53b0a4))
+* **wrap:** glob-only dest-deny walk under extra-root cache dirs ([#165](https://github.com/workpen/workpen/issues/165)) ([d4cd23c](https://github.com/workpen/workpen/commit/d4cd23c424bd475465e052c61ef22c305fde3df9))
+* **wrap:** grant /var/select so macOS sh -c is quiet ([#156](https://github.com/workpen/workpen/issues/156)) ([02093c8](https://github.com/workpen/workpen/commit/02093c8425835e9a604e8eb6d5a4f151b2255376))
+* **wrap:** inherit stdin on Unix run_child_output ([#159](https://github.com/workpen/workpen/issues/159)) ([a51747a](https://github.com/workpen/workpen/commit/a51747afe132cf3a07dc40e7b10576b0453e3b43))
+* **wrap:** keep drained stdout when run timeout fires ([#160](https://github.com/workpen/workpen/issues/160)) ([0fb0c9f](https://github.com/workpen/workpen/commit/0fb0c9fb0228a0cbdfce801f36dc528e70b60b08))
+* **wrap:** occupy missing Linux dest-deny basenames on remount ([#170](https://github.com/workpen/workpen/issues/170)) ([8f1b2ee](https://github.com/workpen/workpen/commit/8f1b2ee3b255b8bd0aebd549bffd2941f295138f))
+* **wrap:** skip hardlink scan in cache dest-deny walks ([#163](https://github.com/workpen/workpen/issues/163)) ([418d3ca](https://github.com/workpen/workpen/commit/418d3ca483f83201209d79696c44ad2f93e0e790))
+* **wrap:** stream run stdout instead of an unbounded Vec ([#162](https://github.com/workpen/workpen/issues/162)) ([1ca0ceb](https://github.com/workpen/workpen/commit/1ca0cebbe896d7f281ef3a31f9f420dbc3298436)), closes [#161](https://github.com/workpen/workpen/issues/161)
+
 ## [0.4.1](https://github.com/workpen/workpen/compare/v0.4.0...v0.4.1) (2026-09-18)
 
 

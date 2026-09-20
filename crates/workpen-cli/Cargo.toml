@@ -1,6 +1,6 @@
 [package]
 name = "workpen-cli"
-version = "0.4.1"
+version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,7 +16,7 @@ name = "workpen"
 path = "src/main.rs"
 
 [dependencies]
-workpen = { version = "0.4.1", path = "../workpen", features = ["gc", "nono"] }
+workpen = { version = "0.5.0", path = "../workpen", features = ["gc", "nono"] }
 
 [dev-dependencies]
 tempfile = "3"
