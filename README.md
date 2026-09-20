@@ -1,10 +1,21 @@
+<p align="center">
+  <img src="docs/brand/workpen.svg" alt="Workpen logo" width="160">
+</p>
+
 # Workpen
+
+[![CI](https://github.com/workpen/workpen/actions/workflows/ci.yml/badge.svg?event=pull_request)](https://github.com/workpen/workpen/actions/workflows/ci.yml)
+[![Security](https://github.com/workpen/workpen/actions/workflows/security.yml/badge.svg?event=pull_request)](https://github.com/workpen/workpen/actions/workflows/security.yml)
+[![crates.io](https://img.shields.io/crates/v/workpen?logo=rust)](https://crates.io/crates/workpen)
+[![docs.rs](https://img.shields.io/docsrs/workpen?logo=docs.rs)](https://docs.rs/workpen)
+[![Release](https://img.shields.io/github/v/release/workpen/workpen?logo=github&sort=semver)](https://github.com/workpen/workpen/releases/latest)
+
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](./LICENSE)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/workpen/workpen/badge)](https://securityscorecards.dev/viewer/?uri=github.com/workpen/workpen)
+[![FOSSA Status](https://github.com/workpen/workpen/actions/workflows/fossa.yml/badge.svg?event=push)](https://github.com/workpen/workpen/actions/workflows/fossa.yml)
 
 Dest-deny and a per-child process jail. The parent is trusted. The
 child is not. This is not a VM.
-
-[![CI](https://github.com/workpen/workpen/actions/workflows/ci.yml/badge.svg?event=push)](https://github.com/workpen/workpen/actions/workflows/ci.yml)
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/workpen/workpen/badge)](https://securityscorecards.dev/viewer/?uri=github.com/workpen/workpen)
 
 ## Install
 
