@@ -36,7 +36,8 @@ The parent is trusted. The child is not.
   bwrap. Do not `create_dir_all` on a nested deny path.
 - `apply_pre_exec` skipped argv dest-deny. It dest-denies the same way
   `run_child` does. Hosts that spawn themselves can also call
-  `dest_deny_command`.
+  `dest_deny_command`. Relative dests resolve against
+  `Command::current_dir` when set, else the first ReadWrite grant.
 - Attached `--flag=.env` and GNU glued shorts (`-a.env`, clustered
   `-la.env`) are dest-denied.
 - Wrapper skip is only `timeout` / `nohup` / `nice`. `time` and

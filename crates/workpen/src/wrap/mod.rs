@@ -997,17 +997,24 @@ impl KernelPolicy {
 
     /// Dest-deny `cmd` argv with the jail [`DenyPolicy`] before spawn.
     ///
-    /// Same rules as [`crate::check_command_argv`] on program plus args.
-    /// Hosts that cannot use [`Self::run_child`] call this, then
-    /// [`Self::apply_pre_exec`] (which also calls it) or their own spawn.
-    /// Hosts match [`KernelError::DestDeny`], not English.
+    /// Relative dests resolve against `cmd.current_dir()` when set, else
+    /// the first ReadWrite grant. Same rules as
+    /// [`crate::check_command_argv`] on program plus args. Hosts that
+    /// jail writes in a capture dir still dest-deny argv against the
+    /// user cwd when they set `current_dir`. Hosts that cannot use
+    /// [`Self::run_child`] call this, then [`Self::apply_pre_exec`]
+    /// (which also calls it) or their own spawn. Hosts match
+    /// [`KernelError::DestDeny`], not English.
     pub fn dest_deny_command(&self, cmd: &Command) -> Result<(), KernelError> {
-        let workspace = self
+        let from_cwd = cmd.get_current_dir();
+        let from_grant = self
             .grants
             .iter()
             .find(|g| g.access == KernelAccess::ReadWrite)
-            .map(|g| g.path.as_path())
-            .ok_or_else(|| KernelError::Apply("dest-deny argv needs a ReadWrite grant".into()))?;
+            .map(|g| g.path.as_path());
+        let workspace = from_cwd.or(from_grant).ok_or_else(|| {
+            KernelError::Apply("dest-deny argv needs a current_dir or ReadWrite grant".into())
+        })?;
         let argv = command_argv(cmd);
         crate::check_command_argv(&argv, workspace, &self.deny_policy)?;
         Ok(())

@@ -39,7 +39,10 @@
 //!   Do not `create_dir_all` on a nested deny path. Do not vendor bwrap.
 //! * `apply_pre_exec` dest-denies argv, then installs the hook. Hosts
 //!   that cannot use `run_child` still call
-//!   [`crate::KernelPolicy::dest_deny_command`].
+//!   [`crate::KernelPolicy::dest_deny_command`]. That check resolves
+//!   relative dests against `Command::current_dir` when set, else the
+//!   first ReadWrite grant (a capture-dir jail still dest-denies the
+//!   user cwd when the host sets `current_dir`).
 //! * Argv dest-deny peels attached `--flag=.env` and GNU glued shorts
 //!   (`-a.env`, clustered `-la.env`). It does not parse unknown script
 //!   languages. Wrapper
