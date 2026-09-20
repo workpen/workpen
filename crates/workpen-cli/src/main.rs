@@ -20,6 +20,14 @@ fn main() -> ExitCode {
     }
 }
 
+const TOP_USAGE: &str = "\
+usage: workpen [--version] [--help] <why|run|gc> ...
+  why [--root DIR] [--extra-root DIR] PATH
+  run [--root DIR] [--extra-root DIR] [--timeout DUR] [--tty] [--] CMD...
+  gc  [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]";
+
+const WHY_USAGE: &str = "usage: workpen why [--root DIR] [--extra-root DIR] PATH";
+
 fn run(args: Vec<String>) -> Result<ExitCode, String> {
     if args.is_empty() {
         eprintln!("usage: workpen <why|run|gc> ...");
@@ -27,6 +35,10 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("{}", workpen::VERSION);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if is_top_help(&args[0]) {
+        println!("{TOP_USAGE}");
         return Ok(ExitCode::SUCCESS);
     }
     match args[0].as_str() {
@@ -39,23 +51,22 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
 
 fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
+    if wants_help(&rest) {
+        println!("{WHY_USAGE}");
+        return Ok(ExitCode::SUCCESS);
+    }
     if let Some(flag) = rest.iter().find(|t| t.starts_with('-')) {
         return Err(format!(
             "unknown flag: {flag} (use --root DIR or --extra-root DIR)"
         ));
     }
     if rest.len() > 1 {
-        return Err(format!(
-            "unexpected argument: {} (usage: workpen why [--root DIR] [--extra-root DIR] PATH)",
-            rest[1]
-        ));
+        return Err(format!("unexpected argument: {} ({WHY_USAGE})", rest[1]));
     }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = resolve_workspace_root(&cwd, &root.to_string_lossy()).map_err(|e| e.to_string())?;
     let (extras, _presented) = resolve_extras(&cwd, &extras)?;
-    let path = rest
-        .first()
-        .ok_or_else(|| "usage: workpen why [--root DIR] [--extra-root DIR] PATH".to_string())?;
+    let path = rest.first().ok_or_else(|| WHY_USAGE.to_string())?;
     let guard = PathGuard::with_extra_roots(&root, &extras).map_err(|e| e.to_string())?;
     let dest = why_dest(&root, path);
     let policy = DenyPolicy::from_workspace(&root).map_err(|e| e.to_string())?;
@@ -81,6 +92,10 @@ const RUN_USAGE: &str =
 
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
+    if wants_help(&rest) {
+        println!("{RUN_USAGE}");
+        return Ok(ExitCode::SUCCESS);
+    }
     let (timeout, tty, rest) = peel_run_flags(&rest)?;
     if let Some(flag) = rest.first().filter(|t| t.starts_with('-') && *t != "--") {
         return Err(format!("unknown flag: {flag} ({RUN_USAGE})"));
@@ -163,6 +178,10 @@ fn peel_run_flags(rest: &[String]) -> Result<(Option<Duration>, bool, &[String])
 
 fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
+    if wants_help(&rest) {
+        println!("{}", gc_usage());
+        return Ok(ExitCode::SUCCESS);
+    }
     if !extras.is_empty() {
         return Err("gc does not take --extra-root".into());
     }
@@ -246,6 +265,22 @@ fn resolve_extras(cwd: &Path, extras: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<P
 
 fn gc_usage() -> String {
     "usage: workpen gc [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]".to_string()
+}
+
+fn is_top_help(arg: &str) -> bool {
+    matches!(arg, "help" | "--help" | "-h")
+}
+
+fn is_help_flag(arg: &str) -> bool {
+    matches!(arg, "--help" | "-h")
+}
+
+/// `--help` / `-h` before `--` is CLI help. After `--` it is the child.
+fn wants_help(tokens: &[String]) -> bool {
+    tokens
+        .iter()
+        .take_while(|t| t.as_str() != "--")
+        .any(|t| is_help_flag(t))
 }
 
 /// Next token after a flag, or error if missing or another `--` flag.

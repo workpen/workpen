@@ -13,19 +13,30 @@ fn workpen() -> Command {
 
 #[test]
 fn help_names_why_run_and_gc() {
-    for arg in ["help", "--help"] {
+    for arg in ["help", "--help", "-h"] {
         let out = workpen().arg(arg).output().expect("spawn workpen");
         assert_eq!(
             out.status.code(),
-            Some(2),
-            "{arg} must exit 2, stdout={} stderr={}",
+            Some(0),
+            "{arg} must exit 0, stdout={} stderr={}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("why"),
+            "{arg} stdout must name why: {stdout}"
+        );
+        assert!(
+            stdout.contains("run"),
+            "{arg} stdout must name run: {stdout}"
+        );
+        assert!(stdout.contains("gc"), "{arg} stdout must name gc: {stdout}");
         let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains("why"), "{arg} stderr must name why: {err}");
-        assert!(err.contains("run"), "{arg} stderr must name run: {err}");
-        assert!(err.contains("gc"), "{arg} stderr must name gc: {err}");
+        assert!(
+            err.is_empty(),
+            "{arg} must print usage on stdout, not stderr: {err}"
+        );
     }
 }
 
@@ -54,10 +65,6 @@ fn unknown_gc_flag_names_max_age() {
     assert!(
         err.contains("--leftover"),
         "stderr must name --leftover: {err}"
-    );
-    assert!(
-        !err.contains("--help"),
-        "unknown gc flag must not advertise --help: {err}"
     );
 }
 
@@ -134,23 +141,26 @@ fn run_spawn_failure_names_the_command() {
 }
 
 #[test]
-fn why_help_is_unknown_flag_not_allowed() {
-    let out = workpen()
-        .args(["why", "--help"])
-        .output()
-        .expect("spawn workpen");
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "why --help must exit 2, stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !stdout.to_ascii_lowercase().contains("allowed"),
-        "why --help must not print allowed: {stdout}"
-    );
+fn why_help_prints_usage_not_allowed() {
+    for args in [vec!["why", "--help"], vec!["why", "-h"]] {
+        let out = workpen().args(&args).output().expect("spawn workpen");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "why help {args:?} must exit 0, stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("usage: workpen why"),
+            "why help {args:?} must print why usage: {stdout}"
+        );
+        assert!(
+            !stdout.to_ascii_lowercase().contains("allowed"),
+            "why help {args:?} must not print allowed: {stdout}"
+        );
+    }
 }
 
 #[test]
@@ -241,23 +251,71 @@ fn run_tty_without_command_names_usage() {
 }
 
 #[test]
-fn run_help_without_separator_is_unknown_flag() {
+fn run_help_without_separator_prints_usage() {
+    for args in [vec!["run", "--help"], vec!["run", "-h"]] {
+        let out = workpen().args(&args).output().expect("spawn workpen");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "run help {args:?} must exit 0, stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stdout.contains("usage: workpen run") && stdout.contains("[--] CMD"),
+            "run help {args:?} must print run usage: {stdout}"
+        );
+        assert!(
+            !err.contains("failed to spawn"),
+            "run help {args:?} must not spawn --help: {err}"
+        );
+    }
+}
+
+#[test]
+fn run_help_after_separator_is_the_child() {
     let out = workpen()
-        .args(["run", "--help"])
+        .args(["run", "--", "--help"])
         .output()
         .expect("spawn workpen");
-    assert_eq!(
+    assert_ne!(
         out.status.code(),
-        Some(2),
-        "run --help must exit 2, stdout={} stderr={}",
+        Some(0),
+        "run -- --help must not be CLI help, stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !err.contains("failed to spawn"),
-        "run --help must not spawn --help: {err}"
+        !stdout.contains("usage: workpen run"),
+        "run -- --help must not print run usage: {stdout}"
     );
+    assert!(
+        err.contains("failed to spawn") || err.contains("--help"),
+        "run -- --help must treat --help as the child: stdout={stdout} stderr={err}"
+    );
+}
+
+#[test]
+fn gc_help_prints_usage() {
+    for args in [vec!["gc", "--help"], vec!["gc", "-h"]] {
+        let out = workpen().args(&args).output().expect("spawn workpen");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "gc help {args:?} must exit 0, stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("usage: workpen gc") && stdout.contains("--max-age"),
+            "gc help {args:?} must print gc usage: {stdout}"
+        );
+    }
 }
 
 #[test]
