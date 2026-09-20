@@ -31,6 +31,26 @@ fn combined(out: &std::process::Output) -> String {
     )
 }
 
+/// Allowed dest after a dest-deny fixture. Linux remount skip now refuses
+/// the whole run when `.env` exists (`with_require_dest_hide`).
+#[cfg(unix)]
+fn assert_run_ok_or_remount_refused(out: &std::process::Output, want: &str, what: &str) {
+    if out.status.success() {
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want, "{what}");
+        return;
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("remount unavailable"),
+        "{what} must succeed or refuse remount skip, stdout={} stderr={err}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("SECRET"),
+        "{what} remount refuse must not leak SECRET"
+    );
+}
+
 #[test]
 fn why_dest_denies_hardlink_sibling_under_root_not_cwd() {
     let (ws, cwd) = workspace_with_env_hardlink();
@@ -133,13 +153,7 @@ fn run_allowed_dest_after_hardlink_dest_deny() {
         .current_dir(cwd.path())
         .output()
         .expect("spawn workpen");
-    assert!(
-        echo.status.success(),
-        "run echo hello must succeed after dest-deny fixture, stdout={} stderr={}",
-        String::from_utf8_lossy(&echo.stdout),
-        String::from_utf8_lossy(&echo.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&echo.stdout).trim(), "hello");
+    assert_run_ok_or_remount_refused(&echo, "hello", "run echo hello after dest-deny fixture");
     let cat = workpen()
         .args(["run", "--root"])
         .arg(ws.path())
@@ -147,13 +161,7 @@ fn run_allowed_dest_after_hardlink_dest_deny() {
         .current_dir(cwd.path())
         .output()
         .expect("spawn workpen");
-    assert!(
-        cat.status.success(),
-        "run cat readme.md must succeed after dest-deny fixture, stdout={} stderr={}",
-        String::from_utf8_lossy(&cat.stdout),
-        String::from_utf8_lossy(&cat.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&cat.stdout).trim(), "ok");
+    assert_run_ok_or_remount_refused(&cat, "ok", "run cat readme.md after dest-deny fixture");
 }
 
 #[cfg(unix)]
@@ -188,13 +196,7 @@ fn run_dest_denies_nested_env_split_string_before_spawn() {
         .current_dir(cwd.path())
         .output()
         .expect("spawn workpen");
-    assert!(
-        allow.status.success(),
-        "run env env -S cat readme.md must succeed, stdout={} stderr={}",
-        String::from_utf8_lossy(&allow.stdout),
-        String::from_utf8_lossy(&allow.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&allow.stdout).trim(), "ok");
+    assert_run_ok_or_remount_refused(&allow, "ok", "run env env -S cat readme.md");
 }
 
 #[cfg(unix)]
@@ -311,13 +313,11 @@ fn run_dest_denies_hardlink_inside_bash_lc_under_root_before_spawn() {
         .current_dir(cwd.path())
         .output()
         .expect("spawn workpen");
-    assert!(
-        echo.status.success(),
-        "run bash -lc echo hello must succeed after dest-deny fixture, stdout={} stderr={}",
-        String::from_utf8_lossy(&echo.stdout),
-        String::from_utf8_lossy(&echo.stderr)
+    assert_run_ok_or_remount_refused(
+        &echo,
+        "hello",
+        "run bash -lc echo hello after dest-deny fixture",
     );
-    assert_eq!(String::from_utf8_lossy(&echo.stdout).trim(), "hello");
 }
 
 #[cfg(unix)]
@@ -500,13 +500,11 @@ fn run_relative_parent_root_dest_denies_hardlink_not_escape() {
         .current_dir(&cwd)
         .output()
         .expect("spawn workpen");
-    assert!(
-        allowed.status.success(),
-        "run --root ../ws echo hello must succeed after dest-deny, stdout={} stderr={}",
-        String::from_utf8_lossy(&allowed.stdout),
-        String::from_utf8_lossy(&allowed.stderr)
+    assert_run_ok_or_remount_refused(
+        &allowed,
+        "hello",
+        "run --root ../ws echo hello after dest-deny",
     );
-    assert_eq!(String::from_utf8_lossy(&allowed.stdout).trim(), "hello");
 }
 
 #[cfg(unix)]

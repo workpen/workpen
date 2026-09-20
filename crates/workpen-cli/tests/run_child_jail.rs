@@ -23,6 +23,30 @@ fn run_echo_succeeds_without_bash_rewrite() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
 }
 
+/// With a workspace `.env`, Linux remount skip must not start the child.
+/// When remount (or Seatbelt) applies, echo still succeeds.
+#[cfg(unix)]
+#[test]
+fn run_with_dotenv_hides_or_refuses() {
+    let dir = TempDir::new().expect("workspace");
+    std::fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--", "/bin/echo", "ok"])
+        .output()
+        .expect("spawn workpen");
+    if out.status.success() {
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+        return;
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("remount unavailable") || err.contains("not started"),
+        "fail-closed remount skip, stderr={err}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn run_stdout_redirect_outside_workspace_is_readable() {
@@ -756,12 +780,15 @@ fn run_drops_env_argv_bash_env_assignment() {
         ])
         .output()
         .expect("spawn workpen");
-    assert!(
-        out.status.success(),
-        "env without denied assignment must still run: status={:?} stderr={}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
-    );
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("remount unavailable"),
+            "env without denied assignment must run or refuse remount skip: status={:?} stderr={err}",
+            out.status
+        );
+        return;
+    }
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         !stdout.contains(".env"),

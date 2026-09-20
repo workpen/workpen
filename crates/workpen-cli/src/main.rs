@@ -104,7 +104,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let (program, args) = workpen::with_bash_noprofile(&cmd[0], &cmd[1..]);
     let mut child = Command::new(program);
     child.args(args).current_dir(guard.canon_root());
-    let jail = workpen::process_jail(guard.canon_root(), &presented).map_err(|e| e.to_string())?;
+    let jail = workpen::process_jail(guard.canon_root(), &presented)
+        .map_err(|e| e.to_string())?
+        .with_require_dest_hide();
     // Copy child pipes to this process as bytes arrive. A Vec of the whole
     // stream would grow without bound (`yes` under --timeout). Inherited
     // child stdout to a file outside --root is a Seatbelt/DACL dest write.

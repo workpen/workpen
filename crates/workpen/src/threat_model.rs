@@ -23,7 +23,9 @@
 //!
 //! * Linux remount can be skipped (`RemountSkipped`). Landlock still
 //!   applies. Landlock cannot hide a file inside an allowed tree.
-//!   In-tree dest-deny is then userspace argv only.
+//!   In-tree dest-deny is then userspace argv only. Default
+//!   `run_child` still starts the child. [`crate::KernelPolicy::with_require_dest_hide`]
+//!   (the `workpen run` CLI) refuses to spawn.
 //! * Extra-root dests still fail-closed when remount is unavailable.
 //! * Linux remount is a **launch snapshot**. `touch .env && cat .env`
 //!   after spawn is userspace-only. macOS has name regexes. Windows

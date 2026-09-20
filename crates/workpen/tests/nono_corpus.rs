@@ -342,6 +342,44 @@ fn run_child_cannot_read_workspace_env_linux() {
     assert_eq!(code.trim(), "0", "cat readme.md must succeed");
 }
 
+/// `with_require_dest_hide` must not start a child that can leak SECRET
+/// when remount is skipped. When remount applies, hide still holds.
+#[cfg(target_os = "linux")]
+#[test]
+fn run_child_require_dest_hide_does_not_spawn_on_remount_skip() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>())
+        .expect("policy")
+        .with_require_dest_hide();
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", SH_READ_DOTENV]).current_dir(dir.path());
+    match policy.run_child(cmd) {
+        Err(KernelError::Apply(msg)) => {
+            assert!(
+                msg.contains("remount unavailable"),
+                "error must name remount: {msg}"
+            );
+            assert!(
+                !dir.path().join("env.out").exists(),
+                "child must not start when remount is skipped"
+            );
+        }
+        Ok((KernelApply::Applied, status)) => {
+            assert!(status.success(), "wrapper must finish: {status:?}");
+            let leaked = fs::read_to_string(dir.path().join("env.out")).unwrap_or_default();
+            assert!(
+                !leaked.contains("SECRET"),
+                "jailed child must not read .env: {leaked:?}"
+            );
+        }
+        other => panic!("must hide or refuse spawn, got {other:?}"),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn linux_run_child_cat_env(
     policy: &workpen::KernelPolicy,

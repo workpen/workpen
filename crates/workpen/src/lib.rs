@@ -51,8 +51,8 @@ pub use why::{Why, explain};
 pub use wrap::{
     KernelAccess, KernelApply, KernelError, KernelGrant, KernelPolicy, child_env_deny_names,
     collect_workspace_dest_denies, collect_workspace_dest_denies_limited, is_denied_child_env,
-    kernel_supported, process_jail, process_jail_with_policy, require_applied, scrub_child_command,
-    spawn_after_setup, with_bash_noprofile,
+    kernel_supported, process_jail, process_jail_with_policy, require_applied, require_dest_hide,
+    scrub_child_command, spawn_after_setup, with_bash_noprofile,
 };
 
 /// Crate version from Cargo.toml.
