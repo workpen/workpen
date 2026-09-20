@@ -3,7 +3,8 @@
 Dest-deny and a per-child process jail. The parent is trusted. The
 child is not. This is not a VM.
 
-[![CI](https://github.com/workpen/workpen/actions/workflows/ci.yml/badge.svg)](https://github.com/workpen/workpen/actions/workflows/ci.yml)
+[![CI](https://github.com/workpen/workpen/actions/workflows/ci.yml/badge.svg?event=push)](https://github.com/workpen/workpen/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/workpen/workpen/badge)](https://securityscorecards.dev/viewer/?uri=github.com/workpen/workpen)
 
 ## Install
 
