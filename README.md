@@ -1,4 +1,4 @@
-# workpen
+# Workpen
 
 Dest-deny and a per-child process jail. The parent is trusted. The
 child is not. This is not a VM.
