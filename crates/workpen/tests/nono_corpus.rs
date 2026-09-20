@@ -14,10 +14,10 @@ use tempfile::TempDir;
 use workpen::resolve_extra_root;
 use workpen::{
     AGENT_LOCK_NAME, CheckDestError, DenyPolicy, DestDenyError, DestDenyKind, KernelAccess,
-    KernelApply, KernelError, child_env_deny_names, collect_workspace_dest_denies,
-    collect_workspace_dest_denies_limited, is_denied_child_env, kernel_supported, load_agent_lock,
-    process_jail, process_jail_with_policy, require_applied, scrub_child_command,
-    spawn_after_setup, with_bash_noprofile,
+    KernelApply, KernelError, check_command_argv, child_env_deny_names,
+    collect_workspace_dest_denies, collect_workspace_dest_denies_limited, is_denied_child_env,
+    kernel_supported, load_agent_lock, process_jail, process_jail_with_policy, require_applied,
+    scrub_child_command, spawn_after_setup, with_bash_noprofile,
 };
 
 fn workspace() -> TempDir {
@@ -2473,6 +2473,29 @@ fn dest_deny_command_is_public_and_matches_run_child() {
     let err = policy
         .dest_deny_command(&cmd)
         .expect_err("public dest_deny");
+    assert!(
+        matches!(err, KernelError::DestDeny(_)),
+        "dest_deny_command must be DestDeny: {err}"
+    );
+}
+
+#[test]
+fn dest_deny_command_uses_command_current_dir_not_rw_grant() {
+    let root = workspace();
+    let ws = root.path().join("ws");
+    let cap = root.path().join("cap");
+    fs::create_dir_all(&ws).expect("ws");
+    fs::create_dir_all(&cap).expect("cap");
+    fs::write(ws.join(".env"), "SECRET=1\n").expect("env");
+    fs::hard_link(ws.join(".env"), ws.join("notes.txt")).expect("hardlink");
+    check_command_argv(&["cat", "notes.txt"], &ws, &DenyPolicy::default())
+        .expect_err("cwd dest-deny sees the hardlink");
+    let policy = process_jail(&cap, std::iter::empty::<&Path>()).expect("capture jail");
+    let mut cmd = Command::new("cat");
+    cmd.arg("notes.txt").current_dir(&ws);
+    let err = policy
+        .dest_deny_command(&cmd)
+        .expect_err("cwd hardlink must dest-deny against current_dir");
     assert!(
         matches!(err, KernelError::DestDeny(_)),
         "dest_deny_command must be DestDeny: {err}"
