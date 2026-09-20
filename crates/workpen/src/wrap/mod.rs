@@ -281,11 +281,12 @@ pub fn kernel_supported() -> bool {
 /// Dest-deny names default to [`crate::default_secret_denies()`] plus
 /// workspace `agent.lock` extras, resolved under the workspace and
 /// each extra-root (except `/tmp` / `/var/tmp`; those trees are too
-/// large to walk). An extra-root whose last component is a cache
-/// dir name (`target`, `node_modules`, `.venv`, `dist`,
-/// `__pycache__`) uses the glob-name cache walk, same as a
+/// large to walk). An extra-root with a cache dir name
+/// (`target`, `node_modules`, `.venv`, `dist`, `__pycache__`)
+/// in any path component uses the glob-name cache walk, same as a
 /// workspace `target/` (no hardlink sibling scan of rustc
-/// artifacts). Missing lock equals defaults. Invalid
+/// artifacts). That includes `--extra-root …/target/debug`.
+/// Missing lock equals defaults. Invalid
 /// lock is [`KernelError::Apply`]. Hosts match [`crate::DestDenyKind`],
 /// not English.
 pub fn process_jail(
@@ -337,7 +338,7 @@ pub fn process_jail_with_policy(
             )?;
             continue;
         }
-        if is_dest_deny_cache_dir_name(entry_file_name(extra)) {
+        if extra_root_is_cache_tree(extra) {
             walk_cache_dest_denies(
                 extra,
                 policy,
@@ -1227,6 +1228,15 @@ fn is_dest_deny_cache_dir_name(name: &str) -> bool {
     DEST_DENY_CACHE_DIR_NAMES
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
+}
+
+/// Extra-root is a cache tree when any path component is a cache
+/// dir name. Basename-only misses `--extra-root …/target/debug`.
+fn extra_root_is_cache_tree(path: &Path) -> bool {
+    path.components().any(|c| match c {
+        std::path::Component::Normal(s) => is_dest_deny_cache_dir_name(&s.to_string_lossy()),
+        _ => false,
+    })
 }
 
 /// Dest-deny a real directory. Directory symlinks are not followed
