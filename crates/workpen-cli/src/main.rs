@@ -22,8 +22,8 @@ fn main() -> ExitCode {
 
 fn run(args: Vec<String>) -> Result<ExitCode, String> {
     if args.is_empty() {
-        eprintln!("Not ready.");
-        return Ok(ExitCode::SUCCESS);
+        eprintln!("usage: workpen <why|run|gc> ...");
+        return Ok(ExitCode::from(2));
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("{}", workpen::VERSION);

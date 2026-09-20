@@ -5,17 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Reserved."
-publish = false
-keywords = []
-categories = []
+description = "CLI for workpen: dest-deny and a per-child process jail."
+publish = true
+readme = "../../README.md"
+keywords = ["sandbox", "cli", "landlock", "seatbelt", "security"]
+categories = ["command-line-utilities", "os"]
 
 [[bin]]
 name = "workpen"
 path = "src/main.rs"
 
 [dependencies]
-workpen = { path = "../workpen", features = ["gc", "nono"] }
+workpen = { version = "0.4.1", path = "../workpen", features = ["gc", "nono"] }
 
 [dev-dependencies]
 tempfile = "3"
