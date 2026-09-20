@@ -46,29 +46,41 @@ jobs:
             echo "TAG must look like vX.Y.Z: ${TAG}" >&2
             exit 1
           fi
+      # Tag trees older than this workflow lack the attach script.
+      # Build the crate at TAG; run helpers from github.sha.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          path: publisher
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ env.TAG }}
+          path: crate
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: "1.95"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: sign-release
+          workspaces: crate
       - name: Build CLI
+        working-directory: crate
         run: cargo build --release --locked -p workpen-cli
       - name: Pack tarball
+        env:
+          ARTIFACTS: ${{ github.workspace }}/artifacts
         run: |
           set -euo pipefail
-          mkdir -p artifacts
-          tar -C target/release -czf artifacts/workpen-cli-x86_64-unknown-linux-gnu.tar.gz workpen
-          ls -la artifacts
+          mkdir -p "$ARTIFACTS"
+          tar -C crate/target/release -czf "$ARTIFACTS/workpen-cli-x86_64-unknown-linux-gnu.tar.gz" workpen
+          ls -la "$ARTIFACTS"
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: artifacts/workpen-cli-x86_64-unknown-linux-gnu.tar.gz
+          subject-path: ${{ github.workspace }}/artifacts/workpen-cli-x86_64-unknown-linux-gnu.tar.gz
       - name: Upload tarball and provenance
         env:
-          ARTIFACTS: artifacts
-        run: bash scripts/attach-release-provenance.sh
+          ARTIFACTS: ${{ github.workspace }}/artifacts
+        run: bash publisher/scripts/attach-release-provenance.sh

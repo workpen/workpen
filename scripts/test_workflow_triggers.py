@@ -189,6 +189,11 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertIn("scripts/attach-release-provenance.sh", text)
         self.assertNotIn('TAG="${TAG}"', text)
         self.assertIn('toolchain: "1.95"', text)
+        self.assertIn("path: publisher", text)
+        self.assertIn("path: crate", text)
+        self.assertIn("ref: ${{ github.sha }}", text)
+        self.assertIn("publisher/scripts/attach-release-provenance.sh", text)
+        self.assertIn("working-directory: crate", text)
         script = (ROOT / "scripts" / "attach-release-provenance.sh").read_text(
             encoding="utf-8"
         )
