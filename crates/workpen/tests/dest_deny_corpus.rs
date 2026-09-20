@@ -1148,10 +1148,31 @@ fn check_command_argv_denies_gnu_glued_short_dests() {
         .expect_err("glued short dest starting with / must dest-deny");
     check_command_argv(&["tool", "-a~/.env", "true"], ws.path(), &policy)
         .expect_err("glued short dest starting with ~ must dest-deny");
+    let clustered = check_command_argv(&["xargs", "-la.env", "echo"], ws.path(), &policy)
+        .expect_err("xargs -la.env echo must dest-deny");
+    match clustered {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(d.kind, DestDenyKind::DenyGlob);
+            assert_eq!(d.matched.as_deref(), Some("**/.env"));
+        }
+        other => panic!("expected DenyGlob **/.env, got {other:?}"),
+    }
+    check_command_argv(&["sudo", "-lD.env", "true"], ws.path(), &policy)
+        .expect_err("sudo -lD.env true must dest-deny");
+    check_command_argv(&["tool", "-la./.env", "true"], ws.path(), &policy)
+        .expect_err("clustered glued ./ dest must dest-deny");
+    check_command_argv(&["tool", "-la/.env", "true"], ws.path(), &policy)
+        .expect_err("clustered glued / dest must dest-deny");
+    check_command_argv(&["tool", "-la~/.env", "true"], ws.path(), &policy)
+        .expect_err("clustered glued ~ dest must dest-deny");
+    check_command_dests("xargs -la.env echo", ws.path(), &policy)
+        .expect_err("command-string clustered glued dest must dest-deny");
     check_command_argv(&["xargs", "echo", "hi"], ws.path(), &policy)
         .expect("xargs echo hi must be allowed");
     check_command_argv(&["xargs", "-areadme.md", "echo"], ws.path(), &policy)
         .expect("xargs -areadme.md echo must be allowed");
+    check_command_argv(&["ls", "-la"], ws.path(), &policy)
+        .expect("ls -la without dest must be allowed");
     check_command_argv(&["tool", "-color"], ws.path(), &policy)
         .expect("-color without dest must be allowed");
     check_command_argv(&["tool", "--flag"], ws.path(), &policy)

@@ -32,7 +32,8 @@
 //!   that cannot use `run_child` still call
 //!   [`crate::KernelPolicy::dest_deny_command`].
 //! * Argv dest-deny peels attached `--flag=.env` and GNU glued shorts
-//!   (`-a.env`). It does not parse unknown script languages. Wrapper
+//!   (`-a.env`, clustered `-la.env`). It does not parse unknown script
+//!   languages. Wrapper
 //!   skip is `timeout` / `nohup` / `nice` / `time` / `stdbuf`.
 //! * Extra-root `/tmp` is one extra dest-deny name level. A hardlink
 //!   under a deeper ordinary dir is not remounted. Path remount does

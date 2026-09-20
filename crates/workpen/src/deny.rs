@@ -525,12 +525,12 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// Dest-denies argv `-f`/`--file` (including attached `--file=.env`) via
 /// [`check_dest`]. Also dest-denies the suffix after `=` on any `--*` /
 /// `-*=` token (`tool --config=.env`). A GNU glued short dest (`-a.env`,
-/// `-D.env`, `-C.env`) dest-denies the remainder after the first ASCII
-/// letter when that remainder starts with `.` `/` or `~`. `-areadme.md`
-/// and `-color` stay allowed. `--color=always` and `--jobs=4` stay
-/// allowed when the suffix is not a dest-deny name. Does not dest-deny
-/// a flattened join of all argv. Does not dest-deny a following
-/// separate token unless that token is already a raw dest.
+/// `-D.env`, `-C.env`, clustered `-la.env`) dest-denies the remainder
+/// after an ASCII-letter cluster when that remainder starts with `.`
+/// `/` or `~`. `-areadme.md` and `-color` stay allowed. `--color=always`
+/// and `--jobs=4` stay allowed when the suffix is not a dest-deny name.
+/// Does not dest-deny a flattened join of all argv. Does not dest-deny
+/// a following separate token unless that token is already a raw dest.
 pub fn check_command_argv(
     cmd: &[impl AsRef<str>],
     root: &Path,
@@ -849,10 +849,11 @@ fn decode_rfc4648_base64(input: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Suffix after `=` on a flag token (`--config=.env`, `-f=.env`), or
-/// a GNU glued short dest (`-a.env`). After the first ASCII letter of
-/// a short option with no `=`, a remainder that starts with `.` `/` or
-/// `~` is the dest. Not `NAME=value` (no leading `-`). Empty values
-/// are ignored. `--flag` and `-areadme.md` are not dests.
+/// a GNU glued short dest (`-a.env`, clustered `-la.env`). After one
+/// or more ASCII letters of a short option with no `=`, a remainder
+/// that starts with `.` `/` or `~` is the dest. Not `NAME=value` (no
+/// leading `-`). Empty values are ignored. `--flag`, `-la`, and
+/// `-areadme.md` are not dests.
 fn attached_flag_dest(token: &str) -> Option<&str> {
     if !token.starts_with('-') || token == "-" || token == "--" {
         return None;
@@ -867,17 +868,22 @@ fn attached_flag_dest(token: &str) -> Option<&str> {
         return None;
     }
     let rest = token.get(1..)?;
-    let mut chars = rest.char_indices();
-    let (_, first) = chars.next()?;
-    if !first.is_ascii_alphabetic() {
+    let mut letters = 0usize;
+    for (i, ch) in rest.char_indices() {
+        if ch.is_ascii_alphabetic() {
+            letters += 1;
+            continue;
+        }
+        if letters == 0 {
+            return None;
+        }
+        let remainder = rest.get(i..)?;
+        if remainder.starts_with(['.', '/', '~']) {
+            return Some(remainder);
+        }
         return None;
     }
-    let remainder = rest.get(chars.next()?.0..)?;
-    if remainder.starts_with(['.', '/', '~']) {
-        Some(remainder)
-    } else {
-        None
-    }
+    None
 }
 
 #[cfg(feature = "nono")]
@@ -1145,8 +1151,8 @@ fn check_env_file_dest(path: &str, root: &Path, policy: &DenyPolicy) -> Result<(
 ///
 /// Absolute dests stay as given. Empty tokens are skipped. Flag-looking
 /// peeled tokens are skipped except an attached `--flag=.env` /
-/// `-f=.env` suffix or a GNU glued short dest (`-a.env`), which is
-/// dest-denied via [`check_dest`]. After
+/// `-f=.env` suffix or a GNU glued short dest (`-a.env`, clustered
+/// `-la.env`), which is dest-denied via [`check_dest`]. After
 /// peeling, an `env`/`env.exe` token dest-denies the following tokens
 /// with the same env-flag dest check used for argv0 env.
 pub fn check_command_dests(
@@ -1180,7 +1186,8 @@ pub fn check_command_dests(
 /// `-Command`, `-CommandWithArgs`, `-EncodedCommand`, `-EncodedArguments`,
 /// and `-File` (including `--switch` and unique prefixes) from remaining
 /// string tokens. Attached `--flag=.env` and GNU glued shorts
-/// (`-a.env`) are dest-denied via [`check_command_dests`].
+/// (`-a.env`, clustered `-la.env`) are dest-denied via
+/// [`check_command_dests`].
 fn check_command_string_env_dests(
     command: &str,
     root: &Path,
