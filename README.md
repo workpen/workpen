@@ -11,6 +11,7 @@
 [![Release](https://img.shields.io/github/v/release/workpen/workpen?logo=github&sort=semver)](https://github.com/workpen/workpen/releases/latest)
 
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](./LICENSE)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/14736/badge)](https://www.bestpractices.dev/projects/14736)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/workpen/workpen/badge)](https://securityscorecards.dev/viewer/?uri=github.com/workpen/workpen)
 [![FOSSA Status](https://github.com/workpen/workpen/actions/workflows/fossa.yml/badge.svg?event=push)](https://github.com/workpen/workpen/actions/workflows/fossa.yml)
 
