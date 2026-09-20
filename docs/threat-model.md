@@ -23,7 +23,8 @@ The parent is trusted. The child is not.
 
 - Linux remount ran. That is `RemountSkipped` when unshare / maps /
   `MS_PRIVATE` is denied. Landlock still applies. In-tree dest-deny is
-  then argv only.
+  then argv only. Default `run_child` still starts the child.
+  `workpen run` uses `with_require_dest_hide` and does not spawn.
 - Extra-root dests are readable when remount is unavailable. Those
   still fail closed.
 - Linux remount covers files created after spawn. It does not. macOS

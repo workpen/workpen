@@ -57,6 +57,7 @@ pub struct KernelPolicy {
     dest_denies: Vec<DestDeny>,
     deny_policy: DenyPolicy,
     network_blocked: bool,
+    require_dest_hide: bool,
 }
 
 /// Result of applying the jail. Hosts match the variant, not English.
@@ -361,6 +362,7 @@ pub fn process_jail_with_policy(
         dest_denies,
         deny_policy: policy.clone(),
         network_blocked: true,
+        require_dest_hide: false,
     })
 }
 
@@ -373,6 +375,25 @@ impl KernelPolicy {
     /// Not a filesystem grant.
     pub fn dest_denies(&self) -> &[DestDeny] {
         &self.dest_denies
+    }
+
+    /// Fail closed when Linux dest-deny remount is skipped.
+    ///
+    /// Default `run_child` still starts the child and returns
+    /// [`KernelApply::RemountSkipped`]. `workpen run` uses this so a
+    /// child that can open in-tree secrets is not started.
+    #[must_use]
+    pub fn with_require_dest_hide(mut self) -> Self {
+        self.require_dest_hide = true;
+        self
+    }
+
+    fn require_spawn(&self, applied: KernelApply) -> Result<KernelApply, KernelError> {
+        if self.require_dest_hide {
+            require_dest_hide(applied)
+        } else {
+            require_applied(applied)
+        }
     }
 
     /// Add host dest-deny paths. Existing files are classified (glob or
@@ -520,7 +541,7 @@ impl KernelPolicy {
             }
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
-            let applied = require_applied(self.apply_pre_exec(&mut cmd)?)?;
+            let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             let status = cmd
                 .status()
                 .map_err(|e| KernelError::Apply(e.to_string()))?;
@@ -563,7 +584,7 @@ impl KernelPolicy {
             }
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
-            let applied = require_applied(self.apply_pre_exec(&mut cmd)?)?;
+            let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             cmd.stdin(std::process::Stdio::inherit());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
@@ -616,7 +637,7 @@ impl KernelPolicy {
             }
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
-            let applied = require_applied(self.apply_pre_exec(&mut cmd)?)?;
+            let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
             cmd.process_group(0);
@@ -662,7 +683,7 @@ impl KernelPolicy {
             }
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
-            let applied = require_applied(self.apply_pre_exec(&mut cmd)?)?;
+            let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             cmd.stdin(std::process::Stdio::inherit());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
@@ -716,7 +737,7 @@ impl KernelPolicy {
             }
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
-            let applied = require_applied(self.apply_pre_exec(&mut cmd)?)?;
+            let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             cmd.stdin(std::process::Stdio::inherit());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
@@ -767,7 +788,7 @@ impl KernelPolicy {
             }
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
-            let applied = require_applied(self.apply_pre_exec(&mut cmd)?)?;
+            let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             cmd.process_group(0);
             let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
             let deadline = Instant::now() + timeout;
@@ -1163,10 +1184,26 @@ pub fn spawn_after_setup<T>(
 ///
 /// [`KernelApply::RemountSkipped`] and [`KernelApply::WfpSkipped`] still
 /// start the child. Hosts that require remount or WFP match those
-/// variants themselves.
+/// variants themselves, or call [`require_dest_hide`].
 pub fn require_applied(applied: KernelApply) -> Result<KernelApply, KernelError> {
     match applied {
         KernelApply::Applied | KernelApply::RemountSkipped | KernelApply::WfpSkipped => Ok(applied),
+        KernelApply::UserspaceOnly => Err(KernelError::Apply(
+            "kernel jail did not apply; child was not started".into(),
+        )),
+    }
+}
+
+/// Refuse a spawn when Linux dest-deny remount did not hide in-tree dests.
+///
+/// [`KernelApply::WfpSkipped`] still starts the child (AppContainer is
+/// the Windows net deny). [`KernelApply::RemountSkipped`] does not.
+pub fn require_dest_hide(applied: KernelApply) -> Result<KernelApply, KernelError> {
+    match applied {
+        KernelApply::Applied | KernelApply::WfpSkipped => Ok(applied),
+        KernelApply::RemountSkipped => Err(KernelError::Apply(
+            "dest-deny remount unavailable; child was not started".into(),
+        )),
         KernelApply::UserspaceOnly => Err(KernelError::Apply(
             "kernel jail did not apply; child was not started".into(),
         )),
@@ -1864,7 +1901,8 @@ mod combine_spawn_restore_tests {
     use super::macos_post_create_env_regexes;
     use super::{
         KernelApply, KernelError, WFP_ERROR_ACCESS_DENIED, combine_spawn_restore,
-        dest_deny_rule_paths, process_jail, require_applied, wfp_skip_access_denied,
+        dest_deny_rule_paths, process_jail, require_applied, require_dest_hide,
+        wfp_skip_access_denied,
     };
     use std::path::Path;
     use std::process::ExitStatus;
@@ -1994,6 +2032,32 @@ mod combine_spawn_restore_tests {
         );
         assert_eq!(
             require_applied(KernelApply::WfpSkipped).expect("wfp skip"),
+            KernelApply::WfpSkipped
+        );
+    }
+
+    #[test]
+    fn require_dest_hide_rejects_remount_skip() {
+        let err = require_dest_hide(KernelApply::RemountSkipped).expect_err("remount skip");
+        match err {
+            KernelError::Apply(msg) => {
+                assert!(
+                    msg.contains("remount unavailable"),
+                    "error must name remount: {msg}"
+                );
+                assert!(
+                    msg.contains("not started"),
+                    "error must say child was not started: {msg}"
+                );
+            }
+            other => panic!("expected Apply, got {other}"),
+        }
+        assert_eq!(
+            require_dest_hide(KernelApply::Applied).expect("Applied"),
+            KernelApply::Applied
+        );
+        assert_eq!(
+            require_dest_hide(KernelApply::WfpSkipped).expect("wfp skip"),
             KernelApply::WfpSkipped
         );
     }
