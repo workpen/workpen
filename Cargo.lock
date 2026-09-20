@@ -1100,9 +1100,9 @@ dependencies = [
 
 [[package]]
 name = "nono"
-version = "0.76.0"
+version = "0.78.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46645e5796c7aa3ad2811a003943907019604fb31996c38257fe33d3eb4fec46"
+checksum = "ecc20908b70c2dddbeaa70f761b7c9c4ee36b86895f8441e0af2f0b1e4f391e3"
 dependencies = [
  "der 0.8.2",
  "getrandom 0.4.3",
@@ -2158,7 +2158,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

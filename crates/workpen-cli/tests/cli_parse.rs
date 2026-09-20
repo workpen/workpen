@@ -62,18 +62,19 @@ fn unknown_gc_flag_names_max_age() {
 }
 
 #[test]
-fn empty_argv_stays_not_ready() {
+fn empty_argv_prints_usage() {
     let out = workpen().output().expect("spawn workpen");
-    assert!(
-        out.status.success(),
-        "empty argv must exit 0, stdout={} stderr={}",
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "empty argv must exit 2, stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("Not ready."),
-        "empty argv must stay stealth: {err}"
+        err.contains("usage: workpen"),
+        "empty argv must print usage: {err}"
     );
 }
 

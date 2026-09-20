@@ -1,4 +1,4 @@
-//! Userspace containment stack. Not ready.
+//! Dest-deny and a per-child process jail. The parent is trusted.
 //!
 //! Hosts call dest-deny with an explicit [`DenyPolicy`]. There is no
 //! process-wide deny slot; a session wrapper can hold the policy:

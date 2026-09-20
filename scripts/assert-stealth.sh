@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Retired after launch. Do not wire into CI.
 # Fail if stealth-public launch surfaces leak.
 set -euo pipefail
 ORG_REPO="${1:-workpen/workpen}"

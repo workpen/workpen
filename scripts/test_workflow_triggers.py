@@ -129,6 +129,14 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertIn("id: unpublished", refuse_block)
         auth_block = text[auth_idx:]
         self.assertIn("steps.unpublished.outputs.skip != 'true'", auth_block)
+        self.assertIn("cargo publish -p workpen", text)
+        self.assertIn("cargo publish -p workpen-cli", text)
+
+    def test_stealth_job_is_launch_standin(self) -> None:
+        text = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+        self.assertIn("name: Stealth", text)
+        self.assertIn("Stealth assert retired after launch", text)
+        self.assertNotIn("assert-stealth.sh", text)
 
     def test_msrv_is_1_95(self) -> None:
         toolchain = (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
@@ -140,6 +148,27 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertIn('toolchain: "1.95"', publish)
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn('rust-version = "1.95"', cargo)
+
+    def test_zizmor_ignores_dependabot_pull_request_target(self) -> None:
+        text = (ROOT / ".github" / "zizmor.yml").read_text(encoding="utf-8")
+        self.assertIn("dangerous-triggers:", text)
+        self.assertIn("dependabot-auto-merge.yml", text)
+        wf = (WORKFLOWS / "dependabot-auto-merge.yml").read_text(encoding="utf-8")
+        self.assertIn("pull_request_target:", wf)
+        self.assertIn("does not checkout the PR HEAD", wf)
+        self.assertNotIn("actions/checkout@", wf)
+
+    def test_scorecard_is_main_schedule_no_compile(self) -> None:
+        text = (WORKFLOWS / "scorecard.yml").read_text(encoding="utf-8")
+        on_block = _on_block(text)
+        self.assertIn("push:", on_block)
+        self.assertIn("branches: [main]", on_block)
+        self.assertIn("schedule:", on_block)
+        self.assertIn("workflow_dispatch:", on_block)
+        self.assertNotIn("pull_request:", on_block)
+        self.assertIn("ossf/scorecard-action@", text)
+        self.assertIn("publish_results: true", text)
+        self.assertNotRegex(text, r"cargo (test|nextest|clippy)")
 
     def test_ci_enables_gc_and_nono_features(self) -> None:
         ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")

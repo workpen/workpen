@@ -5,10 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Reserved."
-publish = false
-keywords = []
-categories = []
+description = "Dest-deny and a per-child process jail (Landlock, Seatbelt, Windows)."
+publish = true
+readme = "../../README.md"
+keywords = ["sandbox", "landlock", "seatbelt", "security", "process"]
+categories = ["os", "command-line-utilities"]
 
 [features]
 default = []
@@ -20,7 +21,7 @@ dunce = "1"
 thiserror = "2"
 
 [target.'cfg(unix)'.dependencies]
-nono = { version = "0.76", optional = true, default-features = false }
+nono = { version = "0.78", optional = true, default-features = false }
 libc = "0.2"
 
 [dev-dependencies]

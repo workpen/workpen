@@ -2,8 +2,8 @@
 
 Crate rustdoc is canonical: `workpen::threat_model`.
 
-This page is the same contract in one place for host authors. It is
-not a launch README. The repo README stays `Not ready.`
+This page is the same contract in one place for host authors. The
+repo README is the public face.
 
 ## Trust boundary
 
