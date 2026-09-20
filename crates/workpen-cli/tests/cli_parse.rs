@@ -220,6 +220,26 @@ fn run_timeout_missing_value_names_usage() {
 }
 
 #[test]
+fn run_tty_without_command_names_usage() {
+    let out = workpen()
+        .args(["run", "--tty"])
+        .output()
+        .expect("spawn workpen");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "run --tty without CMD must exit 2, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("--tty"),
+        "run --tty without CMD must name --tty: {err}"
+    );
+}
+
+#[test]
 fn run_help_without_separator_is_unknown_flag() {
     let out = workpen()
         .args(["run", "--help"])

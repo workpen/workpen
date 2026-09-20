@@ -47,6 +47,122 @@ fn run_with_dotenv_hides_or_refuses() {
     );
 }
 
+const TTY_PROBE: &str = "if [ -t 1 ]; then printf tty; else printf pipe; fi";
+
+#[cfg(unix)]
+#[test]
+fn run_without_tty_stdio_is_not_a_terminal() {
+    let dir = TempDir::new().expect("workspace");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--", "/bin/sh", "-c", TTY_PROBE])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("pipe"),
+        "piped run must not be a tty: {stdout:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_tty_stdio_is_a_terminal() {
+    let dir = TempDir::new().expect("workspace");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--tty", "--", "/bin/sh", "-c", TTY_PROBE])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("tty"),
+        "--tty child stdout must be a terminal: {stdout:?} stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_tty_still_dest_denies_env() {
+    let dir = TempDir::new().expect("workspace");
+    std::fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--tty", "--", "/bin/cat", ".env"])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "--tty cat .env must dest-deny, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !text.contains("SECRET"),
+        "--tty must dest-deny before spawn: {text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_tty_timeout_kills_sleep() {
+    let dir = TempDir::new().expect("workspace");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--tty", "--timeout", "1s", "--", "/bin/sleep", "30"])
+        .output()
+        .expect("spawn workpen");
+    assert_eq!(
+        out.status.code(),
+        Some(124),
+        "--tty timeout must be 124, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn run_tty_is_unavailable_on_windows() {
+    let dir = TempDir::new().expect("workspace");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--tty", "--", "cmd", "/c", "echo ok"])
+        .output()
+        .expect("spawn workpen");
+    assert!(
+        !out.status.success(),
+        "--tty on Windows must fail, stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("tty") && err.contains("Windows"),
+        "--tty must name Windows: {err}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn run_stdout_redirect_outside_workspace_is_readable() {

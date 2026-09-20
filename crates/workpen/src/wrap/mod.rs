@@ -22,6 +22,8 @@ use crate::deny::{
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(unix)]
+mod pty;
 #[cfg(windows)]
 mod windows;
 
@@ -763,6 +765,78 @@ impl KernelPolicy {
             let _ = (cmd, timeout);
             Err(KernelError::Apply(
                 "no kernel backend on this platform".into(),
+            ))
+        }
+    }
+
+    /// Same as [`Self::run_child_forward`] with a PTY for the child.
+    ///
+    /// Unix only. Windows returns [`KernelError::Apply`]. stdin/stdout/
+    /// stderr are the slave. The parent copies the master to this
+    /// process. `setsid` is the child's process group (no extra
+    /// `process_group(0)`).
+    pub fn run_child_forward_pty(
+        &self,
+        cmd: Command,
+    ) -> Result<(KernelApply, ExitStatus), KernelError> {
+        self.run_child_pty(cmd, None).map(|(a, s, _)| (a, s))
+    }
+
+    /// Same as [`Self::run_child_timeout_forward`] with a PTY.
+    pub fn run_child_timeout_forward_pty(
+        &self,
+        cmd: Command,
+        timeout: Duration,
+    ) -> Result<(KernelApply, ExitStatus, bool), KernelError> {
+        self.run_child_pty(cmd, Some(timeout))
+    }
+
+    fn run_child_pty(
+        &self,
+        cmd: Command,
+        timeout: Option<Duration>,
+    ) -> Result<(KernelApply, ExitStatus, bool), KernelError> {
+        self.dest_deny_command(&cmd)?;
+        #[cfg(unix)]
+        {
+            if !kernel_supported() {
+                return Err(KernelError::Apply(
+                    "kernel jail is not available; child was not started".into(),
+                ));
+            }
+            let mut cmd = cmd;
+            scrub_child_command(&mut cmd);
+            let pty = pty::open_pty().map_err(|e| KernelError::Apply(e.to_string()))?;
+            pty::attach_pty(&mut cmd, pty.slave).map_err(|e| KernelError::Apply(e.to_string()))?;
+            let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
+            let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            let (out_th, master_write) =
+                pty::pump_master(pty.master).map_err(|e| KernelError::Apply(e.to_string()))?;
+            let _stdin_th = copy_pipe(std::io::stdin(), master_write);
+            let (status, timed_out) = match timeout {
+                Some(limit) => wait_until_deadline(&mut child, limit)?,
+                None => {
+                    let status = child
+                        .wait()
+                        .map_err(|e| KernelError::Apply(e.to_string()))?;
+                    (status, false)
+                }
+            };
+            join_copy(Some(out_th));
+            Ok((applied, status, timed_out))
+        }
+        #[cfg(windows)]
+        {
+            let _ = (cmd, timeout);
+            Err(KernelError::Apply(
+                "tty is not available on Windows; child was not started".into(),
+            ))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (cmd, timeout);
+            Err(KernelError::Apply(
+                "tty is not available on this platform; child was not started".into(),
             ))
         }
     }

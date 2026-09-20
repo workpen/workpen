@@ -26,6 +26,9 @@
 //!   In-tree dest-deny is then userspace argv only. Default
 //!   `run_child` still starts the child. [`crate::KernelPolicy::with_require_dest_hide`]
 //!   (the `workpen run` CLI) refuses to spawn.
+//! * `workpen run --tty` gives the child a Unix PTY. Windows returns
+//!   [`crate::KernelError::Apply`]. The parent still copies the master;
+//!   dest-deny and the kernel jail still apply.
 //! * Extra-root dests still fail-closed when remount is unavailable.
 //! * Linux remount is a **launch snapshot**. `touch .env && cat .env`
 //!   after spawn is userspace-only. macOS has name regexes. Windows
