@@ -77,11 +77,11 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
 }
 
 const RUN_USAGE: &str =
-    "usage: workpen run [--root DIR] [--extra-root DIR] [--timeout DUR] [--] CMD...";
+    "usage: workpen run [--root DIR] [--extra-root DIR] [--timeout DUR] [--tty] [--] CMD...";
 
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
-    let (timeout, rest) = peel_run_timeout(&rest)?;
+    let (timeout, tty, rest) = peel_run_flags(&rest)?;
     if let Some(flag) = rest.first().filter(|t| t.starts_with('-') && *t != "--") {
         return Err(format!("unknown flag: {flag} ({RUN_USAGE})"));
     }
@@ -110,9 +110,13 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     // Copy child pipes to this process as bytes arrive. A Vec of the whole
     // stream would grow without bound (`yes` under --timeout). Inherited
     // child stdout to a file outside --root is a Seatbelt/DACL dest write.
-    let result = match timeout {
-        Some(limit) => jail.run_child_timeout_forward(child, limit),
-        None => jail
+    let result = match (timeout, tty) {
+        (Some(limit), true) => jail.run_child_timeout_forward_pty(child, limit),
+        (None, true) => jail
+            .run_child_forward_pty(child)
+            .map(|(applied, status)| (applied, status, false)),
+        (Some(limit), false) => jail.run_child_timeout_forward(child, limit),
+        (None, false) => jail
             .run_child_forward(child)
             .map(|(applied, status)| (applied, status, false)),
     };
@@ -136,8 +140,9 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
-fn peel_run_timeout(rest: &[String]) -> Result<(Option<Duration>, &[String]), String> {
+fn peel_run_flags(rest: &[String]) -> Result<(Option<Duration>, bool, &[String]), String> {
     let mut timeout = None;
+    let mut tty = false;
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -146,10 +151,14 @@ fn peel_run_timeout(rest: &[String]) -> Result<(Option<Duration>, &[String]), St
                 timeout = Some(parse_max_age(raw).map_err(|e| e.to_string())?);
                 i += 2;
             }
+            "--tty" => {
+                tty = true;
+                i += 1;
+            }
             _ => break,
         }
     }
-    Ok((timeout, &rest[i..]))
+    Ok((timeout, tty, &rest[i..]))
 }
 
 fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
