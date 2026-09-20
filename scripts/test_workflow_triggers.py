@@ -158,6 +158,45 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertIn("does not checkout the PR HEAD", wf)
         self.assertNotIn("actions/checkout@", wf)
 
+    def test_dependabot_write_is_job_level(self) -> None:
+        text = (WORKFLOWS / "dependabot-auto-merge.yml").read_text(encoding="utf-8")
+        top = text.split("\njobs:", 1)[0]
+        self.assertIn("contents: read", top)
+        self.assertNotIn("contents: write", top)
+        self.assertNotIn("pull-requests: write", top)
+        job = text.split("\njobs:", 1)[1]
+        self.assertIn("contents: write", job)
+        self.assertIn("pull-requests: write", job)
+
+    def test_sign_release_attaches_intoto_not_ci_push(self) -> None:
+        ci_on = _on_block((WORKFLOWS / "ci.yml").read_text(encoding="utf-8"))
+        self.assertNotIn("push:", ci_on)
+        text = (WORKFLOWS / "sign-release.yml").read_text(encoding="utf-8")
+        on_block = _on_block(text)
+        self.assertIn("workflow_dispatch:", on_block)
+        self.assertIn("types: [published]", on_block)
+        self.assertNotIn("pull_request:", on_block)
+        self.assertNotIn("slsa-github-generator", text)
+        top = text.split("\njobs:", 1)[0]
+        self.assertIn("contents: read", top)
+        self.assertNotIn("contents: write", top)
+        job = text.split("\njobs:", 1)[1]
+        self.assertIn("contents: write", job)
+        self.assertIn("id-token: write", job)
+        self.assertIn("attestations: write", job)
+        self.assertIn("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8", text)
+        self.assertIn("workpen-cli-x86_64-unknown-linux-gnu.tar.gz", text)
+        self.assertIn("scripts/attach-release-provenance.sh", text)
+        self.assertNotIn('TAG="${TAG}"', text)
+        self.assertIn('toolchain: "1.95"', text)
+        script = (ROOT / "scripts" / "attach-release-provenance.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('ARTIFACTS=$(cd "$ARTIFACTS" && pwd)', script)
+        self.assertIn(".intoto.jsonl", script)
+        self.assertIn("gh attestation download", script)
+        self.assertNotIn("cosign", script)
+
     def test_scorecard_is_main_schedule_no_compile(self) -> None:
         text = (WORKFLOWS / "scorecard.yml").read_text(encoding="utf-8")
         on_block = _on_block(text)
