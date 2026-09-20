@@ -15,7 +15,7 @@ a fix is possible in this crate.
 
 ## Scope
 
-workpen jails a **child process**. The parent is trusted. This is not
+Workpen jails a **child process**. The parent is trusted. This is not
 a VM. See [docs/threat-model.md](docs/threat-model.md).
 
 In scope: dest-deny bypass, PathGuard escape, kernel-jail apply bugs
