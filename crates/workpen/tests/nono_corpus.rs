@@ -648,6 +648,30 @@ fn collect_workspace_dest_denies_includes_cache_ssh_directory() {
     );
 }
 
+#[test]
+fn cache_walk_dest_denies_glob_names_not_hardlink_siblings() {
+    let dir = workspace();
+    let target = dir.path().join("target");
+    let deps = target.join("debug").join("deps");
+    fs::create_dir_all(&deps).expect("deps");
+    let env = target.join(".env");
+    fs::write(&env, "SECRET=1\n").expect(".env");
+    let rlib = deps.join("libfoo.rlib");
+    fs::hard_link(&env, &rlib).expect("hardlink rlib");
+
+    let found = collect_workspace_dest_denies(dir.path(), &DenyPolicy::default()).expect("collect");
+    assert!(
+        found
+            .iter()
+            .any(|d| d.path == env && d.kind == DestDenyKind::DenyGlob),
+        "target/.env must dest-deny by name: {found:?}"
+    );
+    assert!(
+        found.iter().all(|d| d.path != rlib),
+        "cache walk is dest-deny names only; hardlink sibling rlib must not be planted: {found:?}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn dest_deny_walk_does_not_follow_ssh_directory_symlink() {

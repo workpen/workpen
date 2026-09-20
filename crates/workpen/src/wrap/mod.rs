@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::Duration;
 
-use crate::deny::{CheckDestError, DenyPolicy, DestDeny, DestDenyKind, dest_deny_at};
+use crate::deny::{
+    CheckDestError, DenyPolicy, DestDeny, DestDenyKind, dest_deny_at, dest_deny_glob_only,
+};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -331,7 +333,7 @@ pub fn process_jail_with_policy(
             )?;
             continue;
         }
-        walk_cache_dest_denies(
+        walk_dest_denies(
             extra,
             policy,
             &mut dest_denies,
@@ -1165,9 +1167,10 @@ const DEST_DENY_CACHE_DIR_NAMES: &[&str] =
 /// including hardlink siblings.
 ///
 /// Does not apply the jail. Does not follow directory symlinks. Does
-/// not descend `.git`. Cache trees are walked for dest-deny names
-/// only; non-deny rustc artifacts do not count toward the entry cap.
-/// Walk failure or an entry cap is [`KernelError::Root`].
+/// not descend `.git`. Cache trees are walked for dest-deny glob names
+/// only (no hardlink sibling scan); non-deny rustc artifacts do not
+/// count toward the entry cap. Walk failure or an entry cap is
+/// [`KernelError::Root`].
 pub fn collect_workspace_dest_denies(
     workspace: &Path,
     policy: &DenyPolicy,
@@ -1425,8 +1428,11 @@ fn walk_temp_dest_denies(
     Ok(())
 }
 
-/// Walk a cache tree for dest-deny hits only. Non-deny files are not
-/// charged to the entry cap. Does not follow directory symlinks.
+/// Walk a cache tree for dest-deny glob names only. Non-deny files are
+/// not charged to the entry cap. Does not follow directory symlinks.
+/// Does not canonicalize or hardlink-scan rustc artifacts (`nlink` in
+/// `target/debug/deps` is O(entries^2) and stalls `run --root` on a
+/// populated cargo tree).
 fn walk_cache_dest_denies(
     dir: &Path,
     policy: &DenyPolicy,
@@ -1447,7 +1453,7 @@ fn walk_cache_dest_denies(
             walk_cache_dest_denies(&path, policy, out, remaining, limit)?;
             continue;
         }
-        if let Some(deny) = dest_deny_at(&path, path.display().to_string(), policy) {
+        if let Some(deny) = dest_deny_glob_only(&path, path.display().to_string(), policy) {
             if *remaining == 0 {
                 return Err(dest_deny_walk_cap(dir, limit));
             }

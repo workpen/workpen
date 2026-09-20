@@ -208,6 +208,23 @@ pub(crate) fn dest_deny_at(
     })
 }
 
+/// Glob-name dest-deny only. No canonicalize and no hardlink sibling
+/// scan. Cache trees use this so rustc artifacts are not O(n^2)
+/// readdir'd. Plants `**/.env` names, not every `target/debug/deps`
+/// inode.
+pub(crate) fn dest_deny_glob_only(
+    classified: &Path,
+    display: String,
+    policy: &DenyPolicy,
+) -> Option<DestDeny> {
+    first_matching_deny_glob(policy.globs(), &path_as_glob(classified)).map(|glob| DestDeny {
+        kind: DestDenyKind::DenyGlob,
+        path: classified.to_path_buf(),
+        display,
+        matched: Some(glob),
+    })
+}
+
 pub fn is_path_denied(path: &Path, policy: &DenyPolicy) -> bool {
     classify_dest(path, policy).is_some()
 }
