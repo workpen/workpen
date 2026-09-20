@@ -7,16 +7,22 @@ child is not. This is not a VM.
 
 ## Install
 
-Library (git pin until crates.io has the same tag):
+Library:
 
 ```toml
-workpen = { git = "https://github.com/workpen/workpen", tag = "v0.5.0", features = ["gc", "nono"] }
+workpen = { version = "0.5", features = ["gc", "nono"] }
 ```
 
 CLI:
 
 ```bash
-cargo install --git https://github.com/workpen/workpen --tag v0.5.0 --locked workpen-cli
+cargo install workpen-cli --locked
+```
+
+Git pin:
+
+```toml
+workpen = { git = "https://github.com/workpen/workpen", tag = "v0.5.0", features = ["gc", "nono"] }
 ```
 
 MSRV is 1.95.
