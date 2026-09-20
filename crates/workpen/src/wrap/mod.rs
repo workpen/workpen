@@ -57,6 +57,8 @@ pub struct KernelPolicy {
     dest_denies: Vec<DestDeny>,
     deny_policy: DenyPolicy,
     network_blocked: bool,
+    /// Read by [`Self::require_spawn`] on Unix. Windows has no remount.
+    #[cfg_attr(not(unix), allow(dead_code))]
     require_dest_hide: bool,
 }
 
@@ -388,6 +390,7 @@ impl KernelPolicy {
         self
     }
 
+    #[cfg(unix)]
     fn require_spawn(&self, applied: KernelApply) -> Result<KernelApply, KernelError> {
         if self.require_dest_hide {
             require_dest_hide(applied)

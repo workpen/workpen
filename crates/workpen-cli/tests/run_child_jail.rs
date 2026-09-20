@@ -780,12 +780,15 @@ fn run_drops_env_argv_bash_env_assignment() {
         ])
         .output()
         .expect("spawn workpen");
-    assert!(
-        out.status.success(),
-        "env without denied assignment must still run: status={:?} stderr={}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
-    );
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("remount unavailable"),
+            "env without denied assignment must run or refuse remount skip: status={:?} stderr={err}",
+            out.status
+        );
+        return;
+    }
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         !stdout.contains(".env"),
