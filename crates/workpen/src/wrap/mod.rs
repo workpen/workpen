@@ -171,8 +171,11 @@ fn wait_until_deadline(
             Some(status) => return Ok((status, false)),
             None if Instant::now() >= deadline => {
                 let pid = child.id() as libc::pid_t;
-                // SAFETY: pid is the child's process group (process_group(0)).
+                // SAFETY: pid is this spawn's child. `process_group(0)` or
+                // PTY `setsid` makes it a group leader; `kill` still
+                // works when the group id differs.
                 unsafe {
+                    libc::kill(pid, libc::SIGKILL);
                     libc::killpg(pid, libc::SIGKILL);
                 }
                 let status = child
@@ -807,9 +810,14 @@ impl KernelPolicy {
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
             let pty = pty::open_pty().map_err(|e| KernelError::Apply(e.to_string()))?;
-            pty::attach_pty(&mut cmd, pty.slave).map_err(|e| KernelError::Apply(e.to_string()))?;
+            // unshare/Landlock before setsid/TIOCSCTTY. Linux userns
+            // after a controlling TTY can stop the child on SIGTTIN.
             let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
+            pty::attach_pty(&mut cmd, pty.slave).map_err(|e| KernelError::Apply(e.to_string()))?;
             let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            // Command keeps the slave File after spawn. Linux master
+            // read does not EOF while that fd stays open in the parent.
+            drop(cmd);
             let (out_th, master_write) =
                 pty::pump_master(pty.master).map_err(|e| KernelError::Apply(e.to_string()))?;
             let _stdin_th = copy_pipe(std::io::stdin(), master_write);
@@ -877,8 +885,9 @@ impl KernelPolicy {
                     Some(status) => return Ok((applied, status)),
                     None if Instant::now() >= deadline => {
                         let pid = child.id() as libc::pid_t;
-                        // SAFETY: pid is the child's process group (process_group(0)).
+                        // SAFETY: pid is this spawn's child (`process_group(0)`).
                         unsafe {
+                            libc::kill(pid, libc::SIGKILL);
                             libc::killpg(pid, libc::SIGKILL);
                         }
                         let _ = child.wait();

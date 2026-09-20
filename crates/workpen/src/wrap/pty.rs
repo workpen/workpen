@@ -85,6 +85,11 @@ pub(super) fn attach_pty(cmd: &mut Command, slave: File) -> io::Result<()> {
     cmd.stderr(Stdio::from(slave));
     unsafe {
         cmd.pre_exec(|| {
+            // Userns after a controlling TTY can SIGTTIN/SIGTTOU-stop
+            // the child; parent wait() then never returns.
+            let _ = libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+            let _ = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            let _ = libc::signal(libc::SIGTSTP, libc::SIG_IGN);
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }

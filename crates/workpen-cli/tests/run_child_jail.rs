@@ -1,8 +1,15 @@
 //! Live `workpen run` jails the child, not the parent.
 
 use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
+#[cfg(unix)]
+use std::sync::Mutex;
 
 use tempfile::TempDir;
+
+#[cfg(unix)]
+static PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(unix)]
 #[test]
@@ -75,11 +82,13 @@ fn run_without_tty_stdio_is_not_a_terminal() {
 #[cfg(unix)]
 #[test]
 fn run_tty_stdio_is_a_terminal() {
+    let _g = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = TempDir::new().expect("workspace");
     let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
         .args(["run", "--root"])
         .arg(dir.path())
         .args(["--tty", "--", "/bin/sh", "-c", TTY_PROBE])
+        .stdin(Stdio::null())
         .output()
         .expect("spawn workpen");
     assert!(
@@ -98,12 +107,14 @@ fn run_tty_stdio_is_a_terminal() {
 #[cfg(unix)]
 #[test]
 fn run_tty_still_dest_denies_env() {
+    let _g = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = TempDir::new().expect("workspace");
     std::fs::write(dir.path().join(".env"), "SECRET=1\n").expect("env");
     let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
         .args(["run", "--root"])
         .arg(dir.path())
         .args(["--tty", "--", "/bin/cat", ".env"])
+        .stdin(Stdio::null())
         .output()
         .expect("spawn workpen");
     assert!(
@@ -126,11 +137,13 @@ fn run_tty_still_dest_denies_env() {
 #[cfg(unix)]
 #[test]
 fn run_tty_timeout_kills_sleep() {
+    let _g = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = TempDir::new().expect("workspace");
     let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
         .args(["run", "--root"])
         .arg(dir.path())
         .args(["--tty", "--timeout", "1s", "--", "/bin/sleep", "30"])
+        .stdin(Stdio::null())
         .output()
         .expect("spawn workpen");
     assert_eq!(
