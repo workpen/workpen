@@ -141,6 +141,18 @@ class WorkflowTriggerTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn('rust-version = "1.95"', cargo)
 
+    def test_scorecard_is_main_schedule_no_compile(self) -> None:
+        text = (WORKFLOWS / "scorecard.yml").read_text(encoding="utf-8")
+        on_block = _on_block(text)
+        self.assertIn("push:", on_block)
+        self.assertIn("branches: [main]", on_block)
+        self.assertIn("schedule:", on_block)
+        self.assertIn("workflow_dispatch:", on_block)
+        self.assertNotIn("pull_request:", on_block)
+        self.assertIn("ossf/scorecard-action@", text)
+        self.assertIn("publish_results: true", text)
+        self.assertNotRegex(text, r"cargo (test|nextest|clippy)")
+
     def test_ci_enables_gc_and_nono_features(self) -> None:
         ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
         self.assertIn("--features gc,nono", ci)

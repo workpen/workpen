@@ -1,3 +1,7 @@
+> **Human contributors:** This file is for AI coding assistants.
+> You can safely ignore it. See [CONTRIBUTING.md](CONTRIBUTING.md)
+> instead.
+
 # Agents
 
 Rust workspace. MSRV 1.95. Edition 2024.
