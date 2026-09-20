@@ -1,7 +1,10 @@
 name: Dependabot Auto-Merge
 
+# pull_request_target: Dependabot's pull_request GITHUB_TOKEN is
+# read-only. This job does not checkout the PR HEAD.
 on:
   pull_request_target:
+  workflow_dispatch:
 
 permissions:
   contents: write
