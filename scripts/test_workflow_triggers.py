@@ -141,6 +141,15 @@ class WorkflowTriggerTests(unittest.TestCase):
         cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn('rust-version = "1.95"', cargo)
 
+    def test_zizmor_ignores_dependabot_pull_request_target(self) -> None:
+        text = (ROOT / ".github" / "zizmor.yml").read_text(encoding="utf-8")
+        self.assertIn("dangerous-triggers:", text)
+        self.assertIn("dependabot-auto-merge.yml", text)
+        wf = (WORKFLOWS / "dependabot-auto-merge.yml").read_text(encoding="utf-8")
+        self.assertIn("pull_request_target:", wf)
+        self.assertIn("does not checkout the PR HEAD", wf)
+        self.assertNotIn("actions/checkout@", wf)
+
     def test_scorecard_is_main_schedule_no_compile(self) -> None:
         text = (WORKFLOWS / "scorecard.yml").read_text(encoding="utf-8")
         on_block = _on_block(text)

@@ -1,0 +1,5 @@
+rules:
+  dangerous-triggers:
+    ignore:
+      # Approves same-repo Dependabot PRs. Does not checkout PR HEAD.
+      - dependabot-auto-merge.yml
