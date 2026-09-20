@@ -238,6 +238,44 @@ fn run_forwards_stdin_without_timeout() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn run_tty_forwards_stdin() {
+    let _g = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = TempDir::new().expect("workspace");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .arg("run")
+        .arg("--root")
+        .arg(dir.path())
+        .args(["--tty", "--timeout", "2s", "--", "/bin/cat"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn workpen");
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(b"hi\n")
+            .expect("write stdin");
+    }
+    let out = child.wait_with_output().expect("wait");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "--tty cat must exit 0 after stdin EOF, not hang until --timeout, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        stdout, "hi\n",
+        "--tty piped stdin must reach cat once: stdout={stdout:?}"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn run_sh_c_echo_does_not_warn_var_select() {

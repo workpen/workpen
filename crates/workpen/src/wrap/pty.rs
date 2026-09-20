@@ -2,8 +2,8 @@
 //! inherits the slave as stdin/stdout/stderr.
 
 use std::fs::{File, OpenOptions};
-use std::io;
-use std::os::fd::{FromRawFd, RawFd};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -78,6 +78,7 @@ fn copy_winsize(master_fd: RawFd) {
 }
 
 pub(super) fn attach_pty(cmd: &mut Command, slave: File) -> io::Result<()> {
+    silence_echo_if_piped(&slave);
     let stdin = slave.try_clone()?;
     let stdout = slave.try_clone()?;
     cmd.stdin(Stdio::from(stdin));
@@ -104,4 +105,45 @@ pub(super) fn pump_master(master: File) -> io::Result<(std::thread::JoinHandle<(
     let writer = master.try_clone()?;
     let out = super::copy_pipe(master, std::io::stdout());
     Ok((out, writer))
+}
+
+/// Piped parent stdin is not a TTY. Keep ICANON so VEOF still works;
+/// drop ECHO so `printf hi | workpen run --tty -- cat` is not doubled.
+fn silence_echo_if_piped(slave: &File) {
+    if unsafe { libc::isatty(0) } == 1 {
+        return;
+    }
+    unsafe {
+        let fd = slave.as_raw_fd();
+        let mut ios = std::mem::zeroed::<libc::termios>();
+        if libc::tcgetattr(fd, &mut ios) != 0 {
+            return;
+        }
+        ios.c_lflag &= !(libc::ECHO | libc::ECHOE | libc::ECHOK | libc::ECHONL);
+        let _ = libc::tcsetattr(fd, libc::TCSANOW, &ios);
+    }
+}
+
+/// Copy parent stdin to the master. Closing the write clone does not
+/// EOF the slave while the parent still reads the master, so write
+/// VEOF (`\x04`) when host stdin ends.
+pub(super) fn pump_stdin(mut master: File) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => {
+                    let _ = master.write_all(&[4]);
+                    break;
+                }
+                Ok(n) => {
+                    if master.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
 }

@@ -820,7 +820,7 @@ impl KernelPolicy {
             drop(cmd);
             let (out_th, master_write) =
                 pty::pump_master(pty.master).map_err(|e| KernelError::Apply(e.to_string()))?;
-            let _stdin_th = copy_pipe(std::io::stdin(), master_write);
+            let _stdin_th = pty::pump_stdin(master_write);
             let (status, timed_out) = match timeout {
                 Some(limit) => wait_until_deadline(&mut child, limit)?,
                 None => {
