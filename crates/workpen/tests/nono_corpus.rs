@@ -768,6 +768,32 @@ fn process_jail_dest_denies_extra_root_hardlink_sibling() {
     );
 }
 
+#[test]
+fn extra_root_named_target_is_glob_only_cache_walk() {
+    let dir = workspace();
+    let parent = TempDir::new().expect("parent");
+    let extra = parent.path().join("target");
+    fs::create_dir_all(extra.join("debug").join("deps")).expect("target/debug/deps");
+    let env = extra.join(".env");
+    fs::write(&env, "SECRET=1\n").expect("target/.env");
+    let rlib = extra.join("debug").join("deps").join("libfoo.rlib");
+    fs::hard_link(&env, &rlib).expect("hardlink rlib");
+    let policy = process_jail(dir.path(), [&extra]).expect("policy");
+    assert!(
+        policy
+            .dest_denies()
+            .iter()
+            .any(|d| d.path == env && d.kind == DestDenyKind::DenyGlob),
+        "extra-root target/.env must dest-deny by name: {:?}",
+        policy.dest_denies()
+    );
+    assert!(
+        policy.dest_denies().iter().all(|d| d.path != rlib),
+        "extra-root named target is cache glob-only; rlib hardlink sibling must not be planted: {:?}",
+        policy.dest_denies()
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn process_jail_canonical_workspace_also_grants_unprefixed() {
