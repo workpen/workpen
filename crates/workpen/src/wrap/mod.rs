@@ -281,7 +281,11 @@ pub fn kernel_supported() -> bool {
 /// Dest-deny names default to [`crate::default_secret_denies()`] plus
 /// workspace `agent.lock` extras, resolved under the workspace and
 /// each extra-root (except `/tmp` / `/var/tmp`; those trees are too
-/// large to walk). Missing lock equals defaults. Invalid
+/// large to walk). An extra-root whose last component is a cache
+/// dir name (`target`, `node_modules`, `.venv`, `dist`,
+/// `__pycache__`) uses the glob-name cache walk, same as a
+/// workspace `target/` (no hardlink sibling scan of rustc
+/// artifacts). Missing lock equals defaults. Invalid
 /// lock is [`KernelError::Apply`]. Hosts match [`crate::DestDenyKind`],
 /// not English.
 pub fn process_jail(
@@ -325,6 +329,16 @@ pub fn process_jail_with_policy(
         }
         if is_system_temp_root(extra) {
             collect_system_temp_dest_denies(
+                extra,
+                policy,
+                &mut dest_denies,
+                &mut remaining,
+                DEST_DENY_WALK_LIMIT,
+            )?;
+            continue;
+        }
+        if is_dest_deny_cache_dir_name(entry_file_name(extra)) {
+            walk_cache_dest_denies(
                 extra,
                 policy,
                 &mut dest_denies,
