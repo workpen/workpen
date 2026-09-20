@@ -43,15 +43,17 @@ MSRV is 1.95.
 ## CLI
 
 ```bash
-workpen why --root . -- .env
+workpen why --root . .env
 workpen run --root . -- /bin/echo ok
 ```
+
+![Workpen dest-denies .env then runs echo](demo/run-echo.gif)
 
 `workpen run` dest-denies argv first, then jails the child. Unix
 `--tty` gives the child a PTY. Windows `--tty` refuses. A copy-paste
 run is [examples/run-echo.sh](examples/run-echo.sh).
 
-Commands: `why`, `run`, `gc`. There is no `--help`.
+Commands: `why`, `run`, `gc`. `workpen --help` prints usage.
 
 ## Library
 
