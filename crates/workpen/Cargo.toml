@@ -20,7 +20,7 @@ dunce = "1"
 thiserror = "2"
 
 [target.'cfg(unix)'.dependencies]
-nono = { version = "0.76", optional = true, default-features = false }
+nono = { version = "0.78", optional = true, default-features = false }
 libc = "0.2"
 
 [dev-dependencies]
