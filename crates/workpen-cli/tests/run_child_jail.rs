@@ -47,6 +47,7 @@ fn run_with_dotenv_hides_or_refuses() {
     );
 }
 
+#[cfg(unix)]
 const TTY_PROBE: &str = "if [ -t 1 ]; then printf tty; else printf pipe; fi";
 
 #[cfg(unix)]
