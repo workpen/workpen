@@ -469,6 +469,14 @@ impl KernelPolicy {
     /// returned [`KernelApply::Applied`], the child fail-closes when
     /// enter fails.
     pub fn apply_pre_exec(&self, cmd: &mut Command) -> Result<KernelApply, KernelError> {
+        self.apply_pre_exec_dests(cmd, Vec::new())
+    }
+
+    fn apply_pre_exec_dests(
+        &self,
+        cmd: &mut Command,
+        extra_dests: Vec<PathBuf>,
+    ) -> Result<KernelApply, KernelError> {
         self.dest_deny_command(cmd)?;
         if !kernel_supported() {
             return Ok(KernelApply::UserspaceOnly);
@@ -476,7 +484,8 @@ impl KernelPolicy {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let caps = self.to_capability_set(nono::SignalMode::Isolated)?;
-            let dests: Vec<PathBuf> = self.dest_denies.iter().map(|d| d.path.clone()).collect();
+            let mut dests: Vec<PathBuf> = self.dest_denies.iter().map(|d| d.path.clone()).collect();
+            dests.extend(extra_dests);
             let workspace = self
                 .grants
                 .iter()
@@ -508,6 +517,7 @@ impl KernelPolicy {
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
+            let _ = extra_dests;
             Ok(KernelApply::UserspaceOnly)
         }
     }
@@ -538,6 +548,27 @@ impl KernelPolicy {
     /// Blocking wait has no host-visible kill; use
     /// [`Self::run_child_timeout`]. Hosts that need captured stdout use
     /// [`Self::run_child_output`].
+    #[cfg(target_os = "linux")]
+    fn occupy_and_hook(
+        &self,
+        cmd: &mut Command,
+    ) -> Result<(KernelApply, linux::OccupiedDests), KernelError> {
+        let occupy = linux::occupy_missing(&self.occupy_roots(), self.deny_policy.globs())
+            .map_err(|e| KernelError::Apply(e.to_string()))?;
+        let extra = occupy.paths().to_vec();
+        let applied = self.require_spawn(self.apply_pre_exec_dests(cmd, extra)?)?;
+        Ok((applied, occupy))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn occupy_roots(&self) -> Vec<PathBuf> {
+        self.grants
+            .iter()
+            .filter(|g| g.access == KernelAccess::ReadWrite && !is_system_temp_root(&g.path))
+            .map(|g| g.path.clone())
+            .collect()
+    }
+
     pub fn run_child(&self, cmd: Command) -> Result<(KernelApply, ExitStatus), KernelError> {
         self.dest_deny_command(&cmd)?;
         #[cfg(unix)]
@@ -549,6 +580,9 @@ impl KernelPolicy {
             }
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
+            #[cfg(target_os = "linux")]
+            let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
+            #[cfg(not(target_os = "linux"))]
             let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             let status = cmd
                 .status()
@@ -592,6 +626,9 @@ impl KernelPolicy {
             }
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
+            #[cfg(target_os = "linux")]
+            let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
+            #[cfg(not(target_os = "linux"))]
             let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             cmd.stdin(std::process::Stdio::inherit());
             cmd.stdout(std::process::Stdio::piped());
@@ -645,6 +682,9 @@ impl KernelPolicy {
             }
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
+            #[cfg(target_os = "linux")]
+            let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
+            #[cfg(not(target_os = "linux"))]
             let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
@@ -691,6 +731,9 @@ impl KernelPolicy {
             }
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
+            #[cfg(target_os = "linux")]
+            let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
+            #[cfg(not(target_os = "linux"))]
             let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             cmd.stdin(std::process::Stdio::inherit());
             cmd.stdout(std::process::Stdio::piped());
@@ -745,6 +788,9 @@ impl KernelPolicy {
             }
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
+            #[cfg(target_os = "linux")]
+            let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
+            #[cfg(not(target_os = "linux"))]
             let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             cmd.stdin(std::process::Stdio::inherit());
             cmd.stdout(std::process::Stdio::piped());
@@ -812,6 +858,9 @@ impl KernelPolicy {
             let pty = pty::open_pty().map_err(|e| KernelError::Apply(e.to_string()))?;
             // unshare/Landlock before setsid/TIOCSCTTY. Linux userns
             // after a controlling TTY can stop the child on SIGTTIN.
+            #[cfg(target_os = "linux")]
+            let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
+            #[cfg(not(target_os = "linux"))]
             let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             pty::attach_pty(&mut cmd, pty.slave).map_err(|e| KernelError::Apply(e.to_string()))?;
             let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
@@ -873,6 +922,9 @@ impl KernelPolicy {
             }
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
+            #[cfg(target_os = "linux")]
+            let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
+            #[cfg(not(target_os = "linux"))]
             let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             cmd.process_group(0);
             let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;

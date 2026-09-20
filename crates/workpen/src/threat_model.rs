@@ -30,9 +30,13 @@
 //!   [`crate::KernelError::Apply`]. The parent still copies the master;
 //!   dest-deny and the kernel jail still apply.
 //! * Extra-root dests still fail-closed when remount is unavailable.
-//! * Linux remount is a **launch snapshot**. `touch .env && cat .env`
-//!   after spawn is userspace-only. macOS has name regexes. Windows
-//!   denies existing dests only. Do not plant missing dests.
+//! * Linux remount occupies missing dest-deny **basenames** at the
+//!   workspace root (and extra-roots that are not `/tmp`) when remount
+//!   applies, then unlinks those nodes after the child exits.
+//!   `touch .env && cat .env` at the root is then hide, not a leak.
+//!   Nested `mkdir x && touch x/.env` is still userspace-only.
+//!   macOS has name regexes. Windows denies existing dests only.
+//!   Do not `create_dir_all` on a nested deny path. Do not vendor bwrap.
 //! * `apply_pre_exec` dest-denies argv, then installs the hook. Hosts
 //!   that cannot use `run_child` still call
 //!   [`crate::KernelPolicy::dest_deny_command`].
