@@ -42,16 +42,17 @@ MSRV is 1.95.
 
 ## CLI
 
-```bash
-workpen why --root . .env
-workpen run --root . -- /bin/echo ok
-```
+Dest-deny blocks `.env` and a hardlink of it (`notes.txt`). An ordinary
+file still runs.
 
-![Workpen dest-denies .env then runs echo](demo/run-echo.gif)
+![Workpen dest-denies .env and a hardlink, then cats notes.md](demo/dest-deny.gif)
+
+Copy-paste with the same checks:
+[examples/dest-deny.sh](examples/dest-deny.sh). A spawn-only run is
+[examples/run-echo.sh](examples/run-echo.sh).
 
 `workpen run` dest-denies argv first, then jails the child. Unix
-`--tty` gives the child a PTY. Windows `--tty` refuses. A copy-paste
-run is [examples/run-echo.sh](examples/run-echo.sh).
+`--tty` gives the child a PTY. Windows `--tty` refuses.
 
 Commands: `why`, `run`, `gc`. `workpen --help` prints usage.
 
