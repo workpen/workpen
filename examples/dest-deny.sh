@@ -1,57 +1,51 @@
 #!/usr/bin/env bash
-# Dest-deny .env and a hardlink of it. An ordinary file still runs.
-# Unix only. Optional: WORKPEN=/path/to/workpen  [workspace]
+# Same commands as the README CLI example. Unix only.
+# Optional: WORKPEN=/path/to/workpen
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WS="${1:-$(mktemp -d)}"
-mkdir -p "$WS"
 if [ -n "${WORKPEN:-}" ]; then
   WP=("$WORKPEN")
 elif command -v workpen >/dev/null 2>&1; then
   WP=(workpen)
 else
-  cd "$ROOT"
-  WP=(cargo run -q -p workpen-cli --)
+  WP=(cargo run -q --manifest-path "$ROOT/Cargo.toml" -p workpen-cli --)
 fi
 
-printf 'SECRET=1\n' >"$WS/.env"
-printf 'hello notes\n' >"$WS/notes.md"
-ln "$WS/.env" "$WS/notes.txt"
+rm -rf /tmp/wp
+mkdir /tmp/wp
+cd /tmp/wp
+printf 'SECRET=1\n' >.env
+printf 'hello notes\n' >notes.md
+ln .env notes.txt
 
-echo "# .env is dest-deny"
 set +e
-"${WP[@]}" why --root "$WS" .env
+"${WP[@]}" why --root . .env
 status=$?
 set -e
 test "$status" -eq 1
-echo blocked
 
-echo "# notes.txt is a hardlink of .env"
 set +e
-"${WP[@]}" why --root "$WS" notes.txt
+"${WP[@]}" why --root . notes.txt
 status=$?
 set -e
 test "$status" -eq 1
-echo blocked
 
-echo "# notes.md is ordinary"
 set +e
-"${WP[@]}" why --root "$WS" notes.md
-why_ok=$?
+"${WP[@]}" why --root . notes.md
+status=$?
 set -e
-test "$why_ok" -eq 0
-echo allowed
+test "$status" -eq 0
 
 set +e
-out=$("${WP[@]}" run --root "$WS" -- /bin/cat notes.md 2>"$WS/run.err")
+out=$("${WP[@]}" run --root . -- /bin/cat notes.md 2>run.err)
 run_st=$?
 set -e
 if [ "$run_st" -eq 0 ]; then
   test "$out" = "hello notes"
   printf '%s\n' "$out"
-elif grep -q 'remount unavailable' "$WS/run.err"; then
-  echo "run skipped: dest-deny remount unavailable"
+elif grep -q 'remount unavailable' run.err; then
+  echo "workpen run skipped: dest-deny remount unavailable"
 else
-  cat "$WS/run.err" >&2
+  cat run.err >&2
   exit 1
 fi

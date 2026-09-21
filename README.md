@@ -42,17 +42,31 @@ MSRV is 1.95.
 
 ## CLI
 
-Dest-deny blocks `.env` and a hardlink of it (`notes.txt`). An ordinary
-file still runs.
+After `cargo install workpen-cli --locked`, paste this in a terminal:
+
+```bash
+rm -rf /tmp/wp && mkdir /tmp/wp && cd /tmp/wp
+printf 'SECRET=1\n' > .env
+printf 'hello notes\n' > notes.md
+ln .env notes.txt
+
+workpen why --root . .env
+workpen why --root . notes.txt
+workpen why --root . notes.md
+workpen run --root . -- /bin/cat notes.md
+```
+
+`.env` is dest-deny. `notes.txt` is a hardlink of `.env`, so dest-deny
+too. `notes.md` is ordinary: `why` prints allowed, `run` prints
+`hello notes`. From this repo, `bash examples/dest-deny.sh` is the
+same commands.
 
 ![Workpen dest-denies .env and a hardlink, then cats notes.md](demo/dest-deny.gif)
 
-Copy-paste with the same checks:
-[examples/dest-deny.sh](examples/dest-deny.sh). A spawn-only run is
-[examples/run-echo.sh](examples/run-echo.sh).
-
 `workpen run` dest-denies argv first, then jails the child. Unix
-`--tty` gives the child a PTY. Windows `--tty` refuses.
+`--tty` gives the child a PTY. Windows `--tty` refuses. A spawn-only
+run is [examples/run-echo.sh](examples/run-echo.sh). On Linux, `run`
+does not spawn when dest-deny remount is skipped.
 
 Commands: `why`, `run`, `gc`. `workpen --help` prints usage.
 
