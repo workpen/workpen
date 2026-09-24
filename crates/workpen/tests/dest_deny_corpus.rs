@@ -1236,8 +1236,8 @@ fn check_command_argv_denies_env_flags_after_unknown_prefix() {
 
 #[test]
 fn validate_deny_glob_rejects_brace_backslash_empty_segment() {
-    assert!(validate_deny_glob("**/.env").is_ok());
-    assert!(validate_deny_glob("**/.ssh/**").is_ok());
+    validate_deny_glob("**/.env").expect("**/.env is a valid deny glob");
+    validate_deny_glob("**/.ssh/**").expect("**/.ssh/** is a valid deny glob");
     assert!(validate_deny_glob("{.env,.secret}").is_err());
     assert!(validate_deny_glob("foo\\bar").is_err());
     assert!(validate_deny_glob("foo//bar").is_err());
