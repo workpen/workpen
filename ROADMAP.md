@@ -6,13 +6,14 @@ This is a near-term map, not a promise. Hosts should read
 ## Near
 
 - Keep dest-deny, PathGuard, leftover GC, and per-child kernel jail
-  as the 0.4 library surface.
+  as the library surface. 0.5.0 is the published crate.
 - Keep Linux remount occupy for missing dest-deny basenames when
   remount applies. Nested post-create stays a snapshot.
 
 ## Medium
 
-- crates.io via Trusted Publishing on the 0.5.0 tag.
+- crates.io 0.5.0 is already published through Trusted Publishing
+  (`publish-crates.yml`). Further publishes wait on a release PR.
 - Keep the public README and GitHub About current. Do not re-enable
   stealth.
 
