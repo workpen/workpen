@@ -4,8 +4,8 @@
 
 # Workpen
 
-[![CI](https://github.com/workpen/workpen/actions/workflows/ci.yml/badge.svg?event=pull_request)](https://github.com/workpen/workpen/actions/workflows/ci.yml)
-[![Security](https://github.com/workpen/workpen/actions/workflows/security.yml/badge.svg?event=pull_request)](https://github.com/workpen/workpen/actions/workflows/security.yml)
+[![CI](https://github.com/workpen/workpen/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/workpen/workpen/actions/workflows/ci.yml)
+[![Security](https://github.com/workpen/workpen/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/workpen/workpen/actions/workflows/security.yml)
 [![crates.io](https://img.shields.io/crates/v/workpen?logo=rust)](https://crates.io/crates/workpen)
 [![docs.rs](https://img.shields.io/docsrs/workpen?logo=docs.rs)](https://docs.rs/workpen)
 [![Release](https://img.shields.io/github/v/release/workpen/workpen?logo=github&sort=semver)](https://github.com/workpen/workpen/releases/latest)
