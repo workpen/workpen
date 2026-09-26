@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0](https://github.com/workpen/workpen/compare/v0.5.0...v0.6.0) (2026-09-25)
+
+
+### Features
+
+* **cli:** print usage on --help ([#186](https://github.com/workpen/workpen/issues/186)) ([0043016](https://github.com/workpen/workpen/commit/004301629140d18207fdad49bbfd8bd0fb5e3e10))
+
+
+### Bug Fixes
+
+* **wrap:** dest-deny argv against command current_dir ([#184](https://github.com/workpen/workpen/issues/184)) ([fcb85aa](https://github.com/workpen/workpen/commit/fcb85aa6fae6ecbb6506853538f38c7eece179a8))
+
 ## [0.5.0](https://github.com/workpen/workpen/compare/v0.4.1...v0.5.0) (2026-09-20)
 
 
