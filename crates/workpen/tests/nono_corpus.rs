@@ -1573,6 +1573,36 @@ fn run_child_network_blocked_tcp_fails() {
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn run_child_network_allowed_tcp_connects() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>())
+        .expect("policy")
+        .with_network(false);
+    assert!(!policy.network_blocked());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+    let port = listener.local_addr().expect("addr").port();
+    let script = format!("echo >/dev/tcp/127.0.0.1/{port}");
+    let mut cmd = Command::new("/bin/bash");
+    cmd.args(["-c", &script]).current_dir(dir.path());
+    let (_applied, status) = policy.run_child(cmd).expect("run_child");
+    assert!(
+        status.success(),
+        "with_network(false) must allow TCP to 127.0.0.1:{port}: {status:?}"
+    );
+    listener
+        .set_nonblocking(true)
+        .expect("listener nonblocking");
+    assert!(
+        listener.accept().is_ok(),
+        "handshake must complete on 127.0.0.1:{port}"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn run_child_network_blocked_tcp_fails() {

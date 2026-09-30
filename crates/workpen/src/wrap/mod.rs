@@ -333,36 +333,7 @@ pub fn process_jail_with_policy(
     let mut dest_denies = collect_workspace_dest_denies(workspace.as_ref(), policy)?;
     let mut remaining = DEST_DENY_WALK_LIMIT;
     for extra in &extras {
-        if is_system_read_extra(extra) {
-            continue;
-        }
-        if is_system_temp_root(extra) {
-            collect_system_temp_dest_denies(
-                extra,
-                policy,
-                &mut dest_denies,
-                &mut remaining,
-                DEST_DENY_WALK_LIMIT,
-            )?;
-            continue;
-        }
-        if extra_root_is_cache_tree(extra) {
-            walk_cache_dest_denies(
-                extra,
-                policy,
-                &mut dest_denies,
-                &mut remaining,
-                DEST_DENY_WALK_LIMIT,
-            )?;
-            continue;
-        }
-        walk_dest_denies(
-            extra,
-            policy,
-            &mut dest_denies,
-            &mut remaining,
-            DEST_DENY_WALK_LIMIT,
-        )?;
+        append_extra_dest_denies(extra, policy, &mut dest_denies, &mut remaining)?;
     }
     if let Some(null_dev) = null_device_grant() {
         push_grant(&mut grants, null_dev, KernelAccess::ReadWrite);
@@ -399,6 +370,29 @@ impl KernelPolicy {
     /// Not a filesystem grant.
     pub fn dest_denies(&self) -> &[DestDeny] {
         &self.dest_denies
+    }
+
+    /// When `blocked` is false, Unix `to_capability_set` does not call
+    /// `block_network()`. The default from [`process_jail`] stays blocked.
+    #[must_use]
+    pub fn with_network(mut self, blocked: bool) -> Self {
+        self.network_blocked = blocked;
+        self
+    }
+
+    /// Read-only grant for one extra directory. Home and filesystem root
+    /// are refused the same way as [`add_rw`]. Dest-deny for that tree is
+    /// recorded after the allow.
+    pub fn with_read_root(mut self, path: &Path) -> Result<Self, KernelError> {
+        add_read_grant(&mut self.grants, path)?;
+        let mut remaining = DEST_DENY_WALK_LIMIT;
+        append_extra_dest_denies(
+            path,
+            &self.deny_policy,
+            &mut self.dest_denies,
+            &mut remaining,
+        )?;
+        Ok(self)
     }
 
     /// Fail closed when Linux dest-deny remount is skipped.
@@ -1012,7 +1006,12 @@ impl KernelPolicy {
                 .collect();
             add_macos_dest_deny_rules(&mut caps, &self.dest_denies, &rw, self.deny_policy.globs())?;
         }
-        Ok(caps.block_network().set_signal_mode(signal))
+        let caps = if self.network_blocked {
+            caps.block_network()
+        } else {
+            caps
+        };
+        Ok(caps.set_signal_mode(signal))
     }
 
     /// Dest-deny `cmd` argv with the jail [`DenyPolicy`] before spawn.
@@ -2069,6 +2068,50 @@ fn system_read_dirs() -> Vec<PathBuf> {
     {
         Vec::new()
     }
+}
+
+fn append_extra_dest_denies(
+    extra: &Path,
+    policy: &DenyPolicy,
+    dest_denies: &mut Vec<DestDeny>,
+    remaining: &mut usize,
+) -> Result<(), KernelError> {
+    if is_system_read_extra(extra) {
+        return Ok(());
+    }
+    if is_system_temp_root(extra) {
+        collect_system_temp_dest_denies(
+            extra,
+            policy,
+            dest_denies,
+            remaining,
+            DEST_DENY_WALK_LIMIT,
+        )?;
+        return Ok(());
+    }
+    if extra_root_is_cache_tree(extra) {
+        walk_cache_dest_denies(extra, policy, dest_denies, remaining, DEST_DENY_WALK_LIMIT)?;
+        return Ok(());
+    }
+    walk_dest_denies(extra, policy, dest_denies, remaining, DEST_DENY_WALK_LIMIT)
+}
+
+fn add_read_grant(grants: &mut Vec<KernelGrant>, path: &Path) -> Result<(), KernelError> {
+    let resolved = canonicalize_dir(path)?;
+    if crate::guard::is_user_home_dir(&resolved) {
+        return Err(KernelError::Home(resolved));
+    }
+    if !is_fs_root(path) && path != resolved.as_path() {
+        push_grant(grants, path.to_path_buf(), KernelAccess::Read);
+    }
+    if let Some(alias) = macos_public_alias(&resolved)
+        && !is_fs_root(&alias)
+        && alias != resolved
+    {
+        push_grant(grants, alias, KernelAccess::Read);
+    }
+    push_grant(grants, resolved, KernelAccess::Read);
+    Ok(())
 }
 
 fn add_rw(grants: &mut Vec<KernelGrant>, path: &Path) -> Result<(), KernelError> {

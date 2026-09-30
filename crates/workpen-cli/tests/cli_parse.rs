@@ -897,6 +897,111 @@ fn run_env_scrubs_tokens_and_keeps_opt_in() {
 }
 
 #[test]
+fn policy_prints_jail_without_secret_bytes() {
+    let dir = TempDir::new().expect("workspace");
+    std::fs::write(dir.path().join(".env"), b"SECRET=1\n").expect("env");
+    let out = workpen()
+        .args(["policy", "--root"])
+        .arg(dir.path())
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("network: blocked"), "{stdout}");
+    assert!(stdout.contains("read-write:"), "{stdout}");
+    assert!(stdout.contains("read:"), "{stdout}");
+    assert!(stdout.contains("deny: **/.env"), "{stdout}");
+    assert!(!stdout.contains("SECRET"));
+    let would = workpen()
+        .args(["policy", "--root"])
+        .arg(dir.path())
+        .args(["--", ".env"])
+        .output()
+        .expect("spawn");
+    assert_eq!(would.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&would.stdout);
+    assert!(text.contains("would-deny"), "{text}");
+    assert!(!text.contains("SECRET"));
+}
+
+#[test]
+fn policy_net_is_allowed_and_dashdash_net_is_the_child() {
+    let dir = TempDir::new().expect("workspace");
+    let allowed = workpen()
+        .args(["policy", "--net", "--root"])
+        .arg(dir.path())
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&allowed.stdout);
+    assert!(stdout.contains("network: allowed"), "{stdout}");
+    let child = workpen()
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--", "/bin/echo", "--net"])
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    assert!(
+        stdout.contains("--net") || stdout.contains("echo"),
+        "run -- /bin/echo --net must not enable network by stealing the arg: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_home_and_fs_root_match_run_exit() {
+    let home = std::env::var("HOME").expect("HOME");
+    let policy_home = workpen()
+        .args(["policy", "--root", &home])
+        .output()
+        .expect("spawn");
+    let run_home = workpen()
+        .args(["run", "--root", &home, "--", "/bin/echo", "x"])
+        .output()
+        .expect("spawn");
+    assert_eq!(policy_home.status.code(), Some(3));
+    assert_eq!(policy_home.status.code(), run_home.status.code());
+    let policy_root = workpen()
+        .args(["policy", "--root", "/"])
+        .output()
+        .expect("spawn");
+    let run_root = workpen()
+        .args(["run", "--root", "/", "--", "/bin/echo", "x"])
+        .output()
+        .expect("spawn");
+    assert_eq!(policy_root.status.code(), Some(3));
+    assert_eq!(policy_root.status.code(), run_root.status.code());
+}
+
+#[test]
+fn policy_invalid_lock_exits_like_run() {
+    let dir = TempDir::new().expect("workspace");
+    std::fs::write(dir.path().join("agent.lock"), b"[\n").expect("lock");
+    let policy = workpen()
+        .args(["policy", "--root"])
+        .arg(dir.path())
+        .output()
+        .expect("spawn");
+    let run = workpen()
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--", "/bin/echo", "x"])
+        .output()
+        .expect("spawn");
+    assert_eq!(policy.status.code(), Some(2));
+    assert!(
+        policy.stdout.is_empty(),
+        "invalid lock must not print a partial jail"
+    );
+    assert_eq!(policy.status.code(), run.status.code());
+}
+
+#[test]
 fn run_help_names_network_and_not_always_start() {
     let out = workpen().args(["run", "--help"]).output().expect("spawn");
     let stdout = String::from_utf8_lossy(&out.stdout);
