@@ -89,6 +89,8 @@ start the child.
 
 Commands: `why`, `run`, `gc`. `workpen --help` prints usage.
 
+`workpen gc --max-age 7d` looks under `.workpen-worktrees`. `--dry-run` prints what it would remove and does not delete. It does not clean `target/`.
+
 ## Library
 
 ```rust
