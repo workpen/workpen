@@ -49,10 +49,21 @@ pub fn load_agent_lock_file(path: &Path) -> Result<Vec<String>, AgentLockError> 
 }
 
 fn parse_agent_lock(path: &Path, raw: &str) -> Result<Vec<String>, AgentLockError> {
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let mut globs = Vec::new();
     for (i, line) in raw.lines().enumerate() {
         let line_no = i + 1;
-        let trimmed = line.trim();
+        let mut trimmed = line.trim();
+        while let Some(rest) = trimmed.strip_prefix('\u{feff}') {
+            trimmed = rest;
+        }
+        if trimmed.contains('\u{feff}') {
+            return Err(AgentLockError::Invalid {
+                path: path.to_path_buf(),
+                line: line_no,
+                reason: "UTF-8 BOM is not part of a dest-deny glob".into(),
+            });
+        }
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
@@ -142,6 +153,45 @@ mod tests {
         std::fs::write(&path, "globs = [\"**/*.secret\"]\n").expect("write");
         match load_agent_lock(dir.path()) {
             Err(AgentLockError::Invalid { line, .. }) => assert_eq!(line, 1),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utf8_bom_prefix_keeps_the_glob() {
+        let dir = TempDir::new().expect("tmp");
+        std::fs::write(
+            dir.path().join(AGENT_LOCK_NAME),
+            b"\xef\xbb\xbf**/*.secret\n",
+        )
+        .expect("write");
+        let got = load_agent_lock(dir.path()).expect("parse");
+        assert_eq!(got, ["**/*.secret"]);
+    }
+
+    #[test]
+    fn utf8_bom_on_its_own_line_keeps_the_glob() {
+        let dir = TempDir::new().expect("tmp");
+        std::fs::write(
+            dir.path().join(AGENT_LOCK_NAME),
+            "# note\n\u{feff}**/*.secret\n",
+        )
+        .expect("write");
+        let got = load_agent_lock(dir.path()).expect("parse");
+        assert_eq!(got, ["**/*.secret"]);
+    }
+
+    #[test]
+    fn utf8_bom_inside_the_glob_is_invalid() {
+        let dir = TempDir::new().expect("tmp");
+        std::fs::write(dir.path().join(AGENT_LOCK_NAME), "**/*\u{feff}.secret\n").expect("write");
+        match load_agent_lock(dir.path()) {
+            Err(AgentLockError::Invalid { reason, .. }) => {
+                assert!(
+                    reason.contains("BOM"),
+                    "bom inside glob must be invalid: {reason}"
+                );
+            }
             other => panic!("expected Invalid, got {other:?}"),
         }
     }
