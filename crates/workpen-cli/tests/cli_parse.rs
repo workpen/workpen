@@ -1427,6 +1427,9 @@ fn init_git_repo() -> TempDir {
     dir
 }
 
+/// Windows rejects `"` in a file name. The helper test covers escaping
+/// on every platform. This checks that `why --json` uses that helper.
+#[cfg(unix)]
 #[test]
 fn why_json_escapes_a_quote_in_the_path() {
     let dir = TempDir::new().expect("dir");
