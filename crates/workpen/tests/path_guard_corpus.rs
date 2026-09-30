@@ -137,6 +137,22 @@ fn broken_out_of_tree_symlink_is_symlink_vault() {
 
 #[cfg(unix)]
 #[test]
+fn broken_in_tree_symlink_is_allowed() {
+    let dir = tempfile::tempdir_in("/tmp").expect("tmp workspace");
+    std::os::unix::fs::symlink("missing-name", dir.path().join("alias")).expect("dangling");
+    let guard = PathGuard::new(dir.path(), AbsolutePathPolicy::AllowIfContained).expect("guard");
+    guard
+        .check(Path::new("alias"))
+        .expect("relative dangling symlink stays inside");
+    let shown = dir.path().to_string_lossy().replace("/private/tmp", "/tmp");
+    let absolute = PathBuf::from(shown).join("alias");
+    guard
+        .check(&absolute)
+        .expect("public /tmp spelling of an in-tree dangling symlink stays inside");
+}
+
+#[cfg(unix)]
+#[test]
 fn symlink_inside_workspace_is_allowed() {
     let dir = workspace();
     std::os::unix::fs::symlink(dir.path().join("ok.txt"), dir.path().join("alias"))

@@ -466,9 +466,18 @@ fn walk_guarded(start: &Path, roots: &[PathBuf]) -> Result<PathBuf, PathGuardKin
     let prefix_canon = match dunce::canonicalize(&prefix) {
         Ok(canon) => canon,
         Err(_) => {
-            // Broken in-tree symlink: the dirent exists, but following it
-            // would leave the workspace (or fail). Do not treat as missing.
-            if chain_has_symlink(&prefix) && inside_any_root(&prefix, roots) {
+            let rest = lexical.strip_prefix(&prefix).unwrap_or(Path::new(""));
+            if let Some(target) = lexical_symlink_target(&prefix, rest) {
+                if inside_with_firmlink(&target, roots) {
+                    // The link text stays in the workspace. The final
+                    // file is missing, same as a path that was never created.
+                    return Ok(target);
+                }
+                if chain_has_symlink(&prefix) {
+                    return Err(PathGuardKind::SymlinkVault);
+                }
+            }
+            if chain_has_symlink(&prefix) && inside_with_firmlink(&prefix, roots) {
                 return Err(PathGuardKind::SymlinkVault);
             }
             return Err(PathGuardKind::Escape);
@@ -534,6 +543,45 @@ fn inside_any_root(path: &Path, roots: &[PathBuf]) -> bool {
     roots
         .iter()
         .any(|root| path == root || path.starts_with(root))
+}
+
+/// One `read_link` hop, then the remaining components. Absolute link
+/// text replaces the prefix. Relative link text is joined to its parent.
+fn lexical_symlink_target(prefix: &Path, rest: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read_link(prefix).ok()?;
+    let base = if raw.is_absolute() {
+        raw
+    } else {
+        prefix.parent()?.join(raw)
+    };
+    Some(normalize_lexical(&base.join(rest)))
+}
+
+/// `/tmp` and `/private/tmp` are the same directory on macOS. Compare
+/// both spellings so a dangling link written with the public path is
+/// not an escape from a canonical root.
+fn inside_with_firmlink(path: &Path, roots: &[PathBuf]) -> bool {
+    let path = firmlink_private(path);
+    roots.iter().any(|root| {
+        let root = firmlink_private(root);
+        path == root || path.starts_with(&root)
+    })
+}
+
+fn firmlink_private(path: &Path) -> PathBuf {
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    for (public, private) in [
+        ("/tmp", "/private/tmp"),
+        ("/var", "/private/var"),
+        ("/etc", "/private/etc"),
+    ] {
+        if raw == public || raw.starts_with(&format!("{public}/")) {
+            return PathBuf::from(format!("{private}{}", &raw[public.len()..]));
+        }
+    }
+    path.to_path_buf()
 }
 
 fn is_filesystem_root(path: &Path) -> bool {
