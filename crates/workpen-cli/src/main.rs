@@ -6,9 +6,9 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime};
 
 use workpen::{
-    CheckDestError, DenyPolicy, ExtraRootError, GcConfig, GcDecision, KernelError, PathGuard,
-    PathGuardError, check_command_argv, dest_under_root, parse_max_age, resolve_extra_root_pair,
-    resolve_workspace_root, run_gc_with_policy,
+    CheckDestError, DenyPolicy, DestDenyError, ExtraRootError, GcConfig, GcDecision, KernelError,
+    PathGuard, PathGuardError, check_command_argv, dest_under_root, parse_max_age,
+    resolve_extra_root_pair, resolve_workspace_root, run_gc_with_policy,
 };
 
 fn main() -> ExitCode {
@@ -59,6 +59,12 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
 
 fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
+    let json = rest.iter().any(|token| token == "--json");
+    let rest: Vec<String> = rest
+        .iter()
+        .filter(|token| token.as_str() != "--json")
+        .cloned()
+        .collect();
     if wants_help(&rest) {
         println!("{WHY_USAGE}");
         return Ok(ExitCode::SUCCESS);
@@ -80,27 +86,28 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     let policy = DenyPolicy::from_workspace(&root).map_err(|e| e.to_string())?;
     match workpen::check_dest(&dest.to_string_lossy(), &policy, Some(&guard)) {
         Ok(resolved) => {
-            println!("allowed {}", resolved.display());
+            if json {
+                let shown = resolved.display().to_string();
+                println!("{}", json_line("allowed", 0, Some(&shown), None, None));
+            } else {
+                println!("allowed {}", resolved.display());
+            }
             Ok(ExitCode::SUCCESS)
         }
-        Err(CheckDestError::DestDeny(e)) => {
-            println!("{e}");
-            Ok(ExitCode::from(1))
+        Err(err @ CheckDestError::DestDeny(_)) | Err(err @ CheckDestError::PathGuard(_)) => {
+            check_dest_status(json, 1, &err)
         }
-        Err(CheckDestError::PathGuard(e)) => {
-            println!("{e}");
-            Ok(ExitCode::from(1))
-        }
+        Err(err @ CheckDestError::SpecialFile { .. }) => check_dest_status(json, 1, &err),
         Err(e) => Err(e.to_string()),
     }
 }
 
 const RUN_USAGE: &str = "\
-usage: workpen run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--policy] \
+usage: workpen run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--policy] [--json] \
 [--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...";
 
 const RUN_HELP: &str = "\
-usage: workpen run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--policy] \
+usage: workpen run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--policy] [--json] \
 [--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...
 The network is blocked unless --net is set. --extra-root and --write are read-write. --read is read-only. Dest-deny runs before the child starts, and on Linux the child is not started when secret names cannot be hidden. --policy prints the jail and does not start the child. Exit 124 means the timeout fired. --env opts a name back in. --env-clear drops inherited names except PATH, then applies every --env. Loaders such as LD_PRELOAD stay removed.";
 
@@ -117,6 +124,7 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
     let env_sets = flags.env;
     let report = force_report || flags.report;
     let allow_net = flags.allow_net;
+    let json = flags.json;
     let read_roots = flags.read;
     let write_roots = flags.write;
     let rest = flags.rest;
@@ -146,7 +154,7 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
                 presented.push(shown);
                 extras.push(canon);
             }
-            Err(err @ ExtraRootError::Home(_)) => return refuse(err),
+            Err(err @ ExtraRootError::Home(_)) => return refuse_mapped(json, 3, &err),
             Err(err) => return Err(err.to_string()),
         }
     }
@@ -154,7 +162,7 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
     for read in &read_roots {
         match resolve_extra_root_pair(&cwd, &read.to_string_lossy()) {
             Ok((_shown, canon)) => read_canon.push(canon),
-            Err(err @ ExtraRootError::Home(_)) => return refuse(err),
+            Err(err @ ExtraRootError::Home(_)) => return refuse_mapped(json, 3, &err),
             Err(err) => return Err(err.to_string()),
         }
     }
@@ -198,7 +206,7 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
     if let Err(err) = check_command_argv(cmd, guard.canon_root(), &policy) {
-        return refuse(err);
+        return check_dest_status(json, 3, &err);
     }
     let resolved = match resolve_child_program(&cmd[0], guard.canon_root()) {
         Ok(path) => path,
@@ -266,6 +274,7 @@ struct RunFlags<'a> {
     env: Vec<(String, String)>,
     report: bool,
     allow_net: bool,
+    json: bool,
     read: Vec<PathBuf>,
     write: Vec<PathBuf>,
     rest: &'a [String],
@@ -278,6 +287,7 @@ fn peel_run_flags(rest: &[String]) -> Result<RunFlags<'_>, String> {
     let mut env_sets = Vec::new();
     let mut report = false;
     let mut allow_net = false;
+    let mut json = false;
     let mut read = Vec::new();
     let mut write = Vec::new();
     let mut i = 0;
@@ -309,6 +319,10 @@ fn peel_run_flags(rest: &[String]) -> Result<RunFlags<'_>, String> {
                 allow_net = true;
                 i += 1;
             }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
             "--read" => {
                 read.push(PathBuf::from(flag_value(rest, i, "--read")?));
                 i += 2;
@@ -327,6 +341,7 @@ fn peel_run_flags(rest: &[String]) -> Result<RunFlags<'_>, String> {
         env: env_sets,
         report,
         allow_net,
+        json,
         read,
         write,
         rest: &rest[i..],
@@ -466,6 +481,100 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
 fn refuse(err: impl std::fmt::Display) -> Result<ExitCode, String> {
     eprintln!("{err}");
     Ok(ExitCode::from(3))
+}
+
+fn refuse_mapped(json: bool, code: u8, err: &dyn std::fmt::Display) -> Result<ExitCode, String> {
+    if json {
+        println!(
+            "{}",
+            json_line("denied", code, None, None, Some("path_guard"))
+        );
+        return Ok(ExitCode::from(code));
+    }
+    eprintln!("{err}");
+    Ok(ExitCode::from(code))
+}
+
+fn check_dest_status(json: bool, code: u8, err: &CheckDestError) -> Result<ExitCode, String> {
+    if json {
+        println!("{}", check_dest_json(code, err));
+        return Ok(ExitCode::from(code));
+    }
+    if code == 1 {
+        println!("{err}");
+        Ok(ExitCode::from(1))
+    } else {
+        eprintln!("{err}");
+        Ok(ExitCode::from(code))
+    }
+}
+
+fn check_dest_json(code: u8, err: &CheckDestError) -> String {
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(deny)) => {
+            let kind = match deny.kind {
+                workpen::DestDenyKind::DenyGlob => "deny_glob",
+                workpen::DestDenyKind::HardlinkSibling => "hardlink_sibling",
+            };
+            json_line(
+                "denied",
+                code,
+                Some(&deny.display),
+                deny.matched.as_deref(),
+                Some(kind),
+            )
+        }
+        CheckDestError::PathGuard(PathGuardError::Home(path)) => {
+            let shown = path.display().to_string();
+            json_line("denied", code, Some(&shown), None, Some("path_guard"))
+        }
+        CheckDestError::SpecialFile { path, kind } => {
+            json_line("denied", code, Some(path), Some(kind), Some("special_file"))
+        }
+        CheckDestError::DestDeny(_) | CheckDestError::PathGuard(_) => {
+            json_line("denied", code, None, None, Some("path_guard"))
+        }
+        CheckDestError::Nul | CheckDestError::Directory { .. } | CheckDestError::Io(_) => {
+            json_line("denied", code, None, None, None)
+        }
+    }
+}
+
+fn json_line(
+    result: &str,
+    code: u8,
+    path: Option<&str>,
+    matched: Option<&str>,
+    kind: Option<&str>,
+) -> String {
+    format!(
+        "{{\"result\":{},\"exit\":{code},\"path\":{},\"matched\":{},\"kind\":{}}}",
+        json_string(result),
+        json_opt(path),
+        json_opt(matched),
+        json_opt(kind),
+    )
+}
+
+fn json_opt(value: Option<&str>) -> String {
+    value.map(json_string).unwrap_or_else(|| "null".to_string())
+}
+
+fn json_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// `--version` / `-V` in the program slot is Workpen's version.

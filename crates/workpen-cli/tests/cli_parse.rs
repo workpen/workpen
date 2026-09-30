@@ -897,6 +897,63 @@ fn run_env_scrubs_tokens_and_keeps_opt_in() {
 }
 
 #[test]
+fn why_and_run_json_do_not_leak_or_wrap_success() {
+    let dir = TempDir::new().expect("workspace");
+    std::fs::write(dir.path().join(".env"), b"SECRET=1\n").expect("env");
+    std::fs::write(dir.path().join("notes.md"), b"hello notes\n").expect("notes");
+    let denied = workpen()
+        .args(["why", "--json", "--root"])
+        .arg(dir.path())
+        .arg(".env")
+        .output()
+        .expect("spawn");
+    assert_eq!(denied.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&denied.stdout);
+    assert!(text.contains("\"result\":\"denied\""), "{text}");
+    assert!(text.contains("\"exit\":1"), "{text}");
+    assert!(text.contains("\"kind\":\"deny_glob\""), "{text}");
+    assert!(!text.contains("SECRET"));
+    assert_eq!(text.lines().count(), 1);
+    let allowed = workpen()
+        .args(["why", "--json", "--root"])
+        .arg(dir.path())
+        .arg("notes.md")
+        .output()
+        .expect("spawn");
+    assert_eq!(allowed.status.code(), Some(0));
+    let text = String::from_utf8_lossy(&allowed.stdout);
+    assert!(text.contains("\"result\":\"allowed\""), "{text}");
+    assert_eq!(text.lines().count(), 1);
+    let run_deny = workpen()
+        .args(["run", "--json", "--root"])
+        .arg(dir.path())
+        .args(["--", "/bin/cat", ".env"])
+        .output()
+        .expect("spawn");
+    assert_eq!(run_deny.status.code(), Some(3));
+    let text = String::from_utf8_lossy(&run_deny.stdout);
+    assert!(text.contains("\"result\":\"denied\""), "{text}");
+    assert!(text.contains("\"exit\":3"), "{text}");
+    assert!(!text.contains("SECRET"));
+    assert!(
+        run_deny.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&run_deny.stderr)
+    );
+    let run_ok = workpen()
+        .args(["run", "--json", "--root"])
+        .arg(dir.path())
+        .args(["--", "/bin/echo", "hello-json"])
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&run_ok.stdout);
+    assert!(
+        stdout.contains("hello-json") && !stdout.contains("\"result\""),
+        "success must not wrap stdout: {stdout}"
+    );
+}
+
+#[test]
 fn policy_prints_jail_without_secret_bytes() {
     let dir = TempDir::new().expect("workspace");
     std::fs::write(dir.path().join(".env"), b"SECRET=1\n").expect("env");
