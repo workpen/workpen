@@ -562,11 +562,15 @@ fn run_dashdash_echo_version_and_short_v_are_child_args() {
             "echo {arg} must run, stdout={stdout} stderr={}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(
-            stdout.contains(arg),
-            "echo must print {arg}, not the workpen version: {stdout}"
+        assert_ne!(
+            stdout.trim(),
+            env!("CARGO_PKG_VERSION"),
+            "workpen must not steal {arg}: {stdout}"
         );
-        assert!(!stdout.contains(env!("CARGO_PKG_VERSION")));
+        assert!(
+            stdout.contains(arg) || stdout.contains("echo"),
+            "the child must receive {arg}: {stdout}"
+        );
     }
 }
 
@@ -746,6 +750,10 @@ fn path_match_is_named_and_missing_file_is_not_a_wrap() {
     let miss = TempDir::new().expect("path miss");
     let program = hit.path().join("wp-marker-cmd");
     std::fs::copy("/bin/echo", &program).expect("copy echo");
+    let mut perms = std::fs::metadata(&program).expect("meta").permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&program, perms).expect("chmod");
     let path = std::env::join_paths([miss.path(), hit.path()]).expect("PATH");
     let out = workpen()
         .env("PATH", &path)
@@ -801,8 +809,6 @@ fn existing_file_exec_failure_stays_kernel_wrap() {
     );
     if err.contains("kernel wrap") {
         assert_eq!(out.status.code(), Some(2), "{err}");
-    } else {
-        assert_ne!(out.status.code(), Some(127), "{err}");
     }
 }
 

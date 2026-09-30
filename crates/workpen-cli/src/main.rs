@@ -344,20 +344,55 @@ fn resolve_child_program(argv0: &str, child_cwd: &Path) -> Result<PathBuf, ()> {
         } else {
             child_cwd.join(raw)
         };
-        return if candidate.is_file() {
-            Ok(candidate)
-        } else {
-            Err(())
-        };
+        return first_existing_name(&candidate);
     }
     let path_var = std::env::var_os("PATH").unwrap_or_else(|| OsStr::new("").to_os_string());
     for dir in std::env::split_paths(&path_var) {
         if dir.as_os_str().is_empty() {
             continue;
         }
-        let candidate = dir.join(argv0);
-        if candidate.is_file() {
-            return Ok(candidate);
+        if let Ok(found) = first_existing_name(&dir.join(argv0)) {
+            return Ok(found);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        let root = PathBuf::from(root);
+        for dir in [root.join("System32"), root] {
+            if let Ok(found) = first_existing_name(&dir.join(argv0)) {
+                return Ok(found);
+            }
+        }
+    }
+    Err(())
+}
+
+/// `cmd` on Windows is `cmd.exe`. Keep the first spelling that exists.
+fn first_existing_name(candidate: &Path) -> Result<PathBuf, ()> {
+    if candidate.is_file() {
+        return Ok(candidate.to_path_buf());
+    }
+    #[cfg(windows)]
+    if candidate.extension().is_none() {
+        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        let stem = candidate
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for ext in pathext.split(';') {
+            let ext = ext.trim();
+            if ext.is_empty() {
+                continue;
+            }
+            let ext = if ext.starts_with('.') {
+                ext.to_string()
+            } else {
+                format!(".{ext}")
+            };
+            let with_ext = candidate.with_file_name(format!("{stem}{ext}"));
+            if with_ext.is_file() {
+                return Ok(with_ext);
+            }
         }
     }
     Err(())
