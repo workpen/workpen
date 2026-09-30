@@ -810,6 +810,56 @@ fn run_scrubs_inherited_bash_env() {
 
 #[cfg(unix)]
 #[test]
+fn run_scrubs_startup_env_even_when_opted_in() {
+    if !printenv_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    for (name, value) in [
+        ("PYTHONSTARTUP", "/tmp/evil.py"),
+        ("PYTHONHOME", "/tmp/pyhome"),
+        ("RUBYOPT", "-rvice"),
+        ("LD_LIBRARY_PATH", "/tmp/evil"),
+        ("NODE_PATH", "/tmp/node"),
+    ] {
+        let inherited = Command::new(env!("CARGO_BIN_EXE_workpen"))
+            .env(name, value)
+            .args(["run", "--root"])
+            .arg(dir.path())
+            .args(["--", "/usr/bin/printenv", name])
+            .output()
+            .expect("spawn");
+        let stdout = String::from_utf8_lossy(&inherited.stdout);
+        assert!(
+            !inherited.status.success() && !stdout.contains(value),
+            "inherited {name} must be absent: status={:?} out={stdout} err={}",
+            inherited.status,
+            String::from_utf8_lossy(&inherited.stderr)
+        );
+        let opted = Command::new(env!("CARGO_BIN_EXE_workpen"))
+            .args(["run", "--root"])
+            .arg(dir.path())
+            .args([
+                "--env",
+                &format!("{name}={value}"),
+                "--",
+                "/usr/bin/printenv",
+                name,
+            ])
+            .output()
+            .expect("spawn");
+        let stdout = String::from_utf8_lossy(&opted.stdout);
+        assert!(
+            !opted.status.success() && !stdout.contains(value),
+            "--env {name} must stay removed: status={:?} out={stdout} err={}",
+            opted.status,
+            String::from_utf8_lossy(&opted.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn run_keeps_inherited_path() {
     if !printenv_available() {
         return;
