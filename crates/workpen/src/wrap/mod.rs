@@ -48,8 +48,10 @@ pub struct KernelGrant {
 /// Dest-deny names are a second list, not a grant of `/`. Linux Landlock
 /// cannot dest-deny a file inside an allowed tree
 /// ([nono #1592](https://github.com/nolabs-ai/nono/discussions/1592)).
-/// macOS `run_child` applies Seatbelt `(deny file-read* / file-write*)`
-/// literals (and `subpath` for directories) via nono `add_platform_rule`.
+/// macOS `run_child` applies Seatbelt `(deny file-read* / file-write* /
+/// network-outbound)` literals (and `subpath` for directories) via nono
+/// `add_platform_rule`. `network-outbound` covers `connect(2)` to a Unix
+/// socket, which Seatbelt does not treat as a file operation.
 /// Linux `run_child` bind-overs dest-deny paths in a private mount ns
 /// when unprivileged user namespaces are available. If `unshare` is
 /// denied, remount is skipped and Landlock still applies (in-tree
@@ -2039,6 +2041,9 @@ fn neg_letter(ch: char) -> String {
     format!("[^{}{}.]", ch.to_ascii_uppercase(), ch.to_ascii_lowercase())
 }
 
+/// File operations plus `network-outbound`. Seatbelt treats `connect(2)`
+/// to a Unix socket as network, so a file deny alone still allows it.
+/// `--net` must not open a socket under a dest-denied path.
 #[cfg(target_os = "macos")]
 fn macos_dest_deny_actions() -> &'static [&'static str] {
     &[
@@ -2049,6 +2054,7 @@ fn macos_dest_deny_actions() -> &'static [&'static str] {
         "file-write-unlink",
         "file-write-mode",
         "file-write-owner",
+        "network-outbound",
     ]
 }
 
