@@ -24,7 +24,12 @@ static STOP: AtomicI32 = AtomicI32::new(0);
 #[derive(Clone, Copy)]
 struct Row {
     pid: libc::pid_t,
+    // Start time is only compared on macOS. Linux identifies orphans
+    // by `/proc` after they are reparented, so these fields are unused
+    // there and `-D dead-code` rejects them.
+    #[cfg(target_os = "macos")]
     sec: u64,
+    #[cfg(target_os = "macos")]
     usec: u64,
 }
 
@@ -37,7 +42,9 @@ static mut TABLE: Table = Table {
     n: 0,
     rows: [Row {
         pid: 0,
+        #[cfg(target_os = "macos")]
         sec: 0,
+        #[cfg(target_os = "macos")]
         usec: 0,
     }; MAX_PIDS],
 };
@@ -263,8 +270,15 @@ fn remember(pid: libc::pid_t) {
     if table.n >= MAX_PIDS {
         return;
     }
+    #[cfg(target_os = "macos")]
     let (sec, usec) = start_time(pid).unwrap_or((0, 0));
-    table.rows[table.n] = Row { pid, sec, usec };
+    table.rows[table.n] = Row {
+        pid,
+        #[cfg(target_os = "macos")]
+        sec,
+        #[cfg(target_os = "macos")]
+        usec,
+    };
     table.n += 1;
 }
 
@@ -503,11 +517,6 @@ fn start_time(pid: libc::pid_t) -> Option<(u64, u64)> {
     let sec = u64::from_ne_bytes(buf[120..128].try_into().ok()?);
     let usec = u64::from_ne_bytes(buf[128..136].try_into().ok()?);
     Some((sec, usec))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn start_time(_pid: libc::pid_t) -> Option<(u64, u64)> {
-    None
 }
 
 #[cfg(target_os = "macos")]
