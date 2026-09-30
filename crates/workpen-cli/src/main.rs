@@ -595,6 +595,20 @@ fn program_outside_roots(program: &Path, root: &Path, extras: &[PathBuf]) -> boo
     for extra in extras {
         bases.push(std::fs::canonicalize(extra).unwrap_or_else(|_| extra.clone()));
     }
+    // System programs such as /bin/cat are readable grants, not extra roots.
+    for dir in [
+        "/usr",
+        "/bin",
+        "/lib",
+        "/lib64",
+        "/sbin",
+        "/System",
+        "/Library",
+        "/opt/homebrew",
+        "/usr/local",
+    ] {
+        bases.push(PathBuf::from(dir));
+    }
     !bases.iter().any(|base| canon.starts_with(base))
 }
 

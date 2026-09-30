@@ -940,17 +940,23 @@ fn why_and_run_json_do_not_leak_or_wrap_success() {
         "{}",
         String::from_utf8_lossy(&run_deny.stderr)
     );
-    let run_ok = workpen()
-        .args(["run", "--json", "--root"])
-        .arg(dir.path())
-        .args(["--", "/bin/echo", "hello-json"])
-        .output()
-        .expect("spawn");
-    let stdout = String::from_utf8_lossy(&run_ok.stdout);
-    assert!(
-        stdout.contains("hello-json") && !stdout.contains("\"result\""),
-        "success must not wrap stdout: {stdout}"
-    );
+    #[cfg(unix)]
+    {
+        let run_ok = workpen()
+            .args(["run", "--json", "--root"])
+            .arg(dir.path())
+            .args(["--", "/bin/echo", "hello-json"])
+            .output()
+            .expect("spawn");
+        let stdout = String::from_utf8_lossy(&run_ok.stdout);
+        assert!(
+            run_ok.status.success()
+                && stdout.contains("hello-json")
+                && !stdout.contains("\"result\""),
+            "success must not wrap stdout: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&run_ok.stderr)
+        );
+    }
 }
 
 #[test]
@@ -996,17 +1002,21 @@ fn policy_net_is_allowed_and_dashdash_net_is_the_child() {
         .expect("spawn");
     let stdout = String::from_utf8_lossy(&allowed.stdout);
     assert!(stdout.contains("network: allowed"), "{stdout}");
-    let child = workpen()
-        .args(["run", "--root"])
-        .arg(dir.path())
-        .args(["--", "/bin/echo", "--net"])
-        .output()
-        .expect("spawn");
-    let stdout = String::from_utf8_lossy(&child.stdout);
-    assert!(
-        stdout.contains("--net") || stdout.contains("echo"),
-        "run -- /bin/echo --net must not enable network by stealing the arg: {stdout}"
-    );
+    #[cfg(unix)]
+    {
+        let child = workpen()
+            .args(["run", "--root"])
+            .arg(dir.path())
+            .args(["--", "/bin/echo", "--net"])
+            .output()
+            .expect("spawn");
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            stdout.contains("--net") || stdout.contains("echo"),
+            "run -- /bin/echo --net must not enable network by stealing the arg: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
 }
 
 #[cfg(unix)]
