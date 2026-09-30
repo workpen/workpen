@@ -148,6 +148,25 @@ fn why_empty_path_does_not_claim_escape() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn why_dangling_in_tree_symlink_is_allowed() {
+    let dir = TempDir::new().expect("workspace");
+    std::os::unix::fs::symlink("missing-name", dir.path().join("alias")).expect("link");
+    let out = workpen()
+        .args(["why", "--root"])
+        .arg(dir.path())
+        .arg(dir.path().join("alias"))
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("allowed") && !stdout.contains("escapes"),
+        "a dangling link to a name in the workspace is allowed: stdout={stdout} stderr={stderr}"
+    );
+}
+
 #[test]
 fn run_spawn_failure_names_the_command() {
     let dir = TempDir::new().expect("workspace");
