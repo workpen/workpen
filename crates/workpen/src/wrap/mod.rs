@@ -12,6 +12,8 @@
 //! compile this module.
 
 use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::Duration;
@@ -944,6 +946,13 @@ impl KernelPolicy {
             let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             pty::attach_pty(&mut cmd, pty.slave).map_err(|e| KernelError::Apply(e.to_string()))?;
             let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            // Foreground pgrp from the parent as well. The child's
+            // tcsetpgrp can lose to the session setup on Linux.
+            #[cfg(unix)]
+            {
+                let _ =
+                    unsafe { libc::tcsetpgrp(pty.master.as_raw_fd(), child.id() as libc::pid_t) };
+            }
             // Command keeps the slave File after spawn. Linux master
             // read does not EOF while that fd stays open in the parent.
             drop(cmd);
