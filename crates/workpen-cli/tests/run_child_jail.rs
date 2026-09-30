@@ -1105,3 +1105,113 @@ fn net_cannot_connect_to_a_socket_under_a_denied_directory() {
         Err(err) => panic!("accept: {err}"),
     }
 }
+
+/// A grandchild started with `Popen` must not keep running after `run`
+/// returns. The direct child waits until that grandchild has written
+/// its pid, then exits without waiting for it.
+///
+/// `mode=null` closes the grandchild's stdio so it does not hold the
+/// parent's pipe. `mode=inherit` keeps the pipe open; `run` must not
+/// block on that pipe past the leader's exit.
+#[cfg(unix)]
+fn background_writer_is_gone(timeout: Option<&str>, mode: &str, max_elapsed_ms: Option<u128>) {
+    if !python3_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let ws = dir.path().to_string_lossy().to_string();
+    let script = r#"
+import os, subprocess, sys, time
+ws, mode = sys.argv[1], sys.argv[2]
+py = sys.executable
+child = r"""
+import os, sys, time
+ws = sys.argv[1]
+open(os.path.join(ws, "child.pid"), "w").write(str(os.getpid()))
+time.sleep(5)
+open(os.path.join(ws, "done.txt"), "w").write("done\n")
+"""
+kw = {}
+if mode == "null":
+    kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+subprocess.Popen([py, "-c", child, ws], **kw)
+for _ in range(200):
+    if os.path.exists(os.path.join(ws, "child.pid")):
+        print("saw")
+        raise SystemExit(0)
+    time.sleep(0.05)
+print("start-timeout")
+raise SystemExit(1)
+"#;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_workpen"));
+    cmd.args(["run", "--root"]).arg(&ws);
+    if let Some(limit) = timeout {
+        cmd.args(["--timeout", limit]);
+    }
+    let started = std::time::Instant::now();
+    let out = cmd
+        .args(["--", "python3", "-c", script, &ws, mode])
+        .output()
+        .expect("spawn");
+    let elapsed_ms = started.elapsed().as_millis();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "run must return success, stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("saw"),
+        "parent must observe the grandchild start: {stdout} stderr={stderr}"
+    );
+    if let Some(limit_ms) = max_elapsed_ms {
+        assert!(
+            elapsed_ms < limit_ms,
+            "run took {elapsed_ms}ms, limit {limit_ms}ms, stdout={stdout} stderr={stderr}"
+        );
+    }
+    let pid = std::fs::read_to_string(dir.path().join("child.pid")).expect("pid");
+    let pid = pid.trim().to_string();
+    let mut alive = true;
+    for _ in 0..10 {
+        let check = Command::new("/bin/kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status();
+        alive = check.is_ok_and(|status| status.success());
+        if !alive {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = Command::new("/bin/kill")
+        .args(["-9", &pid])
+        .stderr(Stdio::null())
+        .status();
+    assert!(
+        !dir.path().join("done.txt").exists(),
+        "grandchild must not finish its sleep"
+    );
+    assert!(
+        !alive,
+        "grandchild pid {pid} still alive after run returned"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn background_writer_dies_when_run_returns() {
+    background_writer_is_gone(None, "null", None);
+}
+
+#[cfg(unix)]
+#[test]
+fn background_writer_dies_when_early_exit_beats_timeout() {
+    background_writer_is_gone(Some("30s"), "null", None);
+}
+
+#[cfg(unix)]
+#[test]
+fn background_stdout_holder_does_not_stretch_timeout() {
+    background_writer_is_gone(Some("1s"), "inherit", Some(3000));
+}
