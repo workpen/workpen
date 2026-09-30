@@ -90,7 +90,7 @@ spawn-only run is [examples/run-echo.sh](examples/run-echo.sh). On
 Linux, if the kernel cannot hide secret names, `workpen run` does not
 start the child.
 
-Commands: `why`, `run`, `gc`. `workpen --help` prints usage.
+Commands: `why`, `run`, `policy`, `gc`, `init`, `doctor`. `workpen --help` prints usage. `workpen doctor` reports whether this machine can jail a child and does not start one.
 
 `workpen gc --max-age 7d` looks under `.workpen-worktrees`. `--dry-run` prints what it would remove and does not delete. It does not clean `target/`.
 

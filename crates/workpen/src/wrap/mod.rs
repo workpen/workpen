@@ -263,6 +263,75 @@ fn join_copy(handle: Option<std::thread::JoinHandle<()>>) {
     }
 }
 
+/// Inputs for [`doctor_fails`]. Remount is Linux-only. WFP is Windows-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DoctorFacts {
+    pub kernel_supported: bool,
+    /// `Some` only on Linux. `false` means `workpen run` will not start a child.
+    pub remount_available: Option<bool>,
+    /// `Some(true)` when Windows WFP returned access denied. `None` off Windows.
+    pub wfp_skipped: Option<bool>,
+    /// Probe setup failed, so a child would not start.
+    pub setup_failed: bool,
+}
+
+/// Exit 1 when the kernel is missing, Linux remount is unavailable, or
+/// Windows jail setup failed. WFP skip alone is not a failure.
+#[must_use]
+pub fn doctor_fails(facts: DoctorFacts) -> bool {
+    !facts.kernel_supported || facts.setup_failed || facts.remount_available == Some(false)
+}
+
+/// Probe this machine. Uses a private temp directory, not the user
+/// workspace, and does not plant `.env` or start a user command.
+pub fn collect_doctor_facts() -> DoctorFacts {
+    let kernel_supported = kernel_supported();
+    let dir = private_probe_dir().ok();
+    let _remove = dir.as_ref().map(|path| RemoveProbeDir(path.clone()));
+    #[cfg(target_os = "linux")]
+    let remount_available = Some(linux::dest_remount_available());
+    #[cfg(not(target_os = "linux"))]
+    let remount_available = None;
+    #[cfg(windows)]
+    let (wfp_skipped, setup_failed) = if kernel_supported {
+        match dir.as_deref() {
+            Some(path) => match windows::probe_wfp_skipped(path) {
+                Ok(skipped) => (Some(skipped), false),
+                Err(_) => (None, true),
+            },
+            None => (None, true),
+        }
+    } else {
+        (None, false)
+    };
+    #[cfg(not(windows))]
+    let (wfp_skipped, setup_failed) = (None, false);
+    DoctorFacts {
+        kernel_supported,
+        remount_available,
+        wfp_skipped,
+        setup_failed,
+    }
+}
+
+fn private_probe_dir() -> std::io::Result<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("workpen-doctor-{}-{nanos}", std::process::id()));
+    std::fs::create_dir(&dir)?;
+    Ok(dir)
+}
+
+struct RemoveProbeDir(PathBuf);
+
+impl Drop for RemoveProbeDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Whether this OS can apply a kernel jail.
 #[must_use]
 pub fn kernel_supported() -> bool {
@@ -2468,5 +2537,54 @@ mod combine_spawn_restore_tests {
             "nested extra-root .ssh file must still dest-deny: {:?}",
             policy.dest_denies()
         );
+    }
+}
+
+#[cfg(test)]
+mod doctor_facts_tests {
+    use super::{DoctorFacts, doctor_fails};
+
+    fn facts(
+        kernel_supported: bool,
+        remount_available: Option<bool>,
+        wfp_skipped: Option<bool>,
+        setup_failed: bool,
+    ) -> DoctorFacts {
+        DoctorFacts {
+            kernel_supported,
+            remount_available,
+            wfp_skipped,
+            setup_failed,
+        }
+    }
+
+    #[test]
+    fn unsupported_kernel_fails() {
+        assert!(doctor_fails(facts(false, None, None, false)));
+    }
+
+    #[test]
+    fn wfp_skip_alone_succeeds() {
+        assert!(!doctor_fails(facts(true, None, Some(true), false)));
+    }
+
+    #[test]
+    fn wfp_applied_succeeds() {
+        assert!(!doctor_fails(facts(true, None, Some(false), false)));
+    }
+
+    #[test]
+    fn linux_remount_unavailable_fails_even_when_kernel_works() {
+        assert!(doctor_fails(facts(true, Some(false), None, false)));
+    }
+
+    #[test]
+    fn linux_remount_available_succeeds() {
+        assert!(!doctor_fails(facts(true, Some(true), None, false)));
+    }
+
+    #[test]
+    fn setup_failure_fails() {
+        assert!(doctor_fails(facts(true, None, None, true)));
     }
 }

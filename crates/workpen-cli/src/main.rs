@@ -22,12 +22,13 @@ fn main() -> ExitCode {
 }
 
 const TOP_USAGE: &str = "\
-usage: workpen [--version] [--help] <why|run|policy|gc|init> ...
+usage: workpen [--version] [--help] <why|run|policy|gc|init|doctor> ...
   why [--root DIR] [--extra-root DIR] PATH
   run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--policy] [--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...
   policy [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--] [CMD...]
   gc  [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]
   init [--root DIR]
+  doctor
 
 By default the child cannot use the network. It may read system paths and write inside the workspace. --extra-root is read-write, so a write outside the workspace needs that flag. Secret files are dest-denied before the child starts. / and $HOME are not roots.
 Exit status 0 is success. 1 is a why denial. 2 is usage or a setup failure. 3 is a policy refusal before the child starts. 124 is a timeout. 127 means the program was not found. The child status is passed through, including 2, 3, and 127.";
@@ -53,13 +54,62 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
         "policy" => cmd_run(&args[1..], true),
         "gc" => cmd_gc(&args[1..]),
         "init" => cmd_init(&args[1..]),
+        "doctor" => cmd_doctor(&args[1..]),
         other => Err(format!(
-            "unknown command: {other} (use why, run, policy, gc, or init)"
+            "unknown command: {other} (use why, run, policy, gc, init, or doctor)"
         )),
     }
 }
 
 const INIT_USAGE: &str = "usage: workpen init [--root DIR]";
+
+const DOCTOR_USAGE: &str = "\
+usage: workpen doctor
+Print whether this machine can jail a child. Does not start a command.
+Exit 0 when a child can be jailed, including when Windows WFP is skipped.
+Exit 1 when the kernel jail is unavailable, or on Linux when secret names cannot be hidden.";
+
+const REMOUNT_UNAVAILABLE: &str =
+    "remount: unavailable (unshare, user-namespace id map, or private remount of /)";
+
+fn cmd_doctor(args: &[String]) -> Result<ExitCode, String> {
+    if wants_help(args) {
+        println!("{DOCTOR_USAGE}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !args.is_empty() {
+        return Err(format!("doctor does not take arguments ({DOCTOR_USAGE})"));
+    }
+    let facts = workpen::collect_doctor_facts();
+    println!("os: {}", std::env::consts::OS);
+    println!("version: {}", workpen::VERSION);
+    if facts.kernel_supported {
+        println!("kernel: supported");
+    } else {
+        println!("kernel: unsupported");
+    }
+    match facts.remount_available {
+        Some(true) => println!("remount: available"),
+        Some(false) => println!("{REMOUNT_UNAVAILABLE}"),
+        None => {}
+    }
+    if facts.setup_failed {
+        println!("appcontainer: unavailable");
+    } else if let Some(skipped) = facts.wfp_skipped {
+        println!("appcontainer: available");
+        if skipped {
+            println!("wfp: skipped");
+        } else {
+            println!("wfp: applied");
+        }
+        println!("network: blocked");
+    }
+    if workpen::doctor_fails(facts) {
+        Ok(ExitCode::from(1))
+    } else {
+        Ok(ExitCode::SUCCESS)
+    }
+}
 
 const AGENT_LOCK_TEMPLATE: &str = "\
 # extra dest-deny globs, one per line
