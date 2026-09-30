@@ -15,6 +15,13 @@ categories = ["command-line-utilities", "os"]
 name = "workpen"
 path = "src/main.rs"
 
+# Archives are workpen-cli-<triple>.tar.gz and the file inside is `workpen`.
+# v0.6.0 only published the Linux x86_64 archive. Later tags add the rest.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/workpen-cli-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "workpen{ binary-ext }"
+
 [dependencies]
 workpen = { version = "0.6.0", path = "../workpen", features = ["gc", "nono"] }
 
