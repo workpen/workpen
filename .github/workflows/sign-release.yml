@@ -1,7 +1,8 @@
-# Build the Linux CLI, attest SLSA provenance, and attach both to the
-# GitHub Release. Scorecard Signed-Releases reads `.intoto.jsonl` assets,
-# not the Attestations API. GITHUB_TOKEN tags do not fire push:tags;
+# Build the CLI for each Unix triple, attest SLSA provenance, and attach
+# both to the GitHub Release. Scorecard Signed-Releases reads `.intoto.jsonl`
+# assets, not the Attestations API. GITHUB_TOKEN tags do not fire push:tags;
 # release.published from release-please does fire this workflow.
+# The next published tag packs these archives. v0.6.0 is not re-signed.
 name: Sign release
 
 on:
@@ -23,9 +24,25 @@ permissions:
 
 jobs:
   sign:
-    name: Build and attest Linux CLI
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    name: Build and attest ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # workpen-cli-x86_64-unknown-linux-gnu.tar.gz
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          # workpen-cli-aarch64-unknown-linux-gnu.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          # workpen-cli-aarch64-apple-darwin.tar.gz
+          - os: macos-15
+            target: aarch64-apple-darwin
+          # workpen-cli-x86_64-apple-darwin.tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
     permissions:
       contents: write
       id-token: write
@@ -34,6 +51,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
       REPO: ${{ github.repository }}
+      TARGET: ${{ matrix.target }}
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
@@ -63,23 +81,31 @@ jobs:
           toolchain: "1.95"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: sign-release
+          shared-key: sign-release-${{ matrix.target }}
           workspaces: crate
       - name: Build CLI
         working-directory: crate
-        run: cargo build --release --locked -p workpen-cli
+        run: |
+          set -euo pipefail
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          if [ "$host" != "$TARGET" ]; then
+            echo "runner host ${host} is not ${TARGET}" >&2
+            exit 1
+          fi
+          cargo build --release --locked -p workpen-cli
       - name: Pack tarball
         env:
           ARTIFACTS: ${{ github.workspace }}/artifacts
+          COPYFILE_DISABLE: "1"
         run: |
           set -euo pipefail
           mkdir -p "$ARTIFACTS"
-          tar -C crate/target/release -czf "$ARTIFACTS/workpen-cli-x86_64-unknown-linux-gnu.tar.gz" workpen
+          tar -C crate/target/release -czf "$ARTIFACTS/workpen-cli-${TARGET}.tar.gz" workpen
           ls -la "$ARTIFACTS"
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: ${{ github.workspace }}/artifacts/workpen-cli-x86_64-unknown-linux-gnu.tar.gz
+          subject-path: ${{ github.workspace }}/artifacts/workpen-cli-${{ matrix.target }}.tar.gz
       - name: Upload tarball and provenance
         env:
           ARTIFACTS: ${{ github.workspace }}/artifacts

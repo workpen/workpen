@@ -32,7 +32,10 @@ CLI:
 
 ```bash
 cargo install workpen-cli --locked
+cargo binstall workpen-cli
 ```
+
+`cargo binstall` fetches the GitHub release archive. The 0.6.0 archive is Linux x86_64. Later releases also ship macOS and Linux arm64.
 
 Git pin:
 

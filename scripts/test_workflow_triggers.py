@@ -186,6 +186,28 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertIn("attestations: write", job)
         self.assertIn("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8", text)
         self.assertIn("workpen-cli-x86_64-unknown-linux-gnu.tar.gz", text)
+        for triple in (
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+        ):
+            self.assertIn(triple, text)
+            self.assertIn(f"workpen-cli-{triple}.tar.gz", text)
+        self.assertIn("ubuntu-24.04-arm", text)
+        self.assertIn("os: macos-15-intel", text)
+        self.assertIn("os: macos-15", text)
+        self.assertIn("cargo build --release --locked -p workpen-cli", text)
+        self.assertNotIn("--no-default-features", text)
+        self.assertNotIn("cosign", text)
+        binstall = (ROOT / "crates" / "workpen-cli" / "Cargo.toml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("workpen-cli-{ target }.tar.gz", binstall)
+        self.assertIn('bin-dir = "workpen{ binary-ext }"', binstall)
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("cargo binstall workpen-cli", readme)
+        self.assertIn("cargo install workpen-cli --locked", readme)
         self.assertIn("scripts/attach-release-provenance.sh", text)
         self.assertNotIn('TAG="${TAG}"', text)
         self.assertIn('toolchain: "1.95"', text)
