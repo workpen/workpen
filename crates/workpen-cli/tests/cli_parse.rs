@@ -1370,3 +1370,80 @@ fn init_git_repo() -> TempDir {
     git(&["commit", "-m", "init"]);
     dir
 }
+
+#[test]
+fn doctor_help_names_the_command() {
+    let out = workpen()
+        .args(["doctor", "--help"])
+        .output()
+        .expect("spawn");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("workpen doctor"), "{stdout}");
+    assert!(stdout.contains("Does not start a command"), "{stdout}");
+}
+
+#[test]
+fn doctor_rejects_arguments() {
+    let out = workpen()
+        .args(["doctor", "--root"])
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn doctor_live_reports_this_machine() {
+    let cwd = TempDir::new().expect("cwd");
+    let env_path = cwd.path().join(".env");
+    let out = workpen()
+        .arg("doctor")
+        .current_dir(cwd.path())
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("os:"), "{stdout} {stderr}");
+    assert!(stdout.contains("version:"), "{stdout}");
+    assert!(!stdout.contains("SECRET"));
+    assert!(!env_path.exists(), "doctor must not plant .env");
+    assert!(
+        !stdout.contains("network: open") && !stdout.contains("network: allowed"),
+        "{stdout}"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        if stdout.contains("remount: unavailable") {
+            assert_eq!(out.status.code(), Some(1), "{stdout} {stderr}");
+            assert!(stdout.contains("kernel: supported"), "{stdout}");
+            assert!(stdout.contains("unshare"), "{stdout}");
+            assert!(stdout.contains("user-namespace id map"), "{stdout}");
+            assert!(stdout.contains("private remount of /"), "{stdout}");
+        } else {
+            assert!(out.status.success(), "{stdout} {stderr}");
+            assert!(stdout.contains("remount: available"), "{stdout}");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert!(out.status.success(), "{stdout} {stderr}");
+        assert!(stdout.contains("kernel: supported"), "{stdout}");
+        assert!(!stdout.contains("remount:"), "{stdout}");
+    }
+    #[cfg(windows)]
+    {
+        if stdout.contains("kernel: unsupported") {
+            assert_eq!(out.status.code(), Some(1), "{stdout} {stderr}");
+        } else {
+            assert!(out.status.success(), "{stdout} {stderr}");
+            assert!(
+                stdout.contains("wfp: skipped") || stdout.contains("wfp: applied"),
+                "{stdout}"
+            );
+        }
+    }
+}

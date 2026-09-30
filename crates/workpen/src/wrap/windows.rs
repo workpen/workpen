@@ -662,6 +662,14 @@ fn prepare_network_blocked(policy: &KernelPolicy) -> Result<Prepared, KernelErro
     Ok(prepared)
 }
 
+/// AppContainer plus WFP on `workspace`, without creating a user process.
+/// `Ok(true)` is win32 5 (WFP skipped). The helper file is removed on drop.
+pub(super) fn probe_wfp_skipped(workspace: &Path) -> Result<bool, KernelError> {
+    let policy = super::process_jail(workspace, std::iter::empty::<&Path>())?;
+    let prepared = prepare_network_blocked(&policy)?;
+    Ok(prepared.wfp_skipped)
+}
+
 fn wrap_appcontainer_token(
     restricted: CloseOnDrop,
     package_sid: Handle,

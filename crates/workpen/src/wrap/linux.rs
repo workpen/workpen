@@ -59,6 +59,11 @@ fn remount_available() -> bool {
     probe_private_mount_ns()
 }
 
+/// Real unshare probe. Ignores the test override used by remount unit tests.
+pub(super) fn dest_remount_available() -> bool {
+    probe_private_mount_ns()
+}
+
 /// Fork, try enter, exit. Does not change the parent namespace.
 fn probe_private_mount_ns() -> bool {
     // SAFETY: child only tries enter then `_exit`; parent waitpid reaps it.
