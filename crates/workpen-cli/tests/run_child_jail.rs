@@ -1059,3 +1059,49 @@ fn run_extra_root_tmp_can_write_presented_path() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains('x'), "child must cat the marker: {stdout}");
 }
+
+/// `connect(2)` to a Unix socket is network-outbound. `--net` must not
+/// open a socket that sits under a dest-denied directory.
+#[cfg(target_os = "macos")]
+#[test]
+fn net_cannot_connect_to_a_socket_under_a_denied_directory() {
+    let probe = Command::new("python3")
+        .arg("-c")
+        .arg("import socket")
+        .output();
+    if !probe.is_ok_and(|out| out.status.success()) {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let secrets = dir.path().join("secrets");
+    std::fs::create_dir(&secrets).expect("secrets");
+    let sock = secrets.join("agent.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .current_dir(dir.path())
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args([
+            "--timeout",
+            "5s",
+            "--net",
+            "--",
+            "python3",
+            "-c",
+            r#"import socket; s=socket.socket(socket.AF_UNIX); s.connect("secr"+"ets/agent.sock"); s.send(b"hi"); print("CONNECTED")"#,
+        ])
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("CONNECTED"),
+        "socket under secrets/ must stay denied with --net: stdout={stdout} stderr={stderr}"
+    );
+    match listener.accept() {
+        Ok(_) => panic!("listener accepted a jailed connection"),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(err) => panic!("accept: {err}"),
+    }
+}
