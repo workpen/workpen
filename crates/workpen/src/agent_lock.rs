@@ -97,6 +97,18 @@ mod tests {
     }
 
     #[test]
+    fn trailing_hash_does_not_disable_the_line() {
+        let dir = TempDir::new().expect("tmp");
+        std::fs::write(dir.path().join(AGENT_LOCK_NAME), "secrets/** # note\n").expect("write");
+        let got = load_agent_lock(dir.path()).expect("parse");
+        assert!(
+            !got.is_empty(),
+            "a trailing hash must not turn the line into a comment"
+        );
+        assert!(got.iter().any(|glob| glob.contains("secrets/**")));
+    }
+
+    #[test]
     fn parse_globs_skips_comments() {
         let dir = TempDir::new().expect("tmp");
         std::fs::write(
