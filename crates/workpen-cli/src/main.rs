@@ -85,10 +85,7 @@ fn cmd_init(args: &[String]) -> Result<ExitCode, String> {
         Err(err @ PathGuardError::Home(_)) => return refuse(err),
         Err(err) => return Err(err.to_string()),
     };
-    if root
-        .components()
-        .all(|component| matches!(component, std::path::Component::RootDir))
-    {
+    if path_is_filesystem_root(&root) {
         return refuse(format!(
             "refused filesystem root {}; use a subdirectory, not `/`",
             root.display()
@@ -127,8 +124,16 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
         return Err(format!("unexpected argument: {} ({WHY_USAGE})", rest[1]));
     }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let root = resolve_workspace_root(&cwd, &root.to_string_lossy()).map_err(|e| e.to_string())?;
-    let (extras, _presented) = resolve_extras(&cwd, &extras).map_err(|e| e.to_string())?;
+    let root = match resolve_workspace_root(&cwd, &root.to_string_lossy()) {
+        Ok(root) => root,
+        Err(PathGuardError::Home(path)) if json => return json_guard(1, &path),
+        Err(err) => return Err(err.to_string()),
+    };
+    let (extras, _presented) = match resolve_extras(&cwd, &extras) {
+        Ok(pair) => pair,
+        Err(ExtraRootError::Home(path)) if json => return json_guard(1, &path),
+        Err(err) => return Err(err.to_string()),
+    };
     let path = rest.first().ok_or_else(|| WHY_USAGE.to_string())?;
     let guard = PathGuard::with_extra_roots(&root, &extras).map_err(|e| e.to_string())?;
     let dest = why_dest(&root, path);
@@ -189,12 +194,12 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = match resolve_workspace_root(&cwd, &root.to_string_lossy()) {
         Ok(root) => root,
-        Err(err @ PathGuardError::Home(_)) => return refuse(err),
+        Err(PathGuardError::Home(path)) => return refuse_home(json, path),
         Err(err) => return Err(err.to_string()),
     };
     let (mut extras, mut presented) = match resolve_extras(&cwd, &extras) {
         Ok(pair) => pair,
-        Err(err @ ExtraRootError::Home(_)) => return refuse(err),
+        Err(ExtraRootError::Home(path)) => return refuse_extra_home(json, path),
         Err(err) => return Err(err.to_string()),
     };
     for write in &write_roots {
@@ -203,7 +208,7 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
                 presented.push(shown);
                 extras.push(canon);
             }
-            Err(err @ ExtraRootError::Home(_)) => return refuse_mapped(json, 3, &err),
+            Err(ExtraRootError::Home(path)) => return refuse_extra_home(json, path),
             Err(err) => return Err(err.to_string()),
         }
     }
@@ -211,7 +216,7 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
     for read in &read_roots {
         match resolve_extra_root_pair(&cwd, &read.to_string_lossy()) {
             Ok((_shown, canon)) => read_canon.push(canon),
-            Err(err @ ExtraRootError::Home(_)) => return refuse_mapped(json, 3, &err),
+            Err(ExtraRootError::Home(path)) => return refuse_extra_home(json, path),
             Err(err) => return Err(err.to_string()),
         }
     }
@@ -226,14 +231,14 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
     let policy = DenyPolicy::from_workspace(&root).map_err(|e| e.to_string())?;
     let guard = match PathGuard::with_extra_roots(&root, &extras) {
         Ok(guard) => guard,
-        Err(err @ PathGuardError::Home(_)) => return refuse(err),
+        Err(PathGuardError::Home(path)) => return refuse_home(json, path),
         Err(err) => return Err(err.to_string()),
     };
     let mut jail = match workpen::process_jail(guard.canon_root(), &presented) {
         Ok(policy) => policy.with_require_dest_hide().with_network(!allow_net),
         Err(err @ KernelError::Home(_))
         | Err(err @ KernelError::FsRoot(_))
-        | Err(err @ KernelError::DestDeny(_)) => return refuse(err),
+        | Err(err @ KernelError::DestDeny(_)) => return refuse_kernel(json, err),
         Err(err) => return Err(err.to_string()),
     };
     for read in &read_canon {
@@ -241,7 +246,7 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
             Ok(jail) => jail,
             Err(err @ KernelError::Home(_))
             | Err(err @ KernelError::FsRoot(_))
-            | Err(err @ KernelError::DestDeny(_)) => return refuse(err),
+            | Err(err @ KernelError::DestDeny(_)) => return refuse_kernel(json, err),
             Err(err) => return Err(err.to_string()),
         };
     }
@@ -293,7 +298,7 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
         }
         Err(err @ KernelError::DestDeny(_))
         | Err(err @ KernelError::Home(_))
-        | Err(err @ KernelError::FsRoot(_)) => return refuse(err),
+        | Err(err @ KernelError::FsRoot(_)) => return refuse_kernel(json, err),
         Err(e) => {
             let mut msg = format!("failed to spawn {}: {e}", resolved.display());
             if program_outside_roots(&resolved, guard.canon_root(), &presented) {
@@ -532,16 +537,45 @@ fn refuse(err: impl std::fmt::Display) -> Result<ExitCode, String> {
     Ok(ExitCode::from(3))
 }
 
-fn refuse_mapped(json: bool, code: u8, err: &dyn std::fmt::Display) -> Result<ExitCode, String> {
-    if json {
-        println!(
-            "{}",
-            json_line("denied", code, None, None, Some("path_guard"))
-        );
-        return Ok(ExitCode::from(code));
+fn path_is_filesystem_root(path: &Path) -> bool {
+    match path.parent() {
+        None => true,
+        Some(parent) => parent.as_os_str().is_empty(),
     }
-    eprintln!("{err}");
+}
+
+fn json_guard(code: u8, path: &Path) -> Result<ExitCode, String> {
+    let shown = path.display().to_string();
+    println!(
+        "{}",
+        json_line("denied", code, Some(&shown), None, Some("path_guard"))
+    );
     Ok(ExitCode::from(code))
+}
+
+fn refuse_home(json: bool, path: PathBuf) -> Result<ExitCode, String> {
+    if json {
+        return json_guard(3, &path);
+    }
+    refuse(PathGuardError::Home(path))
+}
+
+fn refuse_extra_home(json: bool, path: PathBuf) -> Result<ExitCode, String> {
+    if json {
+        return json_guard(3, &path);
+    }
+    refuse(ExtraRootError::Home(path))
+}
+
+fn refuse_kernel(json: bool, err: KernelError) -> Result<ExitCode, String> {
+    if !json {
+        return refuse(err);
+    }
+    match err {
+        KernelError::Home(path) | KernelError::FsRoot(path) => json_guard(3, &path),
+        KernelError::DestDeny(inner) => check_dest_status(true, 3, &inner),
+        other => refuse(other),
+    }
 }
 
 fn check_dest_status(json: bool, code: u8, err: &CheckDestError) -> Result<ExitCode, String> {

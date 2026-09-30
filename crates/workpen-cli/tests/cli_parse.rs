@@ -942,8 +942,8 @@ fn why_and_run_json_do_not_leak_or_wrap_success() {
     );
     #[cfg(unix)]
     {
-        // The deny cases above plant `.env`. On Ubuntu that makes `run`
-        // refuse before spawn. Success is a clean root, same as echo.
+        // The deny cases above plant `.env`. A clean root has no dest to
+        // hide, so echo starts and `--json` must not wrap its stdout.
         let clean = TempDir::new().expect("clean");
         let run_ok = workpen()
             .args(["run", "--json", "--root"])
@@ -953,33 +953,66 @@ fn why_and_run_json_do_not_leak_or_wrap_success() {
             .expect("spawn");
         let stdout = String::from_utf8_lossy(&run_ok.stdout);
         let stderr = String::from_utf8_lossy(&run_ok.stderr);
-        if stderr.contains("remount unavailable") {
-            assert!(
-                !stdout.contains("\"result\""),
-                "remount refusal must not wrap stdout: stdout={stdout} stderr={stderr}"
-            );
-        } else {
-            assert!(
-                run_ok.status.success()
-                    && stdout.contains("hello-json")
-                    && !stdout.contains("\"result\""),
-                "success must not wrap stdout: stdout={stdout} stderr={stderr}"
-            );
-            let as_child = workpen()
-                .args(["run", "--root"])
-                .arg(clean.path())
-                .args(["--", "/bin/echo", "--json"])
-                .output()
-                .expect("spawn");
-            let child_out = String::from_utf8_lossy(&as_child.stdout);
-            assert!(
-                as_child.status.success()
-                    && child_out.contains("--json")
-                    && !child_out.contains("\"result\""),
-                "--json after -- is the child: stdout={child_out} stderr={}",
-                String::from_utf8_lossy(&as_child.stderr)
-            );
-        }
+        assert!(
+            run_ok.status.success()
+                && stdout.contains("hello-json")
+                && !stdout.contains("\"result\""),
+            "success must not wrap stdout: stdout={stdout} stderr={stderr}"
+        );
+        let as_child = workpen()
+            .args(["run", "--root"])
+            .arg(clean.path())
+            .args(["--", "/bin/echo", "--json"])
+            .output()
+            .expect("spawn");
+        let child_out = String::from_utf8_lossy(&as_child.stdout);
+        assert!(
+            as_child.status.success()
+                && child_out.contains("--json")
+                && !child_out.contains("\"result\""),
+            "--json after -- is the child: stdout={child_out} stderr={}",
+            String::from_utf8_lossy(&as_child.stderr)
+        );
+        let home = std::env::var("HOME").expect("HOME");
+        let home_out = workpen()
+            .args(["run", "--json", "--root", &home, "--", "/bin/echo", "x"])
+            .output()
+            .expect("spawn");
+        assert_eq!(home_out.status.code(), Some(3));
+        let home_text = String::from_utf8_lossy(&home_out.stdout);
+        assert!(home_text.contains("\"result\":\"denied\""), "{home_text}");
+        assert!(home_text.contains("\"kind\":\"path_guard\""), "{home_text}");
+        assert!(home_text.contains("\"exit\":3"), "{home_text}");
+        assert!(
+            home_out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&home_out.stderr)
+        );
+        let root_out = workpen()
+            .args(["run", "--json", "--root", "/", "--", "/bin/echo", "x"])
+            .output()
+            .expect("spawn");
+        assert_eq!(root_out.status.code(), Some(3));
+        let root_text = String::from_utf8_lossy(&root_out.stdout);
+        assert!(root_text.contains("\"kind\":\"path_guard\""), "{root_text}");
+        assert!(
+            root_out.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&root_out.stderr)
+        );
+        let why_home = workpen()
+            .args(["why", "--json", "--root", &home, "notes.md"])
+            .output()
+            .expect("spawn");
+        assert_eq!(why_home.status.code(), Some(1));
+        let why_text = String::from_utf8_lossy(&why_home.stdout);
+        assert!(why_text.contains("\"kind\":\"path_guard\""), "{why_text}");
+        assert!(why_text.contains("\"exit\":1"), "{why_text}");
+        assert!(
+            why_home.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&why_home.stderr)
+        );
     }
 }
 
