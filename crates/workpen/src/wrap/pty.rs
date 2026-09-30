@@ -87,7 +87,10 @@ pub(super) fn attach_pty(cmd: &mut Command, slave: File) -> io::Result<()> {
     unsafe {
         cmd.pre_exec(|| {
             // Userns after a controlling TTY can SIGTTIN/SIGTTOU-stop
-            // the child; parent wait() then never returns.
+            // the child; parent wait() then never returns. Ignore those
+            // only until this process is the foreground group. Leaving
+            // them ignored makes a later read return EIO, and cat exits 1
+            // after it has already printed the line.
             let _ = libc::signal(libc::SIGTTIN, libc::SIG_IGN);
             let _ = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
             let _ = libc::signal(libc::SIGTSTP, libc::SIG_IGN);
@@ -95,6 +98,11 @@ pub(super) fn attach_pty(cmd: &mut Command, slave: File) -> io::Result<()> {
                 return Err(io::Error::last_os_error());
             }
             let _ = libc::ioctl(0, libc::TIOCSCTTY as _, std::ptr::null::<libc::c_void>());
+            if libc::tcsetpgrp(0, libc::getpid()) == 0 {
+                let _ = libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+                let _ = libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+                let _ = libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+            }
             Ok(())
         });
     }
@@ -134,7 +142,10 @@ pub(super) fn pump_stdin(mut master: File) -> std::thread::JoinHandle<()> {
         loop {
             match stdin.read(&mut buf) {
                 Ok(0) => {
-                    let _ = master.write_all(&[4]);
+                    // One VEOF on an empty line is EOF. A second covers a
+                    // line that was still sitting in the canonical buffer.
+                    let _ = master.write_all(&[4, 4]);
+                    let _ = master.flush();
                     break;
                 }
                 Ok(n) => {

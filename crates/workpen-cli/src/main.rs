@@ -31,6 +31,9 @@ usage: workpen [--version] [--help] <why|run|policy|gc|init|doctor> ...
   doctor
 
 By default the child cannot use the network. It may read system paths and write inside the workspace. --extra-root is read-write, so a write outside the workspace needs that flag. Secret files are dest-denied before the child starts. / and $HOME are not roots.
+why reports whether one path is dest-denied under the root. It does not spawn.
+run dest-denies argv, then starts one jailed child when the jail applies.
+gc reclaims leftover worktrees under .workpen-worktrees. It does not clean target/.
 Exit status 0 is success. 1 is a why denial. 2 is usage or a setup failure. 3 is a policy refusal before the child starts. 124 is a timeout. 127 means the program was not found. The child status is passed through, including 2, 3, and 127.";
 
 const WHY_USAGE: &str = "usage: workpen why [--root DIR] [--extra-root DIR] PATH";
@@ -576,7 +579,7 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
                 }
             }
         }
-        println!("{} worktrees", rows.len());
+        println!("{} leftover worktrees", rows.len());
     }
     Ok(ExitCode::SUCCESS)
 }
