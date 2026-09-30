@@ -1867,3 +1867,20 @@ fn open_verified_read_symlink_to_env_is_dest_deny() {
         other => panic!("symlink to .env must dest-deny, got {other:?}"),
     }
 }
+
+#[test]
+fn file_inside_denied_directory_is_denied() {
+    let policy = DenyPolicy::default();
+    assert!(
+        is_path_denied(Path::new("nested/.env/token"), &policy),
+        "a file under a directory named .env must be denied"
+    );
+    assert!(
+        is_path_denied(Path::new("cfg/.env.d/secret"), &policy),
+        "a file under a .env.* directory must be denied"
+    );
+    assert!(
+        !is_path_denied(Path::new(".env.example/notes"), &policy),
+        "children of a dotenv template name stay allowed"
+    );
+}
