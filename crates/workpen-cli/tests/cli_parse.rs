@@ -1405,6 +1405,30 @@ fn init_git_repo() -> TempDir {
 }
 
 #[test]
+fn why_json_escapes_a_quote_in_the_path() {
+    let dir = TempDir::new().expect("dir");
+    let file = dir.path().join("say\"hi.txt");
+    std::fs::write(&file, b"ok").expect("write");
+    let out = workpen()
+        .args(["why", "--json", "--root"])
+        .arg(dir.path())
+        .arg(&file)
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "why --json should allow the file: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("say\\\"hi.txt"),
+        "quote in the path must be escaped: {stdout}"
+    );
+    assert!(stdout.lines().count() == 1, "one JSON object: {stdout}");
+}
+
+#[test]
 fn doctor_help_names_the_command() {
     let out = workpen()
         .args(["doctor", "--help"])

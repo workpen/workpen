@@ -895,3 +895,15 @@ fn parse_roots(args: &[String]) -> Result<(PathBuf, Vec<PathBuf>, Vec<String>), 
     }
     Ok((root, extras, rest))
 }
+
+#[cfg(test)]
+mod json_escape_tests {
+    use super::json_string;
+
+    #[test]
+    fn json_string_escapes_quote_backslash_and_controls() {
+        assert_eq!(json_string("say\"hi\\there"), "\"say\\\"hi\\\\there\"");
+        assert_eq!(json_string("a\nb\rc\td"), "\"a\\nb\\rc\\td\"");
+        assert_eq!(json_string("\u{0001}"), "\"\\u0001\"");
+    }
+}
