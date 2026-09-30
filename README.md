@@ -15,15 +15,17 @@
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/workpen/workpen/badge)](https://securityscorecards.dev/viewer/?uri=github.com/workpen/workpen)
 [![FOSSA Status](https://github.com/workpen/workpen/actions/workflows/fossa.yml/badge.svg?event=push)](https://github.com/workpen/workpen/actions/workflows/fossa.yml)
 
-Dest-deny and a per-child process jail. The parent is trusted. The
-child is not. This is not a VM.
+Workpen runs one untrusted command in a project directory. By default
+the child cannot read secret files, cannot read your home directory,
+cannot use the network, and cannot write outside that directory.
+The parent is trusted. This is not a VM.
 
 ## Install
 
 Library:
 
 ```toml
-workpen = { version = "0.5", features = ["gc", "nono"] }
+workpen = { version = "0.6", features = ["gc", "nono"] }
 ```
 
 CLI:
@@ -35,7 +37,7 @@ cargo install workpen-cli --locked
 Git pin:
 
 ```toml
-workpen = { git = "https://github.com/workpen/workpen", tag = "v0.5.0", features = ["gc", "nono"] }
+workpen = { git = "https://github.com/workpen/workpen", tag = "v0.6.0", features = ["gc", "nono"] }
 ```
 
 MSRV is 1.95.
@@ -53,20 +55,37 @@ ln .env notes.txt
 workpen why --root . .env
 workpen why --root . notes.txt
 workpen why --root . notes.md
+workpen run --root . -- /bin/cat .env
 workpen run --root . -- /bin/cat notes.md
 ```
 
 `.env` is dest-deny. `notes.txt` is a hardlink of `.env`, so dest-deny
-too. `notes.md` is ordinary: `why` prints allowed, `run` prints
+too. `workpen run` on `.env` refuses and does not print the secret.
+`notes.md` is ordinary: `why` prints allowed, `run` prints
 `hello notes`. From this repo, `bash examples/dest-deny.sh` is the
 same commands.
 
-![Workpen dest-denies .env and a hardlink, then cats notes.md](demo/dest-deny.gif)
+`workpen run` checks dest-deny before it starts the child. By default
+the network is off. `$HOME` is not a workspace and not an extra root.
+`--extra-root` is an explicit extra directory with read-write access,
+so a write outside the workspace is possible only when you pass that
+flag. PathGuard still refuses `/` and `$HOME` as either root.
 
-`workpen run` dest-denies argv first, then jails the child. Unix
-`--tty` gives the child a PTY. Windows `--tty` refuses. A spawn-only
-run is [examples/run-echo.sh](examples/run-echo.sh). On Linux, `run`
-does not spawn when dest-deny remount is skipped.
+`agent.lock` in the workspace adds dest-deny globs on top of the
+built-in list. One glob per line. A line that starts with `#` is a
+comment. Blank lines are skipped. A missing file means the built-in
+denies only. A file that is only comments does not turn those denies
+off.
+
+```text
+# extra dest-deny globs, one per line
+# secrets/**
+```
+
+Unix `--tty` gives the child a PTY. Windows `--tty` refuses. A
+spawn-only run is [examples/run-echo.sh](examples/run-echo.sh). On
+Linux, if the kernel cannot hide secret names, `workpen run` does not
+start the child.
 
 Commands: `why`, `run`, `gc`. `workpen --help` prints usage.
 
@@ -89,15 +108,14 @@ in one page is [docs/threat-model.md](docs/threat-model.md).
 
 ## Limits
 
-- Linux remount skip: `workpen run` does not spawn. Library `run_child`
-  still starts the child (`RemountSkipped`) unless you opt into
-  `with_require_dest_hide`.
+- On Linux, if the kernel cannot hide secret names, `workpen run`
+  does not start the child. Library `run_child` still starts the child
+  (`RemountSkipped`) unless you opt into `with_require_dest_hide`.
 - Nested Linux post-create (`mkdir x && touch x/.env`) is a launch
   snapshot. Workspace-root missing dest-deny names are occupied when
   remount applies.
 - Windows WFP without admin is skipped (`WfpSkipped`). AppContainer
   with no network capabilities is the unelevated net deny.
-- Do not vendor bubblewrap.
 
 ## Contributing
 

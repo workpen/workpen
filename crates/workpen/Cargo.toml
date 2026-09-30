@@ -37,3 +37,6 @@ required-features = ["gc"]
 [[test]]
 name = "nono_corpus"
 required-features = ["nono"]
+
+[package.metadata.docs.rs]
+features = ["gc", "nono"]

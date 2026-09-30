@@ -21,47 +21,54 @@
 //!
 //! # What `KernelApply::Applied` does not mean
 //!
-//! * Linux remount can be skipped (`RemountSkipped`). Landlock still
-//!   applies. Landlock cannot hide a file inside an allowed tree.
-//!   In-tree dest-deny is then userspace argv only. Default
-//!   `run_child` still starts the child. [`crate::KernelPolicy::with_require_dest_hide`]
-//!   (the `workpen run` CLI) refuses to spawn.
-//! * `workpen run --tty` gives the child a Unix PTY. Windows returns
-//!   [`crate::KernelError::Apply`]. The parent still copies the master;
-//!   dest-deny and the kernel jail still apply.
-//! * Extra-root dests still fail-closed when remount is unavailable.
-//! * Linux remount occupies missing dest-deny **basenames** at the
-//!   workspace root (and extra-roots that are not `/tmp`) when remount
-//!   applies, then unlinks those nodes after the child exits.
-//!   `touch .env && cat .env` at the root is then hide, not a leak.
-//!   Nested `mkdir x && touch x/.env` is still userspace-only.
+//! * Linux remount ran. Skip is `RemountSkipped` when unshare / maps /
+//!   `MS_PRIVATE` is denied. Landlock still applies. Landlock cannot
+//!   hide a file inside an allowed tree. In-tree dest-deny is then
+//!   userspace argv only. Default `run_child` still starts the child.
+//!   [`crate::KernelPolicy::with_require_dest_hide`] (the `workpen run`
+//!   CLI) refuses to spawn.
+//! * `workpen run --tty` works on Windows. Windows returns
+//!   [`crate::KernelError::Apply`]. On Unix the child gets a PTY. The
+//!   parent still copies the master; dest-deny and the kernel jail
+//!   still apply.
+//! * Extra-root dests stay hidden when remount is unavailable. They
+//!   stay readable and still fail closed.
+//! * A hide of every name created after launch. When remount applies,
+//!   missing dest-deny **basenames** at the workspace root (and
+//!   extra-roots that are not `/tmp`) are occupied, then unlinked after
+//!   the child exits. `touch .env && cat .env` at the root is then hide,
+//!   not a leak. Nested `mkdir x && touch x/.env` is still userspace-only.
 //!   macOS has name regexes. Windows denies existing dests only.
 //!   Do not `create_dir_all` on a nested deny path. Do not vendor bwrap.
-//! * `apply_pre_exec` dest-denies argv, then installs the hook. Hosts
-//!   that cannot use `run_child` still call
+//! * `apply_pre_exec` skipped argv dest-deny. It dest-denies argv, then
+//!   installs the hook. Hosts that cannot use `run_child` still call
 //!   [`crate::KernelPolicy::dest_deny_command`]. That check resolves
 //!   relative dests against `Command::current_dir` when set, else the
 //!   first ReadWrite grant (a capture-dir jail still dest-denies the
 //!   user cwd when the host sets `current_dir`).
+//! * Extra-root `/tmp` remounts every hardlink. `/tmp` is one extra
+//!   dest-deny name level. A hardlink under a deeper ordinary dir is
+//!   not remounted. Path remount does not hide other hardlinks to the
+//!   same inode. Userspace [`crate::check_dest`] still dest-denies
+//!   hardlink siblings when the host calls it. In-child open of a
+//!   planted `/tmp/proj/sub/leaked` is the same class as post-create.
+//! * Windows WFP ran. Win32 5 is `WfpSkipped`. AppContainer is still
+//!   the net deny. Do not revert that skip.
+//! * Renaming the dest-deny parent is in scope. Parent-rename of a
+//!   dest-deny ancestor (`mv workspace out`) is out of scope. Leaf
+//!   `mv .env leaked` is a Seatbelt last-match contract on macOS.
+//! * Windows `Stdio::piped` on `run_child` captures stdout. The child
+//!   inherits the handle or gets NUL. Hosts that need captured stdout
+//!   call [`crate::KernelPolicy::run_child_output`].
+//!
+//! # Promises
+//!
 //! * Argv dest-deny peels attached `--flag=.env` and GNU glued shorts
 //!   (`-a.env`, clustered `-la.env`). It does not parse unknown script
-//!   languages. Wrapper
-//!   skip is `timeout` / `nohup` / `nice` / `time` / `stdbuf`.
-//! * Extra-root `/tmp` is one extra dest-deny name level. A hardlink
-//!   under a deeper ordinary dir is not remounted. Path remount does
-//!   not hide other hardlinks to the same inode. Userspace
-//!   [`crate::check_dest`] still dest-denies hardlink siblings when
-//!   the host calls it. In-child open of a planted
-//!   `/tmp/proj/sub/leaked` is the same class as post-create.
-//! * Windows WFP win32 5 is `WfpSkipped`. AppContainer is still the
-//!   net deny. Do not revert that skip.
-//! * Parent-rename of a dest-deny ancestor (`mv workspace out`) is
-//!   out of scope. Leaf `mv .env leaked` is a Seatbelt last-match
-//!   contract on macOS.
-//! * Child env scrubs `TMPDIR` / `TEMP` / `TMP`. The child uses the
-//!   platform default temp.
-//! * Windows `run_child` inherits or NUL. Hosts that need captured
-//!   stdout call [`crate::KernelPolicy::run_child_output`].
+//!   languages.
+//! * Wrapper skip is `timeout`, `nohup`, `nice`, `time`, and `stdbuf`.
+//! * The child environment removes `TMPDIR`, `TEMP`, and `TMP`. The
+//!   child uses the platform default temp directory.
 //!
 //! # Process hardening
 //!
@@ -83,4 +90,4 @@
 //! New [`crate::KernelError`] / [`crate::DestDenyError`] /
 //! [`crate::KernelApply`] variants are breaking for exhaustive hosts
 //! even in 0.x. Do not bump to 1.0 in the same change as a behavior
-//! change. crates.io stays unpublished until a human launch yes.
+//! change. 0.6.0 is on crates.io; later publishes still wait on a release PR.

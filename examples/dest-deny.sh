@@ -37,6 +37,26 @@ set -e
 test "$status" -eq 0
 
 set +e
+env_out=$("${WP[@]}" run --root . -- /bin/cat .env 2>env.err)
+env_st=$?
+set -e
+test "$env_st" -ne 0
+{
+  printf '%s\n' "$env_out"
+  cat env.err
+} >env.all
+if grep -q 'SECRET=1' env.all; then
+  echo "run .env leaked SECRET" >&2
+  exit 1
+fi
+if ! grep -q 'deny glob' env.all; then
+  echo "run .env was not dest-deny" >&2
+  cat env.err >&2
+  exit 1
+fi
+echo "run refused .env"
+
+set +e
 out=$("${WP[@]}" run --root . -- /bin/cat notes.md 2>run.err)
 run_st=$?
 set -e
