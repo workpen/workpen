@@ -37,7 +37,8 @@ without `Signed-off-by`.
 Land a failing corpus test before product-module changes. Corpus
 tests live under `crates/workpen/tests/`.
 
-Do not dest-parent-copy from Bline, Grok, or Codex.
+Do not copy source from Bline, Grok, or Codex into this repo. Port
+behavior by writing a new test here first.
 
 ## Identity
 

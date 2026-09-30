@@ -23,37 +23,43 @@ The parent is trusted. The child is not.
 
 - Linux remount ran. That is `RemountSkipped` when unshare / maps /
   `MS_PRIVATE` is denied. Landlock still applies. In-tree dest-deny is
-  then argv only. Default `run_child` still starts the child.
-  `workpen run` uses `with_require_dest_hide` and does not spawn.
-- `workpen run --tty` is a Unix PTY. Windows refuses. Dest-deny and
-  the kernel jail still apply.
-- Extra-root dests are readable when remount is unavailable. Those
-  still fail closed.
-- Linux remount occupies missing dest-deny basenames at the workspace
-  root when remount applies (`touch .env && cat .env`). Nested
-  `mkdir x && touch x/.env` is still a launch snapshot. macOS has
-  name regexes. Windows denies existing dests only. Do not vendor
-  bwrap. Do not `create_dir_all` on a nested deny path.
+  then argv only. Default
+  `run_child` still starts the child. `workpen run` uses
+  `with_require_dest_hide` and does not spawn.
+- `workpen run --tty` works on Windows. Windows refuses. Dest-deny and
+  the kernel jail still apply where the child starts.
+- Extra-root dests stay hidden when remount is unavailable. Those
+  dests stay readable and still fail closed.
+- Nested post-create is hidden. When remount applies, missing
+  dest-deny basenames at the workspace root are occupied
+  (`touch .env && cat .env`). Nested `mkdir x && touch x/.env` is
+  still a launch snapshot. macOS has name regexes. Windows denies
+  existing dests only. Do not vendor bwrap. Do not `create_dir_all`
+  on a nested deny path.
 - `apply_pre_exec` skipped argv dest-deny. It dest-denies the same way
   `run_child` does. Hosts that spawn themselves can also call
   `dest_deny_command`. Relative dests resolve against
   `Command::current_dir` when set, else the first ReadWrite grant.
-- Attached `--flag=.env` and GNU glued shorts (`-a.env`, clustered
-  `-la.env`) are dest-denied.
-- Wrapper skip is only `timeout` / `nohup` / `nice`. `time` and
-  `stdbuf` are wrappers too.
-- Extra-root `/tmp` is one dest-deny name level. A hardlink under a
-  deeper ordinary dir is not remounted. `check_dest` still dest-denies
-  hardlink siblings when the host calls it. In-child open of a planted
-  `/tmp/proj/sub/leaked` is the same class as post-create.
+- Extra-root `/tmp` remounts every hardlink. `/tmp` is one dest-deny
+  name level. A hardlink under a deeper ordinary dir is not remounted.
+  `check_dest` still dest-denies hardlink siblings when the host calls
+  it. In-child open of a planted `/tmp/proj/sub/leaked` is the same
+  class as post-create.
 - Windows WFP ran. Win32 5 is `WfpSkipped`. AppContainer is still on.
-- Renaming the dest-deny parent unmasks nothing. Parent-rename is out
-  of scope. Leaf `mv .env leaked` is a macOS last-match contract.
-- The child inherits `TMPDIR`. Those names are scrubbed.
-- Windows `Stdio::piped` on `run_child` is a host-readable pipe. Use
-  `run_child_output`.
-- Linux `PR_SET_DUMPABLE=0` in `pre_exec` lasts until `execve`. A
+- Renaming the dest-deny parent is in scope. Parent-rename is out of
+  scope. Leaf `mv .env leaked` is a macOS last-match contract.
+- Windows `Stdio::piped` on `run_child` captures stdout for the host.
+  It is a host-readable pipe. Use `run_child_output`.
+- Linux `PR_SET_DUMPABLE=0` in `pre_exec` lasts after `execve`. A
   readable program starts dumpable again. `RLIMIT_CORE=0` survives.
+
+## Promises
+
+- Argv dest-deny includes attached `--flag=.env` and GNU glued shorts
+  (`-a.env`, clustered `-la.env`).
+- Wrapper skip is `timeout`, `nohup`, `nice`, `time`, and `stdbuf`.
+- The child environment removes `TMPDIR`, `TEMP`, and `TMP`. The child
+  uses the platform default temp directory.
 
 ## Hosts
 
@@ -62,4 +68,4 @@ Match `KernelError`, `DestDenyError`, `CheckDestError`, and
 
 New variants are breaking for exhaustive matches even in 0.x.
 
-crates.io stays unpublished until a human says launch.
+0.6.0 is on crates.io; later publishes still wait on a release PR.

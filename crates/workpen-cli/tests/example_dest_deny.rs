@@ -37,7 +37,11 @@ fn dest_deny_example_blocks_secret_and_hardlink() {
         "must cat notes.md or skip Linux remount: stdout={stdout} stderr={stderr}"
     );
     assert!(
-        !stdout.contains("SECRET=1"),
-        "must not leak SECRET: {stdout}"
+        stdout.contains("run refused .env"),
+        "must run-refuse .env: {stdout}"
+    );
+    assert!(
+        !stdout.contains("SECRET=1") && !stderr.contains("SECRET=1"),
+        "must not leak SECRET: stdout={stdout} stderr={stderr}"
     );
 }
