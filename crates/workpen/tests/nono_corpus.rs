@@ -2289,7 +2289,8 @@ fn scrub_child_command_removes_denied_names() {
     let mut cmd = Command::new("true");
     cmd.env("XAI_API_KEY", "secret")
         .env("LD_PRELOAD", "evil.so")
-        .env("BASH_ENV", "/tmp/evil.sh");
+        .env("BASH_ENV", "/tmp/evil.sh")
+        .env("PYTHONSTARTUP", "/tmp/evil.py");
     scrub_child_command(&mut cmd);
     let value_of = |name: &str| {
         cmd.get_envs()
@@ -2301,7 +2302,7 @@ fn scrub_child_command_removes_denied_names() {
         Some(Some("secret".to_string())),
         "an explicit token opt-in must stay"
     );
-    for name in ["LD_PRELOAD", "BASH_ENV"] {
+    for name in ["LD_PRELOAD", "BASH_ENV", "PYTHONSTARTUP"] {
         assert_eq!(
             value_of(name),
             Some(None),
@@ -2320,8 +2321,13 @@ fn child_env_deny_names_include_loader_and_keys() {
         "BASH_ENV",
         "ENV",
         "NODE_OPTIONS",
+        "NODE_PATH",
         "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
         "PERL5OPT",
+        "RUBYOPT",
+        "LD_LIBRARY_PATH",
         "XAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",

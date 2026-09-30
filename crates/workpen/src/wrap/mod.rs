@@ -1145,8 +1145,13 @@ pub fn child_env_deny_names() -> &'static [&'static str] {
         "BASH_ENV",
         "ENV",
         "NODE_OPTIONS",
+        "NODE_PATH",
         "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
         "PERL5OPT",
+        "RUBYOPT",
+        "LD_LIBRARY_PATH",
         "XAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
@@ -1202,8 +1207,13 @@ pub(crate) fn is_child_env_loader(name: &OsStr) -> bool {
         "BASH_ENV",
         "ENV",
         "NODE_OPTIONS",
+        "NODE_PATH",
         "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
         "PERL5OPT",
+        "RUBYOPT",
+        "LD_LIBRARY_PATH",
     ];
     LOADERS.iter().any(|n| raw.eq_ignore_ascii_case(n))
 }
