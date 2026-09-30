@@ -366,7 +366,7 @@ fn run_dest_denies_hardlink_inside_bash_uc_and_infix_redirect() {
 
 #[cfg(unix)]
 #[test]
-fn run_refuses_dev_null_special_file_before_spawn() {
+fn run_allows_dev_null() {
     let ws = TempDir::new().expect("workspace");
     let cwd = TempDir::new().expect("other cwd");
     if !std::path::Path::new("/dev/null").exists() {
@@ -379,18 +379,16 @@ fn run_refuses_dev_null_special_file_before_spawn() {
         .current_dir(cwd.path())
         .output()
         .expect("spawn workpen");
-    assert_eq!(
-        out.status.code(),
-        Some(3),
-        "run cat /dev/null must exit 3, stdout={} stderr={}",
+    assert!(
+        out.status.success(),
+        "cat /dev/null must run, stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let text = combined(&out);
-    let lower = text.to_ascii_lowercase();
     assert!(
-        lower.contains("special") || lower.contains("device") || lower.contains("refuse"),
-        "run must name the special-file dest deny: {text}"
+        out.stdout.is_empty(),
+        "cat /dev/null prints nothing: {}",
+        String::from_utf8_lossy(&out.stdout)
     );
 }
 

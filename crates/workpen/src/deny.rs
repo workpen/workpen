@@ -170,7 +170,15 @@ struct DestDenyHit {
 }
 
 fn classify_dest_hit(path: &Path, policy: &DenyPolicy) -> Option<DestDenyHit> {
-    if let Some(glob) = first_matching_deny_glob(policy.globs(), &path_as_glob(path)) {
+    classify_dest_hit_root(path, policy, None)
+}
+
+fn classify_dest_hit_root(
+    path: &Path,
+    policy: &DenyPolicy,
+    root: Option<&Path>,
+) -> Option<DestDenyHit> {
+    if let Some(glob) = first_matching_deny_glob_under(policy.globs(), &path_as_glob(path), root) {
         return Some(DestDenyHit {
             kind: DestDenyKind::DenyGlob,
             matched: Some(glob),
@@ -179,14 +187,15 @@ fn classify_dest_hit(path: &Path, policy: &DenyPolicy) -> Option<DestDenyHit> {
 
     let canon = std::fs::canonicalize(path).ok();
     if let Some(canon) = &canon
-        && let Some(glob) = first_matching_deny_glob(policy.globs(), &path_as_glob(canon))
+        && let Some(glob) =
+            first_matching_deny_glob_under(policy.globs(), &path_as_glob(canon), root)
     {
         return Some(DestDenyHit {
             kind: DestDenyKind::DenyGlob,
             matched: Some(glob),
         });
     }
-    match hardlink_sibling_hit(path, canon.as_deref(), policy) {
+    match hardlink_sibling_hit(path, canon.as_deref(), policy, root) {
         HardlinkHit::Denied { sibling } => Some(DestDenyHit {
             kind: DestDenyKind::HardlinkSibling,
             matched: sibling,
@@ -200,7 +209,16 @@ pub(crate) fn dest_deny_at(
     display: String,
     policy: &DenyPolicy,
 ) -> Option<DestDeny> {
-    classify_dest_hit(classified, policy).map(|hit| DestDeny {
+    dest_deny_at_root(classified, display, policy, None)
+}
+
+fn dest_deny_at_root(
+    classified: &Path,
+    display: String,
+    policy: &DenyPolicy,
+    root: Option<&Path>,
+) -> Option<DestDeny> {
+    classify_dest_hit_root(classified, policy, root).map(|hit| DestDeny {
         kind: hit.kind,
         path: classified.to_path_buf(),
         display,
@@ -244,11 +262,21 @@ pub fn check_dest(
     policy: &DenyPolicy,
     guard: Option<&PathGuard>,
 ) -> Result<PathBuf, CheckDestError> {
+    check_dest_rooted(path, policy, guard, None)
+}
+
+fn check_dest_rooted(
+    path: &str,
+    policy: &DenyPolicy,
+    guard: Option<&PathGuard>,
+    workspace: Option<&Path>,
+) -> Result<PathBuf, CheckDestError> {
     if path.contains('\0') {
         return Err(CheckDestError::Nul);
     }
     let raw = Path::new(path);
-    if let Some(deny) = dest_deny_at(raw, path.to_owned(), policy) {
+    let glob_root = workspace.or_else(|| guard.map(|g| g.canon_root()));
+    if let Some(deny) = dest_deny_at_root(raw, path.to_owned(), policy, glob_root) {
         return Err(CheckDestError::DestDeny(DestDenyError::Denied(deny)));
     }
 
@@ -271,7 +299,7 @@ pub fn check_dest(
         }
     };
 
-    if let Some(deny) = dest_deny_at(&resolved, path.to_owned(), policy) {
+    if let Some(deny) = dest_deny_at_root(&resolved, path.to_owned(), policy, glob_root) {
         return Err(CheckDestError::DestDeny(DestDenyError::Denied(deny)));
     }
     reject_special_file(&resolved)?;
@@ -310,6 +338,24 @@ fn directory_read_error(path: &Path) -> CheckDestError {
     }
 }
 
+/// The process null device, and only when it is still a character device.
+/// A symlink to a regular file is not this device.
+#[cfg(unix)]
+pub(crate) fn is_null_device(path: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_char_device() {
+        return false;
+    }
+    let Ok(null_meta) = std::fs::metadata("/dev/null") else {
+        return false;
+    };
+    null_meta.file_type().is_char_device() && meta.rdev() == null_meta.rdev()
+}
+
 fn reject_special_file(path: &Path) -> Result<(), CheckDestError> {
     #[cfg(unix)]
     {
@@ -328,6 +374,9 @@ fn reject_special_file(path: &Path) -> Result<(), CheckDestError> {
             None
         };
         if let Some(kind) = kind {
+            if kind == "device" && is_null_device(path) {
+                return Ok(());
+            }
             return Err(CheckDestError::SpecialFile {
                 path: path.display().to_string(),
                 kind,
@@ -540,11 +589,11 @@ pub fn check_command_argv(
         let token = token.as_ref();
         if !token.is_empty() && !token.starts_with('-') {
             let dest = dest_under_root(root, token);
-            check_dest(&dest.to_string_lossy(), policy, None)?;
+            check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
         }
         if let Some(value) = attached_flag_dest(token) {
             let dest = dest_under_root(root, value);
-            check_dest(&dest.to_string_lossy(), policy, None)?;
+            check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
         }
         if let Some(body) = shell_c_body(token, cmd.get(i + 1).map(|s| s.as_ref())) {
             check_command_dests(body, root, policy)?;
@@ -743,7 +792,8 @@ fn check_cmd_powershell_remaining_dests(
             {
                 refuse_powershell_stdin_dash(path)?;
                 let dest = dest_under_root(root, path);
-                return check_dest(&dest.to_string_lossy(), policy, None).map(|_| ());
+                return check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))
+                    .map(|_| ());
             }
             if let Some(body) =
                 powershell_command_body(token.as_ref(), rest.get(j + 1).map(|s| s.as_ref()))
@@ -1144,7 +1194,7 @@ fn check_env_named_operand(
 
 fn check_env_file_dest(path: &str, root: &Path, policy: &DenyPolicy) -> Result<(), CheckDestError> {
     let dest = dest_under_root(root, path);
-    check_dest(&dest.to_string_lossy(), policy, None).map(|_| ())
+    check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root)).map(|_| ())
 }
 
 /// Join extracted command dests under `root` and dest-deny each.
@@ -1167,14 +1217,14 @@ pub fn check_command_dests(
             }
             if let Some(value) = attached_flag_dest(peeled) {
                 let dest = dest_under_root(root, value);
-                check_dest(&dest.to_string_lossy(), policy, None)?;
+                check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
                 continue;
             }
             if peeled.starts_with('-') {
                 continue;
             }
             let dest = dest_under_root(root, peeled);
-            check_dest(&dest.to_string_lossy(), policy, None)?;
+            check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
         }
     }
     check_command_string_env_dests(command, root, policy)
@@ -1387,6 +1437,142 @@ pub fn path_is_denied_glob(globs: &[String], path: &str) -> bool {
 }
 
 fn first_matching_deny_glob(globs: &[String], path: &str) -> Option<String> {
+    first_matching_deny_glob_under(globs, path, None).filter(|g| g != "..")
+}
+
+/// Glob match for `path` relative to `root` when `root` is set.
+///
+/// Slash-globs are anchored at the workspace, after stripping either
+/// firmlink spelling (`/tmp` and `/private/tmp`). A `..` that leaves the
+/// root is denied. Single-segment globs (`*.pem`, `id_rsa`) also match
+/// the basename. `**/` globs still match paths outside the root.
+pub fn path_is_denied_under_root(globs: &[String], path: &str, root: &Path) -> bool {
+    first_matching_deny_glob_under(globs, path, Some(root)).is_some()
+}
+
+fn first_matching_deny_glob_under(
+    globs: &[String],
+    path: &str,
+    root: Option<&Path>,
+) -> Option<String> {
+    let Some(root) = root else {
+        return first_matching_deny_glob_unscoped(globs, path);
+    };
+    let had_dotdot = path.split(['/', '\\']).any(|seg| seg == "..");
+    let Some(collapsed) = lexical_absolute(path) else {
+        return Some("..".to_string());
+    };
+    let (match_path, outside) = match strip_workspace_root(&collapsed, root) {
+        Some(rel) => (rel, false),
+        None if had_dotdot => return Some("..".to_string()),
+        None => (collapsed, true),
+    };
+    let template = is_env_template_basename(&match_path);
+    let base = match_path.rsplit('/').next().unwrap_or(match_path.as_str());
+    globs
+        .iter()
+        .find(|g| {
+            if template && is_default_env_star_glob(g) {
+                return false;
+            }
+            let slashed = normalize_glob_text(g).contains('/');
+            if outside && slashed && !normalize_glob_text(g).starts_with("**/") {
+                return false;
+            }
+            if path_matches_deny_glob(g, &match_path) {
+                return true;
+            }
+            !slashed && path_matches_deny_glob(g, base)
+        })
+        .cloned()
+}
+
+/// Collapse `.` and `..`. `Err` is not used; `None` means `..` left the
+/// filesystem root.
+fn lexical_absolute(path: &str) -> Option<String> {
+    let norm = normalize_glob_text(path);
+    let absolute = norm.starts_with('/');
+    let mut segs = Vec::new();
+    for seg in norm.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            if segs.pop().is_none() && absolute {
+                return None;
+            }
+            continue;
+        }
+        segs.push(seg);
+    }
+    if absolute {
+        Some(format!("/{}", segs.join("/")))
+    } else {
+        Some(segs.join("/"))
+    }
+}
+
+fn strip_workspace_root(path: &str, root: &Path) -> Option<String> {
+    let path_segs = lexical_absolute(path)?;
+    for spelling in firmlink_spellings(root) {
+        let Some(root_s) = lexical_absolute(&path_as_glob(&spelling)) else {
+            continue;
+        };
+        if let Some(rel) = strip_prefix_path(&path_segs, &root_s) {
+            return Some(rel);
+        }
+    }
+    None
+}
+
+fn strip_prefix_path(path: &str, root: &str) -> Option<String> {
+    let path = path.trim_end_matches('/');
+    let root = root.trim_end_matches('/');
+    if path.eq_ignore_ascii_case(root) {
+        return Some(String::new());
+    }
+    let prefix = format!("{root}/");
+    if path.len() >= prefix.len() && path[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+        return Some(path[prefix.len()..].to_string());
+    }
+    None
+}
+
+fn firmlink_spellings(path: &Path) -> Vec<PathBuf> {
+    let mut out = vec![path.to_path_buf()];
+    if let Some(alias) = firmlink_alias_path(path)
+        && !out.iter().any(|p| p == &alias)
+    {
+        out.push(alias);
+    }
+    out
+}
+
+fn firmlink_alias_path(path: &Path) -> Option<PathBuf> {
+    let raw = path.to_str()?.replace('\\', "/");
+    const PAIRS: [(&str, &str); 3] = [
+        ("/tmp", "/private/tmp"),
+        ("/var", "/private/var"),
+        ("/etc", "/private/etc"),
+    ];
+    for (public, private) in PAIRS {
+        if raw == public || raw.starts_with(&format!("{public}/")) {
+            return Some(PathBuf::from(format!(
+                "{private}{}",
+                raw.strip_prefix(public).unwrap_or("")
+            )));
+        }
+        if raw == private || raw.starts_with(&format!("{private}/")) {
+            return Some(PathBuf::from(format!(
+                "{public}{}",
+                raw.strip_prefix(private).unwrap_or("")
+            )));
+        }
+    }
+    None
+}
+
+pub(crate) fn first_matching_deny_glob_unscoped(globs: &[String], path: &str) -> Option<String> {
     let template = is_env_template_basename(path);
     let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
     globs
@@ -1395,12 +1581,13 @@ fn first_matching_deny_glob(globs: &[String], path: &str) -> Option<String> {
             if template && is_default_env_star_glob(g) {
                 return false;
             }
-            path_matches_deny_glob(g, path) || path_matches_deny_glob(g, base)
+            let slashed = normalize_glob_text(g).contains('/');
+            path_matches_deny_glob(g, path) || (!slashed && path_matches_deny_glob(g, base))
         })
         .cloned()
 }
 
-fn is_default_env_star_glob(pattern: &str) -> bool {
+pub(crate) fn is_default_env_star_glob(pattern: &str) -> bool {
     normalize_glob_text(pattern) == "**/.env.*"
 }
 
@@ -1464,23 +1651,28 @@ enum HardlinkHit {
 
 fn hardlink_sibling_denied(path: &Path, canon: Option<&Path>, policy: &DenyPolicy) -> bool {
     matches!(
-        hardlink_sibling_hit(path, canon, policy),
+        hardlink_sibling_hit(path, canon, policy, None),
         HardlinkHit::Denied { .. }
     )
 }
 
-fn hardlink_sibling_hit(path: &Path, canon: Option<&Path>, policy: &DenyPolicy) -> HardlinkHit {
+fn hardlink_sibling_hit(
+    path: &Path,
+    canon: Option<&Path>,
+    policy: &DenyPolicy,
+    root: Option<&Path>,
+) -> HardlinkHit {
     #[cfg(unix)]
     {
-        hardlink_sibling_hit_unix(path, canon, policy)
+        hardlink_sibling_hit_unix(path, canon, policy, root)
     }
     #[cfg(windows)]
     {
-        hardlink_sibling_hit_windows(path, canon, policy)
+        hardlink_sibling_hit_windows(path, canon, policy, root)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (path, canon, policy);
+        let _ = (path, canon, policy, root);
         HardlinkHit::Allowed
     }
 }
@@ -1490,6 +1682,7 @@ fn hardlink_sibling_hit_unix(
     path: &Path,
     canon: Option<&Path>,
     policy: &DenyPolicy,
+    root: Option<&Path>,
 ) -> HardlinkHit {
     use std::os::unix::fs::MetadataExt;
 
@@ -1534,7 +1727,9 @@ fn hardlink_sibling_hit_unix(
             if sibling_meta.dev() != meta.dev() || sibling_meta.ino() != meta.ino() {
                 continue;
             }
-            if path_is_denied_glob(policy.globs(), &path_as_glob(&entry_path)) {
+            if first_matching_deny_glob_under(policy.globs(), &path_as_glob(&entry_path), root)
+                .is_some()
+            {
                 let sibling = entry_path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned());
@@ -1582,6 +1777,7 @@ fn hardlink_hit_from_win_names(
     names: &[std::ffi::OsString],
     nlink: u32,
     policy: &DenyPolicy,
+    root: Option<&Path>,
 ) -> HardlinkHit {
     if names.len() < nlink as usize {
         return HardlinkHit::Denied { sibling: None };
@@ -1591,7 +1787,7 @@ fn hardlink_hit_from_win_names(
     }
     for n in names {
         let s = n.to_string_lossy().replace('\\', "/");
-        if path_is_denied_glob(policy.globs(), &s) {
+        if first_matching_deny_glob_under(policy.globs(), &s, root).is_some() {
             let sibling = Path::new(&s)
                 .file_name()
                 .map(|base| base.to_string_lossy().into_owned());
@@ -1608,6 +1804,7 @@ fn hardlink_sibling_hit_windows(
     path: &Path,
     canon: Option<&Path>,
     policy: &DenyPolicy,
+    root: Option<&Path>,
 ) -> HardlinkHit {
     let probe = canon.unwrap_or(path);
     let meta = match std::fs::metadata(probe) {
@@ -1625,7 +1822,7 @@ fn hardlink_sibling_hit_windows(
         Err(_) => return HardlinkHit::Denied { sibling: None },
     };
     match win_hardlink_names(probe) {
-        Ok(names) => hardlink_hit_from_win_names(&names, nlink, policy),
+        Ok(names) => hardlink_hit_from_win_names(&names, nlink, policy, root),
         Err(_) => HardlinkHit::Denied { sibling: None },
     }
 }
@@ -2054,7 +2251,7 @@ mod classify_hardlink_tests {
     fn win_names_shorter_than_nlink_is_hardlink_sibling() {
         let policy = DenyPolicy::default();
         let names = [std::ffi::OsString::from(r"C:\ws\notes.txt")];
-        match hardlink_hit_from_win_names(&names, 2, &policy) {
+        match hardlink_hit_from_win_names(&names, 2, &policy, None) {
             HardlinkHit::Denied { sibling: None } => {}
             other => panic!("incomplete name list must deny, got {other:?}"),
         }
@@ -2064,7 +2261,7 @@ mod classify_hardlink_tests {
     fn win_names_matching_nlink_without_deny_glob_is_allowed() {
         let policy = DenyPolicy::default();
         let names = [std::ffi::OsString::from(r"C:\ws\notes.txt")];
-        match hardlink_hit_from_win_names(&names, 1, &policy) {
+        match hardlink_hit_from_win_names(&names, 1, &policy, None) {
             HardlinkHit::Allowed => {}
             other => panic!("single name and nlink 1 must allow, got {other:?}"),
         }
@@ -2072,7 +2269,7 @@ mod classify_hardlink_tests {
             std::ffi::OsString::from(r"C:\ws\a.txt"),
             std::ffi::OsString::from(r"C:\ws\b.txt"),
         ];
-        match hardlink_hit_from_win_names(&two, 2, &policy) {
+        match hardlink_hit_from_win_names(&two, 2, &policy, None) {
             HardlinkHit::Allowed => {}
             other => panic!("listed names with no deny glob must allow, got {other:?}"),
         }
@@ -2085,7 +2282,7 @@ mod classify_hardlink_tests {
             std::ffi::OsString::from(r"C:\ws\.env"),
             std::ffi::OsString::from(r"C:\ws\notes.txt"),
         ];
-        match hardlink_hit_from_win_names(&names, 2, &policy) {
+        match hardlink_hit_from_win_names(&names, 2, &policy, None) {
             HardlinkHit::Denied {
                 sibling: Some(name),
             } => assert_eq!(name, ".env"),

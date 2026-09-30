@@ -1144,6 +1144,14 @@ fn existing_system_dirs_are_read() {
         if grant.path == workspace || grant.path == presented {
             continue;
         }
+        if grant.path == Path::new("/dev/null") {
+            assert_eq!(
+                grant.access,
+                KernelAccess::ReadWrite,
+                "/dev/null is the one read-write device file"
+            );
+            continue;
+        }
         assert_eq!(
             grant.access,
             KernelAccess::Read,

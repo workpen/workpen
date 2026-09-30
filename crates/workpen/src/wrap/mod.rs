@@ -364,6 +364,9 @@ pub fn process_jail_with_policy(
             DEST_DENY_WALK_LIMIT,
         )?;
     }
+    if let Some(null_dev) = null_device_grant() {
+        push_grant(&mut grants, null_dev, KernelAccess::ReadWrite);
+    }
     Ok(KernelPolicy {
         grants,
         dest_denies,
@@ -371,6 +374,20 @@ pub fn process_jail_with_policy(
         network_blocked: true,
         require_dest_hide: false,
     })
+}
+
+/// Read-write on the null device file only, when that path is still a
+/// character device. Missing path and a symlink to a regular file get
+/// no grant. `/dev` itself stays a read grant.
+fn null_device_grant() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        let path = PathBuf::from("/dev/null");
+        if crate::deny::is_null_device(&path) {
+            return Some(path);
+        }
+    }
+    None
 }
 
 impl KernelPolicy {
@@ -978,9 +995,12 @@ impl KernelPolicy {
                 KernelAccess::Read => nono::AccessMode::Read,
                 KernelAccess::ReadWrite => nono::AccessMode::ReadWrite,
             };
-            caps = caps
-                .allow_path(&grant.path, mode)
-                .map_err(|e| KernelError::Apply(e.to_string()))?;
+            caps = if grant.path.is_dir() {
+                caps.allow_path(&grant.path, mode)
+            } else {
+                caps.allow_file(&grant.path, mode)
+            }
+            .map_err(|e| KernelError::Apply(e.to_string()))?;
         }
         #[cfg(target_os = "macos")]
         {
@@ -1405,7 +1425,7 @@ pub fn require_dest_hide(applied: KernelApply) -> Result<KernelApply, KernelErro
     match applied {
         KernelApply::Applied | KernelApply::WfpSkipped => Ok(applied),
         KernelApply::RemountSkipped => Err(KernelError::Apply(
-            "dest-deny remount unavailable; child was not started".into(),
+            "dest-deny remount unavailable (unshare, user-namespace id map, or private remount of /); child was not started".into(),
         )),
         KernelApply::UserspaceOnly => Err(KernelError::Apply(
             "kernel jail did not apply; child was not started".into(),
@@ -1802,6 +1822,12 @@ fn add_macos_post_create_rules(
         // One filter only. Combined (subpath)(regex) denied the whole tree.
         let mut regexes = macos_post_create_env_regexes(&prefix);
         for glob in globs {
+            // Default `**/.env.*` is replaced by the template-aware segment
+            // regexes. Any other glob, including a custom dotenv pattern,
+            // still becomes a Seatbelt regex.
+            if crate::deny::is_default_env_star_glob(glob) {
+                continue;
+            }
             if let Some(re) = crate::dest_deny_glob_regex(&prefix, glob) {
                 regexes.push(re);
             }
@@ -1866,12 +1892,64 @@ fn firmlink_alias(path: &Path) -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn macos_post_create_env_regexes(prefix: &str) -> Vec<String> {
+    let star = env_star_segment();
     vec![
         format!("^{prefix}/[.][Ee][Nn][Vv]$"),
         format!("^{prefix}/.*/[.][Ee][Nn][Vv]$"),
-        format!("^{prefix}/[.][Ee][Nn][Vv][.].*$"),
-        format!("^{prefix}/.*/[.][Ee][Nn][Vv][.].*$"),
+        format!("^{prefix}/{star}$"),
+        format!("^{prefix}/.*/{star}$"),
     ]
+}
+
+/// One path segment: `.env` or `.env.<tail>` where the tail's last
+/// dot-segment is not exactly `example`, `sample`, or `template`.
+#[cfg(target_os = "macos")]
+fn env_star_segment() -> String {
+    let last = format!(
+        "({one}|{two}|{three}|{four}|{five}|{sample}|{example}|{template}|{nine})",
+        one = "[^.]",
+        two = "[^.][^.]?",
+        three = "[^.][^.][^.]?",
+        four = "[^.][^.][^.][^.]?",
+        five = "[^.][^.][^.][^.][^.]?",
+        sample = not_exact_segment("sample"),
+        example = not_exact_segment("example"),
+        template = not_exact_segment("template"),
+        nine = "[^.][^.][^.][^.][^.][^.][^.][^.][^.][^.]*",
+    );
+    format!(
+        "[.][Ee][Nn][Vv]([.]([^.]{plus}\\.)*{last_seg})?",
+        plus = "+",
+        last_seg = last
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn not_exact_segment(word: &str) -> String {
+    let mut alts = Vec::new();
+    let chars: Vec<char> = word.chars().collect();
+    for (i, ch) in chars.iter().enumerate() {
+        let mut part = String::new();
+        for prev in &chars[..i] {
+            part.push_str(&letter_class(*prev));
+        }
+        part.push_str(&neg_letter(*ch));
+        for _ in 0..(chars.len() - i - 1) {
+            part.push_str("[^.]");
+        }
+        alts.push(part);
+    }
+    format!("({})", alts.join("|"))
+}
+
+#[cfg(target_os = "macos")]
+fn letter_class(ch: char) -> String {
+    format!("[{}{}]", ch.to_ascii_uppercase(), ch.to_ascii_lowercase())
+}
+
+#[cfg(target_os = "macos")]
+fn neg_letter(ch: char) -> String {
+    format!("[^{}{}.]", ch.to_ascii_uppercase(), ch.to_ascii_lowercase())
 }
 
 #[cfg(target_os = "macos")]
@@ -2191,16 +2269,41 @@ mod combine_spawn_restore_tests {
     #[test]
     fn macos_post_create_env_regexes_match_dot_env_any_case() {
         let got = macos_post_create_env_regexes("/ws");
-        assert_eq!(
-            got,
-            [
-                "^/ws/[.][Ee][Nn][Vv]$",
-                "^/ws/.*/[.][Ee][Nn][Vv]$",
-                "^/ws/[.][Ee][Nn][Vv][.].*$",
-                "^/ws/.*/[.][Ee][Nn][Vv][.].*$",
-            ]
-            .map(str::to_string)
+        assert_eq!(got.len(), 4, "{got:?}");
+        assert!(got[0].contains("[.][Ee][Nn][Vv]$"), "{got:?}");
+        assert!(got[2].contains("[.][Ee][Nn][Vv]"), "{got:?}");
+        assert!(
+            !got[2].contains("[.].*$"),
+            "star regex must not be an open .env.* : {got:?}"
         );
+        assert_env_star_regex_skips_templates(&got[2]);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_env_star_regex_skips_templates(star_anchored: &str) {
+        let mut re = unsafe { std::mem::zeroed::<libc::regex_t>() };
+        let c = std::ffi::CString::new(star_anchored).expect("regex");
+        let rc =
+            unsafe { libc::regcomp(&mut re, c.as_ptr(), libc::REG_EXTENDED | libc::REG_NOSUB) };
+        assert_eq!(rc, 0, "seatbelt env-star regex must compile");
+        let check = |name: &str, want: bool| {
+            let path = std::ffi::CString::new(format!("/ws/{name}")).expect("path");
+            let hit = unsafe { libc::regexec(&re, path.as_ptr(), 0, std::ptr::null_mut(), 0) } == 0;
+            assert_eq!(
+                hit, want,
+                "{name} match={hit} want={want} re={star_anchored}"
+            );
+        };
+        check(".env.local", true);
+        check(".env.production", true);
+        check(".ENV.LOCAL", true);
+        check(".env.example", false);
+        check(".env.EXAMPLE", false);
+        check(".env.sample", false);
+        check(".env.template", false);
+        check(".env.local.example", false);
+        check("readme.md", false);
+        unsafe { libc::regfree(&mut re) };
     }
 
     #[test]
@@ -2249,9 +2352,15 @@ mod combine_spawn_restore_tests {
                     "error must name remount: {msg}"
                 );
                 assert!(
-                    msg.contains("not started"),
+                    msg.contains("child was not started"),
                     "error must say child was not started: {msg}"
                 );
+                for phrase in ["unshare", "user-namespace id map", "private remount of /"] {
+                    assert!(
+                        msg.contains(phrase),
+                        "remount refusal must name {phrase}: {msg}"
+                    );
+                }
             }
             other => panic!("expected Apply, got {other}"),
         }
