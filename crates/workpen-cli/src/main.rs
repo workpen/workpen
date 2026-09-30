@@ -6,9 +6,9 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime};
 
 use workpen::{
-    CheckDestError, DenyPolicy, ExtraRootError, GcConfig, GcDecision, KernelError, PathGuard,
-    PathGuardError, check_command_argv, dest_under_root, parse_max_age, resolve_extra_root_pair,
-    resolve_workspace_root, run_gc_with_policy,
+    CheckDestError, DenyPolicy, DestDenyError, ExtraRootError, GcConfig, GcDecision, KernelError,
+    PathGuard, PathGuardError, check_command_argv, dest_under_root, parse_max_age,
+    resolve_extra_root_pair, resolve_workspace_root, run_gc_with_policy,
 };
 
 fn main() -> ExitCode {
@@ -22,10 +22,12 @@ fn main() -> ExitCode {
 }
 
 const TOP_USAGE: &str = "\
-usage: workpen [--version] [--help] <why|run|gc> ...
+usage: workpen [--version] [--help] <why|run|policy|gc|init> ...
   why [--root DIR] [--extra-root DIR] PATH
-  run [--root DIR] [--extra-root DIR] [--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...
+  run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--policy] [--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...
+  policy [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--] [CMD...]
   gc  [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]
+  init [--root DIR]
 
 By default the child cannot use the network. It may read system paths and write inside the workspace. --extra-root is read-write, so a write outside the workspace needs that flag. Secret files are dest-denied before the child starts. / and $HOME are not roots.
 Exit status 0 is success. 1 is a why denial. 2 is usage or a setup failure. 3 is a policy refusal before the child starts. 124 is a timeout. 127 means the program was not found. The child status is passed through, including 2, 3, and 127.";
@@ -47,14 +49,71 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
     }
     match args[0].as_str() {
         "why" => cmd_why(&args[1..]),
-        "run" => cmd_run(&args[1..]),
+        "run" => cmd_run(&args[1..], false),
+        "policy" => cmd_run(&args[1..], true),
         "gc" => cmd_gc(&args[1..]),
-        other => Err(format!("unknown command: {other} (use why, run, or gc)")),
+        "init" => cmd_init(&args[1..]),
+        other => Err(format!(
+            "unknown command: {other} (use why, run, policy, gc, or init)"
+        )),
     }
+}
+
+const INIT_USAGE: &str = "usage: workpen init [--root DIR]";
+
+const AGENT_LOCK_TEMPLATE: &str = "\
+# extra dest-deny globs, one per line
+# A line that starts with # is a comment. Blank lines are skipped.
+# secrets/**
+";
+
+fn cmd_init(args: &[String]) -> Result<ExitCode, String> {
+    let (root, extras, rest) = parse_roots(args)?;
+    if wants_help(&rest) {
+        println!("{INIT_USAGE}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !extras.is_empty() {
+        return Err(format!("init does not take --extra-root ({INIT_USAGE})"));
+    }
+    if let Some(flag) = rest.first() {
+        return Err(format!("unknown argument: {flag} ({INIT_USAGE})"));
+    }
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root = match resolve_workspace_root(&cwd, &root.to_string_lossy()) {
+        Ok(root) => root,
+        Err(err @ PathGuardError::Home(_)) => return refuse(err),
+        Err(err) => return Err(err.to_string()),
+    };
+    if root
+        .components()
+        .all(|component| matches!(component, std::path::Component::RootDir))
+    {
+        return refuse(format!(
+            "refused filesystem root {}; use a subdirectory, not `/`",
+            root.display()
+        ));
+    }
+    let path = root.join(workpen::AGENT_LOCK_NAME);
+    if path.exists() {
+        return Err(format!(
+            "agent.lock already exists at {}; init does not change it",
+            path.display()
+        ));
+    }
+    std::fs::write(&path, AGENT_LOCK_TEMPLATE).map_err(|e| e.to_string())?;
+    println!("wrote {}", path.display());
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
+    let json = rest.iter().any(|token| token == "--json");
+    let rest: Vec<String> = rest
+        .iter()
+        .filter(|token| token.as_str() != "--json")
+        .cloned()
+        .collect();
     if wants_help(&rest) {
         println!("{WHY_USAGE}");
         return Ok(ExitCode::SUCCESS);
@@ -76,31 +135,32 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     let policy = DenyPolicy::from_workspace(&root).map_err(|e| e.to_string())?;
     match workpen::check_dest(&dest.to_string_lossy(), &policy, Some(&guard)) {
         Ok(resolved) => {
-            println!("allowed {}", resolved.display());
+            if json {
+                let shown = resolved.display().to_string();
+                println!("{}", json_line("allowed", 0, Some(&shown), None, None));
+            } else {
+                println!("allowed {}", resolved.display());
+            }
             Ok(ExitCode::SUCCESS)
         }
-        Err(CheckDestError::DestDeny(e)) => {
-            println!("{e}");
-            Ok(ExitCode::from(1))
+        Err(err @ CheckDestError::DestDeny(_)) | Err(err @ CheckDestError::PathGuard(_)) => {
+            check_dest_status(json, 1, &err)
         }
-        Err(CheckDestError::PathGuard(e)) => {
-            println!("{e}");
-            Ok(ExitCode::from(1))
-        }
+        Err(err @ CheckDestError::SpecialFile { .. }) => check_dest_status(json, 1, &err),
         Err(e) => Err(e.to_string()),
     }
 }
 
 const RUN_USAGE: &str = "\
-usage: workpen run [--root DIR] [--extra-root DIR] [--timeout DUR] [--tty] \
-[--env NAME[=VALUE]] [--env-clear] [--] CMD...";
+usage: workpen run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--policy] [--json] \
+[--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...";
 
 const RUN_HELP: &str = "\
-usage: workpen run [--root DIR] [--extra-root DIR] [--timeout DUR] [--tty] \
-[--env NAME[=VALUE]] [--env-clear] [--] CMD...
-The network is blocked. --extra-root is read-write. Dest-deny runs before the child starts, and on Linux the child is not started when secret names cannot be hidden. Exit 124 means the timeout fired. --env opts a name back in. --env-clear drops inherited names except PATH, then applies every --env. Loaders such as LD_PRELOAD stay removed.";
+usage: workpen run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--policy] [--json] \
+[--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...
+The network is blocked unless --net is set. --extra-root and --write are read-write. --read is read-only. Dest-deny runs before the child starts, and on Linux the child is not started when secret names cannot be hidden. --policy prints the jail and does not start the child. Exit 124 means the timeout fired. --env opts a name back in. --env-clear drops inherited names except PATH, then applies every --env. Loaders such as LD_PRELOAD stay removed.";
 
-fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
+fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
     if wants_help(&rest) {
         println!("{RUN_HELP}");
@@ -111,6 +171,11 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let tty = flags.tty;
     let env_clear = flags.env_clear;
     let env_sets = flags.env;
+    let report = force_report || flags.report;
+    let allow_net = flags.allow_net;
+    let json = flags.json;
+    let read_roots = flags.read;
+    let write_roots = flags.write;
     let rest = flags.rest;
     let saw_dashdash = rest.first().map(String::as_str) == Some("--");
     let cmd_preview: &[String] = if saw_dashdash { &rest[1..] } else { rest };
@@ -127,17 +192,35 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         Err(err @ PathGuardError::Home(_)) => return refuse(err),
         Err(err) => return Err(err.to_string()),
     };
-    let (extras, presented) = match resolve_extras(&cwd, &extras) {
+    let (mut extras, mut presented) = match resolve_extras(&cwd, &extras) {
         Ok(pair) => pair,
         Err(err @ ExtraRootError::Home(_)) => return refuse(err),
         Err(err) => return Err(err.to_string()),
     };
+    for write in &write_roots {
+        match resolve_extra_root_pair(&cwd, &write.to_string_lossy()) {
+            Ok((shown, canon)) => {
+                presented.push(shown);
+                extras.push(canon);
+            }
+            Err(err @ ExtraRootError::Home(_)) => return refuse_mapped(json, 3, &err),
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+    let mut read_canon = Vec::new();
+    for read in &read_roots {
+        match resolve_extra_root_pair(&cwd, &read.to_string_lossy()) {
+            Ok((_shown, canon)) => read_canon.push(canon),
+            Err(err @ ExtraRootError::Home(_)) => return refuse_mapped(json, 3, &err),
+            Err(err) => return Err(err.to_string()),
+        }
+    }
     let cmd = if rest.first().map(String::as_str) == Some("--") {
         &rest[1..]
     } else {
         rest
     };
-    if cmd.is_empty() {
+    if cmd.is_empty() && !report {
         return Err(RUN_USAGE.into());
     }
     let policy = DenyPolicy::from_workspace(&root).map_err(|e| e.to_string())?;
@@ -146,16 +229,34 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         Err(err @ PathGuardError::Home(_)) => return refuse(err),
         Err(err) => return Err(err.to_string()),
     };
-    if let Err(err) = check_command_argv(cmd, guard.canon_root(), &policy) {
-        return refuse(err);
-    }
-    let jail = match workpen::process_jail(guard.canon_root(), &presented) {
-        Ok(policy) => policy.with_require_dest_hide(),
+    let mut jail = match workpen::process_jail(guard.canon_root(), &presented) {
+        Ok(policy) => policy.with_require_dest_hide().with_network(!allow_net),
         Err(err @ KernelError::Home(_))
         | Err(err @ KernelError::FsRoot(_))
         | Err(err @ KernelError::DestDeny(_)) => return refuse(err),
         Err(err) => return Err(err.to_string()),
     };
+    for read in &read_canon {
+        jail = match jail.with_read_root(read) {
+            Ok(jail) => jail,
+            Err(err @ KernelError::Home(_))
+            | Err(err @ KernelError::FsRoot(_))
+            | Err(err @ KernelError::DestDeny(_)) => return refuse(err),
+            Err(err) => return Err(err.to_string()),
+        };
+    }
+    if report {
+        print_policy(&jail, &policy);
+        if !cmd.is_empty()
+            && let Err(err) = check_command_argv(cmd, guard.canon_root(), &policy)
+        {
+            println!("would-deny: {err}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Err(err) = check_command_argv(cmd, guard.canon_root(), &policy) {
+        return check_dest_status(json, 3, &err);
+    }
     let resolved = match resolve_child_program(&cmd[0], guard.canon_root()) {
         Ok(path) => path,
         Err(()) => {
@@ -220,6 +321,11 @@ struct RunFlags<'a> {
     tty: bool,
     env_clear: bool,
     env: Vec<(String, String)>,
+    report: bool,
+    allow_net: bool,
+    json: bool,
+    read: Vec<PathBuf>,
+    write: Vec<PathBuf>,
     rest: &'a [String],
 }
 
@@ -228,6 +334,11 @@ fn peel_run_flags(rest: &[String]) -> Result<RunFlags<'_>, String> {
     let mut tty = false;
     let mut env_clear = false;
     let mut env_sets = Vec::new();
+    let mut report = false;
+    let mut allow_net = false;
+    let mut json = false;
+    let mut read = Vec::new();
+    let mut write = Vec::new();
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -249,6 +360,26 @@ fn peel_run_flags(rest: &[String]) -> Result<RunFlags<'_>, String> {
                 env_sets.push(parse_env_set(raw)?);
                 i += 2;
             }
+            "--policy" => {
+                report = true;
+                i += 1;
+            }
+            "--net" => {
+                allow_net = true;
+                i += 1;
+            }
+            "--json" => {
+                json = true;
+                i += 1;
+            }
+            "--read" => {
+                read.push(PathBuf::from(flag_value(rest, i, "--read")?));
+                i += 2;
+            }
+            "--write" => {
+                write.push(PathBuf::from(flag_value(rest, i, "--write")?));
+                i += 2;
+            }
             _ => break,
         }
     }
@@ -257,8 +388,32 @@ fn peel_run_flags(rest: &[String]) -> Result<RunFlags<'_>, String> {
         tty,
         env_clear,
         env: env_sets,
+        report,
+        allow_net,
+        json,
+        read,
+        write,
         rest: &rest[i..],
     })
+}
+
+fn print_policy(jail: &workpen::KernelPolicy, policy: &DenyPolicy) {
+    for grant in jail.grants() {
+        let access = match grant.access {
+            workpen::KernelAccess::ReadWrite => "read-write",
+            workpen::KernelAccess::Read => "read",
+        };
+        println!("{access}: {}", grant.path.display());
+    }
+    let network = if jail.network_blocked() {
+        "blocked"
+    } else {
+        "allowed"
+    };
+    println!("network: {network}");
+    for glob in policy.globs() {
+        println!("deny: {glob}");
+    }
 }
 
 fn parse_env_set(raw: &str) -> Result<(String, String), String> {
@@ -377,6 +532,100 @@ fn refuse(err: impl std::fmt::Display) -> Result<ExitCode, String> {
     Ok(ExitCode::from(3))
 }
 
+fn refuse_mapped(json: bool, code: u8, err: &dyn std::fmt::Display) -> Result<ExitCode, String> {
+    if json {
+        println!(
+            "{}",
+            json_line("denied", code, None, None, Some("path_guard"))
+        );
+        return Ok(ExitCode::from(code));
+    }
+    eprintln!("{err}");
+    Ok(ExitCode::from(code))
+}
+
+fn check_dest_status(json: bool, code: u8, err: &CheckDestError) -> Result<ExitCode, String> {
+    if json {
+        println!("{}", check_dest_json(code, err));
+        return Ok(ExitCode::from(code));
+    }
+    if code == 1 {
+        println!("{err}");
+        Ok(ExitCode::from(1))
+    } else {
+        eprintln!("{err}");
+        Ok(ExitCode::from(code))
+    }
+}
+
+fn check_dest_json(code: u8, err: &CheckDestError) -> String {
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(deny)) => {
+            let kind = match deny.kind {
+                workpen::DestDenyKind::DenyGlob => "deny_glob",
+                workpen::DestDenyKind::HardlinkSibling => "hardlink_sibling",
+            };
+            json_line(
+                "denied",
+                code,
+                Some(&deny.display),
+                deny.matched.as_deref(),
+                Some(kind),
+            )
+        }
+        CheckDestError::PathGuard(PathGuardError::Home(path)) => {
+            let shown = path.display().to_string();
+            json_line("denied", code, Some(&shown), None, Some("path_guard"))
+        }
+        CheckDestError::SpecialFile { path, kind } => {
+            json_line("denied", code, Some(path), Some(kind), Some("special_file"))
+        }
+        CheckDestError::DestDeny(_) | CheckDestError::PathGuard(_) => {
+            json_line("denied", code, None, None, Some("path_guard"))
+        }
+        CheckDestError::Nul | CheckDestError::Directory { .. } | CheckDestError::Io(_) => {
+            json_line("denied", code, None, None, None)
+        }
+    }
+}
+
+fn json_line(
+    result: &str,
+    code: u8,
+    path: Option<&str>,
+    matched: Option<&str>,
+    kind: Option<&str>,
+) -> String {
+    format!(
+        "{{\"result\":{},\"exit\":{code},\"path\":{},\"matched\":{},\"kind\":{}}}",
+        json_string(result),
+        json_opt(path),
+        json_opt(matched),
+        json_opt(kind),
+    )
+}
+
+fn json_opt(value: Option<&str>) -> String {
+    value.map(json_string).unwrap_or_else(|| "null".to_string())
+}
+
+fn json_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// `--version` / `-V` in the program slot is Workpen's version.
 /// A token after the program, or after `--`, belongs to the child.
 fn version_flag_before_child(cmd: &[String]) -> bool {
@@ -394,6 +643,20 @@ fn program_outside_roots(program: &Path, root: &Path, extras: &[PathBuf]) -> boo
     bases.push(std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
     for extra in extras {
         bases.push(std::fs::canonicalize(extra).unwrap_or_else(|_| extra.clone()));
+    }
+    // System programs such as /bin/cat are readable grants, not extra roots.
+    for dir in [
+        "/usr",
+        "/bin",
+        "/lib",
+        "/lib64",
+        "/sbin",
+        "/System",
+        "/Library",
+        "/opt/homebrew",
+        "/usr/local",
+    ] {
+        bases.push(PathBuf::from(dir));
     }
     !bases.iter().any(|base| canon.starts_with(base))
 }
