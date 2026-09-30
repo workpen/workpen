@@ -111,6 +111,30 @@ fn why_honors_workspace_agent_lock_extra_glob() {
 }
 
 #[test]
+fn why_denies_a_file_inside_a_denied_directory() {
+    let ws = tempfile::TempDir::new().expect("workspace");
+    let dir = ws.path().join("nested/.env");
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(dir.join("token"), "x\n").expect("token");
+    let deny = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["why", "--root"])
+        .arg(ws.path())
+        .arg("nested/.env/token")
+        .output()
+        .expect("spawn workpen");
+    let stdout = String::from_utf8_lossy(&deny.stdout);
+    let stderr = String::from_utf8_lossy(&deny.stderr);
+    assert!(
+        !deny.status.success(),
+        "why nested/.env/token must deny, stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stdout.to_ascii_lowercase().contains("allowed"),
+        "why must not allow a file inside .env: {stdout}"
+    );
+}
+
+#[test]
 fn why_honors_agent_lock_with_utf8_bom() {
     let ws = tempfile::TempDir::new().expect("workspace");
     std::fs::write(ws.path().join("agent.lock"), b"\xef\xbb\xbf**/*.secret\n").expect("lock");

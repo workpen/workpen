@@ -173,6 +173,50 @@ fn classify_dest_hit(path: &Path, policy: &DenyPolicy) -> Option<DestDenyHit> {
     classify_dest_hit_root(path, policy, None)
 }
 
+/// A directory named `.env` is denied as that directory. Seatbelt then
+/// applies the deny to everything inside it. Match those children here
+/// so `why` does not call them allowed. Stop at the workspace root so a
+/// parent directory outside the workspace cannot deny the whole tree.
+fn ancestor_deny_glob(path: &Path, policy: &DenyPolicy, root: Option<&Path>) -> Option<String> {
+    let mut cursor = path.parent();
+    while let Some(dir) = cursor {
+        if dir.as_os_str().is_empty() {
+            break;
+        }
+        if dir.is_absolute()
+            && let Some(root) = root
+            && !ancestor_inside_workspace(dir, root)
+        {
+            break;
+        }
+        if let Some(glob) = first_matching_deny_glob_under(policy.globs(), &path_as_glob(dir), root)
+        {
+            return Some(glob);
+        }
+        let next = dir.parent();
+        if next == Some(dir) {
+            break;
+        }
+        cursor = next;
+    }
+    None
+}
+
+fn ancestor_inside_workspace(dir: &Path, root: &Path) -> bool {
+    let dir_s = path_as_glob(dir);
+    for spelling in firmlink_spellings(root) {
+        let root_s = path_as_glob(&spelling).trim_end_matches('/').to_string();
+        if root_s.is_empty() {
+            continue;
+        }
+        let prefix = format!("{root_s}/");
+        if dir_s.len() > prefix.len() && dir_s[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+            return true;
+        }
+    }
+    false
+}
+
 fn classify_dest_hit_root(
     path: &Path,
     policy: &DenyPolicy,
@@ -189,6 +233,20 @@ fn classify_dest_hit_root(
     if let Some(canon) = &canon
         && let Some(glob) =
             first_matching_deny_glob_under(policy.globs(), &path_as_glob(canon), root)
+    {
+        return Some(DestDenyHit {
+            kind: DestDenyKind::DenyGlob,
+            matched: Some(glob),
+        });
+    }
+    if let Some(glob) = ancestor_deny_glob(path, policy, root) {
+        return Some(DestDenyHit {
+            kind: DestDenyKind::DenyGlob,
+            matched: Some(glob),
+        });
+    }
+    if let Some(canon) = &canon
+        && let Some(glob) = ancestor_deny_glob(canon, policy, root)
     {
         return Some(DestDenyHit {
             kind: DestDenyKind::DenyGlob,
