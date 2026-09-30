@@ -253,6 +253,29 @@ fn run_equals_root_is_unknown_flag() {
 }
 
 #[test]
+fn run_and_policy_missing_value_names_that_flag() {
+    for cmd in ["run", "policy"] {
+        for flag in ["--read", "--write", "--env"] {
+            let out = workpen().args([cmd, flag]).output().expect("spawn");
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{cmd} {flag} must exit 2: {err}"
+            );
+            assert!(
+                err.contains(&format!("missing {flag} value")),
+                "{cmd} {flag} must name the flag: {err}"
+            );
+            assert!(
+                !err.contains("workpen gc"),
+                "{cmd} {flag} must not print gc usage: {err}"
+            );
+        }
+    }
+}
+
+#[test]
 fn run_timeout_missing_value_names_usage() {
     let out = workpen()
         .args(["run", "--timeout"])
