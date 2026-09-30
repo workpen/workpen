@@ -911,14 +911,14 @@ fn dry_run_does_not_refresh_last_used() {
 }
 
 #[test]
-fn registry_unreadable_is_error() {
+fn plain_directory_is_not_a_git_repository() {
     let dir = TempDir::new().expect("tmp");
     match run_gc(
         dir.path(),
         &GcConfig::new(dir.path(), Duration::from_secs(1)),
     ) {
-        Err(GcError::RegistryUnreadable(_)) => {}
-        other => panic!("expected RegistryUnreadable, got {other:?}"),
+        Err(GcError::NotARepo(_)) => {}
+        other => panic!("expected NotARepo, got {other:?}"),
     }
 }
 
