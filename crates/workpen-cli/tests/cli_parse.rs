@@ -812,6 +812,90 @@ fn existing_file_exec_failure_stays_kernel_wrap() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn run_env_scrubs_tokens_and_keeps_opt_in() {
+    let dir = TempDir::new().expect("workspace");
+    let inherited = workpen()
+        .env("GITHUB_TOKEN", "fixture")
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--", "/usr/bin/env"])
+        .output()
+        .expect("spawn");
+    let text = String::from_utf8_lossy(&inherited.stdout);
+    assert!(
+        inherited.status.success(),
+        "env must run, stderr={}",
+        String::from_utf8_lossy(&inherited.stderr)
+    );
+    assert!(
+        !text.contains("GITHUB_TOKEN") && !text.contains("fixture"),
+        "inherited token must be absent"
+    );
+
+    let argv = workpen()
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--", "/usr/bin/env", "GITHUB_TOKEN=fixture", "/usr/bin/env"])
+        .output()
+        .expect("spawn");
+    let text = String::from_utf8_lossy(&argv.stdout);
+    assert!(
+        !text.contains("fixture"),
+        "argv env assignment must be stripped"
+    );
+
+    let opted = workpen()
+        .env("GITHUB_TOKEN", "fixture")
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--env", "GITHUB_TOKEN", "--", "/usr/bin/env"])
+        .output()
+        .expect("spawn");
+    let text = String::from_utf8_lossy(&opted.stdout);
+    assert!(
+        text.contains("GITHUB_TOKEN=fixture"),
+        "opt-in must show the parent value"
+    );
+
+    let loader = workpen()
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--env", "LD_PRELOAD=/tmp/nope.so", "--", "/usr/bin/env"])
+        .output()
+        .expect("spawn");
+    let text = String::from_utf8_lossy(&loader.stdout);
+    assert!(!text.contains("LD_PRELOAD") && !text.contains("nope.so"));
+
+    let cleared = workpen()
+        .env("GITHUB_TOKEN", "fixture")
+        .args(["run", "--env", "FOO=bar", "--env-clear", "--root"])
+        .arg(dir.path())
+        .args(["--", "echo", "ok"])
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&cleared.stdout);
+    assert!(
+        cleared.status.success(),
+        "relative echo after --env-clear must run, stderr={}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    assert!(stdout.contains("ok"), "{stdout}");
+
+    let echo_flag = workpen()
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--", "/bin/echo", "--env"])
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&echo_flag.stdout);
+    assert!(
+        stdout.contains("--env") || stdout.contains("echo"),
+        "run -- /bin/echo --env is the child: {stdout}"
+    );
+}
+
 #[test]
 fn run_help_names_network_and_not_always_start() {
     let out = workpen().args(["run", "--help"]).output().expect("spawn");

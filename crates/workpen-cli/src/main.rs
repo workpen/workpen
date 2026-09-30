@@ -24,7 +24,7 @@ fn main() -> ExitCode {
 const TOP_USAGE: &str = "\
 usage: workpen [--version] [--help] <why|run|gc> ...
   why [--root DIR] [--extra-root DIR] PATH
-  run [--root DIR] [--extra-root DIR] [--timeout DUR] [--tty] [--] CMD...
+  run [--root DIR] [--extra-root DIR] [--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...
   gc  [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]
 
 By default the child cannot use the network. It may read system paths and write inside the workspace. --extra-root is read-write, so a write outside the workspace needs that flag. Secret files are dest-denied before the child starts. / and $HOME are not roots.
@@ -91,12 +91,14 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
-const RUN_USAGE: &str =
-    "usage: workpen run [--root DIR] [--extra-root DIR] [--timeout DUR] [--tty] [--] CMD...";
+const RUN_USAGE: &str = "\
+usage: workpen run [--root DIR] [--extra-root DIR] [--timeout DUR] [--tty] \
+[--env NAME[=VALUE]] [--env-clear] [--] CMD...";
 
 const RUN_HELP: &str = "\
-usage: workpen run [--root DIR] [--extra-root DIR] [--timeout DUR] [--tty] [--] CMD...
-The network is blocked. --extra-root is read-write. Dest-deny runs before the child starts, and on Linux the child is not started when secret names cannot be hidden. Exit 124 means the timeout fired.";
+usage: workpen run [--root DIR] [--extra-root DIR] [--timeout DUR] [--tty] \
+[--env NAME[=VALUE]] [--env-clear] [--] CMD...
+The network is blocked. --extra-root is read-write. Dest-deny runs before the child starts, and on Linux the child is not started when secret names cannot be hidden. Exit 124 means the timeout fired. --env opts a name back in. --env-clear drops inherited names except PATH, then applies every --env. Loaders such as LD_PRELOAD stay removed.";
 
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
@@ -104,7 +106,12 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         println!("{RUN_HELP}");
         return Ok(ExitCode::SUCCESS);
     }
-    let (timeout, tty, rest) = peel_run_flags(&rest)?;
+    let flags = peel_run_flags(&rest)?;
+    let timeout = flags.timeout;
+    let tty = flags.tty;
+    let env_clear = flags.env_clear;
+    let env_sets = flags.env;
+    let rest = flags.rest;
     let saw_dashdash = rest.first().map(String::as_str) == Some("--");
     let cmd_preview: &[String] = if saw_dashdash { &rest[1..] } else { rest };
     if !saw_dashdash && version_flag_before_child(cmd_preview) {
@@ -159,6 +166,7 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let (program, args) = workpen::with_bash_noprofile(&resolved, &cmd[1..]);
     let mut child = Command::new(program);
     child.args(args).current_dir(guard.canon_root());
+    apply_child_env(&mut child, env_clear, &env_sets);
     // Copy child pipes to this process as bytes arrive. A Vec of the whole
     // stream would grow without bound (`yes` under --timeout). Inherited
     // child stdout to a file outside --root is a Seatbelt/DACL dest write.
@@ -207,9 +215,19 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
-fn peel_run_flags(rest: &[String]) -> Result<(Option<Duration>, bool, &[String]), String> {
+struct RunFlags<'a> {
+    timeout: Option<Duration>,
+    tty: bool,
+    env_clear: bool,
+    env: Vec<(String, String)>,
+    rest: &'a [String],
+}
+
+fn peel_run_flags(rest: &[String]) -> Result<RunFlags<'_>, String> {
     let mut timeout = None;
     let mut tty = false;
+    let mut env_clear = false;
+    let mut env_sets = Vec::new();
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -222,10 +240,55 @@ fn peel_run_flags(rest: &[String]) -> Result<(Option<Duration>, bool, &[String])
                 tty = true;
                 i += 1;
             }
+            "--env-clear" => {
+                env_clear = true;
+                i += 1;
+            }
+            "--env" => {
+                let raw = flag_value(rest, i, "--env")?;
+                env_sets.push(parse_env_set(raw)?);
+                i += 2;
+            }
             _ => break,
         }
     }
-    Ok((timeout, tty, &rest[i..]))
+    Ok(RunFlags {
+        timeout,
+        tty,
+        env_clear,
+        env: env_sets,
+        rest: &rest[i..],
+    })
+}
+
+fn parse_env_set(raw: &str) -> Result<(String, String), String> {
+    if let Some((name, value)) = raw.split_once('=') {
+        if name.is_empty() {
+            return Err(format!("--env needs a name ({RUN_USAGE})"));
+        }
+        return Ok((name.to_string(), value.to_string()));
+    }
+    if raw.is_empty() {
+        return Err(format!("--env needs a name ({RUN_USAGE})"));
+    }
+    let value = std::env::var(raw).unwrap_or_default();
+    Ok((raw.to_string(), value))
+}
+
+fn apply_child_env(child: &mut Command, env_clear: bool, env_sets: &[(String, String)]) {
+    if env_clear {
+        child.env_clear();
+        if let Some(path) = std::env::var_os("PATH") {
+            child.env("PATH", path);
+        }
+        #[cfg(windows)]
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            child.env("SystemRoot", &root);
+        }
+    }
+    for (name, value) in env_sets {
+        child.env(name, value);
+    }
 }
 
 fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {

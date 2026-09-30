@@ -1379,13 +1379,19 @@ fn create_kill_job() -> Result<CloseOnDrop, KernelError> {
 
 fn environment_block(cmd: &Command) -> Vec<u16> {
     let mut pairs: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let mut explicit_keep = Vec::new();
     for (key, value) in cmd.get_envs() {
         pairs.retain(|(k, _)| !env_key_eq(k, key));
         if let Some(value) = value {
-            pairs.push((key.to_os_string(), value.to_os_string()));
+            if !super::is_child_env_loader(key) {
+                explicit_keep.push(key.to_os_string());
+                pairs.push((key.to_os_string(), value.to_os_string()));
+            }
         }
     }
-    pairs.retain(|(k, _)| !is_denied_child_env(k));
+    pairs.retain(|(k, _)| {
+        !is_denied_child_env(k) || explicit_keep.iter().any(|keep| env_key_eq(keep, k))
+    });
     let mut out = Vec::new();
     for (key, value) in pairs {
         out.extend(key.encode_wide());

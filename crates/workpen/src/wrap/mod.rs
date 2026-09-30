@@ -1061,19 +1061,77 @@ pub fn child_env_deny_names() -> &'static [&'static str] {
     ]
 }
 
-/// True when `name` is on the child-env denylist (ASCII case-insensitive).
+/// True when `name` must not be inherited by the child.
+///
+/// Exact denylist names, plus a final `_TOKEN` / `_SECRET` / `_PASSWORD`
+/// segment and a final `_API_KEY`. The underscore is required.
+/// `_KEY` alone is not enough: `CACHE_KEY` and `GIT_CONFIG_KEY_0` stay.
+/// A `_KEY` name that contains `_PUBLIC_` or `_ANON_`, or that ends with
+/// `_PUBLIC_KEY` or `_PUB_KEY`, stays. `_TOKEN` stays denied even then.
 #[must_use]
 pub fn is_denied_child_env(name: impl AsRef<OsStr>) -> bool {
     let raw = name.as_ref().to_string_lossy();
-    child_env_deny_names()
+    if raw.is_empty() {
+        return false;
+    }
+    if child_env_deny_names()
         .iter()
         .any(|n| raw.eq_ignore_ascii_case(n))
+    {
+        return true;
+    }
+    let upper = raw.to_ascii_uppercase();
+    let last = upper.rsplit('_').next().unwrap_or(upper.as_str());
+    if matches!(last, "TOKEN" | "SECRET" | "PASSWORD") {
+        return true;
+    }
+    upper.ends_with("_API_KEY") && !public_key_env_exception(&upper)
 }
 
-/// Remove denylist keys from `cmd` so Unix `status` does not inherit them.
+fn public_key_env_exception(upper: &str) -> bool {
+    upper.contains("_PUBLIC_")
+        || upper.contains("_ANON_")
+        || upper.ends_with("_PUBLIC_KEY")
+        || upper.ends_with("_PUB_KEY")
+}
+
+/// Loader and script-execution names. `--env` cannot put these back.
+pub(crate) fn is_child_env_loader(name: &OsStr) -> bool {
+    let raw = name.to_string_lossy();
+    const LOADERS: &[&str] = &[
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "BASH_ENV",
+        "ENV",
+        "NODE_OPTIONS",
+        "PYTHONPATH",
+        "PERL5OPT",
+    ];
+    LOADERS.iter().any(|n| raw.eq_ignore_ascii_case(n))
+}
+
+/// Remove denied inherited names. An explicit `cmd.env` is kept, except loaders.
 pub fn scrub_child_command(cmd: &mut Command) {
-    for name in child_env_deny_names() {
-        cmd.env_remove(name);
+    let explicit: Vec<(OsString, bool)> = cmd
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.is_some()))
+        .collect();
+    let kept: Vec<OsString> = explicit
+        .iter()
+        .filter(|(_, set)| *set)
+        .map(|(key, _)| key.clone())
+        .filter(|key| !is_child_env_loader(key))
+        .collect();
+    for (key, _) in std::env::vars_os() {
+        if is_denied_child_env(&key) && !kept.iter().any(|kept| kept == &key) {
+            cmd.env_remove(&key);
+        }
+    }
+    for (key, set) in &explicit {
+        if *set && is_child_env_loader(key) {
+            cmd.env_remove(key);
+        }
     }
 }
 
