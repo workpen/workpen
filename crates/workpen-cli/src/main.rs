@@ -22,11 +22,12 @@ fn main() -> ExitCode {
 }
 
 const TOP_USAGE: &str = "\
-usage: workpen [--version] [--help] <why|run|policy|gc> ...
+usage: workpen [--version] [--help] <why|run|policy|gc|init> ...
   why [--root DIR] [--extra-root DIR] PATH
   run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--policy] [--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...
   policy [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--] [CMD...]
   gc  [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]
+  init [--root DIR]
 
 By default the child cannot use the network. It may read system paths and write inside the workspace. --extra-root is read-write, so a write outside the workspace needs that flag. Secret files are dest-denied before the child starts. / and $HOME are not roots.
 Exit status 0 is success. 1 is a why denial. 2 is usage or a setup failure. 3 is a policy refusal before the child starts. 124 is a timeout. 127 means the program was not found. The child status is passed through, including 2, 3, and 127.";
@@ -51,10 +52,58 @@ fn run(args: Vec<String>) -> Result<ExitCode, String> {
         "run" => cmd_run(&args[1..], false),
         "policy" => cmd_run(&args[1..], true),
         "gc" => cmd_gc(&args[1..]),
+        "init" => cmd_init(&args[1..]),
         other => Err(format!(
-            "unknown command: {other} (use why, run, policy, or gc)"
+            "unknown command: {other} (use why, run, policy, gc, or init)"
         )),
     }
+}
+
+const INIT_USAGE: &str = "usage: workpen init [--root DIR]";
+
+const AGENT_LOCK_TEMPLATE: &str = "\
+# extra dest-deny globs, one per line
+# A line that starts with # is a comment. Blank lines are skipped.
+# secrets/**
+";
+
+fn cmd_init(args: &[String]) -> Result<ExitCode, String> {
+    let (root, extras, rest) = parse_roots(args)?;
+    if wants_help(&rest) {
+        println!("{INIT_USAGE}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !extras.is_empty() {
+        return Err(format!("init does not take --extra-root ({INIT_USAGE})"));
+    }
+    if let Some(flag) = rest.first() {
+        return Err(format!("unknown argument: {flag} ({INIT_USAGE})"));
+    }
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root = match resolve_workspace_root(&cwd, &root.to_string_lossy()) {
+        Ok(root) => root,
+        Err(err @ PathGuardError::Home(_)) => return refuse(err),
+        Err(err) => return Err(err.to_string()),
+    };
+    if root
+        .components()
+        .all(|component| matches!(component, std::path::Component::RootDir))
+    {
+        return refuse(format!(
+            "refused filesystem root {}; use a subdirectory, not `/`",
+            root.display()
+        ));
+    }
+    let path = root.join(workpen::AGENT_LOCK_NAME);
+    if path.exists() {
+        return Err(format!(
+            "agent.lock already exists at {}; init does not change it",
+            path.display()
+        ));
+    }
+    std::fs::write(&path, AGENT_LOCK_TEMPLATE).map_err(|e| e.to_string())?;
+    println!("wrote {}", path.display());
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_why(args: &[String]) -> Result<ExitCode, String> {

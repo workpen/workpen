@@ -960,6 +960,76 @@ fn why_and_run_json_do_not_leak_or_wrap_success() {
 }
 
 #[test]
+fn init_writes_comments_and_does_not_replace_an_existing_file() {
+    let dir = TempDir::new().expect("workspace");
+    std::fs::write(dir.path().join(".env"), b"SECRET=1\n").expect("env");
+    let created = workpen()
+        .args(["init", "--root"])
+        .arg(dir.path())
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        created.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let path = dir.path().join("agent.lock");
+    let body = std::fs::read_to_string(&path).expect("read lock");
+    for line in body.lines() {
+        let trimmed = line.trim();
+        assert!(
+            trimmed.is_empty() || trimmed.starts_with('#'),
+            "init line must be a comment or blank: {line}"
+        );
+    }
+    assert!(body.contains("# secrets/**"), "{body}");
+    assert!(!body.lines().any(|line| line.trim() == "secrets/**"));
+    let why = workpen()
+        .args(["why", "--root"])
+        .arg(dir.path())
+        .arg(".env")
+        .output()
+        .expect("spawn");
+    assert_eq!(why.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&why.stdout);
+    assert!(text.to_ascii_lowercase().contains("deny"), "{text}");
+    assert!(!text.contains("SECRET"));
+    let again = workpen()
+        .args(["init", "--root"])
+        .arg(dir.path())
+        .output()
+        .expect("spawn");
+    assert_eq!(again.status.code(), Some(2));
+    assert_eq!(std::fs::read_to_string(&path).expect("unchanged"), body);
+    let nested = TempDir::new().expect("dir lock");
+    std::fs::create_dir(nested.path().join("agent.lock")).expect("dir");
+    let blocked = workpen()
+        .args(["init", "--root"])
+        .arg(nested.path())
+        .output()
+        .expect("spawn");
+    assert_eq!(blocked.status.code(), Some(2));
+    assert!(nested.path().join("agent.lock").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn init_refuses_home_and_filesystem_root() {
+    let home = std::env::var("HOME").expect("HOME");
+    let home_out = workpen()
+        .args(["init", "--root", &home])
+        .output()
+        .expect("spawn");
+    assert_eq!(home_out.status.code(), Some(3));
+    let root_out = workpen()
+        .args(["init", "--root", "/"])
+        .output()
+        .expect("spawn");
+    assert_eq!(root_out.status.code(), Some(3));
+}
+
+#[test]
 fn policy_prints_jail_without_secret_bytes() {
     let dir = TempDir::new().expect("workspace");
     std::fs::write(dir.path().join(".env"), b"SECRET=1\n").expect("env");
