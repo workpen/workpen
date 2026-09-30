@@ -8,8 +8,8 @@ use workpen::{
     DestDenyKind, PathGuard, check_command_argv, check_command_dests, check_dest, classify_dest,
     default_secret_denies, deny_patch_dests, deny_patch_dests_with_display, dest_deny_glob_regex,
     dest_deny_message, is_env_template_basename, is_path_denied, open_verified_read,
-    path_is_denied_glob, path_matches_deny_glob, reject_command_secret_path_tokens,
-    validate_deny_glob, verify_post_open,
+    path_is_denied_glob, path_is_denied_under_root, path_matches_deny_glob,
+    reject_command_secret_path_tokens, validate_deny_glob, verify_post_open,
 };
 
 /// `matches deny glob **/.env` must not pass when wording only names `**/.env.*`.
@@ -1772,10 +1772,46 @@ fn check_dest_refuses_device() {
         return;
     }
     let policy = DenyPolicy::default();
-    match check_dest("/dev/null", &policy, None) {
-        Err(CheckDestError::SpecialFile { kind, .. }) => assert_eq!(kind, "device"),
-        other => panic!("device must be SpecialFile, got {other:?}"),
+    check_dest("/dev/null", &policy, None).expect("/dev/null char device is allowed");
+    if Path::new("/dev/zero").exists() {
+        match check_dest("/dev/zero", &policy, None) {
+            Err(CheckDestError::SpecialFile { kind, .. }) => assert_eq!(kind, "device"),
+            other => panic!("/dev/zero must stay SpecialFile, got {other:?}"),
+        }
     }
+}
+
+#[test]
+fn private_glob_is_root_relative_not_firmlink_prefix() {
+    let globs = vec!["private/**".to_string()];
+    let root = Path::new("/tmp/wp");
+    assert!(
+        !path_is_denied_under_root(&globs, "/private/tmp/wp/ls", root),
+        "private/** must not match the /private firmlink prefix"
+    );
+    assert!(
+        !path_is_denied_under_root(&globs, "/tmp/wp/subdir/private/secret", root),
+        "slash glob stays anchored"
+    );
+    assert!(!path_is_denied_under_root(
+        &globs,
+        "/tmp/wp/docs/private",
+        root
+    ));
+    assert!(path_is_denied_under_root(
+        &globs,
+        "/tmp/wp/private/secret",
+        root
+    ));
+    assert!(path_is_denied_under_root(
+        &globs,
+        "/private/tmp/wp/../etc/passwd",
+        root
+    ));
+    let secrets = vec!["**/id_rsa".to_string(), "**/.env".to_string()];
+    assert!(path_is_denied_under_root(&secrets, "/home/a/id_rsa", root));
+    assert!(path_is_denied_under_root(&secrets, "/home/a/.env", root));
+    assert!(!path_is_denied_under_root(&globs, "/home/a/readme", root));
 }
 
 #[test]
