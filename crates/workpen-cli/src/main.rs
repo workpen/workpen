@@ -858,13 +858,7 @@ fn wants_help(tokens: &[String]) -> bool {
 fn flag_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str, String> {
     match args.get(i + 1) {
         Some(v) if !v.starts_with("--") => Ok(v.as_str()),
-        _ => Err(if flag == "--root" || flag == "--extra-root" {
-            format!("missing {flag} value")
-        } else if flag == "--timeout" {
-            RUN_USAGE.into()
-        } else {
-            gc_usage()
-        }),
+        _ => Err(format!("missing {flag} value")),
     }
 }
 
@@ -894,4 +888,16 @@ fn parse_roots(args: &[String]) -> Result<(PathBuf, Vec<PathBuf>, Vec<String>), 
         }
     }
     Ok((root, extras, rest))
+}
+
+#[cfg(test)]
+mod json_escape_tests {
+    use super::json_string;
+
+    #[test]
+    fn json_string_escapes_quote_backslash_and_controls() {
+        assert_eq!(json_string("say\"hi\\there"), "\"say\\\"hi\\\\there\"");
+        assert_eq!(json_string("a\nb\rc\td"), "\"a\\nb\\rc\\td\"");
+        assert_eq!(json_string("\u{0001}"), "\"\\u0001\"");
+    }
 }

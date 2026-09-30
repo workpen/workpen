@@ -253,6 +253,29 @@ fn run_equals_root_is_unknown_flag() {
 }
 
 #[test]
+fn run_and_policy_missing_value_names_that_flag() {
+    for cmd in ["run", "policy"] {
+        for flag in ["--read", "--write", "--env"] {
+            let out = workpen().args([cmd, flag]).output().expect("spawn");
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{cmd} {flag} must exit 2: {err}"
+            );
+            assert!(
+                err.contains(&format!("missing {flag} value")),
+                "{cmd} {flag} must name the flag: {err}"
+            );
+            assert!(
+                !err.contains("workpen gc"),
+                "{cmd} {flag} must not print gc usage: {err}"
+            );
+        }
+    }
+}
+
+#[test]
 fn run_timeout_missing_value_names_usage() {
     let out = workpen()
         .args(["run", "--timeout"])
@@ -1402,6 +1425,33 @@ fn init_git_repo() -> TempDir {
     git(&["add", "README"]);
     git(&["commit", "-m", "init"]);
     dir
+}
+
+/// Windows rejects `"` in a file name. The helper test covers escaping
+/// on every platform. This checks that `why --json` uses that helper.
+#[cfg(unix)]
+#[test]
+fn why_json_escapes_a_quote_in_the_path() {
+    let dir = TempDir::new().expect("dir");
+    let file = dir.path().join("say\"hi.txt");
+    std::fs::write(&file, b"ok").expect("write");
+    let out = workpen()
+        .args(["why", "--json", "--root"])
+        .arg(dir.path())
+        .arg(&file)
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "why --json should allow the file: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("say\\\"hi.txt"),
+        "quote in the path must be escaped: {stdout}"
+    );
+    assert!(stdout.lines().count() == 1, "one JSON object: {stdout}");
 }
 
 #[test]
