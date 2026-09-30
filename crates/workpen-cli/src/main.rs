@@ -121,7 +121,7 @@ const AGENT_LOCK_TEMPLATE: &str = "\
 ";
 
 fn cmd_init(args: &[String]) -> Result<ExitCode, String> {
-    let (root, extras, rest) = parse_roots(args)?;
+    let (root, extras, rest) = parse_roots(args, &[], &[])?;
     if wants_help(&rest) {
         println!("{INIT_USAGE}");
         return Ok(ExitCode::SUCCESS);
@@ -157,7 +157,7 @@ fn cmd_init(args: &[String]) -> Result<ExitCode, String> {
 }
 
 fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
-    let (root, extras, rest) = parse_roots(args)?;
+    let (root, extras, rest) = parse_roots(args, &[], &["--json"])?;
     let json = rest.iter().any(|token| token == "--json");
     let rest: Vec<String> = rest
         .iter()
@@ -219,7 +219,11 @@ usage: workpen run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [-
 The network is blocked unless --net is set. --extra-root and --write are read-write. --read is read-only. Dest-deny runs before the child starts, and on Linux the child is not started when secret names cannot be hidden. --policy prints the jail and does not start the child. Exit 124 means the timeout fired. --env opts a name back in. --env-clear drops inherited names except PATH, then applies every --env. Loaders such as LD_PRELOAD stay removed.";
 
 fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
-    let (root, extras, rest) = parse_roots(args)?;
+    let (root, extras, rest) = parse_roots(
+        args,
+        &["--timeout", "--env", "--read", "--write"],
+        &["--tty", "--env-clear", "--policy", "--net", "--json"],
+    )?;
     if wants_help(&rest) {
         println!("{RUN_HELP}");
         return Ok(ExitCode::SUCCESS);
@@ -505,7 +509,7 @@ fn apply_child_env(child: &mut Command, env_clear: bool, env_sets: &[(String, St
 }
 
 fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
-    let (root, extras, rest) = parse_roots(args)?;
+    let (root, extras, rest) = parse_roots(args, &["--max-age", "--leftover"], &["--dry-run"])?;
     if wants_help(&rest) {
         println!("{}", gc_usage());
         println!(
@@ -862,30 +866,49 @@ fn flag_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str, S
     }
 }
 
-fn parse_roots(args: &[String]) -> Result<(PathBuf, Vec<PathBuf>, Vec<String>), String> {
+/// `--root` and `--extra-root` apply only before the command.
+/// `valued` and `switches` are that subcommand's other flags, so
+/// `run --timeout 5s --root DIR cmd` still sees `--root`.
+/// A later `--root` stays in `rest` for the child.
+fn parse_roots(
+    args: &[String],
+    valued: &[&str],
+    switches: &[&str],
+) -> Result<(PathBuf, Vec<PathBuf>, Vec<String>), String> {
     let mut root = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut extras = Vec::new();
     let mut rest = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--root" => {
-                root = PathBuf::from(flag_value(args, i, "--root")?);
-                i += 2;
-            }
-            "--extra-root" => {
-                extras.push(PathBuf::from(flag_value(args, i, "--extra-root")?));
-                i += 2;
-            }
-            "--" => {
-                rest.extend(args[i..].iter().cloned());
-                break;
-            }
-            _ => {
-                rest.push(args[i].clone());
-                i += 1;
-            }
+        let token = args[i].as_str();
+        if token == "--" {
+            rest.extend(args[i..].iter().cloned());
+            break;
         }
+        if token == "--root" {
+            root = PathBuf::from(flag_value(args, i, "--root")?);
+            i += 2;
+            continue;
+        }
+        if token == "--extra-root" {
+            extras.push(PathBuf::from(flag_value(args, i, "--extra-root")?));
+            i += 2;
+            continue;
+        }
+        if valued.contains(&token) {
+            let value = flag_value(args, i, token)?;
+            rest.push(args[i].clone());
+            rest.push(value.to_string());
+            i += 2;
+            continue;
+        }
+        if switches.contains(&token) {
+            rest.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+        rest.extend(args[i..].iter().cloned());
+        break;
     }
     Ok((root, extras, rest))
 }
