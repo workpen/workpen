@@ -32,6 +32,22 @@ fn help_names_why_run_and_gc() {
             "{arg} stdout must name run: {stdout}"
         );
         assert!(stdout.contains("gc"), "{arg} stdout must name gc: {stdout}");
+        assert!(
+            stdout.contains("network") && stdout.contains("read-write"),
+            "{arg} must describe the network default and extra-root access: {stdout}"
+        );
+        assert!(
+            stdout.contains("does not spawn")
+                && stdout.contains("jailed child")
+                && stdout.contains(".workpen-worktrees"),
+            "{arg} must describe why, run, and gc: {stdout}"
+        );
+        assert!(
+            stdout.contains("1 is a why denial")
+                && stdout.contains("3 is a policy refusal")
+                && stdout.contains("124 is a timeout"),
+            "{arg} must list exit codes: {stdout}"
+        );
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
             err.is_empty(),
@@ -91,6 +107,12 @@ fn empty_argv_prints_usage() {
     assert!(
         err.contains("network") && err.contains("read-write"),
         "empty argv must describe the default child: {err}"
+    );
+    assert!(
+        err.contains("does not spawn")
+            && err.contains(".workpen-worktrees")
+            && err.contains("124 is a timeout"),
+        "empty argv must include the long help: {err}"
     );
 }
 
@@ -501,7 +523,7 @@ fn gc_honors_workspace_agent_lock_cache_secret() {
         "gc must not reclaim leftover with agent.lock extra: {combined}"
     );
     assert!(
-        stdout.contains("keep") && stdout.contains("1 worktrees"),
+        stdout.contains("keep") && stdout.contains("1 leftover worktrees"),
         "gc must keep the row and print a count: {stdout}"
     );
 }
@@ -1204,6 +1226,10 @@ fn run_help_names_network_and_not_always_start() {
         "run help must name network: {stdout}"
     );
     assert!(
+        stdout.contains("--timeout") && stdout.contains("--tty"),
+        "run help must name --timeout and --tty: {stdout}"
+    );
+    assert!(
         stdout.contains("read-write"),
         "run help must name read-write: {stdout}"
     );
@@ -1217,6 +1243,9 @@ fn run_help_names_network_and_not_always_start() {
 #[test]
 fn gc_empty_names_leftover_dir_and_max_age_token() {
     let repo = init_git_repo();
+    let target = repo.path().join("target");
+    std::fs::create_dir_all(target.join("stale")).expect("target");
+    std::fs::write(target.join("stale").join("old"), b"x").expect("target file");
     for extra in [Vec::<&str>::new(), vec!["--dry-run"]] {
         let mut args = vec![
             "gc".to_string(),
@@ -1243,6 +1272,10 @@ fn gc_empty_names_leftover_dir_and_max_age_token() {
         assert!(
             !stdout.contains("keep "),
             "empty gc must not invent keep rows: {stdout}"
+        );
+        assert!(
+            !stdout.contains("target/"),
+            "gc must not report target/ as a leftover root: {stdout}"
         );
     }
 }
@@ -1304,7 +1337,7 @@ fn gc_dry_run_reclaim_line_stays() {
         stdout.contains("dry-run: would reclaim"),
         "reclaimable tree must keep the reclaim line: {stdout}"
     );
-    assert!(stdout.contains("1 worktrees"), "{stdout}");
+    assert!(stdout.contains("1 leftover worktrees"), "{stdout}");
     assert!(leftover.exists(), "dry-run must not delete the worktree");
 }
 
