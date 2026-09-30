@@ -26,6 +26,8 @@ use crate::deny::{
 mod linux;
 #[cfg(unix)]
 mod pty;
+#[cfg(unix)]
+mod reaper;
 #[cfg(windows)]
 mod windows;
 
@@ -159,8 +161,9 @@ fn apply_detail(err: &KernelError) -> String {
 /// callers can write them before GNU timeout 124. [`KernelError::Timeout`]
 /// stays a unit variant on [`KernelPolicy::run_child_timeout`].
 /// The child is an unreaped zombie (`WNOWAIT`), so its pid cannot be
-/// recycled. Signal the process group before the reap. A background
-/// grandchild stays in that group unless it calls `setsid`.
+/// recycled. Signal its process group before the reap when this pid
+/// leads that group. A `setsid` grandchild is stopped by the pre_exec
+/// reaper, not by this `killpg`.
 #[cfg(unix)]
 fn kill_group_if_zombie(pid: libc::pid_t) -> bool {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -175,8 +178,10 @@ fn kill_group_if_zombie(pid: libc::pid_t) -> bool {
     if rc != 0 || info.si_signo != libc::SIGCHLD {
         return false;
     }
-    unsafe {
-        libc::killpg(pid, libc::SIGKILL);
+    if reaper::is_group_leader(pid) {
+        unsafe {
+            libc::killpg(pid, libc::SIGKILL);
+        }
     }
     true
 }
@@ -200,16 +205,35 @@ fn reap_process_group(
             return Ok((status, false));
         }
         if deadline.is_some_and(|end| Instant::now() >= end) {
-            // SAFETY: pid is this spawn's child. `process_group(0)` or
-            // PTY `setsid` makes it a group leader.
+            // Ask the reaper to kill the command and any `setsid`
+            // descendant, then exit. SIGKILL would skip that cleanup.
             unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                libc::killpg(pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGTERM);
             }
-            let status = child
-                .wait()
-                .map_err(|e| KernelError::Apply(e.to_string()))?;
-            return Ok((status, true));
+            let grace = Instant::now() + Duration::from_millis(300);
+            loop {
+                if kill_group_if_zombie(pid) {
+                    let status = child
+                        .wait()
+                        .map_err(|e| KernelError::Apply(e.to_string()))?;
+                    return Ok((status, true));
+                }
+                if Instant::now() >= grace {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                    if reaper::is_group_leader(pid) {
+                        unsafe {
+                            libc::killpg(pid, libc::SIGKILL);
+                        }
+                    }
+                    let status = child
+                        .wait()
+                        .map_err(|e| KernelError::Apply(e.to_string()))?;
+                    return Ok((status, true));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -618,6 +642,7 @@ impl KernelPolicy {
             unsafe {
                 use std::os::unix::process::CommandExt;
                 cmd.pre_exec(move || {
+                    reaper::supervise_or_continue()?;
                     #[cfg(target_os = "linux")]
                     linux::apply_dest_deny_remounts(&dests, &workspace, require_remount)?;
                     #[cfg(not(target_os = "linux"))]
@@ -990,12 +1015,12 @@ impl KernelPolicy {
             let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             pty::attach_pty(&mut cmd, pty.slave).map_err(|e| KernelError::Apply(e.to_string()))?;
             let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
-            // Foreground pgrp from the parent as well. The child's
-            // tcsetpgrp can lose to the session setup on Linux.
+            // The spawned pid is the reaper. Foreground the command
+            // after it becomes a session leader. The child also calls
+            // tcsetpgrp; this covers the Linux race the other way.
             #[cfg(unix)]
-            {
-                let _ =
-                    unsafe { libc::tcsetpgrp(pty.master.as_raw_fd(), child.id() as libc::pid_t) };
+            if let Some(leader) = reaper::leader_pid(child.id() as libc::pid_t) {
+                let _ = unsafe { libc::tcsetpgrp(pty.master.as_raw_fd(), leader) };
             }
             // Command keeps the slave File after spawn. Linux master
             // read does not EOF while that fd stays open in the parent.
@@ -1027,9 +1052,10 @@ impl KernelPolicy {
     ///
     /// Same fail-closed setup as [`Self::run_child`]. Unix places the
     /// child in its own process group and `killpg`s that group when the
-    /// leader exits and again on the deadline. Windows waits with a
-    /// bounded `WaitForSingleObject` and closes the job so
-    /// `KILL_ON_JOB_CLOSE` stops the child.
+    /// leader exits and again on the deadline. A grandchild that called
+    /// `setsid` is stopped by the pre_exec reaper before this wait
+    /// returns. Windows waits with a bounded `WaitForSingleObject` and
+    /// closes the job so `KILL_ON_JOB_CLOSE` stops the child.
     pub fn run_child_timeout(
         &self,
         cmd: Command,
