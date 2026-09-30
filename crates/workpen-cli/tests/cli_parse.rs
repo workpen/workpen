@@ -664,6 +664,84 @@ fn run_short_v_after_command_without_dashdash() {
     assert!(!stdout.contains(env!("CARGO_PKG_VERSION")));
 }
 
+#[cfg(unix)]
+#[test]
+fn run_root_after_the_command_is_child_argv() {
+    let dir = TempDir::new().expect("workspace");
+    let missing = dir.path().join("not-a-workspace");
+    let out = workpen()
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["/bin/echo", "--root"])
+        .arg(&missing)
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "echo --root must run in the first workspace: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("--root") && stdout.contains("not-a-workspace"),
+        "echo must receive --root: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("path guard"),
+        "the later --root must not replace the workspace: {stderr}"
+    );
+
+    let ordered = workpen()
+        .args(["run", "--timeout", "5s", "--root"])
+        .arg(dir.path())
+        .args(["/bin/echo", "kept"])
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&ordered.stdout);
+    assert!(
+        ordered.status.success() && stdout.contains("kept"),
+        "a flag before --root must still run the child: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&ordered.stderr)
+    );
+
+    let extra = workpen()
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["/bin/echo", "--extra-root", "/tmp/not-an-extra-root"])
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&extra.stdout);
+    let stderr = String::from_utf8_lossy(&extra.stderr);
+    assert!(
+        extra.status.success() && stdout.contains("--extra-root"),
+        "echo must receive --extra-root: stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[test]
+fn why_extra_root_after_the_path_is_not_a_root() {
+    let dir = TempDir::new().expect("workspace");
+    std::fs::write(dir.path().join("notes.md"), b"ok\n").expect("notes");
+    let out = workpen()
+        .args(["why", "--root"])
+        .arg(dir.path())
+        .args(["notes.md", "--extra-root", "/tmp/not-an-extra-root"])
+        .output()
+        .expect("spawn");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a flag after the path is usage: stdout={} stderr={stderr}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        stderr.contains("unknown flag") && stderr.contains("--extra-root"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn run_dashdash_version_is_the_child_program() {
     let dir = TempDir::new().expect("workspace");
