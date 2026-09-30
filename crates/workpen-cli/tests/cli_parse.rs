@@ -453,6 +453,27 @@ fn gc_rejects_extra_root() {
 }
 
 #[test]
+fn gc_outside_a_git_repo_names_that() {
+    let dir = TempDir::new().expect("dir");
+    let out = workpen()
+        .args(["gc", "--root"])
+        .arg(dir.path())
+        .args(["--max-age", "1s", "--dry-run"])
+        .output()
+        .expect("spawn");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(
+        err.contains("not a git repository"),
+        "must say it is not a git repository: {err}"
+    );
+    assert!(
+        !err.contains("fatal:"),
+        "must not pass through git fatal: {err}"
+    );
+}
+
+#[test]
 fn gc_leftover_flag_as_value_is_missing() {
     let out = workpen()
         .args(["gc", "--leftover", "--max-age", "7d"])

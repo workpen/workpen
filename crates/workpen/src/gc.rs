@@ -75,6 +75,8 @@ pub enum GcError {
     InvalidDuration(String),
     #[error("worktree registry unreadable: {0}")]
     RegistryUnreadable(String),
+    #[error("{0} is not a git repository; gc reclaims leftover worktrees of a git repo")]
+    NotARepo(String),
     #[error("git {op} failed: {detail}")]
     Git { op: String, detail: String },
     #[error("refuse to treat home as a git workspace: {0}")]
@@ -385,6 +387,9 @@ fn is_git_repo(cwd: &Path) -> bool {
 
 fn registered_worktrees(cwd: &Path) -> Result<Vec<Registered>, GcError> {
     let out = git(cwd, &["worktree", "list", "--porcelain"]).map_err(|e| match e {
+        GcError::Git { detail, .. } if detail.contains("not a git repository") => {
+            GcError::NotARepo(cwd.display().to_string())
+        }
         GcError::Git { detail, .. } => GcError::RegistryUnreadable(detail),
         other => other,
     })?;
