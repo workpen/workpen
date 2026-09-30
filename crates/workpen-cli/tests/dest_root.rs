@@ -119,9 +119,10 @@ fn run_dest_denies_hardlink_sibling_under_root_before_spawn() {
         .current_dir(cwd.path())
         .output()
         .expect("spawn workpen");
-    assert!(
-        !out.status.success(),
-        "run cat notes.txt hardlink sibling must fail, stdout={} stderr={}",
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "run cat notes.txt hardlink sibling must exit 3, stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -378,9 +379,10 @@ fn run_refuses_dev_null_special_file_before_spawn() {
         .current_dir(cwd.path())
         .output()
         .expect("spawn workpen");
-    assert!(
-        !out.status.success(),
-        "run cat /dev/null must fail closed, stdout={} stderr={}",
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "run cat /dev/null must exit 3, stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );

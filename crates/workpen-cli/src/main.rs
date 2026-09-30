@@ -1,13 +1,14 @@
 //! workpen CLI. Wrap, explain, leftover GC.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime};
 
 use workpen::{
-    CheckDestError, DenyPolicy, GcConfig, GcDecision, KernelError, PathGuard, check_command_argv,
-    dest_under_root, parse_max_age, resolve_extra_root_pair, resolve_workspace_root,
-    run_gc_with_policy,
+    CheckDestError, DenyPolicy, ExtraRootError, GcConfig, GcDecision, KernelError, PathGuard,
+    PathGuardError, check_command_argv, dest_under_root, parse_max_age, resolve_extra_root_pair,
+    resolve_workspace_root, run_gc_with_policy,
 };
 
 fn main() -> ExitCode {
@@ -24,16 +25,19 @@ const TOP_USAGE: &str = "\
 usage: workpen [--version] [--help] <why|run|gc> ...
   why [--root DIR] [--extra-root DIR] PATH
   run [--root DIR] [--extra-root DIR] [--timeout DUR] [--tty] [--] CMD...
-  gc  [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]";
+  gc  [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]
+
+By default the child cannot use the network. It may read system paths and write inside the workspace. --extra-root is read-write, so a write outside the workspace needs that flag. Secret files are dest-denied before the child starts. / and $HOME are not roots.
+Exit status 0 is success. 1 is a why denial. 2 is usage or a setup failure. 3 is a policy refusal before the child starts. 124 is a timeout. 127 means the program was not found. The child status is passed through, including 2, 3, and 127.";
 
 const WHY_USAGE: &str = "usage: workpen why [--root DIR] [--extra-root DIR] PATH";
 
 fn run(args: Vec<String>) -> Result<ExitCode, String> {
     if args.is_empty() {
-        eprintln!("usage: workpen <why|run|gc> ...");
+        eprintln!("{TOP_USAGE}");
         return Ok(ExitCode::from(2));
     }
-    if args.iter().any(|a| a == "--version" || a == "-V") {
+    if args[0] == "--version" || args[0] == "-V" {
         println!("{}", workpen::VERSION);
         return Ok(ExitCode::SUCCESS);
     }
@@ -65,7 +69,7 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = resolve_workspace_root(&cwd, &root.to_string_lossy()).map_err(|e| e.to_string())?;
-    let (extras, _presented) = resolve_extras(&cwd, &extras)?;
+    let (extras, _presented) = resolve_extras(&cwd, &extras).map_err(|e| e.to_string())?;
     let path = rest.first().ok_or_else(|| WHY_USAGE.to_string())?;
     let guard = PathGuard::with_extra_roots(&root, &extras).map_err(|e| e.to_string())?;
     let dest = why_dest(&root, path);
@@ -90,19 +94,37 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
 const RUN_USAGE: &str =
     "usage: workpen run [--root DIR] [--extra-root DIR] [--timeout DUR] [--tty] [--] CMD...";
 
+const RUN_HELP: &str = "\
+usage: workpen run [--root DIR] [--extra-root DIR] [--timeout DUR] [--tty] [--] CMD...
+The network is blocked. --extra-root is read-write. Dest-deny runs before the child starts, and on Linux the child is not started when secret names cannot be hidden. Exit 124 means the timeout fired.";
+
 fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
     if wants_help(&rest) {
-        println!("{RUN_USAGE}");
+        println!("{RUN_HELP}");
         return Ok(ExitCode::SUCCESS);
     }
     let (timeout, tty, rest) = peel_run_flags(&rest)?;
+    let saw_dashdash = rest.first().map(String::as_str) == Some("--");
+    let cmd_preview: &[String] = if saw_dashdash { &rest[1..] } else { rest };
+    if !saw_dashdash && version_flag_before_child(cmd_preview) {
+        println!("{}", workpen::VERSION);
+        return Ok(ExitCode::SUCCESS);
+    }
     if let Some(flag) = rest.first().filter(|t| t.starts_with('-') && *t != "--") {
         return Err(format!("unknown flag: {flag} ({RUN_USAGE})"));
     }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let root = resolve_workspace_root(&cwd, &root.to_string_lossy()).map_err(|e| e.to_string())?;
-    let (extras, presented) = resolve_extras(&cwd, &extras)?;
+    let root = match resolve_workspace_root(&cwd, &root.to_string_lossy()) {
+        Ok(root) => root,
+        Err(err @ PathGuardError::Home(_)) => return refuse(err),
+        Err(err) => return Err(err.to_string()),
+    };
+    let (extras, presented) = match resolve_extras(&cwd, &extras) {
+        Ok(pair) => pair,
+        Err(err @ ExtraRootError::Home(_)) => return refuse(err),
+        Err(err) => return Err(err.to_string()),
+    };
     let cmd = if rest.first().map(String::as_str) == Some("--") {
         &rest[1..]
     } else {
@@ -112,16 +134,31 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
         return Err(RUN_USAGE.into());
     }
     let policy = DenyPolicy::from_workspace(&root).map_err(|e| e.to_string())?;
-    let guard = PathGuard::with_extra_roots(&root, &extras).map_err(|e| e.to_string())?;
-    if let Err(e) = check_command_argv(cmd, guard.canon_root(), &policy) {
-        return Err(e.to_string());
+    let guard = match PathGuard::with_extra_roots(&root, &extras) {
+        Ok(guard) => guard,
+        Err(err @ PathGuardError::Home(_)) => return refuse(err),
+        Err(err) => return Err(err.to_string()),
+    };
+    if let Err(err) = check_command_argv(cmd, guard.canon_root(), &policy) {
+        return refuse(err);
     }
-    let (program, args) = workpen::with_bash_noprofile(&cmd[0], &cmd[1..]);
+    let jail = match workpen::process_jail(guard.canon_root(), &presented) {
+        Ok(policy) => policy.with_require_dest_hide(),
+        Err(err @ KernelError::Home(_))
+        | Err(err @ KernelError::FsRoot(_))
+        | Err(err @ KernelError::DestDeny(_)) => return refuse(err),
+        Err(err) => return Err(err.to_string()),
+    };
+    let resolved = match resolve_child_program(&cmd[0], guard.canon_root()) {
+        Ok(path) => path,
+        Err(()) => {
+            eprintln!("command not found: {}", cmd[0]);
+            return Ok(ExitCode::from(127));
+        }
+    };
+    let (program, args) = workpen::with_bash_noprofile(&resolved, &cmd[1..]);
     let mut child = Command::new(program);
     child.args(args).current_dir(guard.canon_root());
-    let jail = workpen::process_jail(guard.canon_root(), &presented)
-        .map_err(|e| e.to_string())?
-        .with_require_dest_hide();
     // Copy child pipes to this process as bytes arrive. A Vec of the whole
     // stream would grow without bound (`yes` under --timeout). Inherited
     // child stdout to a file outside --root is a Seatbelt/DACL dest write.
@@ -145,12 +182,27 @@ fn cmd_run(args: &[String]) -> Result<ExitCode, String> {
                 "child finished but {e}; workspace ACL may still grant the write-restricted SID"
             ));
         }
-        Err(e) => return Err(format!("failed to spawn {}: {e}", cmd[0])),
+        Err(err @ KernelError::DestDeny(_))
+        | Err(err @ KernelError::Home(_))
+        | Err(err @ KernelError::FsRoot(_)) => return refuse(err),
+        Err(e) => {
+            let mut msg = format!("failed to spawn {}: {e}", resolved.display());
+            if program_outside_roots(&resolved, guard.canon_root(), &presented) {
+                msg.push_str("; pass --extra-root for that directory if the program should run");
+            }
+            return Err(msg);
+        }
         Ok(ok) => ok,
     };
     if timed_out {
         eprintln!("child killed after the deadline");
         return Ok(ExitCode::from(124));
+    }
+    if status.code().is_none() && program_outside_roots(&resolved, guard.canon_root(), &presented) {
+        return Err(format!(
+            "failed to spawn {}: kernel wrap apply failed: program is outside the readable roots; pass --extra-root for that directory if the program should run",
+            resolved.display()
+        ));
     }
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
@@ -180,12 +232,16 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(args)?;
     if wants_help(&rest) {
         println!("{}", gc_usage());
+        println!(
+            "gc looks under .workpen-worktrees, or the directory named by --leftover. It is not a target/ cleaner. When nothing is left, it prints that directory and the max-age token."
+        );
         return Ok(ExitCode::SUCCESS);
     }
     if !extras.is_empty() {
         return Err("gc does not take --extra-root".into());
     }
     let mut max_age = None;
+    let mut max_age_token = None;
     let mut leftover = None;
     let mut dry_run = false;
     let mut i = 0;
@@ -194,6 +250,7 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
             "--max-age" => {
                 let raw = flag_value(&rest, i, "--max-age")?;
                 max_age = Some(parse_max_age(raw).map_err(|e| e.to_string())?);
+                max_age_token = Some(raw.to_string());
                 i += 2;
             }
             "--leftover" => {
@@ -212,6 +269,7 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
         }
     }
     let max_age = max_age.ok_or_else(gc_usage)?;
+    let max_age_token = max_age_token.ok_or_else(gc_usage)?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = resolve_workspace_root(&cwd, &root.to_string_lossy()).map_err(|e| e.to_string())?;
     let policy = DenyPolicy::from_workspace(&root).map_err(|e| e.to_string())?;
@@ -226,20 +284,118 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
         };
     }
     let rows = run_gc_with_policy(&root, &cfg, &policy).map_err(|e| e.to_string())?;
-    for (path, decision) in &rows {
-        match decision {
-            GcDecision::Keep { reason } => {
-                println!("keep {} ({})", path.display(), reason.as_str());
+    if rows.is_empty() {
+        println!(
+            "no leftover worktrees under {} (max-age {max_age_token})",
+            cfg.leftover_dir.display()
+        );
+    } else {
+        for (path, decision) in &rows {
+            match decision {
+                GcDecision::Keep { reason } => {
+                    println!("keep {} ({})", path.display(), reason.as_str());
+                }
+                GcDecision::Reclaim { .. } if dry_run => {
+                    println!("dry-run: would reclaim {}", path.display());
+                }
+                GcDecision::Reclaim { .. } => {
+                    println!("reclaimed {}", path.display());
+                }
             }
-            GcDecision::Reclaim { .. } if dry_run => {
-                println!("dry-run: would reclaim {}", path.display());
-            }
-            GcDecision::Reclaim { .. } => {
-                println!("reclaimed {}", path.display());
+        }
+        println!("{} worktrees", rows.len());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Policy refusal. `Ok(3)` so `main` does not turn the status into 2.
+fn refuse(err: impl std::fmt::Display) -> Result<ExitCode, String> {
+    eprintln!("{err}");
+    Ok(ExitCode::from(3))
+}
+
+/// `--version` / `-V` in the program slot is Workpen's version.
+/// A token after the program, or after `--`, belongs to the child.
+fn version_flag_before_child(cmd: &[String]) -> bool {
+    matches!(
+        cmd.first().map(String::as_str),
+        Some("--version") | Some("-V")
+    )
+}
+
+/// Find the program in the parent. A slash path is relative to the child cwd.
+/// A bare name uses the parent's `PATH`, keeping the first match's spelling.
+fn program_outside_roots(program: &Path, root: &Path, extras: &[PathBuf]) -> bool {
+    let canon = std::fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let mut bases = Vec::with_capacity(1 + extras.len());
+    bases.push(std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
+    for extra in extras {
+        bases.push(std::fs::canonicalize(extra).unwrap_or_else(|_| extra.clone()));
+    }
+    !bases.iter().any(|base| canon.starts_with(base))
+}
+
+fn resolve_child_program(argv0: &str, child_cwd: &Path) -> Result<PathBuf, ()> {
+    let raw = Path::new(argv0);
+    let has_sep = argv0.contains('/') || argv0.contains('\\');
+    if raw.is_absolute() || has_sep {
+        let candidate = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            child_cwd.join(raw)
+        };
+        return first_existing_name(&candidate);
+    }
+    let path_var = std::env::var_os("PATH").unwrap_or_else(|| OsStr::new("").to_os_string());
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        if let Ok(found) = first_existing_name(&dir.join(argv0)) {
+            return Ok(found);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        let root = PathBuf::from(root);
+        for dir in [root.join("System32"), root] {
+            if let Ok(found) = first_existing_name(&dir.join(argv0)) {
+                return Ok(found);
             }
         }
     }
-    Ok(ExitCode::SUCCESS)
+    Err(())
+}
+
+/// `cmd` on Windows is `cmd.exe`. Keep the first spelling that exists.
+fn first_existing_name(candidate: &Path) -> Result<PathBuf, ()> {
+    if candidate.is_file() {
+        return Ok(candidate.to_path_buf());
+    }
+    #[cfg(windows)]
+    if candidate.extension().is_none() {
+        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        let stem = candidate
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for ext in pathext.split(';') {
+            let ext = ext.trim();
+            if ext.is_empty() {
+                continue;
+            }
+            let ext = if ext.starts_with('.') {
+                ext.to_string()
+            } else {
+                format!(".{ext}")
+            };
+            let with_ext = candidate.with_file_name(format!("{stem}{ext}"));
+            if with_ext.is_file() {
+                return Ok(with_ext);
+            }
+        }
+    }
+    Err(())
 }
 
 /// Blank `why` PATH stays blank so PathGuard reports empty, not the workspace.
@@ -251,12 +407,14 @@ fn why_dest(root: &Path, path: &str) -> PathBuf {
     }
 }
 
-fn resolve_extras(cwd: &Path, extras: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
+fn resolve_extras(
+    cwd: &Path,
+    extras: &[PathBuf],
+) -> Result<(Vec<PathBuf>, Vec<PathBuf>), ExtraRootError> {
     let mut canon = Vec::with_capacity(extras.len());
     let mut presented = Vec::with_capacity(extras.len());
     for extra in extras {
-        let (presented_abs, resolved) =
-            resolve_extra_root_pair(cwd, &extra.to_string_lossy()).map_err(|e| e.to_string())?;
+        let (presented_abs, resolved) = resolve_extra_root_pair(cwd, &extra.to_string_lossy())?;
         presented.push(presented_abs);
         canon.push(resolved);
     }
