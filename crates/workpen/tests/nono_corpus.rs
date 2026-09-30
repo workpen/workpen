@@ -2214,9 +2214,36 @@ fn run_does_not_duplicate_existing_noprofile() {
 
 #[test]
 fn is_denied_child_env_keys_and_not_path() {
-    assert!(is_denied_child_env("xai_api_key"));
-    assert!(is_denied_child_env("Ld_Preload"));
-    assert!(!is_denied_child_env("PATH"));
+    for name in [
+        "xai_api_key",
+        "Ld_Preload",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "NPM_TOKEN",
+        "github_token",
+        "SOME_SECRET",
+        "SOME_PASSWORD",
+        "SOME_API_KEY",
+        "NEXT_PUBLIC_GITHUB_TOKEN",
+        "AWS_ACCESS_KEY_ID",
+    ] {
+        assert!(is_denied_child_env(name), "{name} must be denied");
+    }
+    for name in [
+        "PATH",
+        "HOME",
+        "TOKENIZER",
+        "KEYBOARD",
+        "LESSKEY",
+        "CARGO_HOME",
+        "GIT_CONFIG_KEY_0",
+        "SSH_KEY_PATH",
+        "SSH_PUBLIC_KEY",
+        "NEXT_PUBLIC_API_KEY",
+        "CACHE_KEY",
+    ] {
+        assert!(!is_denied_child_env(name), "{name} must stay");
+    }
 }
 
 #[test]
@@ -2226,12 +2253,22 @@ fn scrub_child_command_removes_denied_names() {
         .env("LD_PRELOAD", "evil.so")
         .env("BASH_ENV", "/tmp/evil.sh");
     scrub_child_command(&mut cmd);
-    for name in ["XAI_API_KEY", "LD_PRELOAD", "BASH_ENV"] {
-        let value = cmd
-            .get_envs()
+    let value_of = |name: &str| {
+        cmd.get_envs()
             .find(|(key, _)| *key == name)
-            .map(|(_, value)| value);
-        assert_eq!(value, Some(None), "{name} must be removed from cmd envs");
+            .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    };
+    assert_eq!(
+        value_of("XAI_API_KEY"),
+        Some(Some("secret".to_string())),
+        "an explicit token opt-in must stay"
+    );
+    for name in ["LD_PRELOAD", "BASH_ENV"] {
+        assert_eq!(
+            value_of(name),
+            Some(None),
+            "{name} is a loader and stays removed"
+        );
     }
 }
 
@@ -2517,7 +2554,6 @@ fn run_child_scrubs_tmpdir() {
     let mut cmd = Command::new("cmd");
     #[cfg(windows)]
     cmd.args(["/c", "echo %TMPDIR%"]);
-    cmd.env("TMPDIR", "/tmp/host-secret-scratch");
     cmd.current_dir(dir.path());
     let (applied, output) = policy.run_child_output(cmd).expect("output");
     assert!(
@@ -2529,8 +2565,33 @@ fn run_child_scrubs_tmpdir() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !stdout.contains("host-secret-scratch"),
+        stdout.is_empty(),
         "child must not print inherited TMPDIR: {stdout:?}"
+    );
+}
+
+#[test]
+fn run_child_keeps_explicit_tmpdir() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    #[cfg(unix)]
+    let mut cmd = Command::new("/bin/sh");
+    #[cfg(unix)]
+    cmd.args(["-c", r#"printf %s "$TMPDIR""#]);
+    #[cfg(windows)]
+    let mut cmd = Command::new("cmd");
+    #[cfg(windows)]
+    cmd.args(["/c", "echo %TMPDIR%"]);
+    cmd.env("TMPDIR", "/tmp/host-opt-in");
+    cmd.current_dir(dir.path());
+    let (_applied, output) = policy.run_child_output(cmd).expect("output");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("host-opt-in"),
+        "explicit TMPDIR must reach the child: {stdout:?}"
     );
 }
 
