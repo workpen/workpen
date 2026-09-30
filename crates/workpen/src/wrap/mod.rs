@@ -158,38 +158,69 @@ fn apply_detail(err: &KernelError) -> String {
 /// The bool is `timed_out`. Deadline still returns the drained bytes so
 /// callers can write them before GNU timeout 124. [`KernelError::Timeout`]
 /// stays a unit variant on [`KernelPolicy::run_child_timeout`].
+/// The child is an unreaped zombie (`WNOWAIT`), so its pid cannot be
+/// recycled. Signal the process group before the reap. A background
+/// grandchild stays in that group unless it calls `setsid`.
+#[cfg(unix)]
+fn kill_group_if_zombie(pid: libc::pid_t) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+        )
+    };
+    if rc != 0 || info.si_signo != libc::SIGCHLD {
+        return false;
+    }
+    unsafe {
+        libc::killpg(pid, libc::SIGKILL);
+    }
+    true
+}
+
+/// Wait until the direct child exits or `timeout` elapses, then signal
+/// its process group. `true` means the deadline fired.
+#[cfg(unix)]
+fn reap_process_group(
+    child: &mut std::process::Child,
+    timeout: Option<Duration>,
+) -> Result<(ExitStatus, bool), KernelError> {
+    use std::time::Instant;
+
+    let pid = child.id() as libc::pid_t;
+    let deadline = timeout.map(|limit| Instant::now() + limit);
+    loop {
+        if kill_group_if_zombie(pid) {
+            let status = child
+                .wait()
+                .map_err(|e| KernelError::Apply(e.to_string()))?;
+            return Ok((status, false));
+        }
+        if deadline.is_some_and(|end| Instant::now() >= end) {
+            // SAFETY: pid is this spawn's child. `process_group(0)` or
+            // PTY `setsid` makes it a group leader.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::killpg(pid, libc::SIGKILL);
+            }
+            let status = child
+                .wait()
+                .map_err(|e| KernelError::Apply(e.to_string()))?;
+            return Ok((status, true));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[cfg(unix)]
 fn wait_until_deadline(
     child: &mut std::process::Child,
     timeout: Duration,
-) -> Result<(std::process::ExitStatus, bool), KernelError> {
-    use std::thread;
-    use std::time::Instant;
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child
-            .try_wait()
-            .map_err(|e| KernelError::Apply(e.to_string()))?
-        {
-            Some(status) => return Ok((status, false)),
-            None if Instant::now() >= deadline => {
-                let pid = child.id() as libc::pid_t;
-                // SAFETY: pid is this spawn's child. `process_group(0)` or
-                // PTY `setsid` makes it a group leader; `kill` still
-                // works when the group id differs.
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                    libc::killpg(pid, libc::SIGKILL);
-                }
-                let status = child
-                    .wait()
-                    .map_err(|e| KernelError::Apply(e.to_string()))?;
-                return Ok((status, true));
-            }
-            None => thread::sleep(Duration::from_millis(10)),
-        }
-    }
+) -> Result<(ExitStatus, bool), KernelError> {
+    reap_process_group(child, Some(timeout))
 }
 
 #[cfg(unix)]
@@ -662,15 +693,17 @@ impl KernelPolicy {
                     "kernel jail is not available; child was not started".into(),
                 ));
             }
+            use std::os::unix::process::CommandExt;
+
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
             #[cfg(target_os = "linux")]
             let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
             #[cfg(not(target_os = "linux"))]
             let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
-            let status = cmd
-                .status()
-                .map_err(|e| KernelError::Apply(e.to_string()))?;
+            cmd.process_group(0);
+            let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            let (status, _) = reap_process_group(&mut child, None)?;
             Ok((applied, status))
         }
         #[cfg(windows)]
@@ -708,6 +741,8 @@ impl KernelPolicy {
                     "kernel jail is not available; child was not started".into(),
                 ));
             }
+            use std::os::unix::process::CommandExt;
+
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
             #[cfg(target_os = "linux")]
@@ -717,10 +752,16 @@ impl KernelPolicy {
             cmd.stdin(std::process::Stdio::inherit());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
-            let output = cmd
-                .spawn()
-                .and_then(|c| c.wait_with_output())
-                .map_err(|e| KernelError::Apply(e.to_string()))?;
+            cmd.process_group(0);
+            let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            let stdout = child.stdout.take().map(drain_pipe);
+            let stderr = child.stderr.take().map(drain_pipe);
+            let (status, _) = reap_process_group(&mut child, None)?;
+            let output = std::process::Output {
+                status,
+                stdout: join_drain(stdout),
+                stderr: join_drain(stderr),
+            };
             Ok((applied, output))
         }
         #[cfg(windows)]
@@ -813,6 +854,8 @@ impl KernelPolicy {
                     "kernel jail is not available; child was not started".into(),
                 ));
             }
+            use std::os::unix::process::CommandExt;
+
             let mut cmd = cmd;
             scrub_child_command(&mut cmd);
             #[cfg(target_os = "linux")]
@@ -822,12 +865,11 @@ impl KernelPolicy {
             cmd.stdin(std::process::Stdio::inherit());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
+            cmd.process_group(0);
             let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
             let stdout = child.stdout.take().map(|p| copy_pipe(p, std::io::stdout()));
             let stderr = child.stderr.take().map(|p| copy_pipe(p, std::io::stderr()));
-            let status = child
-                .wait()
-                .map_err(|e| KernelError::Apply(e.to_string()))?;
+            let (status, _) = reap_process_group(&mut child, None)?;
             join_copy(stdout);
             join_copy(stderr);
             Ok((applied, status))
@@ -961,15 +1003,7 @@ impl KernelPolicy {
             let (out_th, master_write) =
                 pty::pump_master(pty.master).map_err(|e| KernelError::Apply(e.to_string()))?;
             let _stdin_th = pty::pump_stdin(master_write);
-            let (status, timed_out) = match timeout {
-                Some(limit) => wait_until_deadline(&mut child, limit)?,
-                None => {
-                    let status = child
-                        .wait()
-                        .map_err(|e| KernelError::Apply(e.to_string()))?;
-                    (status, false)
-                }
-            };
+            let (status, timed_out) = reap_process_group(&mut child, timeout)?;
             join_copy(Some(out_th));
             Ok((applied, status, timed_out))
         }
@@ -992,9 +1026,10 @@ impl KernelPolicy {
     /// Spawn `cmd` under the kernel jail and kill it after `timeout`.
     ///
     /// Same fail-closed setup as [`Self::run_child`]. Unix places the
-    /// child in its own process group and `killpg`s on the deadline.
-    /// Windows waits with a bounded `WaitForSingleObject` and closes
-    /// the job so `KILL_ON_JOB_CLOSE` stops the child.
+    /// child in its own process group and `killpg`s that group when the
+    /// leader exits and again on the deadline. Windows waits with a
+    /// bounded `WaitForSingleObject` and closes the job so
+    /// `KILL_ON_JOB_CLOSE` stops the child.
     pub fn run_child_timeout(
         &self,
         cmd: Command,
@@ -1004,7 +1039,6 @@ impl KernelPolicy {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            use std::time::Instant;
 
             if !kernel_supported() {
                 return Err(KernelError::Apply(
@@ -1019,26 +1053,11 @@ impl KernelPolicy {
             let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
             cmd.process_group(0);
             let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
-            let deadline = Instant::now() + timeout;
-            loop {
-                match child
-                    .try_wait()
-                    .map_err(|e| KernelError::Apply(e.to_string()))?
-                {
-                    Some(status) => return Ok((applied, status)),
-                    None if Instant::now() >= deadline => {
-                        let pid = child.id() as libc::pid_t;
-                        // SAFETY: pid is this spawn's child (`process_group(0)`).
-                        unsafe {
-                            libc::kill(pid, libc::SIGKILL);
-                            libc::killpg(pid, libc::SIGKILL);
-                        }
-                        let _ = child.wait();
-                        return Err(KernelError::Timeout);
-                    }
-                    None => std::thread::sleep(Duration::from_millis(10)),
-                }
+            let (status, timed_out) = reap_process_group(&mut child, Some(timeout))?;
+            if timed_out {
+                return Err(KernelError::Timeout);
             }
+            Ok((applied, status))
         }
         #[cfg(windows)]
         {
