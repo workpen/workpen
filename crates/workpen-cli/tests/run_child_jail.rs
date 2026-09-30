@@ -266,7 +266,8 @@ fn run_tty_forwards_stdin() {
     assert_eq!(
         out.status.code(),
         Some(0),
-        "--tty cat must exit 0 after stdin EOF, not hang until --timeout, stderr={}",
+        "--tty cat must exit 0 after stdin EOF, not hang until --timeout, stdout={:?} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");

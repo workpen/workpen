@@ -942,20 +942,44 @@ fn why_and_run_json_do_not_leak_or_wrap_success() {
     );
     #[cfg(unix)]
     {
+        // The deny cases above plant `.env`. On Ubuntu that makes `run`
+        // refuse before spawn. Success is a clean root, same as echo.
+        let clean = TempDir::new().expect("clean");
         let run_ok = workpen()
             .args(["run", "--json", "--root"])
-            .arg(dir.path())
+            .arg(clean.path())
             .args(["--", "/bin/echo", "hello-json"])
             .output()
             .expect("spawn");
         let stdout = String::from_utf8_lossy(&run_ok.stdout);
-        assert!(
-            run_ok.status.success()
-                && stdout.contains("hello-json")
-                && !stdout.contains("\"result\""),
-            "success must not wrap stdout: stdout={stdout} stderr={}",
-            String::from_utf8_lossy(&run_ok.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&run_ok.stderr);
+        if stderr.contains("remount unavailable") {
+            assert!(
+                !stdout.contains("\"result\""),
+                "remount refusal must not wrap stdout: stdout={stdout} stderr={stderr}"
+            );
+        } else {
+            assert!(
+                run_ok.status.success()
+                    && stdout.contains("hello-json")
+                    && !stdout.contains("\"result\""),
+                "success must not wrap stdout: stdout={stdout} stderr={stderr}"
+            );
+            let as_child = workpen()
+                .args(["run", "--root"])
+                .arg(clean.path())
+                .args(["--", "/bin/echo", "--json"])
+                .output()
+                .expect("spawn");
+            let child_out = String::from_utf8_lossy(&as_child.stdout);
+            assert!(
+                as_child.status.success()
+                    && child_out.contains("--json")
+                    && !child_out.contains("\"result\""),
+                "--json after -- is the child: stdout={child_out} stderr={}",
+                String::from_utf8_lossy(&as_child.stderr)
+            );
+        }
     }
 }
 

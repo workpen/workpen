@@ -381,8 +381,8 @@ impl KernelPolicy {
     }
 
     /// Read-only grant for one extra directory. Home and filesystem root
-    /// are refused the same way as [`add_rw`]. Dest-deny for that tree is
-    /// recorded after the allow.
+    /// are refused the same way as a read-write extra root. Dest-deny for
+    /// that tree is recorded after the allow.
     pub fn with_read_root(mut self, path: &Path) -> Result<Self, KernelError> {
         add_read_grant(&mut self.grants, path)?;
         let mut remaining = DEST_DENY_WALK_LIMIT;
