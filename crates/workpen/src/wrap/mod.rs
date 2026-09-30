@@ -1096,7 +1096,7 @@ fn public_key_env_exception(upper: &str) -> bool {
 }
 
 /// Loader and script-execution names. `--env` cannot put these back.
-fn is_child_env_loader(name: &OsStr) -> bool {
+pub(crate) fn is_child_env_loader(name: &OsStr) -> bool {
     let raw = name.to_string_lossy();
     const LOADERS: &[&str] = &[
         "LD_PRELOAD",

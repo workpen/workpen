@@ -2372,7 +2372,7 @@ fn run_child_scrubs_bash_env() {
 }
 
 #[test]
-fn run_child_scrubs_xai_api_key() {
+fn run_child_keeps_explicit_xai_api_key() {
     if !printenv_available() {
         return;
     }
@@ -2382,8 +2382,8 @@ fn run_child_scrubs_xai_api_key() {
     cmd.env("XAI_API_KEY", "secret").current_dir(dir.path());
     let (_applied, status) = policy.run_child(cmd).expect("run_child");
     assert!(
-        !status.success(),
-        "XAI_API_KEY must be absent after scrub: {status:?}"
+        status.success(),
+        "an explicit XAI_API_KEY opt-in must reach the child: {status:?}"
     );
 }
 
@@ -2553,7 +2553,7 @@ fn run_child_scrubs_tmpdir() {
     #[cfg(windows)]
     let mut cmd = Command::new("cmd");
     #[cfg(windows)]
-    cmd.args(["/c", "echo %TMPDIR%"]);
+    cmd.args(["/c", "if defined TMPDIR (echo SET) else (echo UNSET)"]);
     cmd.current_dir(dir.path());
     let (applied, output) = policy.run_child_output(cmd).expect("output");
     assert!(
@@ -2564,9 +2564,15 @@ fn run_child_scrubs_tmpdir() {
         "scrub spawn must start: {applied:?}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    #[cfg(unix)]
     assert!(
         stdout.is_empty(),
         "child must not print inherited TMPDIR: {stdout:?}"
+    );
+    #[cfg(windows)]
+    assert!(
+        stdout.contains("UNSET"),
+        "child must not inherit TMPDIR: {stdout:?}"
     );
 }
 
@@ -2585,7 +2591,7 @@ fn run_child_keeps_explicit_tmpdir() {
     let mut cmd = Command::new("cmd");
     #[cfg(windows)]
     cmd.args(["/c", "echo %TMPDIR%"]);
-    cmd.env("TMPDIR", "/tmp/host-opt-in");
+    cmd.env("TMPDIR", "host-opt-in");
     cmd.current_dir(dir.path());
     let (_applied, output) = policy.run_child_output(cmd).expect("output");
     let stdout = String::from_utf8_lossy(&output.stdout);
