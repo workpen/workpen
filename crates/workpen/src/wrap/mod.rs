@@ -1845,6 +1845,7 @@ fn macos_post_create_env_regexes(prefix: &str) -> Vec<String> {
 
 /// One path segment: `.env` or `.env.<tail>` where the tail's last
 /// dot-segment is not exactly `example`, `sample`, or `template`.
+#[cfg(target_os = "macos")]
 fn env_star_segment() -> String {
     let last = format!(
         "({one}|{two}|{three}|{four}|{five}|{sample}|{example}|{template}|{nine})",
@@ -1865,6 +1866,7 @@ fn env_star_segment() -> String {
     )
 }
 
+#[cfg(target_os = "macos")]
 fn not_exact_segment(word: &str) -> String {
     let mut alts = Vec::new();
     let chars: Vec<char> = word.chars().collect();
@@ -1882,10 +1884,12 @@ fn not_exact_segment(word: &str) -> String {
     format!("({})", alts.join("|"))
 }
 
+#[cfg(target_os = "macos")]
 fn letter_class(ch: char) -> String {
     format!("[{}{}]", ch.to_ascii_uppercase(), ch.to_ascii_lowercase())
 }
 
+#[cfg(target_os = "macos")]
 fn neg_letter(ch: char) -> String {
     format!("[^{}{}.]", ch.to_ascii_uppercase(), ch.to_ascii_lowercase())
 }
@@ -2217,7 +2221,7 @@ mod combine_spawn_restore_tests {
         assert_env_star_regex_skips_templates(&got[2]);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     fn assert_env_star_regex_skips_templates(star_anchored: &str) {
         let mut re = unsafe { std::mem::zeroed::<libc::regex_t>() };
         let c = std::ffi::CString::new(star_anchored).expect("regex");
