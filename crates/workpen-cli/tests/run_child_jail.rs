@@ -1112,7 +1112,10 @@ fn net_cannot_connect_to_a_socket_under_a_denied_directory() {
 ///
 /// `mode=null` closes the grandchild's stdio so it does not hold the
 /// parent's pipe. `mode=inherit` keeps the pipe open; `run` must not
-/// block on that pipe past the leader's exit.
+/// block on that pipe past the leader's exit. `mode=setsid` is the
+/// null case plus `os.setsid` in the grandchild. It does not plant a
+/// dest-deny name: a workspace `.env` on a host that cannot enter a
+/// user namespace refuses to start the child.
 #[cfg(unix)]
 fn background_writer_is_gone(timeout: Option<&str>, mode: &str, max_elapsed_ms: Option<u128>) {
     if !python3_available() {
@@ -1126,15 +1129,24 @@ ws, mode = sys.argv[1], sys.argv[2]
 py = sys.executable
 child = r"""
 import os, sys, time
-ws = sys.argv[1]
+ws, mode = sys.argv[1], sys.argv[2]
+if mode == "setsid":
+    os.setsid()
+    outside = os.path.join("/tmp", "wp-setsid-" + os.path.basename(ws))
+    try:
+        open(outside, "w").write("x")
+        probe = "tmp=open"
+    except OSError as exc:
+        probe = "tmp=" + type(exc).__name__
+    open(os.path.join(ws, "probed.txt"), "w").write(probe + "\n")
 open(os.path.join(ws, "child.pid"), "w").write(str(os.getpid()))
 time.sleep(5)
 open(os.path.join(ws, "done.txt"), "w").write("done\n")
 """
 kw = {}
-if mode == "null":
+if mode == "null" or mode == "setsid":
     kw = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-subprocess.Popen([py, "-c", child, ws], **kw)
+subprocess.Popen([py, "-c", child, ws, mode], **kw)
 for _ in range(200):
     if os.path.exists(os.path.join(ws, "child.pid")):
         print("saw")
@@ -1196,12 +1208,31 @@ raise SystemExit(1)
         !alive,
         "grandchild pid {pid} still alive after run returned"
     );
+    if mode == "setsid" {
+        let outside = std::path::PathBuf::from(format!(
+            "/tmp/wp-setsid-{}",
+            dir.path().file_name().expect("name").to_string_lossy()
+        ));
+        let leaked = outside.exists();
+        let probe = std::fs::read_to_string(dir.path().join("probed.txt")).unwrap_or_default();
+        let _ = std::fs::remove_file(&outside);
+        assert!(
+            !probe.contains("tmp=open") && !leaked,
+            "write outside the workspace must fail: probe={probe} leaked={leaked}"
+        );
+    }
 }
 
 #[cfg(unix)]
 #[test]
 fn background_writer_dies_when_run_returns() {
     background_writer_is_gone(None, "null", None);
+}
+
+#[cfg(unix)]
+#[test]
+fn background_setsid_writer_dies_when_run_returns() {
+    background_writer_is_gone(None, "setsid", None);
 }
 
 #[cfg(unix)]
