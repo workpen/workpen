@@ -60,11 +60,13 @@ The parent is trusted. The child is not.
 - Wrapper skip is `timeout`, `nohup`, `nice`, `time`, and `stdbuf`.
 - The child environment removes `TMPDIR`, `TEMP`, and `TMP`. The child
   uses the platform default temp directory.
-- When `run_child` returns, a grandchild that called `setsid` is not
-  still running. Linux adopts it with `PR_SET_CHILD_SUBREAPER`. macOS
-  records descendants seen while the command is alive and signals those
-  pids. A macOS command that forks and exits before that descendant is
-  observed can still leave it running.
+- When `run_child` returns successfully, a grandchild that called
+  `setsid` is not still running. Linux adopts it with
+  `PR_SET_CHILD_SUBREAPER`. macOS records the command's descendants,
+  including one created by a fork the reaper is notified about, and
+  signals those pids. A descendant past the recorded set, or a fork
+  whose new pid is no longer visible, is `KernelError::Descendants`.
+  The CLI exits 4 and prints `descendants were not fully stopped`.
 
 ## Hosts
 
