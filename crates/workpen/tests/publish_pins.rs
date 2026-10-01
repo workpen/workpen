@@ -1,6 +1,6 @@
 //! README install pins and publish sentences track the crate manifests.
 //!
-//! Manifest `0.6.0` is README `version = "0.6"` and `tag = "v0.6.0"`.
+//! Manifest `0.7.0` is README `version = "0.7"` and `tag = "v0.7.0"`.
 //! The two strings are not the same pin.
 
 use std::fs;

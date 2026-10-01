@@ -16,7 +16,8 @@ name = "workpen"
 path = "src/main.rs"
 
 # Archives are workpen-cli-<triple>.tar.gz and the file inside is `workpen`.
-# v0.6.0 only published the Linux x86_64 archive. Later tags add the rest.
+# 0.7.0 publishes Linux and macOS, x86_64 and arm64.
+# v0.6.0 published only the Linux x86_64 archive.
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/workpen-cli-{ target }.tar.gz"
 pkg-fmt = "tgz"
