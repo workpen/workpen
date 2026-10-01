@@ -25,7 +25,7 @@ The parent is trusted. This is not a VM.
 Library:
 
 ```toml
-workpen = { version = "0.6", features = ["gc", "nono"] }
+workpen = { version = "0.7", features = ["gc", "nono"] }
 ```
 
 CLI:
@@ -35,12 +35,12 @@ cargo install workpen-cli --locked
 cargo binstall workpen-cli
 ```
 
-`cargo binstall` fetches the GitHub release archive. The 0.6.0 archive is Linux x86_64. Later releases also ship macOS and Linux arm64.
+`cargo binstall` fetches the GitHub release archive. 0.7.0 ships Linux and macOS, on x86_64 and arm64. The file inside each archive is `workpen`.
 
 Git pin:
 
 ```toml
-workpen = { git = "https://github.com/workpen/workpen", tag = "v0.6.0", features = ["gc", "nono"] }
+workpen = { git = "https://github.com/workpen/workpen", tag = "v0.7.0", features = ["gc", "nono"] }
 ```
 
 MSRV is 1.95.
