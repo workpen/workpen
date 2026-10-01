@@ -115,8 +115,9 @@ pub enum KernelError {
     /// Child finished; DACL restore failed. Hosts match this, not English.
     #[error("kernel wrap restore failed: {0}")]
     Restore(String),
-    /// A descendant pid did not fit in the recorded set, or a fork's new
-    /// pid was no longer visible. The CLI exits 4.
+    /// A descendant pid did not fit in the recorded set, or macOS left a
+    /// live process with the command's name outside that set. The CLI
+    /// exits 4.
     #[error("kernel wrap did not track every descendant")]
     Descendants,
 }

@@ -11,9 +11,11 @@
 //! reparented to the reaper when the command exits. macOS has no
 //! subreaper. The reaper stops the command until a fork watch is armed,
 //! records descendants from that watch and from walks, and signals those
-//! pids. A pid that does not fit in the recorded set, or a fork whose
-//! new pid is no longer listed, is reported on `report_fd`. The host
-//! turns that byte into `KernelError::Descendants`.
+//! pids. A pid that does not fit in the recorded set is reported on
+//! `report_fd`. On macOS a fork whose parent has exited is reported
+//! the same way when a live process with that command's name is still
+//! outside the recorded set. The host turns that byte into
+//! `KernelError::Descendants`.
 
 use std::cell::Cell;
 use std::io;
@@ -22,6 +24,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 const MAX_PIDS: usize = 128;
 const LIST_MAX: usize = 1024;
 const SCAN_NS: libc::c_long = 2_000_000;
+/// Polls of `proc_pidinfo` after continue. A short command can exit
+/// before the reaper runs again, and a zombie no longer answers.
+#[cfg(target_os = "macos")]
+const IDENTITY_POLLS: usize = 4096;
 
 static STOP: AtomicI32 = AtomicI32::new(0);
 static mut MISSED: u8 = 0;
@@ -82,10 +88,34 @@ struct PidSet {
 }
 
 #[cfg(target_os = "macos")]
-static mut PENDING: PidSet = PidSet {
-    n: 0,
-    pids: [0; MAX_PIDS + 1],
+static mut CMD_PID: libc::pid_t = 0;
+
+/// Program name captured after exec. The reaper's own name is the
+/// pre-exec image, so it must not be stored here.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct Identity {
+    ready: u8,
+    comm: [u8; 16],
+    uid: u32,
+    sec: u64,
+    usec: u64,
+}
+
+#[cfg(target_os = "macos")]
+static mut IDENT: Identity = Identity {
+    ready: 0,
+    comm: [0; 16],
+    uid: 0,
+    sec: 0,
+    usec: 0,
 };
+
+#[cfg(target_os = "macos")]
+static mut REAPER_COMM: [u8; 16] = [0; 16];
+
+#[cfg(target_os = "macos")]
+static mut REAPER_COMM_READY: u8 = 0;
 
 #[cfg(target_os = "macos")]
 static mut SEEN: PidSet = PidSet {
@@ -193,16 +223,25 @@ fn reaper_main(cmd: libc::pid_t, report_fd: i32) -> ! {
         libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
     }
     reset_tracking();
+    #[cfg(target_os = "macos")]
+    unsafe {
+        std::ptr::addr_of_mut!(CMD_PID).write(cmd);
+    }
     install_stop_handler();
     detach_stdio();
     let kq = watch_command(cmd, report_fd);
-    // The command is already running. Read fork notes before the fd
-    // walk so a short helper is still in the child list.
-    drain_proc_events(kq);
     // `Command::spawn` reads a CLOEXEC error pipe until exec. This
     // process does not exec, so close every extra fd or the parent
     // blocks in `spawn` until we exit. Keep the report and the watch.
+    // On macOS the command is still stopped here. Continuing first lets
+    // a setsid child exit during the walk.
     close_extra_fds(report_fd, kq);
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { libc::kill(cmd, libc::SIGCONT) };
+        cache_command_identity(cmd);
+    }
+    drain_proc_events(kq);
     let mut status = 0;
     loop {
         if STOP.load(Ordering::Relaxed) != 0 {
@@ -210,6 +249,8 @@ fn reaper_main(cmd: libc::pid_t, report_fd: i32) -> ! {
         }
         drain_proc_events(kq);
         remember_tree(cmd, kq);
+        #[cfg(target_os = "macos")]
+        remember_identity(cmd);
         let waited = unsafe { libc::waitpid(cmd, &mut status, libc::WNOHANG) };
         if waited == cmd {
             finish(cmd, status, report_fd, kq);
@@ -307,10 +348,8 @@ fn watch_command_macos(cmd: libc::pid_t, report_fd: i32) -> i32 {
         if kq >= 0 {
             unsafe { libc::close(kq) };
         }
-        unsafe { libc::kill(cmd, libc::SIGCONT) };
         return -1;
     }
-    unsafe { libc::kill(cmd, libc::SIGCONT) };
     kq
 }
 
@@ -901,41 +940,50 @@ fn handle_event(ev: &libc::kevent, kq: i32) {
     let note_exit = fflags & libc::NOTE_EXIT != 0;
     if note_fork {
         on_fork(ident, kq, note_exit);
-    } else if note_exit {
-        on_exit(ident);
     }
 }
 
 #[cfg(target_os = "macos")]
 fn on_fork(parent: libc::pid_t, kq: i32, also_exit: bool) {
+    remember_identity(parent);
+    let cmd = unsafe { std::ptr::addr_of!(CMD_PID).read() };
+    remember_identity(cmd);
     let mut kids = [0; LIST_MAX];
-    let (n, trunc) = direct_children(parent, &mut kids);
+    let (mut n, trunc) = direct_children(parent, &mut kids);
     if trunc {
         mark_missed();
     }
+    if n == 0 && !also_exit && !parent_is_gone(parent) {
+        // The child may not be linked yet. A few rereads catch that.
+        // A helper the parent already waited for stays absent.
+        for _ in 0..16 {
+            let (n2, trunc2) = direct_children(parent, &mut kids);
+            if trunc2 {
+                mark_missed();
+            }
+            if n2 > 0 {
+                n = n2;
+                break;
+            }
+            if parent_is_gone(parent) {
+                break;
+            }
+        }
+    }
     if n > 0 {
-        clear_pending(parent);
         note_seen(parent);
         for kid in kids.into_iter().take(n) {
             note_pid(kid, kq);
         }
         return;
     }
-    // This fork's pid is already gone. Once the parent has exited it
-    // was reparented, even if an older sibling is in the table.
-    if also_exit || parent_is_gone(parent) {
-        mark_missed();
-        clear_pending(parent);
+    // setsid does not drop a live child while this parent still exists.
+    if !also_exit && !parent_is_gone(parent) {
         return;
     }
-    if !has_seen(parent) {
-        set_pending(parent);
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn on_exit(parent: libc::pid_t) {
-    if take_pending(parent) && !has_seen(parent) {
+    // Reparented. Report only a live process that still has this
+    // command's name. Do not signal an unmatched pid.
+    if untracked_same_name(parent) {
         mark_missed();
     }
 }
@@ -946,32 +994,6 @@ fn note_seen(pid: libc::pid_t) {
     if !pidset_insert(seen, pid) {
         mark_missed();
     }
-}
-
-#[cfg(target_os = "macos")]
-fn has_seen(pid: libc::pid_t) -> bool {
-    let seen = unsafe { &*std::ptr::addr_of!(SEEN) };
-    pidset_contains(seen, pid)
-}
-
-#[cfg(target_os = "macos")]
-fn set_pending(pid: libc::pid_t) {
-    let pending = unsafe { &mut *std::ptr::addr_of_mut!(PENDING) };
-    if !pidset_insert(pending, pid) {
-        mark_missed();
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn clear_pending(pid: libc::pid_t) {
-    let pending = unsafe { &mut *std::ptr::addr_of_mut!(PENDING) };
-    pidset_remove(pending, pid);
-}
-
-#[cfg(target_os = "macos")]
-fn take_pending(pid: libc::pid_t) -> bool {
-    let pending = unsafe { &mut *std::ptr::addr_of_mut!(PENDING) };
-    pidset_remove(pending, pid)
 }
 
 #[cfg(target_os = "macos")]
@@ -989,16 +1011,6 @@ fn pidset_insert(set: &mut PidSet, pid: libc::pid_t) -> bool {
     }
     set.pids[set.n] = pid;
     set.n += 1;
-    true
-}
-
-#[cfg(target_os = "macos")]
-fn pidset_remove(set: &mut PidSet, pid: libc::pid_t) -> bool {
-    let Some(i) = set.pids[..set.n].iter().position(|item| *item == pid) else {
-        return false;
-    };
-    set.n -= 1;
-    set.pids[i] = set.pids[set.n];
     true
 }
 
@@ -1082,6 +1094,147 @@ unsafe extern "C" {
     ) -> libc::c_int;
 }
 
+#[cfg(target_os = "macos")]
+fn identity_ready() -> bool {
+    unsafe { std::ptr::addr_of!(IDENT).read().ready != 0 }
+}
+
+/// `proc_pidinfo` on a zombie returns nothing. Read the name while the
+/// command is still alive, and skip the pre-exec image.
+#[cfg(target_os = "macos")]
+fn remember_identity(pid: libc::pid_t) {
+    if pid <= 0 || identity_ready() {
+        return;
+    }
+    let Some(info) = bsdinfo(pid) else {
+        return;
+    };
+    let comm = &info[48..64];
+    if comm.iter().all(|byte| *byte == 0) {
+        return;
+    }
+    let Some(mine) = reaper_comm() else {
+        return;
+    };
+    if comm == mine.as_slice() {
+        return;
+    }
+    let sec = u64::from_ne_bytes(info[120..128].try_into().unwrap_or([0; 8]));
+    let usec = u64::from_ne_bytes(info[128..136].try_into().unwrap_or([0; 8]));
+    // A zero start would match every later process with this name.
+    if sec == 0 && usec == 0 {
+        return;
+    }
+    unsafe {
+        let ident = &mut *std::ptr::addr_of_mut!(IDENT);
+        ident.comm.copy_from_slice(comm);
+        ident.uid = u32::from_ne_bytes(info[20..24].try_into().unwrap_or([0; 4]));
+        ident.sec = sec;
+        ident.usec = usec;
+        ident.ready = 1;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn reaper_comm() -> Option<[u8; 16]> {
+    unsafe {
+        if std::ptr::addr_of!(REAPER_COMM_READY).read() == 0 {
+            let info = bsdinfo(libc::getpid())?;
+            (*std::ptr::addr_of_mut!(REAPER_COMM)).copy_from_slice(&info[48..64]);
+            std::ptr::addr_of_mut!(REAPER_COMM_READY).write(1);
+        }
+        Some(std::ptr::addr_of!(REAPER_COMM).read())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cache_command_identity(cmd: libc::pid_t) {
+    for _ in 0..IDENTITY_POLLS {
+        if identity_ready() {
+            return;
+        }
+        remember_identity(cmd);
+        if identity_ready() || unsafe { libc::kill(cmd, 0) } != 0 {
+            return;
+        }
+    }
+}
+
+/// Live launchd child with this command's name, started with the
+/// command, and not already recorded. A full child buffer is a miss:
+/// the orphan may sit past the end.
+#[cfg(target_os = "macos")]
+fn untracked_same_name(parent: libc::pid_t) -> bool {
+    remember_identity(parent);
+    let cmd = unsafe { std::ptr::addr_of!(CMD_PID).read() };
+    remember_identity(cmd);
+    if !identity_ready() {
+        return false;
+    }
+    let ident = unsafe { std::ptr::addr_of!(IDENT).read() };
+    if ident.sec == 0 && ident.usec == 0 {
+        return false;
+    }
+    let me = unsafe { libc::getpid() };
+    let mut kids = [0; 4096];
+    let (n, trunc) = direct_children(1, &mut kids);
+    for pid in kids.into_iter().take(n) {
+        if pid <= 0 || pid == cmd || pid == me || pid == parent || is_recorded(pid) {
+            continue;
+        }
+        let Some(info) = bsdinfo(pid) else {
+            continue;
+        };
+        let status = u32::from_ne_bytes(info[4..8].try_into().unwrap_or([0; 4]));
+        if status == 5 || &info[48..64] != ident.comm.as_slice() {
+            continue;
+        }
+        let ouid = u32::from_ne_bytes(info[20..24].try_into().unwrap_or([0; 4]));
+        if ouid != ident.uid {
+            continue;
+        }
+        let stamp = (
+            u64::from_ne_bytes(info[120..128].try_into().unwrap_or([0; 8])),
+            u64::from_ne_bytes(info[128..136].try_into().unwrap_or([0; 8])),
+        );
+        if stamp.0 == 0 && stamp.1 == 0 {
+            continue;
+        }
+        if stamp >= (ident.sec, ident.usec) {
+            return true;
+        }
+    }
+    trunc
+}
+
+#[cfg(target_os = "macos")]
+fn bsdinfo(pid: libc::pid_t) -> Option<[u8; 136]> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut buf = [0u8; 136];
+    let n = unsafe {
+        proc_pidinfo(
+            pid as libc::c_int,
+            3,
+            0,
+            buf.as_mut_ptr().cast(),
+            buf.len() as libc::c_int,
+        )
+    };
+    if n < 136 { None } else { Some(buf) }
+}
+
+#[cfg(target_os = "macos")]
+fn is_recorded(pid: libc::pid_t) -> bool {
+    let table = unsafe { &*std::ptr::addr_of!(TABLE) };
+    if table.rows[..table.n].iter().any(|row| row.pid == pid) {
+        return true;
+    }
+    let over = unsafe { &*std::ptr::addr_of!(OVERFLOW) };
+    over.rows[..over.n].iter().any(|row| row.pid == pid)
+}
+
 fn reset_tracking() {
     unsafe {
         std::ptr::addr_of_mut!(MISSED).write(0);
@@ -1090,8 +1243,15 @@ fn reset_tracking() {
         #[cfg(target_os = "macos")]
         {
             (*std::ptr::addr_of_mut!(OVERFLOW)).n = 0;
-            (*std::ptr::addr_of_mut!(PENDING)).n = 0;
             (*std::ptr::addr_of_mut!(SEEN)).n = 0;
+            std::ptr::addr_of_mut!(CMD_PID).write(0);
+            std::ptr::addr_of_mut!(IDENT).write(Identity {
+                ready: 0,
+                comm: [0; 16],
+                uid: 0,
+                sec: 0,
+                usec: 0,
+            });
         }
     }
 }
@@ -1105,6 +1265,10 @@ fn missed() -> bool {
 }
 
 fn write_report(fd: i32) {
+    #[cfg(target_os = "macos")]
+    if untracked_same_name(0) {
+        mark_missed();
+    }
     if fd < 0 {
         return;
     }

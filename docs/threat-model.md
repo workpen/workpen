@@ -64,9 +64,11 @@ The parent is trusted. The child is not.
   `setsid` is not still running. Linux adopts it with
   `PR_SET_CHILD_SUBREAPER`. macOS records the command's descendants,
   including one created by a fork the reaper is notified about, and
-  signals those pids. A descendant past the recorded set, or a fork
-  whose new pid is no longer visible, is `KernelError::Descendants`.
-  The CLI exits 4 and prints `descendants were not fully stopped`.
+  signals those pids. A descendant past the recorded set is
+  `KernelError::Descendants`. On macOS a fork whose parent has exited
+  is that error when a live process with the command's name is still
+  outside the recorded set. A child the parent already waited for is
+  not. The CLI exits 4 and prints `descendants were not fully stopped`.
 
 ## Hosts
 
