@@ -34,7 +34,7 @@ By default the child cannot use the network. It may read system paths and write 
 why reports whether one path is dest-denied under the root. It does not spawn.
 run dest-denies argv, then starts one jailed child when the jail applies.
 gc reclaims leftover worktrees under .workpen-worktrees. It does not clean target/.
-Exit status 0 is success. 1 is a why denial. 2 is usage or a setup failure. 3 is a policy refusal before the child starts. 124 is a timeout. 127 means the program was not found. The child status is passed through, including 2, 3, and 127.";
+Exit status 0 is success. 1 is a why denial. 2 is usage or a setup failure. 3 is a policy refusal before the child starts. 4 means descendants were not fully stopped. 124 is a timeout. 127 means the program was not found. The child status is passed through, including 2, 3, and 127.";
 
 const WHY_USAGE: &str = "usage: workpen why [--root DIR] [--extra-root DIR] PATH";
 
@@ -352,6 +352,16 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
             return Err(format!(
                 "child finished but {e}; workspace ACL may still grant the write-restricted SID"
             ));
+        }
+        Err(KernelError::Descendants) => {
+            if json {
+                println!(
+                    "{}",
+                    json_line("denied", 4, None, None, Some("descendants"))
+                );
+            }
+            eprintln!("descendants were not fully stopped");
+            return Ok(ExitCode::from(4));
         }
         Err(err @ KernelError::DestDeny(_))
         | Err(err @ KernelError::Home(_))

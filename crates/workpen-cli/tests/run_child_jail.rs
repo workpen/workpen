@@ -1246,3 +1246,453 @@ fn background_writer_dies_when_early_exit_beats_timeout() {
 fn background_stdout_holder_does_not_stretch_timeout() {
     background_writer_is_gone(Some("1s"), "inherit", Some(3000));
 }
+
+#[cfg(unix)]
+const DESCENDANTS_STOPPED: &str = "descendants were not fully stopped";
+
+#[cfg(unix)]
+fn pid_alive(pid: &str) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn kill_pid(pid: &str) {
+    let _ = Command::new("/bin/kill")
+        .args(["-9", pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Kills every pid in `pids.txt` when the test ends, including on panic.
+#[cfg(unix)]
+struct KillPidFile(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for KillPidFile {
+    fn drop(&mut self) {
+        let Ok(text) = std::fs::read_to_string(&self.0) else {
+            return;
+        };
+        for pid in text.split_whitespace() {
+            kill_pid(pid);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_setsid_herd(n: usize, expect_signal: bool) {
+    assert!(
+        python3_available(),
+        "python3 is required to prove the descendant cap"
+    );
+    let dir = TempDir::new().expect("workspace");
+    let ws = dir.path().to_string_lossy().to_string();
+    let pid_file = dir.path().join("pids.txt");
+    let _cleanup = KillPidFile(pid_file.clone());
+    let script = r#"
+import os, subprocess, sys, time
+n = int(sys.argv[1])
+ws = sys.argv[2]
+py = sys.executable
+code = r'''
+import os, sys, time
+os.setsid()
+fd = os.open("/dev/null", os.O_RDWR)
+os.dup2(fd, 0)
+os.dup2(fd, 1)
+os.dup2(fd, 2)
+open(sys.argv[1], "w").write("ready")
+time.sleep(30)
+'''
+pids = []
+for i in range(n):
+    ready = os.path.join(ws, "ready-%d" % i)
+    proc = subprocess.Popen(
+        [py, "-c", code, ready],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    pids.append(proc.pid)
+with open(os.path.join(ws, "pids.txt"), "w") as handle:
+    handle.write("\n".join(str(pid) for pid in pids) + "\n")
+deadline = time.time() + 20
+while time.time() < deadline:
+    got = 0
+    for i in range(n):
+        if os.path.exists(os.path.join(ws, "ready-%d" % i)):
+            got += 1
+    if got == n:
+        time.sleep(0.3)
+        raise SystemExit(0)
+    time.sleep(0.02)
+sys.stderr.write("started %d of %d\n" % (got, n))
+raise SystemExit(2)
+"#;
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(&ws)
+        .args(["--timeout", "45s", "--", "python3", "-c", script])
+        .arg(n.to_string())
+        .arg(&ws)
+        .output()
+        .expect("spawn workpen");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let pids = std::fs::read_to_string(&pid_file).unwrap_or_default();
+    let mut alive = Vec::new();
+    for pid in pids.split_whitespace() {
+        if pid_alive(pid) {
+            alive.push(pid.to_string());
+        }
+    }
+    if expect_signal {
+        assert!(
+            !out.status.success(),
+            "n={n} must not succeed when a descendant pid cannot be stored, alive={alive:?} stdout={stdout} stderr={stderr}"
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(4),
+            "n={n} must exit 4, alive={alive:?} stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stderr.contains(DESCENDANTS_STOPPED),
+            "n={n} stderr must say descendants were not fully stopped: {stderr}"
+        );
+        assert!(
+            !stderr.contains("failed to spawn"),
+            "n={n} must not look like a spawn failure: {stderr}"
+        );
+    } else {
+        assert!(
+            out.status.success(),
+            "n={n} must succeed, alive={alive:?} stdout={stdout} stderr={stderr}"
+        );
+    }
+    assert!(
+        alive.is_empty(),
+        "n={n} left setsid grandchildren alive: {alive:?} stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_stops_one_hundred_twenty_eight_setsid_children() {
+    run_setsid_herd(128, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_reports_when_descendant_cap_is_exceeded() {
+    run_setsid_herd(129, true);
+}
+
+#[cfg(unix)]
+const RACER_C: &str = r#"
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        return 2;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        return 1;
+    }
+    if (pid == 0) {
+        if (setsid() < 0) {
+            _exit(1);
+        }
+        int fd = open("/dev/null", O_RDWR);
+        if (fd >= 0) {
+            dup2(fd, 0);
+            dup2(fd, 1);
+            dup2(fd, 2);
+            if (fd > 2) {
+                close(fd);
+            }
+        }
+        for (;;) {
+            pause();
+        }
+    }
+    FILE *handle = fopen(argv[1], "w");
+    if (handle == 0) {
+        _exit(1);
+    }
+    fprintf(handle, "%ld\n", (long)pid);
+    fclose(handle);
+    _exit(0);
+}
+"#;
+
+#[cfg(unix)]
+fn compile_c(dir: &std::path::Path, name: &str, source: &str) -> Option<std::path::PathBuf> {
+    let src = dir.join(format!("{name}.c"));
+    let bin = dir.join(name);
+    std::fs::write(&src, source).ok()?;
+    let compiled = Command::new("cc")
+        .arg("-O2")
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    if compiled.success() { Some(bin) } else { None }
+}
+
+#[cfg(unix)]
+fn compile_setsid_racer(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    compile_c(dir, "racer", RACER_C)
+}
+
+/// Fork, `setsid`, and `_exit` before a 2ms poll can see the child.
+/// Success means that child is dead. Any other status must say the
+/// tree was not fully stopped. Skips when `cc` cannot build the helper.
+#[cfg(unix)]
+#[test]
+fn run_stops_or_reports_a_fast_setsid_orphan() {
+    let dir = TempDir::new().expect("workspace");
+    let Some(bin) = compile_setsid_racer(dir.path()) else {
+        return;
+    };
+    let ws = dir.path().to_string_lossy().to_string();
+    for trial in 0..20 {
+        let pid_path = dir.path().join(format!("child-{trial}.pid"));
+        let _cleanup = KillPidFile(pid_path.clone());
+        let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+            .args(["run", "--root"])
+            .arg(&ws)
+            .args(["--timeout", "5s", "--"])
+            .arg(&bin)
+            .arg(&pid_path)
+            .output()
+            .expect("spawn workpen");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let pid = std::fs::read_to_string(&pid_path).unwrap_or_default();
+        let pid = pid.trim();
+        assert!(
+            !pid.is_empty(),
+            "trial {trial} did not record a child pid, stdout={stdout} stderr={stderr}"
+        );
+        let alive = pid_alive(pid);
+        if out.status.success() {
+            assert!(
+                !alive,
+                "trial {trial} returned success while pid {pid} was still alive, stdout={stdout} stderr={stderr}"
+            );
+        } else {
+            assert_eq!(
+                out.status.code(),
+                Some(4),
+                "trial {trial} must exit 4 when the child tree is incomplete, alive={alive} stdout={stdout} stderr={stderr}"
+            );
+            assert!(
+                stderr.contains(DESCENDANTS_STOPPED),
+                "trial {trial} stderr must say descendants were not fully stopped: {stderr}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+const DECOY_RACER_C: &str = r#"
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static void park(void) {
+    int fd = open("/dev/null", O_RDWR);
+    if (fd >= 0) {
+        dup2(fd, 0);
+        dup2(fd, 1);
+        dup2(fd, 2);
+        if (fd > 2) {
+            close(fd);
+        }
+    }
+    for (;;) {
+        pause();
+    }
+}
+
+int main(int argc, char **argv) {
+    int status = 0;
+    pid_t mid;
+    pid_t decoy;
+    pid_t hop;
+    if (argc < 2) {
+        return 2;
+    }
+    mid = fork();
+    if (mid < 0) {
+        return 1;
+    }
+    if (mid != 0) {
+        if (waitpid(mid, &status, 0) != mid) {
+            return 1;
+        }
+        usleep(20000);
+        return 0;
+    }
+    decoy = fork();
+    if (decoy < 0) {
+        _exit(1);
+    }
+    if (decoy == 0) {
+        if (setsid() < 0) {
+            _exit(1);
+        }
+        park();
+    }
+    /* Recorded sleeper, then a fork that exits before its child can be listed. */
+    usleep(50000);
+    hop = fork();
+    if (hop < 0) {
+        _exit(1);
+    }
+    if (hop == 0) {
+        pid_t orphan = fork();
+        FILE *handle;
+        if (orphan < 0) {
+            _exit(1);
+        }
+        if (orphan == 0) {
+            if (setsid() < 0) {
+                _exit(1);
+            }
+            park();
+        }
+        handle = fopen(argv[1], "w");
+        if (handle == 0) {
+            _exit(1);
+        }
+        fprintf(handle, "%ld\n%ld\n", (long)decoy, (long)orphan);
+        fclose(handle);
+        _exit(0);
+    }
+    _exit(0);
+}
+"#;
+
+/// A recorded sleeper must not hide a later fork that exits immediately.
+#[cfg(unix)]
+#[test]
+fn run_stops_or_reports_a_setsid_orphan_after_a_decoy() {
+    let dir = TempDir::new().expect("workspace");
+    let Some(bin) = compile_c(dir.path(), "decoy", DECOY_RACER_C) else {
+        return;
+    };
+    let ws = dir.path().to_string_lossy().to_string();
+    for trial in 0..10 {
+        let pid_path = dir.path().join(format!("decoy-{trial}.pid"));
+        let _cleanup = KillPidFile(pid_path.clone());
+        let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+            .args(["run", "--root"])
+            .arg(&ws)
+            .args(["--timeout", "5s", "--"])
+            .arg(&bin)
+            .arg(&pid_path)
+            .output()
+            .expect("spawn workpen");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let text = std::fs::read_to_string(&pid_path).unwrap_or_default();
+        let mut pids = text.split_whitespace();
+        let decoy = pids.next().unwrap_or("").to_string();
+        let orphan = pids.next().unwrap_or("").to_string();
+        assert!(
+            !decoy.is_empty() && !orphan.is_empty(),
+            "trial {trial} did not record both pids, text={text:?} stdout={stdout} stderr={stderr}"
+        );
+        let orphan_alive = pid_alive(&orphan);
+        if out.status.success() {
+            assert!(
+                !orphan_alive,
+                "trial {trial} returned success while orphan {orphan} was still alive, stdout={stdout} stderr={stderr}"
+            );
+            assert!(
+                !pid_alive(&decoy),
+                "trial {trial} returned success while decoy {decoy} was still alive, stdout={stdout} stderr={stderr}"
+            );
+            assert!(
+                !stderr.contains(DESCENDANTS_STOPPED),
+                "trial {trial} succeeded but still reported a miss: {stderr}"
+            );
+        } else {
+            assert_eq!(
+                out.status.code(),
+                Some(4),
+                "trial {trial} must exit 4 when the orphan was not tracked, orphan_alive={orphan_alive} stdout={stdout} stderr={stderr}"
+            );
+            assert!(
+                stderr.contains(DESCENDANTS_STOPPED),
+                "trial {trial} stderr must say descendants were not fully stopped: {stderr}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+const REAPED_FORKS_C: &str = r#"
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    for (int i = 0; i < 8; i++) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            return 1;
+        }
+        if (pid == 0) {
+            _exit(0);
+        }
+        int status = 0;
+        if (waitpid(pid, &status, 0) != pid) {
+            return 1;
+        }
+    }
+    return 0;
+}
+"#;
+
+/// Fork plus wait is a finished helper, not an escaped descendant.
+#[cfg(unix)]
+#[test]
+fn run_reaped_forks_do_not_report_a_miss() {
+    let dir = TempDir::new().expect("workspace");
+    let Some(bin) = compile_c(dir.path(), "reaped", REAPED_FORKS_C) else {
+        return;
+    };
+    let ws = dir.path().to_string_lossy().to_string();
+    let out = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(&ws)
+        .args(["--timeout", "5s", "--"])
+        .arg(&bin)
+        .output()
+        .expect("spawn workpen");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "reaped helpers must succeed, status={:?} stderr={stderr}",
+        out.status.code()
+    );
+    assert!(
+        !stderr.contains(DESCENDANTS_STOPPED),
+        "reaped helpers must not report an untracked descendant: {stderr}"
+    );
+}

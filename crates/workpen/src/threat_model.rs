@@ -69,11 +69,16 @@
 //! * Wrapper skip is `timeout`, `nohup`, `nice`, `time`, and `stdbuf`.
 //! * The child environment removes `TMPDIR`, `TEMP`, and `TMP`. The
 //!   child uses the platform default temp directory.
-//! * When `run_child` returns, a grandchild that called `setsid` is
-//!   not still running. Linux adopts it with `PR_SET_CHILD_SUBREAPER`.
-//!   macOS records descendants seen while the command is alive and
-//!   signals those pids. A macOS command that forks and exits before
-//!   that descendant is observed can still leave it running.
+//! * When `run_child` returns successfully, a grandchild that called
+//!   `setsid` is not still running. Linux adopts it with
+//!   `PR_SET_CHILD_SUBREAPER`. macOS records the command's descendants,
+//!   including one created by a fork the reaper is notified about, and
+//!   signals those pids. A descendant past the recorded set is
+//!   [`crate::KernelError::Descendants`]. On macOS a fork whose parent
+//!   has exited is that error when a live process with the command's
+//!   name is still outside the recorded set. A child the parent already
+//!   waited for is not. The CLI exits 4 and prints
+//!   `descendants were not fully stopped`.
 //!
 //! # Process hardening
 //!

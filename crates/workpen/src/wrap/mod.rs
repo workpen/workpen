@@ -115,6 +115,11 @@ pub enum KernelError {
     /// Child finished; DACL restore failed. Hosts match this, not English.
     #[error("kernel wrap restore failed: {0}")]
     Restore(String),
+    /// A descendant pid did not fit in the recorded set, or macOS left a
+    /// live process with the command's name outside that set. The CLI
+    /// exits 4.
+    #[error("kernel wrap did not track every descendant")]
+    Descendants,
 }
 
 /// Merge spawn and DACL-restore results. Timeout stays Timeout.
@@ -199,10 +204,8 @@ fn reap_process_group(
     let deadline = timeout.map(|limit| Instant::now() + limit);
     loop {
         if kill_group_if_zombie(pid) {
-            let status = child
-                .wait()
-                .map_err(|e| KernelError::Apply(e.to_string()))?;
-            return Ok((status, false));
+            let status = wait_reaped(child)?;
+            return finish_reap(status, false);
         }
         if deadline.is_some_and(|end| Instant::now() >= end) {
             // Ask the reaper to kill the command and any `setsid`
@@ -213,10 +216,8 @@ fn reap_process_group(
             let grace = Instant::now() + Duration::from_millis(300);
             loop {
                 if kill_group_if_zombie(pid) {
-                    let status = child
-                        .wait()
-                        .map_err(|e| KernelError::Apply(e.to_string()))?;
-                    return Ok((status, true));
+                    let status = wait_reaped(child)?;
+                    return finish_reap(status, true);
                 }
                 if Instant::now() >= grace {
                     unsafe {
@@ -227,15 +228,43 @@ fn reap_process_group(
                             libc::killpg(pid, libc::SIGKILL);
                         }
                     }
-                    let status = child
-                        .wait()
-                        .map_err(|e| KernelError::Apply(e.to_string()))?;
-                    return Ok((status, true));
+                    let status = wait_reaped(child)?;
+                    return finish_reap(status, true);
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn wait_reaped(child: &mut std::process::Child) -> Result<ExitStatus, KernelError> {
+    child.wait().map_err(|err| {
+        reaper::discard_report();
+        KernelError::Apply(err.to_string())
+    })
+}
+
+#[cfg(unix)]
+fn finish_reap(status: ExitStatus, timed_out: bool) -> Result<(ExitStatus, bool), KernelError> {
+    if !reaper::take_descendant_report(timed_out) {
+        return Err(KernelError::Descendants);
+    }
+    Ok((status, timed_out))
+}
+
+#[cfg(unix)]
+fn spawn_jailed(cmd: &mut Command) -> Result<std::process::Child, KernelError> {
+    match cmd.spawn() {
+        Ok(child) => {
+            reaper::close_parent_report_write();
+            Ok(child)
+        }
+        Err(err) => {
+            reaper::discard_report();
+            Err(KernelError::Apply(err.to_string()))
+        }
     }
 }
 
@@ -639,10 +668,14 @@ impl KernelPolicy {
             let require_remount = remount == KernelApply::Applied;
             // Safety: the set and dest list are built in the parent; the hook
             // only applies them and maps failure to io::Error.
+            // The report fd is captured by value. After `fork` the
+            // reaper's address space is a copy, so a parent thread-local
+            // would not be the pipe this process inherited.
+            let report_fd = reaper::prepare_report();
             unsafe {
                 use std::os::unix::process::CommandExt;
                 cmd.pre_exec(move || {
-                    reaper::supervise_or_continue()?;
+                    reaper::supervise_or_continue(report_fd)?;
                     #[cfg(target_os = "linux")]
                     linux::apply_dest_deny_remounts(&dests, &workspace, require_remount)?;
                     #[cfg(not(target_os = "linux"))]
@@ -696,8 +729,18 @@ impl KernelPolicy {
         let occupy = linux::occupy_missing(&self.occupy_roots(), self.deny_policy.globs())
             .map_err(|e| KernelError::Apply(e.to_string()))?;
         let extra = occupy.paths().to_vec();
-        let applied = self.require_spawn(self.apply_pre_exec_dests(cmd, extra)?)?;
+        let applied = self.apply_pre_exec_dests(cmd, extra)?;
+        let applied = self
+            .require_spawn(applied)
+            .inspect_err(|_| reaper::discard_report())?;
         Ok((applied, occupy))
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn hook_ready(&self, cmd: &mut Command) -> Result<KernelApply, KernelError> {
+        let applied = self.apply_pre_exec(cmd)?;
+        self.require_spawn(applied)
+            .inspect_err(|_| reaper::discard_report())
     }
 
     #[cfg(target_os = "linux")]
@@ -725,9 +768,9 @@ impl KernelPolicy {
             #[cfg(target_os = "linux")]
             let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
             #[cfg(not(target_os = "linux"))]
-            let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
+            let applied = self.hook_ready(&mut cmd)?;
             cmd.process_group(0);
-            let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            let mut child = spawn_jailed(&mut cmd)?;
             let (status, _) = reap_process_group(&mut child, None)?;
             Ok((applied, status))
         }
@@ -773,12 +816,12 @@ impl KernelPolicy {
             #[cfg(target_os = "linux")]
             let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
             #[cfg(not(target_os = "linux"))]
-            let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
+            let applied = self.hook_ready(&mut cmd)?;
             cmd.stdin(std::process::Stdio::inherit());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
             cmd.process_group(0);
-            let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            let mut child = spawn_jailed(&mut cmd)?;
             let stdout = child.stdout.take().map(drain_pipe);
             let stderr = child.stderr.take().map(drain_pipe);
             let (status, _) = reap_process_group(&mut child, None)?;
@@ -835,11 +878,11 @@ impl KernelPolicy {
             #[cfg(target_os = "linux")]
             let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
             #[cfg(not(target_os = "linux"))]
-            let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
+            let applied = self.hook_ready(&mut cmd)?;
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
             cmd.process_group(0);
-            let child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            let child = spawn_jailed(&mut cmd)?;
             let (output, timed_out) = wait_child_timeout_output(child, timeout)?;
             Ok((applied, output, timed_out))
         }
@@ -886,12 +929,12 @@ impl KernelPolicy {
             #[cfg(target_os = "linux")]
             let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
             #[cfg(not(target_os = "linux"))]
-            let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
+            let applied = self.hook_ready(&mut cmd)?;
             cmd.stdin(std::process::Stdio::inherit());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
             cmd.process_group(0);
-            let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            let mut child = spawn_jailed(&mut cmd)?;
             let stdout = child.stdout.take().map(|p| copy_pipe(p, std::io::stdout()));
             let stderr = child.stderr.take().map(|p| copy_pipe(p, std::io::stderr()));
             let (status, _) = reap_process_group(&mut child, None)?;
@@ -942,12 +985,12 @@ impl KernelPolicy {
             #[cfg(target_os = "linux")]
             let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
             #[cfg(not(target_os = "linux"))]
-            let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
+            let applied = self.hook_ready(&mut cmd)?;
             cmd.stdin(std::process::Stdio::inherit());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
             cmd.process_group(0);
-            let child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            let child = spawn_jailed(&mut cmd)?;
             let (status, timed_out) = wait_child_timeout_forward(child, timeout)?;
             Ok((applied, status, timed_out))
         }
@@ -1012,9 +1055,12 @@ impl KernelPolicy {
             #[cfg(target_os = "linux")]
             let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
             #[cfg(not(target_os = "linux"))]
-            let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
-            pty::attach_pty(&mut cmd, pty.slave).map_err(|e| KernelError::Apply(e.to_string()))?;
-            let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            let applied = self.hook_ready(&mut cmd)?;
+            pty::attach_pty(&mut cmd, pty.slave).map_err(|e| {
+                reaper::discard_report();
+                KernelError::Apply(e.to_string())
+            })?;
+            let mut child = spawn_jailed(&mut cmd)?;
             // The spawned pid is the reaper. Foreground the command
             // after it becomes a session leader. The child also calls
             // tcsetpgrp; this covers the Linux race the other way.
@@ -1025,8 +1071,10 @@ impl KernelPolicy {
             // Command keeps the slave File after spawn. Linux master
             // read does not EOF while that fd stays open in the parent.
             drop(cmd);
-            let (out_th, master_write) =
-                pty::pump_master(pty.master).map_err(|e| KernelError::Apply(e.to_string()))?;
+            let (out_th, master_write) = pty::pump_master(pty.master).map_err(|e| {
+                reaper::discard_report();
+                KernelError::Apply(e.to_string())
+            })?;
             let _stdin_th = pty::pump_stdin(master_write);
             let (status, timed_out) = reap_process_group(&mut child, timeout)?;
             join_copy(Some(out_th));
@@ -1054,7 +1102,9 @@ impl KernelPolicy {
     /// child in its own process group and `killpg`s that group when the
     /// leader exits and again on the deadline. A grandchild that called
     /// `setsid` is stopped by the pre_exec reaper before this wait
-    /// returns. Windows waits with a bounded `WaitForSingleObject` and
+    /// returns. A pid that was not stored is
+    /// [`KernelError::Descendants`] instead of the child status.
+    /// Windows waits with a bounded `WaitForSingleObject` and
     /// closes the job so `KILL_ON_JOB_CLOSE` stops the child.
     pub fn run_child_timeout(
         &self,
@@ -1076,9 +1126,9 @@ impl KernelPolicy {
             #[cfg(target_os = "linux")]
             let (applied, _occupy) = self.occupy_and_hook(&mut cmd)?;
             #[cfg(not(target_os = "linux"))]
-            let applied = self.require_spawn(self.apply_pre_exec(&mut cmd)?)?;
+            let applied = self.hook_ready(&mut cmd)?;
             cmd.process_group(0);
-            let mut child = cmd.spawn().map_err(|e| KernelError::Apply(e.to_string()))?;
+            let mut child = spawn_jailed(&mut cmd)?;
             let (status, timed_out) = reap_process_group(&mut child, Some(timeout))?;
             if timed_out {
                 return Err(KernelError::Timeout);
