@@ -48,8 +48,12 @@ class WorkflowTriggerTests(unittest.TestCase):
 
     def test_security_has_trivy_and_weekly_deny(self) -> None:
         text = (WORKFLOWS / "security.yml").read_text(encoding="utf-8")
-        self.assertIn("aquasecurity/trivy-action@", text)
-        self.assertIn("scan-type: fs", text)
+        script = (ROOT / ".github/scripts/trivy-fs.sh").read_text(encoding="utf-8")
+        self.assertIn("aquasecurity/setup-trivy@", text)
+        self.assertIn(".github/scripts/trivy-fs.sh", text)
+        self.assertIn("restore-keys: cache-trivy-", text)
+        self.assertIn("failed to download vulnerability DB", script)
+        self.assertIn("--skip-db-update", script)
         self.assertIn("name: cargo-deny", text)
         self.assertIn("github.event_name == 'schedule'", text)
 
