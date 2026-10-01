@@ -1452,6 +1452,7 @@ fn compile_c(dir: &std::path::Path, name: &str, source: &str) -> Option<std::pat
     if compiled.success() { Some(bin) } else { None }
 }
 
+#[cfg(unix)]
 fn compile_setsid_racer(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     compile_c(dir, "racer", RACER_C)
 }
