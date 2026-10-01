@@ -77,6 +77,30 @@ fn copy_winsize(master_fd: RawFd) {
     }
 }
 
+/// Close `CLOEXEC` fds above stdio. Rust's spawn error pipe is one of
+/// them. Closing it lets the parent return from `spawn` before `exec`.
+fn close_cloexec_fds() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 1024,
+        rlim_max: 1024,
+    };
+    unsafe {
+        libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+    }
+    let end = libc::c_int::try_from(limit.rlim_cur.min(4096)).unwrap_or(4096);
+    if end <= 3 {
+        return;
+    }
+    for fd in 3..end {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 && flags & libc::FD_CLOEXEC != 0 {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
 pub(super) fn attach_pty(cmd: &mut Command, slave: File) -> io::Result<()> {
     silence_echo_if_piped(&slave);
     let stdin = slave.try_clone()?;
@@ -98,10 +122,30 @@ pub(super) fn attach_pty(cmd: &mut Command, slave: File) -> io::Result<()> {
                 return Err(io::Error::last_os_error());
             }
             let _ = libc::ioctl(0, libc::TIOCSCTTY as _, std::ptr::null::<libc::c_void>());
-            if libc::tcsetpgrp(0, libc::getpid()) == 0 {
-                let _ = libc::signal(libc::SIGTTIN, libc::SIG_DFL);
-                let _ = libc::signal(libc::SIGTTOU, libc::SIG_DFL);
-                let _ = libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+            // `Command::spawn` blocks on the exec-error pipe until this
+            // process execs. Close that pipe now so the parent can
+            // `tcsetpgrp` the master before `cat` reads. Leaving
+            // SIGTTIN ignored across that read makes `cat` exit 1
+            // after it has already printed the line.
+            close_cloexec_fds();
+            let pid = libc::getpid();
+            for _ in 0..200 {
+                let _ = libc::tcsetpgrp(0, pid);
+                if libc::tcgetpgrp(0) == pid {
+                    let _ = libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+                    let _ = libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+                    let _ = libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+                    break;
+                }
+                let req = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000,
+                };
+                let mut rem = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                libc::nanosleep(&req, &mut rem);
             }
             Ok(())
         });
