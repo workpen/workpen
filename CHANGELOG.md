@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.7.0](https://github.com/workpen/workpen/compare/v0.6.0...v0.7.0) (2026-10-01)
+
+
+### Features
+
+* **cli:** add workpen doctor ([#224](https://github.com/workpen/workpen/issues/224)) ([2c34be4](https://github.com/workpen/workpen/commit/2c34be4968b35f935a7a9bde6af8e7660d4a6ca4))
+* **cli:** print the jail and add read, write, and net grants ([#219](https://github.com/workpen/workpen/issues/219)) ([124d7e4](https://github.com/workpen/workpen/commit/124d7e411fc2d1160a26753549c285f9b0dcd338))
+* **cli:** scrub token-shaped env and add --env ([#216](https://github.com/workpen/workpen/issues/216)) ([8055887](https://github.com/workpen/workpen/commit/8055887cbdb754bd41de2ad591694bc45bf61989))
+* ship macOS and arm64 release archives ([#218](https://github.com/workpen/workpen/issues/218)) ([9170646](https://github.com/workpen/workpen/commit/91706468ad21f80e53c6b018fa9f7809d4f71a47))
+
+
+### Bug Fixes
+
+* align Seatbelt templates, null device, and root-relative globs ([#215](https://github.com/workpen/workpen/issues/215)) ([28edd4f](https://github.com/workpen/workpen/commit/28edd4f2ae0e4bf30088a946941659b7c021af0e))
+* **cli:** drop interpreter startup env from the child ([#229](https://github.com/workpen/workpen/issues/229)) ([37fb6ab](https://github.com/workpen/workpen/commit/37fb6ab3cedc20ed6ef5fbbec94be491124dc557))
+* **cli:** emit JSON for home and filesystem-root refusals ([#222](https://github.com/workpen/workpen/issues/222)) ([adeb64d](https://github.com/workpen/workpen/commit/adeb64d19596fa607cd7bf0e3c409f8c013ebae3))
+* **cli:** keep --root after the command for the child ([#228](https://github.com/workpen/workpen/issues/228)) ([0159126](https://github.com/workpen/workpen/commit/0159126d259451b4f4f2fc18a028576ffba0ace8))
+* **cli:** name a missing flag value and lock JSON escapes ([#226](https://github.com/workpen/workpen/issues/226)) ([ef14fc0](https://github.com/workpen/workpen/commit/ef14fc0c7346ed9ebb10b176c6b3b26e4c272e32))
+* **cli:** say when gc is not in a git repository ([#227](https://github.com/workpen/workpen/issues/227)) ([52f611b](https://github.com/workpen/workpen/commit/52f611b221b0e1a4afad1abde4af5ba7035b1e90))
+* **cli:** separate version, policy, and missing-program exits ([#214](https://github.com/workpen/workpen/issues/214)) ([069ccbf](https://github.com/workpen/workpen/commit/069ccbf6c68a34e18e285621b1f9b281698a1bed))
+* **deny:** deny files inside a denied directory ([#234](https://github.com/workpen/workpen/issues/234)) ([877a0d2](https://github.com/workpen/workpen/commit/877a0d213d9354a2c00ab71311af1b0342da0420))
+* **guard:** allow a dangling symlink that stays in the workspace ([#231](https://github.com/workpen/workpen/issues/231)) ([8cdc3b4](https://github.com/workpen/workpen/commit/8cdc3b4b5479f62dd75ef06ec6d9d0a9f59e8468))
+* **lock:** strip a UTF-8 BOM from agent.lock globs ([#232](https://github.com/workpen/workpen/issues/232)) ([0806ebb](https://github.com/workpen/workpen/commit/0806ebbcfe225eddbd7639cf932c97f01ac6fff9))
+* **wrap:** deny network connect on dest-denied socket paths ([#230](https://github.com/workpen/workpen/issues/230)) ([ad9cf1a](https://github.com/workpen/workpen/commit/ad9cf1acbf3becbdb62426aea2b2f7399b7d90a3))
+* **wrap:** stop grandchildren when the child exits ([#233](https://github.com/workpen/workpen/issues/233)) ([1e2e1e4](https://github.com/workpen/workpen/commit/1e2e1e4e69ba7a4f186949d45d1cec5f9282c990))
+* **wrap:** stop setsid grandchildren when run returns ([#236](https://github.com/workpen/workpen/issues/236)) ([986d204](https://github.com/workpen/workpen/commit/986d2043101a0180ada24c8b3ec41bb75fe0212d))
+
 ## [0.6.0](https://github.com/workpen/workpen/compare/v0.5.0...v0.6.0) (2026-09-25)
 
 
