@@ -108,6 +108,10 @@ jobs:
     name: Trivy
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      # actions/cache save
+      actions: write
     steps:
       - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2
         with:
@@ -115,14 +119,25 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: aquasecurity/trivy-action@d2a0b60797ff03db6132bd4e2b293f9b37081297 # master
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
         with:
-          scan-type: fs
-          scan-ref: .
-          scanners: vuln
-          severity: HIGH,CRITICAL
-          exit-code: "1"
-          ignore-unfixed: true
+          version: v0.74.0
+          cache: "true"
+      - name: Restore Trivy DB
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/trivy
+          key: cache-trivy-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: cache-trivy-
+      - name: Scan
+        id: scan
+        run: bash .github/scripts/trivy-fs.sh
+      - name: Save Trivy DB
+        if: steps.scan.outputs.updated == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/trivy
+          key: cache-trivy-${{ github.run_id }}-${{ github.run_attempt }}
 
   cargo-deny:
     name: cargo-deny
