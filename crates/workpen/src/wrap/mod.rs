@@ -116,8 +116,10 @@ pub enum KernelError {
     #[error("kernel wrap restore failed: {0}")]
     Restore(String),
     /// A descendant pid did not fit in the recorded set, or macOS left a
-    /// live process with the command's name outside that set. The CLI
-    /// exits 4.
+    /// live process with the command's name outside that set.
+    /// [`KernelPolicy::run_child`] returns this instead of the child
+    /// status. Hosts that spawn after [`KernelPolicy::apply_pre_exec`]
+    /// get it from [`KernelPolicy::finish_pre_exec`]. The CLI exits 4.
     #[error("kernel wrap did not track every descendant")]
     Descendants,
 }
@@ -636,8 +638,58 @@ impl KernelPolicy {
     /// entered. Extra-root dests still fail-closed. If the parent probe
     /// returned [`KernelApply::Applied`], the child fail-closes when
     /// enter fails.
+    ///
+    /// The hook forks a reaper. After the host waits for the spawned
+    /// child, call [`Self::finish_pre_exec`]. A miss is
+    /// [`KernelError::Descendants`], not the child status. Call
+    /// [`Self::discard_pre_exec`] when spawn fails or the host does not
+    /// wait. [`Self::run_child`] waits and finishes itself.
+    ///
+    /// The report is one pipe per thread, not per policy value. A second
+    /// `apply_pre_exec` on this thread drops an unread report.
     pub fn apply_pre_exec(&self, cmd: &mut Command) -> Result<KernelApply, KernelError> {
         self.apply_pre_exec_dests(cmd, Vec::new())
+    }
+
+    /// Read the descendant report for a child spawned after
+    /// [`Self::apply_pre_exec`].
+    ///
+    /// Call this once, after the host's own wait. `Ok(status)` means the
+    /// reaper tracked every descendant. [`KernelError::Descendants`]
+    /// means it did not: the report was a miss, the pipe was missing, or
+    /// the reaper wrote nothing. Pass `timed_out: true` when the host's
+    /// deadline already fired. The deadline wins and this returns
+    /// `Ok(status)`, same as [`Self::run_child_timeout`].
+    ///
+    /// Closes the report pipe. Leaving it unread holds that pipe until
+    /// the next [`Self::apply_pre_exec`].
+    pub fn finish_pre_exec(
+        &self,
+        status: ExitStatus,
+        timed_out: bool,
+    ) -> Result<ExitStatus, KernelError> {
+        let _ = self;
+        #[cfg(unix)]
+        {
+            finish_reap(status, timed_out).map(|(status, _)| status)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = timed_out;
+            Ok(status)
+        }
+    }
+
+    /// Drop the descendant report without reading it.
+    ///
+    /// Use this when [`Self::apply_pre_exec`] succeeded but the host did
+    /// not wait (spawn failed, or the host gave up). The next
+    /// `apply_pre_exec` also drops an unread pipe. A later
+    /// [`Self::finish_pre_exec`] on this thread then has no report.
+    pub fn discard_pre_exec(&self) {
+        let _ = self;
+        #[cfg(unix)]
+        reaper::discard_report();
     }
 
     fn apply_pre_exec_dests(

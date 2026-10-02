@@ -1256,6 +1256,7 @@ fn apply_pre_exec_does_not_jail_the_parent() {
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
     let mut cmd = Command::new("true");
     let applied = policy.apply_pre_exec(&mut cmd).expect("pre_exec");
+    policy.discard_pre_exec();
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     assert_eq!(applied, KernelApply::Applied);
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1281,6 +1282,277 @@ fn apply_pre_exec_child_can_echo() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+    let status = policy
+        .finish_pre_exec(out.status, false)
+        .expect("tracked descendants");
+    assert!(status.success(), "finish must keep the child status");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn finish_pre_exec_without_a_report_is_descendants_unless_timed_out() {
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let status = Command::new("true").status().expect("true");
+    let err = policy
+        .finish_pre_exec(status, false)
+        .expect_err("missing report");
+    assert!(
+        matches!(err, KernelError::Descendants),
+        "a missing report must not look like a tracked tree: {err}"
+    );
+    let kept = policy
+        .finish_pre_exec(status, true)
+        .expect("deadline keeps the status");
+    assert!(kept.success(), "timeout must ignore the report");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const HOST_RACER_C: &str = r#"
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    pid_t pid;
+    FILE *handle;
+    int fd;
+    if (argc < 2) {
+        return 2;
+    }
+    pid = fork();
+    if (pid < 0) {
+        return 1;
+    }
+    if (pid == 0) {
+        if (setsid() < 0) {
+            _exit(1);
+        }
+        fd = open("/dev/null", O_RDWR);
+        if (fd >= 0) {
+            dup2(fd, 0);
+            dup2(fd, 1);
+            dup2(fd, 2);
+            if (fd > 2) {
+                close(fd);
+            }
+        }
+        for (;;) {
+            pause();
+        }
+    }
+    handle = fopen(argv[1], "w");
+    if (handle == 0) {
+        _exit(1);
+    }
+    fprintf(handle, "%ld\n", (long)pid);
+    fclose(handle);
+    _exit(0);
+}
+"#;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const HOST_CAP_C: &str = r#"
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    int n;
+    int i;
+    FILE *handle;
+    if (argc < 3) {
+        return 2;
+    }
+    n = atoi(argv[1]);
+    handle = fopen(argv[2], "w");
+    if (handle == 0) {
+        return 1;
+    }
+    for (i = 0; i < n; i++) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            return 1;
+        }
+        if (pid == 0) {
+            int fd;
+            if (setsid() < 0) {
+                _exit(1);
+            }
+            fd = open("/dev/null", O_RDWR);
+            if (fd >= 0) {
+                dup2(fd, 0);
+                dup2(fd, 1);
+                dup2(fd, 2);
+                if (fd > 2) {
+                    close(fd);
+                }
+            }
+            for (;;) {
+                pause();
+            }
+        }
+        fprintf(handle, "%ld\n", (long)pid);
+    }
+    if (fclose(handle) != 0) {
+        return 1;
+    }
+    /* Stay alive so the reaper can count past the recorded set. */
+    usleep(300000);
+    return 0;
+}
+"#;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn pid_alive(pid: &str) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", pid])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn kill_pid(pid: &str) {
+    let _ = Command::new("/bin/kill")
+        .args(["-9", pid])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Kills every pid in the file when the test ends, including on panic.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct KillPidFile(PathBuf);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for KillPidFile {
+    fn drop(&mut self) {
+        let Ok(text) = fs::read_to_string(&self.0) else {
+            return;
+        };
+        for pid in text.split_whitespace() {
+            kill_pid(pid);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn compile_c(dir: &Path, name: &str, source: &str) -> Option<PathBuf> {
+    let src = dir.join(format!("{name}.c"));
+    let bin = dir.join(name);
+    fs::write(&src, source).ok()?;
+    let compiled = Command::new("cc")
+        .arg("-O2")
+        .arg("-o")
+        .arg(&bin)
+        .arg(&src)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    compiled.success().then_some(bin)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn host_wait(policy: &workpen::KernelPolicy, cmd: &mut Command) -> std::process::ExitStatus {
+    policy.apply_pre_exec(cmd).expect("pre_exec");
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            policy.discard_pre_exec();
+            panic!("spawn: {err}");
+        }
+    };
+    match child.wait() {
+        Ok(status) => status,
+        Err(err) => {
+            policy.discard_pre_exec();
+            panic!("wait: {err}");
+        }
+    }
+}
+
+/// The host spawned the child itself. Success from `wait` is not a
+/// tracked tree: `finish_pre_exec` has to surface the miss.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn apply_pre_exec_finish_reports_when_descendant_cap_is_exceeded() {
+    let dir = workspace();
+    let Some(bin) = compile_c(dir.path(), "hostcap", HOST_CAP_C) else {
+        return;
+    };
+    let pid_path = dir.path().join("pids.txt");
+    let _cleanup = KillPidFile(pid_path.clone());
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new(&bin);
+    cmd.current_dir(dir.path())
+        .arg("129")
+        .arg(&pid_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let status = host_wait(&policy, &mut cmd);
+    assert!(
+        status.success(),
+        "the reaper still exits with the command status, not exit 4"
+    );
+    let err = policy
+        .finish_pre_exec(status, false)
+        .expect_err("129 descendants must not fit");
+    assert!(
+        matches!(err, KernelError::Descendants),
+        "finish must return Descendants, not the child status: {err}"
+    );
+    let text = fs::read_to_string(&pid_path).unwrap_or_default();
+    let pids: Vec<&str> = text.split_whitespace().collect();
+    assert_eq!(pids.len(), 129, "helper did not record 129 pids: {text:?}");
+    let alive: Vec<&str> = pids.into_iter().filter(|pid| pid_alive(pid)).collect();
+    assert!(
+        alive.is_empty(),
+        "finish reported the cap but left pids alive: {alive:?}"
+    );
+}
+
+/// Fork, `setsid`, and exit before a poll can see the child. The host
+/// uses `apply_pre_exec` plus `finish_pre_exec`, not `run_child`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn apply_pre_exec_finish_stops_or_reports_a_fast_setsid_orphan() {
+    let dir = workspace();
+    let Some(bin) = compile_c(dir.path(), "hostracer", HOST_RACER_C) else {
+        return;
+    };
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    for trial in 0..20 {
+        let pid_path = dir.path().join(format!("child-{trial}.pid"));
+        let _cleanup = KillPidFile(pid_path.clone());
+        let mut cmd = Command::new(&bin);
+        cmd.current_dir(dir.path())
+            .arg(&pid_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let status = host_wait(&policy, &mut cmd);
+        let pid = fs::read_to_string(&pid_path).unwrap_or_default();
+        let pid = pid.trim();
+        assert!(!pid.is_empty(), "trial {trial} did not record a child pid");
+        let alive = pid_alive(pid);
+        match policy.finish_pre_exec(status, false) {
+            Ok(finished) => {
+                assert!(
+                    finished.success(),
+                    "trial {trial} finish returned a failed status"
+                );
+                assert!(
+                    !alive,
+                    "trial {trial} returned success while pid {pid} was still alive"
+                );
+            }
+            Err(KernelError::Descendants) => {}
+            Err(err) => panic!("trial {trial} unexpected error: {err}"),
+        }
+    }
 }
 
 #[test]
