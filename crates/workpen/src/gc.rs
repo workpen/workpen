@@ -103,13 +103,23 @@ pub fn parse_max_age(raw: &str) -> Result<Duration, GcError> {
             "duration must be greater than zero: {s}"
         )));
     }
-    match unit.to_ascii_lowercase().as_str() {
-        "s" => Ok(Duration::from_secs(n)),
-        "m" => Ok(Duration::from_secs(n.saturating_mul(60))),
-        "h" => Ok(Duration::from_secs(n.saturating_mul(3600))),
-        "d" => Ok(Duration::from_secs(n.saturating_mul(86400))),
-        _ => Err(GcError::InvalidDuration(format!("{s} (use s, m, h, d)"))),
+    let dur = match unit.to_ascii_lowercase().as_str() {
+        "s" => Duration::from_secs(n),
+        "m" => Duration::from_secs(n.saturating_mul(60)),
+        "h" => Duration::from_secs(n.saturating_mul(3600)),
+        "d" => Duration::from_secs(n.saturating_mul(86400)),
+        _ => {
+            return Err(GcError::InvalidDuration(format!("{s} (use s, m, h, d)")));
+        }
+    };
+    // `Instant + duration` panics when the sum does not fit. A timeout
+    // that large must be a usage error, not an abort after the child starts.
+    if std::time::Instant::now().checked_add(dur).is_none() {
+        return Err(GcError::InvalidDuration(format!(
+            "duration does not fit on the clock: {s}"
+        )));
     }
+    Ok(dur)
 }
 
 /// Age filter then classify. Untracked trees are never age-gc'd.
@@ -942,6 +952,19 @@ mod parse_tests {
         assert_eq!(trees.len(), 2);
         assert!(!trees[0].locked);
         assert!(trees[1].locked);
+    }
+
+    #[test]
+    fn parse_max_age_rejects_a_duration_the_clock_cannot_hold() {
+        match parse_max_age("999999999999999d") {
+            Err(GcError::InvalidDuration(msg)) => {
+                assert!(
+                    msg.contains("does not fit on the clock"),
+                    "huge duration must name the clock: {msg}"
+                );
+            }
+            other => panic!("huge duration must stay InvalidDuration, got {other:?}"),
+        }
     }
 
     #[test]

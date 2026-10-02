@@ -295,6 +295,28 @@ fn run_and_policy_missing_value_names_that_flag() {
 }
 
 #[test]
+fn run_timeout_that_does_not_fit_on_the_clock_exits_2() {
+    let dir = TempDir::new().expect("workspace");
+    let out = workpen()
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--timeout", "999999999999999d", "--", "true"])
+        .output()
+        .expect("spawn");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "huge --timeout must exit 2, not panic: {err}"
+    );
+    assert!(
+        err.contains("does not fit on the clock"),
+        "huge --timeout must name the clock: {err}"
+    );
+    assert!(!err.contains("panicked"), "{err}");
+}
+
+#[test]
 fn run_timeout_missing_value_names_usage() {
     let out = workpen()
         .args(["run", "--timeout"])
