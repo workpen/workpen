@@ -145,13 +145,41 @@ fn cmd_init(args: &[String]) -> Result<ExitCode, String> {
         ));
     }
     let path = root.join(workpen::AGENT_LOCK_NAME);
-    if path.exists() {
-        return Err(format!(
-            "agent.lock already exists at {}; init does not change it",
-            path.display()
-        ));
+    // exists() follows a dangling symlink, and fs::write then creates the
+    // target outside the workspace. create_new fails if the final component
+    // is already a symlink.
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(format!(
+                "agent.lock at {} is a symlink; init does not follow it",
+                path.display()
+            ));
+        }
+        Ok(_) => {
+            return Err(format!(
+                "agent.lock already exists at {}; init does not change it",
+                path.display()
+            ));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.to_string()),
     }
-    std::fs::write(&path, AGENT_LOCK_TEMPLATE).map_err(|e| e.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "agent.lock already exists at {}; init does not change it",
+                    path.display()
+                )
+            } else {
+                err.to_string()
+            }
+        })?;
+    std::io::Write::write_all(&mut file, AGENT_LOCK_TEMPLATE.as_bytes())
+        .map_err(|e| e.to_string())?;
     println!("wrote {}", path.display());
     Ok(ExitCode::SUCCESS)
 }

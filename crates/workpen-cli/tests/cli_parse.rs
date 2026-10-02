@@ -1235,6 +1235,31 @@ fn init_writes_comments_and_does_not_replace_an_existing_file() {
 
 #[cfg(unix)]
 #[test]
+fn init_does_not_follow_an_agent_lock_symlink() {
+    let dir = TempDir::new().expect("workspace");
+    let outside = TempDir::new().expect("outside");
+    let target = outside.path().join("pwned");
+    std::os::unix::fs::symlink(&target, dir.path().join("agent.lock")).expect("link");
+    let out = workpen()
+        .args(["init", "--root"])
+        .arg(dir.path())
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("symlink"), "{err}");
+    assert!(!target.exists(), "init wrote through the symlink");
+    let meta = std::fs::symlink_metadata(dir.path().join("agent.lock")).expect("link remains");
+    assert!(meta.file_type().is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
 fn init_refuses_home_and_filesystem_root() {
     let home = std::env::var("HOME").expect("HOME");
     let home_out = workpen()

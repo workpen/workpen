@@ -943,7 +943,21 @@ fn arm_knote_macos(kq: i32, pid: libc::pid_t) -> bool {
             std::ptr::null(),
         )
     };
-    rc == 0 || (rc < 0 && errno() == libc::EEXIST)
+    if rc == 0 || (rc < 0 && errno() == libc::EEXIST) {
+        return true;
+    }
+    // A zombie still answers kill(pid, 0), and proc_pidinfo returns
+    // nothing. It cannot fork. A pid that is already gone can have
+    // left a setsid child, so that case stays a miss. Do not call
+    // proc_pidinfo on the stopped command: that call does not return
+    // before SIGCONT.
+    if rc < 0 && errno() == libc::ESRCH {
+        let cmd = unsafe { std::ptr::addr_of!(CMD_PID).read() };
+        if pid != cmd && proc_info_missing(pid) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -1070,6 +1084,24 @@ fn start_time(pid: libc::pid_t) -> Option<(u64, u64)> {
     let sec = u64::from_ne_bytes(buf[120..128].try_into().ok()?);
     let usec = u64::from_ne_bytes(buf[128..136].try_into().ok()?);
     Some((sec, usec))
+}
+
+#[cfg(target_os = "macos")]
+fn proc_info_missing(pid: libc::pid_t) -> bool {
+    if pid <= 0 || unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    let mut buf = [0u8; 136];
+    let n = unsafe {
+        proc_pidinfo(
+            pid as libc::c_int,
+            3,
+            0,
+            buf.as_mut_ptr().cast(),
+            buf.len() as libc::c_int,
+        )
+    };
+    n < 8
 }
 
 #[cfg(target_os = "macos")]
