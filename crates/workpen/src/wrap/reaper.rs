@@ -7,9 +7,11 @@
 //! command. The reaper exits only after that command and the descendants
 //! it can still see are gone.
 //!
-//! Linux sets `PR_SET_CHILD_SUBREAPER`, so a `setsid` grandchild is
-//! reparented to the reaper when the command exits. macOS has no
-//! subreaper. The reaper stops the command until a fork watch is armed,
+//! Linux sets `PR_SET_CHILD_SUBREAPER` before the reaper forks, so a
+//! `setsid` grandchild is reparented here even when the command exits
+//! before the first poll. An empty `/proc/.../children` read is not
+//! proof that no child exists. macOS has no subreaper. The reaper
+//! stops the command until a fork watch is armed,
 //! records descendants from that watch and from walks, and signals those
 //! pids. A pid that does not fit in the recorded set is reported on
 //! `report_fd`. On macOS a fork whose parent has exited is reported
@@ -24,6 +26,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 const MAX_PIDS: usize = 128;
 const LIST_MAX: usize = 1024;
 const SCAN_NS: libc::c_long = 2_000_000;
+/// Empty child-list reads after the command has exited. One snapshot
+/// can miss a grandchild that was reparented in that same exit.
+#[cfg(target_os = "linux")]
+const EMPTY_CHILD_POLLS: u32 = 4;
 /// Polls of `proc_pidinfo` after continue. A short command can exit
 /// before the reaper runs again, and a zombie no longer answers.
 #[cfg(target_os = "macos")]
@@ -195,6 +201,16 @@ pub(super) fn take_descendant_report(timed_out: bool) -> bool {
 /// `report_fd` is the write end, captured by value so the child does not
 /// read the parent's thread-local after this fork.
 pub(super) fn supervise_or_continue(report_fd: i32) -> io::Result<()> {
+    // `fork` returns into the command immediately. This process is the
+    // reaper, so the subreaper flag has to be set first or a `setsid`
+    // grandchild whose parent exits in that window is reparented to
+    // pid 1. The child list stays empty and the reaper exits 0.
+    // The command inherits `has_child_subreaper`, which is what makes
+    // the kernel walk up to this process.
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         return Err(io::Error::last_os_error());
@@ -218,10 +234,8 @@ fn reaper_main(cmd: libc::pid_t, report_fd: i32) -> ! {
     unsafe {
         libc::setpgid(0, 0);
     }
-    #[cfg(target_os = "linux")]
-    unsafe {
-        libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
-    }
+    // Subreaper was set before the fork. Setting it here is after the
+    // command is already running.
     reset_tracking();
     #[cfg(target_os = "macos")]
     unsafe {
@@ -655,15 +669,28 @@ fn kill_adopted() {
     // children. Repeat so a grandchild's own children are adopted and
     // killed too. macOS does not reparent them here; `kill_recorded`
     // covers the pids observed earlier.
-    for _ in 0..32 {
+    //
+    // A count above MAX_PIDS did not fit in the recorded set, even
+    // when the poll never saw those pids before the command exited.
+    let mut kills = 0u32;
+    let mut empty = 0u32;
+    let empty_limit = empty_child_polls();
+    while kills < 32 {
         let mut kids = [0; LIST_MAX];
         let (n, trunc) = direct_children(unsafe { libc::getpid() }, &mut kids);
-        if trunc {
+        if trunc || n > MAX_PIDS {
             mark_missed();
         }
         if n == 0 {
-            break;
+            if empty >= empty_limit {
+                break;
+            }
+            empty += 1;
+            sleep_scan();
+            continue;
         }
+        empty = 0;
+        kills += 1;
         for kid in kids.into_iter().take(n) {
             unsafe {
                 libc::kill(kid, libc::SIGKILL);
@@ -671,6 +698,17 @@ fn kill_adopted() {
         }
         drain_zombies();
         sleep_scan();
+    }
+}
+
+fn empty_child_polls() -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        EMPTY_CHILD_POLLS
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
     }
 }
 

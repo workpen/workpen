@@ -71,14 +71,18 @@
 //!   child uses the platform default temp directory.
 //! * When `run_child` returns successfully, a grandchild that called
 //!   `setsid` is not still running. Linux adopts it with
-//!   `PR_SET_CHILD_SUBREAPER`. macOS records the command's descendants,
-//!   including one created by a fork the reaper is notified about, and
-//!   signals those pids. A descendant past the recorded set is
-//!   [`crate::KernelError::Descendants`]. On macOS a fork whose parent
-//!   has exited is that error when a live process with the command's
-//!   name is still outside the recorded set. A child the parent already
-//!   waited for is not. The CLI exits 4 and prints
-//!   `descendants were not fully stopped`.
+//!   `PR_SET_CHILD_SUBREAPER`, set before the command can run, so a
+//!   grandchild that exits in the same turn is still adopted. macOS
+//!   records the command's descendants, including one created by a fork
+//!   the reaper is notified about, and signals those pids. A descendant
+//!   past the recorded set is [`crate::KernelError::Descendants`]. On
+//!   macOS a fork whose parent has exited is that error when a live
+//!   process with the command's name is still outside the recorded set.
+//!   A child the parent already waited for is not. The CLI exits 4 and
+//!   prints `descendants were not fully stopped`. Hosts that spawn
+//!   after `apply_pre_exec` and wait themselves call `finish_pre_exec`
+//!   and match that variant. `discard_pre_exec` drops the report when
+//!   spawn fails.
 //!
 //! # Process hardening
 //!
