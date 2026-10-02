@@ -958,8 +958,15 @@ mod parse_tests {
     fn commit_is_dangling_git_failure_is_not_dangling() {
         let dir = tempfile::tempdir().expect("tmp");
         match commit_is_dangling(dir.path(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
-            Ok(false) | Err(_) => {}
-            Ok(true) => panic!("git failure must not treat commit as dangling"),
+            Err(GcError::Git { op, .. }) => {
+                assert!(
+                    op.contains("branch"),
+                    "a failed contains check must stay a git error: {op}"
+                );
+            }
+            other => {
+                panic!("git failure must be Err so the sha is not skipped as reachable: {other:?}")
+            }
         }
     }
 

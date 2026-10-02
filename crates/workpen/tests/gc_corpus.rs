@@ -704,7 +704,10 @@ fn unreadable_gitignored_cache_dir_is_kept() {
         .find(|(p, _)| p.file_name() == wt.file_name())
         .expect("cache-unreadable row");
     match &row.1 {
-        GcDecision::Keep { .. } => {}
+        GcDecision::Keep {
+            reason:
+                KeepReason::UniqueUntracked | KeepReason::DirtyWork | KeepReason::StatusUnreadable,
+        } => {}
         other => panic!("run_gc must keep leftover with unreadable target/, got {other:?}"),
     }
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("restore for read");
