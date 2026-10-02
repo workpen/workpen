@@ -1290,6 +1290,50 @@ fn apply_pre_exec_child_can_echo() {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
+fn discard_pre_exec_then_finish_is_descendants() {
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("/bin/echo");
+    cmd.arg("ok");
+    assert_eq!(
+        policy.apply_pre_exec(&mut cmd).expect("pre_exec"),
+        KernelApply::Applied
+    );
+    let out = cmd.output().expect("spawn child");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    policy.discard_pre_exec();
+    let err = policy
+        .finish_pre_exec(out.status, false)
+        .expect_err("discarded report");
+    assert!(
+        matches!(err, KernelError::Descendants),
+        "a discarded report must not look like a tracked tree: {err}"
+    );
+
+    let mut again = Command::new("/bin/echo");
+    again.arg("ok");
+    assert_eq!(
+        policy.apply_pre_exec(&mut again).expect("pre_exec"),
+        KernelApply::Applied
+    );
+    let out = again.output().expect("spawn child");
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status = policy
+        .finish_pre_exec(out.status, false)
+        .expect("a later apply still tracks a child with no grandchildren");
+    assert!(status.success(), "finish must keep the child status");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
 fn finish_pre_exec_without_a_report_is_descendants_unless_timed_out() {
     let dir = workspace();
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
