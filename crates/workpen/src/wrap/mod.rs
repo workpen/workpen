@@ -203,7 +203,25 @@ fn reap_process_group(
     use std::time::Instant;
 
     let pid = child.id() as libc::pid_t;
-    let deadline = timeout.map(|limit| Instant::now() + limit);
+    let deadline = match timeout {
+        None => None,
+        Some(limit) => match timeout_deadline(limit) {
+            Ok(end) => Some(end),
+            Err(err) => {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                if reaper::is_group_leader(pid) {
+                    unsafe {
+                        libc::killpg(pid, libc::SIGKILL);
+                    }
+                }
+                let _ = wait_reaped(child);
+                reaper::discard_report();
+                return Err(err);
+            }
+        },
+    };
     loop {
         if kill_group_if_zombie(pid) {
             let status = wait_reaped(child)?;
@@ -238,6 +256,14 @@ fn reap_process_group(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// `Instant + duration` panics when the sum does not fit.
+#[cfg(unix)]
+fn timeout_deadline(limit: Duration) -> Result<std::time::Instant, KernelError> {
+    std::time::Instant::now()
+        .checked_add(limit)
+        .ok_or_else(|| KernelError::Apply("timeout does not fit on the clock".into()))
 }
 
 #[cfg(unix)]
@@ -2437,6 +2463,27 @@ fn is_fs_root(path: &Path) -> bool {
     match path.parent() {
         None => true,
         Some(parent) => parent.as_os_str().is_empty(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod timeout_deadline_tests {
+    use std::time::Duration;
+
+    use super::{KernelError, timeout_deadline};
+
+    #[test]
+    fn one_second_fits() {
+        assert!(timeout_deadline(Duration::from_secs(1)).is_ok());
+    }
+
+    #[test]
+    fn max_seconds_does_not_fit() {
+        let err = timeout_deadline(Duration::from_secs(u64::MAX)).expect_err("overflow");
+        assert!(
+            matches!(err, KernelError::Apply(ref msg) if msg.contains("does not fit")),
+            "{err:?}"
+        );
     }
 }
 
