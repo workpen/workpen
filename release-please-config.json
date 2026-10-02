@@ -19,6 +19,26 @@
           "type": "toml",
           "path": "crates/workpen-cli/Cargo.toml",
           "jsonpath": "$.dependencies.workpen.version"
+        },
+        {
+          "type": "generic",
+          "path": "README.md"
+        },
+        {
+          "type": "generic",
+          "path": "GOVERNANCE.md"
+        },
+        {
+          "type": "generic",
+          "path": "ROADMAP.md"
+        },
+        {
+          "type": "generic",
+          "path": "docs/threat-model.md"
+        },
+        {
+          "type": "generic",
+          "path": "crates/workpen/src/threat_model.rs"
         }
       ]
     }

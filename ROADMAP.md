@@ -6,7 +6,7 @@ This is a near-term map, not a promise. Hosts should read
 ## Near
 
 - Keep dest-deny, PathGuard, leftover GC, and per-child kernel jail
-  as the library surface. 0.7.0 is the published crate.
+  as the library surface. 0.7.0 is the published crate. <!-- x-release-please-version -->
 - Keep Linux remount occupy for missing dest-deny basenames when
   remount applies. Nested post-create stays a snapshot.
 
