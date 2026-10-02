@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/workpen/workpen/compare/v0.7.0...v0.7.1) (2026-10-02)
+
+
+### Bug Fixes
+
+* **wrap:** report descendants the reaper did not track ([#241](https://github.com/workpen/workpen/issues/241)) ([63d4f72](https://github.com/workpen/workpen/commit/63d4f725ff58c9661985bcd1f6308ef1c053a07c))
+
 ## [0.7.0](https://github.com/workpen/workpen/compare/v0.6.0...v0.7.0) (2026-10-01)
 
 
