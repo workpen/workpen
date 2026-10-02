@@ -1707,6 +1707,33 @@ enum HardlinkHit {
     Denied { sibling: Option<String> },
 }
 
+/// Earliest deny glob wins. Equal globs use the basename so the
+/// reported sibling does not follow directory order.
+fn denied_basename_rank(
+    globs: &[String],
+    path: &Path,
+    root: Option<&Path>,
+) -> Option<(usize, String)> {
+    let glob = first_matching_deny_glob_under(globs, &path_as_glob(path), root)?;
+    if glob == ".." {
+        return None;
+    }
+    let idx = globs
+        .iter()
+        .position(|candidate| candidate == &glob)
+        .unwrap_or(usize::MAX);
+    let base = path.file_name()?.to_string_lossy().into_owned();
+    Some((idx, base))
+}
+
+fn prefer_sibling(best: Option<(usize, String)>, next: (usize, String)) -> Option<(usize, String)> {
+    match best {
+        None => Some(next),
+        Some((idx, name)) if next.0 < idx || (next.0 == idx && next.1 < name) => Some(next),
+        Some(kept) => Some(kept),
+    }
+}
+
 fn hardlink_sibling_denied(path: &Path, canon: Option<&Path>, policy: &DenyPolicy) -> bool {
     matches!(
         hardlink_sibling_hit(path, canon, policy, None),
@@ -1771,9 +1798,11 @@ fn hardlink_sibling_hit_unix(
         return HardlinkHit::Denied { sibling: None };
     }
     let mut found = 0u64;
+    let mut best: Option<(usize, String)> = None;
     for parent in &parents {
         let entries = match std::fs::read_dir(parent) {
             Ok(rd) => rd,
+            Err(_) if best.is_some() => break,
             Err(_) => return HardlinkHit::Denied { sibling: None },
         };
         for entry in entries.flatten() {
@@ -1785,16 +1814,16 @@ fn hardlink_sibling_hit_unix(
             if sibling_meta.dev() != meta.dev() || sibling_meta.ino() != meta.ino() {
                 continue;
             }
-            if first_matching_deny_glob_under(policy.globs(), &path_as_glob(&entry_path), root)
-                .is_some()
-            {
-                let sibling = entry_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned());
-                return HardlinkHit::Denied { sibling };
-            }
             found += 1;
+            if let Some(rank) = denied_basename_rank(policy.globs(), &entry_path, root) {
+                best = prefer_sibling(best, rank);
+            }
         }
+    }
+    if let Some((_, sibling)) = best {
+        return HardlinkHit::Denied {
+            sibling: Some(sibling),
+        };
     }
     if found < nlink {
         HardlinkHit::Denied { sibling: None }
@@ -1843,14 +1872,17 @@ fn hardlink_hit_from_win_names(
     if names.len() <= 1 {
         return HardlinkHit::Allowed;
     }
+    let mut best: Option<(usize, String)> = None;
     for n in names {
         let s = n.to_string_lossy().replace('\\', "/");
-        if first_matching_deny_glob_under(policy.globs(), &s, root).is_some() {
-            let sibling = Path::new(&s)
-                .file_name()
-                .map(|base| base.to_string_lossy().into_owned());
-            return HardlinkHit::Denied { sibling };
+        if let Some(rank) = denied_basename_rank(policy.globs(), Path::new(&s), root) {
+            best = prefer_sibling(best, rank);
         }
+    }
+    if let Some((_, sibling)) = best {
+        return HardlinkHit::Denied {
+            sibling: Some(sibling),
+        };
     }
     HardlinkHit::Allowed
 }
@@ -2345,6 +2377,22 @@ mod classify_hardlink_tests {
                 sibling: Some(name),
             } => assert_eq!(name, ".env"),
             other => panic!("hardlink of .env must name sibling, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn win_names_prefer_earlier_deny_glob_over_list_order() {
+        let policy = DenyPolicy::default();
+        let names = [
+            std::ffi::OsString::from(r"C:\ws\.env.example-link"),
+            std::ffi::OsString::from(r"C:\ws\notes.txt"),
+            std::ffi::OsString::from(r"C:\ws\.env"),
+        ];
+        match hardlink_hit_from_win_names(&names, 3, &policy, None) {
+            HardlinkHit::Denied {
+                sibling: Some(name),
+            } => assert_eq!(name, ".env"),
+            other => panic!("earlier deny glob must win, got {other:?}"),
         }
     }
 }
