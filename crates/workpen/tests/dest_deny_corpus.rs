@@ -241,6 +241,28 @@ fn dest_deny_message_reports_hardlink_not_glob_for_sibling() {
 }
 
 #[test]
+fn hardlink_message_prefers_earlier_deny_glob_over_readdir_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let env = dir.path().join(".env");
+    std::fs::write(&env, "API_KEY=secret\n").expect("write .env");
+    let notes = dir.path().join("notes.txt");
+    std::fs::hard_link(&env, &notes).expect("hardlink notes");
+    let alias = dir.path().join(".env.example-link");
+    std::fs::hard_link(&env, &alias).expect("hardlink alias");
+    let policy = DenyPolicy::default();
+    let msg = dest_deny_message(&notes, &notes.to_string_lossy(), &policy)
+        .expect("notes.txt shares the .env inode");
+    assert!(
+        msg.contains("denied name .env"),
+        "the reported sibling must be .env, not a later glob: {msg}"
+    );
+    assert!(
+        !msg.contains(".env.example-link"),
+        "readdir must not win over **/.env: {msg}"
+    );
+}
+
+#[test]
 fn names_deny_glob_token_is_not_star_prefix() {
     assert!(names_deny_glob_token(
         "path denied by sandbox profile (matches deny glob **/.env): .env",
