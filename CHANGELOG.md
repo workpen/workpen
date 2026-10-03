@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.7.2](https://github.com/workpen/workpen/compare/v0.7.1...v0.7.2) (2026-10-02)
+
+
+### Bug Fixes
+
+* do not report a zombie helper or follow an agent.lock symlink ([#251](https://github.com/workpen/workpen/issues/251)) ([b3c9183](https://github.com/workpen/workpen/commit/b3c91839fd6d4afdf2c0137e4136e0202a6de3b6))
+* name the earliest deny glob as the hardlink sibling ([#248](https://github.com/workpen/workpen/issues/248)) ([8cee55b](https://github.com/workpen/workpen/commit/8cee55be397ee39af52e718a8846711def527733))
+* reject a timeout that does not fit on the clock ([#252](https://github.com/workpen/workpen/issues/252)) ([53de2b1](https://github.com/workpen/workpen/commit/53de2b1d78689618e80bda1d609d57817309e26e))
+* **wrap:** adopt a fast setsid grandchild and report it ([#246](https://github.com/workpen/workpen/issues/246)) ([c7c231d](https://github.com/workpen/workpen/commit/c7c231db83dd3b07c03618523606afd8889d0e3e)), closes [#245](https://github.com/workpen/workpen/issues/245) [#244](https://github.com/workpen/workpen/issues/244)
+
 ## [0.7.1](https://github.com/workpen/workpen/compare/v0.7.0...v0.7.1) (2026-10-02)
 
 

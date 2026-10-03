@@ -104,4 +104,4 @@
 //! New [`crate::KernelError`] / [`crate::DestDenyError`] /
 //! [`crate::KernelApply`] variants are breaking for exhaustive hosts
 //! even in 0.x. Do not bump to 1.0 in the same change as a behavior
-//! change. 0.7.1 is on crates.io; later publishes still wait on a release PR. <!-- x-release-please-version -->
+//! change. 0.7.2 is on crates.io; later publishes still wait on a release PR. <!-- x-release-please-version -->
