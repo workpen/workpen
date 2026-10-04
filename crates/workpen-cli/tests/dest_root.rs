@@ -2,7 +2,6 @@
 
 #[cfg(unix)]
 use std::fs;
-#[cfg(unix)]
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -920,5 +919,133 @@ fn gc_missing_root_is_clear_error_not_registry() {
     assert!(
         lower.contains("does not exist"),
         "missing --root must say workspace root does not exist: {text}"
+    );
+}
+
+fn home_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    let home = std::fs::canonicalize(&home).ok()?;
+    home.is_dir().then_some(home)
+}
+
+/// `--read $HOME` is a policy refusal. The message must name a read
+/// dir. Calling it an extra write dir sends the user to the wrong flag.
+#[test]
+fn run_read_home_names_read_dir_and_exits_3() {
+    let Some(home) = home_dir() else {
+        return;
+    };
+    let ws = TempDir::new().expect("workspace");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("readme");
+    let out = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .arg("--read")
+        .arg(&home)
+        .args(["--", "/bin/true"])
+        .output()
+        .expect("spawn");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "--read HOME is a policy refusal, stderr={err}"
+    );
+    assert!(
+        err.contains("extra read dir"),
+        "--read HOME must name a read dir: {err}"
+    );
+    assert!(
+        !err.contains("extra write dir"),
+        "--read HOME must not say write: {err}"
+    );
+}
+
+/// `--write $HOME` stays a write-dir refusal.
+#[test]
+fn run_write_home_still_names_write_dir() {
+    let Some(home) = home_dir() else {
+        return;
+    };
+    let ws = TempDir::new().expect("workspace");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("readme");
+    let out = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .arg("--write")
+        .arg(&home)
+        .args(["--", "/bin/true"])
+        .output()
+        .expect("spawn");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "stderr={err}");
+    assert!(
+        err.contains("extra write dir"),
+        "--write HOME must name a write dir: {err}"
+    );
+}
+
+/// A `--read` symlink to `/` is the same policy refusal as `--read /`,
+/// not a usage error, and it is not a write root.
+#[cfg(unix)]
+#[test]
+fn run_read_symlink_to_root_exits_3() {
+    let ws = TempDir::new().expect("workspace");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("readme");
+    let link = ws.path().join("rootlink");
+    std::os::unix::fs::symlink("/", &link).expect("symlink");
+    let out = workpen()
+        .args(["run", "--root"])
+        .arg(ws.path())
+        .arg("--read")
+        .arg(&link)
+        .args(["--", "/bin/true"])
+        .output()
+        .expect("spawn");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "--read symlink to / is a policy refusal, stderr={err}"
+    );
+    assert!(
+        err.contains("extra read dir"),
+        "--read symlink must name a read dir: {err}"
+    );
+    assert!(
+        err.to_ascii_lowercase().contains("escaped"),
+        "--read symlink must say it escaped: {err}"
+    );
+}
+
+/// `why --extra-root` of `/` or `$HOME` is a denial (exit 1), not usage.
+#[cfg(unix)]
+#[test]
+fn why_extra_root_symlink_to_root_exits_1() {
+    let ws = TempDir::new().expect("workspace");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("readme");
+    let link = ws.path().join("rootlink");
+    std::os::unix::fs::symlink("/", &link).expect("symlink");
+    let out = workpen()
+        .args(["why", "--root"])
+        .arg(ws.path())
+        .arg("--extra-root")
+        .arg(&link)
+        .arg("readme.md")
+        .output()
+        .expect("spawn");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "why extra-root symlink to / is a denial, stderr={err}"
+    );
+    assert!(
+        err.contains("extra write dir"),
+        "why extra-root is a write root: {err}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("allowed"),
+        "why must not allow the path"
     );
 }
