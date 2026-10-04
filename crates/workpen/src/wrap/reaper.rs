@@ -493,9 +493,11 @@ unsafe extern "C" fn on_stop(_sig: libc::c_int) {
 /// still has open. Closing the descriptor here would also close the
 /// PTY slave and the stdout pipe before Rust `dup2`s them onto stdio.
 /// Descriptors that already have `FD_CLOEXEC` (the spawn error pipe
-/// and the reaper report) are left alone. The scan stops at 4096,
-/// same as [`close_extra_fds`].
+/// and the reaper report) are left alone. The walk follows the soft
+/// `RLIMIT_NOFILE` and stops at 65536. [`close_extra_fds`] stops at
+/// 4096, which left `cat <&5000` able to read the secret.
 pub(super) fn cloexec_inherited_fds() {
+    const SCAN_CAP: libc::rlim_t = 65536;
     let mut limit = libc::rlimit {
         rlim_cur: 1024,
         rlim_max: 1024,
@@ -503,7 +505,7 @@ pub(super) fn cloexec_inherited_fds() {
     unsafe {
         libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
     }
-    let end = libc::c_int::try_from(limit.rlim_cur.min(4096)).unwrap_or(4096);
+    let end = libc::c_int::try_from(limit.rlim_cur.min(SCAN_CAP)).unwrap_or(65536);
     if end <= 3 {
         return;
     }
