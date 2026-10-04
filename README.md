@@ -35,12 +35,12 @@ cargo install workpen-cli --locked
 cargo binstall workpen-cli
 ```
 
-`cargo binstall` fetches the GitHub release archive. 0.7.2 ships Linux and macOS, on x86_64 and arm64. The file inside each archive is `workpen`. <!-- x-release-please-version -->
+`cargo binstall` fetches the GitHub release archive. 0.7.3 ships Linux and macOS, on x86_64 and arm64. The file inside each archive is `workpen`. <!-- x-release-please-version -->
 
 Git pin:
 
 ```toml
-workpen = { git = "https://github.com/workpen/workpen", tag = "v0.7.2", features = ["gc", "nono"] } <!-- x-release-please-version -->
+workpen = { git = "https://github.com/workpen/workpen", tag = "v0.7.3", features = ["gc", "nono"] } <!-- x-release-please-version -->
 ```
 
 MSRV is 1.95.

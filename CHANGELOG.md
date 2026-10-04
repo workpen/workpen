@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.3](https://github.com/workpen/workpen/compare/v0.7.2...v0.7.3) (2026-10-04)
+
+
+### Bug Fixes
+
+* cloexec inherited fds up to the soft nofile limit ([#257](https://github.com/workpen/workpen/issues/257)) ([eaeccd1](https://github.com/workpen/workpen/commit/eaeccd13044536f7aca7da4ae353023b9d5be70d))
+* drop inherited fds before the jailed command ([#256](https://github.com/workpen/workpen/issues/256)) ([79fa9cd](https://github.com/workpen/workpen/commit/79fa9cda6e5cf023eed1ce8a5da0bd19d8fa723c))
+* name --read refusals and use policy exits ([#258](https://github.com/workpen/workpen/issues/258)) ([1f3f84b](https://github.com/workpen/workpen/commit/1f3f84bdc1eb0ea42bb1e9a15f81f677d5d48edd))
+* pass the child exit code through on Windows ([#259](https://github.com/workpen/workpen/issues/259)) ([8943292](https://github.com/workpen/workpen/commit/8943292b8dcd11c1d8cf596e2f77a1ca13c58967))
+* report a killed child as 128 plus the signal ([#260](https://github.com/workpen/workpen/issues/260)) ([a59b041](https://github.com/workpen/workpen/commit/a59b041e7b217e4c3a1f227b1c150baab4b14793))
+* return a sendable pre-exec report ([#254](https://github.com/workpen/workpen/issues/254)) ([e14a97a](https://github.com/workpen/workpen/commit/e14a97a7ccf221115a3a3534df7c73a035c1812f)), closes [#253](https://github.com/workpen/workpen/issues/253)
+
 ## [0.7.2](https://github.com/workpen/workpen/compare/v0.7.1...v0.7.2) (2026-10-02)
 
 
