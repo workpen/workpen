@@ -596,6 +596,50 @@ fn run_child_cannot_read_env_hardlink_sibling() {
     );
 }
 
+/// A shell `exec 3<secret` must not survive into the jailed command.
+/// Path checks never see a read of an already-open descriptor.
+#[cfg(unix)]
+#[test]
+fn run_child_cannot_read_inherited_secret_fd() {
+    if !kernel_supported() {
+        return;
+    }
+    let dir = workspace();
+    let env_path = dir.path().join(".env");
+    fs::write(&env_path, "SECRET=1\n").expect("env");
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    let file = fs::File::open(&env_path).expect("open secret");
+    use std::os::fd::IntoRawFd;
+    let fd = file.into_raw_fd();
+    // Rust opens with CLOEXEC. A shell redirection does not.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert!(flags >= 0, "fcntl getfd");
+    let cleared = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+    assert_eq!(cleared, 0, "clear cloexec");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let script = format!("cat <&{fd} >inherited.out; echo $? >inherited.code");
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", &script]).current_dir(dir.path());
+    let (applied, status) = policy.run_child(cmd).expect("run_child");
+    unsafe { libc::close(fd) };
+    assert!(
+        matches!(applied, KernelApply::Applied | KernelApply::RemountSkipped),
+        "{applied:?}"
+    );
+    assert!(status.success(), "wrapper must finish: {status:?}");
+    let leaked = fs::read_to_string(dir.path().join("inherited.out")).unwrap_or_default();
+    assert!(
+        !leaked.contains("SECRET"),
+        "inherited fd must not leak: {leaked:?}"
+    );
+    let code = fs::read_to_string(dir.path().join("inherited.code")).unwrap_or_default();
+    assert_ne!(
+        code.trim(),
+        "0",
+        "read of inherited secret fd must fail: {code:?} leaked={leaked:?}"
+    );
+}
+
 #[test]
 fn dest_deny_walk_skips_git_and_does_not_charge_cache_artifacts() {
     let dir = workspace();

@@ -60,6 +60,10 @@ The parent is trusted. The child is not.
 - Wrapper skip is `timeout`, `nohup`, `nice`, `time`, and `stdbuf`.
 - The child environment removes `TMPDIR`, `TEMP`, and `TMP`. The child
   uses the platform default temp directory.
+- On Unix, descriptors above stdio that lack `FD_CLOEXEC` get that
+  flag before `exec`. An inherited secret fd does not survive into
+  the command (`cat <&3`). Standard streams stay open. The scan
+  stops at 4096, the same cap as the reaper's extra-fd walk.
 - When `run_child` returns successfully, a grandchild that called
   `setsid` is not still running. Linux adopts it with
   `PR_SET_CHILD_SUBREAPER`, set before the command can run, so a
