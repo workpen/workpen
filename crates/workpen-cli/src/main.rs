@@ -409,7 +409,19 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
             resolved.display()
         ));
     }
-    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+    let code = child_process_exit_code(status.code());
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    std::process::exit(code);
+}
+
+/// Status passed to `process::exit` for the child.
+///
+/// Windows keeps the full code (`9009` is command not found).
+/// Unix masks to 8 bits in the kernel. Masking here first
+/// turned `256` into `0` on Windows.
+fn child_process_exit_code(code: Option<i32>) -> i32 {
+    code.unwrap_or(1)
 }
 
 struct RunFlags<'a> {
@@ -988,5 +1000,18 @@ mod json_escape_tests {
         assert_eq!(json_string("say\"hi\\there"), "\"say\\\"hi\\\\there\"");
         assert_eq!(json_string("a\nb\rc\td"), "\"a\\nb\\rc\\td\"");
         assert_eq!(json_string("\u{0001}"), "\"\\u0001\"");
+    }
+}
+
+#[cfg(test)]
+mod child_exit_tests {
+    use super::child_process_exit_code;
+
+    #[test]
+    fn child_exit_above_255_is_passed_through() {
+        assert_eq!(child_process_exit_code(Some(9009)), 9009);
+        assert_eq!(child_process_exit_code(Some(256)), 256);
+        assert_eq!(child_process_exit_code(Some(2)), 2);
+        assert_eq!(child_process_exit_code(None), 1);
     }
 }
