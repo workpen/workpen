@@ -212,8 +212,7 @@ fn cmd_why(args: &[String]) -> Result<ExitCode, String> {
     };
     let (extras, _presented) = match resolve_extras(&cwd, &extras) {
         Ok(pair) => pair,
-        Err(ExtraRootError::Home(path)) if json => return json_guard(1, &path),
-        Err(err) => return Err(err.to_string()),
+        Err(err) => return finish_extra(err, false, json, 1),
     };
     let path = rest.first().ok_or_else(|| WHY_USAGE.to_string())?;
     let guard = PathGuard::with_extra_roots(&root, &extras).map_err(|e| e.to_string())?;
@@ -284,8 +283,7 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
     };
     let (mut extras, mut presented) = match resolve_extras(&cwd, &extras) {
         Ok(pair) => pair,
-        Err(ExtraRootError::Home(path)) => return refuse_extra_home(json, path),
-        Err(err) => return Err(err.to_string()),
+        Err(err) => return finish_extra(err, false, json, 3),
     };
     for write in &write_roots {
         match resolve_extra_root_pair(&cwd, &write.to_string_lossy()) {
@@ -293,16 +291,14 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
                 presented.push(shown);
                 extras.push(canon);
             }
-            Err(ExtraRootError::Home(path)) => return refuse_extra_home(json, path),
-            Err(err) => return Err(err.to_string()),
+            Err(err) => return finish_extra(err, false, json, 3),
         }
     }
     let mut read_canon = Vec::new();
     for read in &read_roots {
         match resolve_extra_root_pair(&cwd, &read.to_string_lossy()) {
             Ok((_shown, canon)) => read_canon.push(canon),
-            Err(ExtraRootError::Home(path)) => return refuse_extra_home(json, path),
-            Err(err) => return Err(err.to_string()),
+            Err(err) => return finish_extra(err, true, json, 3),
         }
     }
     let cmd = if rest.first().map(String::as_str) == Some("--") {
@@ -655,11 +651,43 @@ fn refuse_home(json: bool, path: PathBuf) -> Result<ExitCode, String> {
     refuse(PathGuardError::Home(path))
 }
 
-fn refuse_extra_home(json: bool, path: PathBuf) -> Result<ExitCode, String> {
-    if json {
-        return json_guard(3, &path);
+fn extra_message(err: &ExtraRootError, read: bool) -> String {
+    let text = err.to_string();
+    if read {
+        text.replace("extra write dir", "extra read dir")
+    } else {
+        text
     }
-    refuse(ExtraRootError::Home(path))
+}
+
+/// `$HOME` and a path that canonicalizes to `/` are policy refusals.
+/// `--read` must not call that path a write dir. Missing paths stay usage.
+fn finish_extra(
+    err: ExtraRootError,
+    read: bool,
+    json: bool,
+    policy_code: u8,
+) -> Result<ExitCode, String> {
+    let text = extra_message(&err, read);
+    match err {
+        ExtraRootError::Home(path) => {
+            if json {
+                json_guard(policy_code, &path)
+            } else {
+                eprintln!("{text}");
+                Ok(ExitCode::from(policy_code))
+            }
+        }
+        ExtraRootError::EscapedToRoot { resolved, .. } => {
+            if json {
+                json_guard(policy_code, Path::new(&resolved))
+            } else {
+                eprintln!("{text}");
+                Ok(ExitCode::from(policy_code))
+            }
+        }
+        _ => Err(text),
+    }
 }
 
 fn refuse_kernel(json: bool, err: KernelError) -> Result<ExitCode, String> {
