@@ -71,8 +71,9 @@
 //!   child uses the platform default temp directory.
 //! * On Unix, descriptors above stdio that lack `FD_CLOEXEC` get that
 //!   flag before `exec`. An inherited secret fd does not survive into
-//!   the command (`cat <&3`). Standard streams stay open. The scan
-//!   stops at 4096, the same cap as the reaper's extra-fd walk.
+//!   the command (`cat <&3`, including a descriptor above 4096).
+//!   Standard streams stay open. The scan follows the soft
+//!   `RLIMIT_NOFILE` and stops at 65536.
 //! * When `run_child` returns successfully, a grandchild that called
 //!   `setsid` is not still running. Linux adopts it with
 //!   `PR_SET_CHILD_SUBREAPER`, set before the command can run, so a

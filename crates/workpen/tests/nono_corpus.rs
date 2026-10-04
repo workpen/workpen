@@ -640,6 +640,63 @@ fn run_child_cannot_read_inherited_secret_fd() {
     );
 }
 
+/// The first cloexec scan stopped at 4096. A descriptor above that
+/// still survived `exec` (`cat <&5000` printed the secret).
+#[cfg(unix)]
+#[test]
+fn run_child_cannot_read_inherited_secret_fd_past_4096() {
+    if !kernel_supported() {
+        return;
+    }
+    const HIGH: libc::c_int = 5000;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let got = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    assert_eq!(got, 0, "getrlimit");
+    let need = libc::rlim_t::try_from(HIGH).expect("fd") + 1;
+    if limit.rlim_cur < need {
+        if limit.rlim_max < need {
+            return;
+        }
+        limit.rlim_cur = need;
+        let raised = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+        assert_eq!(raised, 0, "setrlimit");
+    }
+    let dir = workspace();
+    let env_path = dir.path().join(".env");
+    fs::write(&env_path, "SECRET=1\n").expect("env");
+    let file = fs::File::open(&env_path).expect("open secret");
+    use std::os::fd::IntoRawFd;
+    let low = file.into_raw_fd();
+    let duped = unsafe { libc::dup2(low, HIGH) };
+    assert_eq!(duped, HIGH, "dup2");
+    unsafe { libc::close(low) };
+    let flags = unsafe { libc::fcntl(HIGH, libc::F_GETFD) };
+    assert!(flags >= 0, "fcntl getfd");
+    let cleared = unsafe { libc::fcntl(HIGH, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+    assert_eq!(cleared, 0, "clear cloexec");
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let script = format!("cat <&{HIGH} >inherited.out; echo $? >inherited.code");
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", &script]).current_dir(dir.path());
+    let (applied, status) = policy.run_child(cmd).expect("run_child");
+    unsafe { libc::close(HIGH) };
+    assert!(
+        matches!(applied, KernelApply::Applied | KernelApply::RemountSkipped),
+        "{applied:?}"
+    );
+    assert!(status.success(), "wrapper must finish: {status:?}");
+    let leaked = fs::read_to_string(dir.path().join("inherited.out")).unwrap_or_default();
+    assert!(
+        !leaked.contains("SECRET"),
+        "fd {HIGH} must not leak: {leaked:?}"
+    );
+    let code = fs::read_to_string(dir.path().join("inherited.code")).unwrap_or_default();
+    assert_ne!(code.trim(), "0", "fd {HIGH} must fail: {code:?}");
+}
+
 #[test]
 fn dest_deny_walk_skips_git_and_does_not_charge_cache_artifacts() {
     let dir = workspace();
