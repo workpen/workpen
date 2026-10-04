@@ -14,7 +14,7 @@ use tempfile::TempDir;
 use workpen::resolve_extra_root;
 use workpen::{
     AGENT_LOCK_NAME, CheckDestError, DenyPolicy, DestDenyError, DestDenyKind, KernelAccess,
-    KernelApply, KernelError, check_command_argv, child_env_deny_names,
+    KernelApply, KernelError, PreExecReport, check_command_argv, child_env_deny_names,
     collect_workspace_dest_denies, collect_workspace_dest_denies_limited, is_denied_child_env,
     kernel_supported, load_agent_lock, process_jail, process_jail_with_policy, require_applied,
     scrub_child_command, spawn_after_setup, with_bash_noprofile,
@@ -1262,6 +1262,121 @@ fn apply_pre_exec_does_not_jail_the_parent() {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     assert_eq!(applied, KernelApply::UserspaceOnly);
     fs::write(&marker, "free").expect("parent must still write outside the workspace");
+}
+
+#[test]
+fn pre_exec_report_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<PreExecReport>();
+}
+
+/// `true` has no grandchild. The report moves to the thread that waited,
+/// the same migration an `.await` can do.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn pre_exec_report_finish_on_another_thread_keeps_a_clean_command() {
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("true");
+    let (applied, report) = policy.apply_pre_exec_report(&mut cmd).expect("pre_exec");
+    assert_eq!(applied, KernelApply::Applied);
+    let mut child = cmd.spawn().expect("spawn");
+    let finished = std::thread::spawn(move || {
+        let status = child.wait().expect("wait");
+        report.finish(status, false)
+    })
+    .join()
+    .expect("finish thread");
+    let status = finished.expect("clean true must not be a missed descendant");
+    assert!(status.success(), "finish must keep the child status");
+}
+
+/// Two reports stay independent. A thread-local slot would drop the first
+/// pipe when the second `apply` runs.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn two_pre_exec_reports_finish_on_other_threads() {
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut first = Command::new("true");
+    let mut second = Command::new("true");
+    let (applied, report_a) = policy.apply_pre_exec_report(&mut first).expect("first");
+    assert_eq!(applied, KernelApply::Applied);
+    let (applied, report_b) = policy.apply_pre_exec_report(&mut second).expect("second");
+    assert_eq!(applied, KernelApply::Applied);
+    let mut child_a = first.spawn().expect("spawn first");
+    let mut child_b = second.spawn().expect("spawn second");
+    let left = std::thread::spawn(move || {
+        let status = child_a.wait().expect("wait first");
+        report_a.finish(status, false)
+    });
+    let right = std::thread::spawn(move || {
+        let status = child_b.wait().expect("wait second");
+        report_b.finish(status, false)
+    });
+    let status_a = left
+        .join()
+        .expect("first finish thread")
+        .expect("first true must not be a missed descendant");
+    let status_b = right
+        .join()
+        .expect("second finish thread")
+        .expect("second true must not be a missed descendant");
+    assert!(status_a.success() && status_b.success());
+}
+
+/// No spawn means the reaper never writes. That is still a miss unless
+/// the host deadline already fired. `discard` must not stick the next pipe.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn pre_exec_report_without_spawn_is_descendants_unless_timed_out() {
+    let dir = workspace();
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let status = Command::new("true").status().expect("status");
+    let mut skipped = Command::new("true");
+    let (applied, report) = policy
+        .apply_pre_exec_report(&mut skipped)
+        .expect("pre_exec");
+    assert_eq!(applied, KernelApply::Applied);
+    drop(skipped);
+    let missed = std::thread::spawn(move || report.finish(status, false))
+        .join()
+        .expect("finish thread");
+    assert!(
+        matches!(missed, Err(KernelError::Descendants)),
+        "an unread reaper must not look tracked: {missed:?}"
+    );
+
+    let mut skipped = Command::new("true");
+    let (_, report) = policy
+        .apply_pre_exec_report(&mut skipped)
+        .expect("pre_exec");
+    drop(skipped);
+    let kept = std::thread::spawn(move || report.finish(status, true))
+        .join()
+        .expect("timeout finish thread")
+        .expect("deadline keeps the status");
+    assert!(kept.success(), "timeout must ignore the report");
+
+    let mut abandoned = Command::new("true");
+    let (_, report) = policy
+        .apply_pre_exec_report(&mut abandoned)
+        .expect("pre_exec");
+    report.discard();
+    drop(abandoned);
+
+    let mut again = Command::new("true");
+    let (applied, report) = policy.apply_pre_exec_report(&mut again).expect("next");
+    assert_eq!(applied, KernelApply::Applied);
+    let mut child = again.spawn().expect("spawn");
+    let status = std::thread::spawn(move || {
+        let status = child.wait().expect("wait");
+        report.finish(status, false)
+    })
+    .join()
+    .expect("next finish thread")
+    .expect("discard must not stick the next command");
+    assert!(status.success(), "finish must keep the child status");
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
