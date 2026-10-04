@@ -642,10 +642,18 @@ fn run_child_cannot_read_inherited_secret_fd() {
 
 /// The first cloexec scan stopped at 4096. A descriptor above that
 /// still survived `exec` (`cat <&5000` printed the secret).
+///
+/// Dash, which is `/bin/sh` on Ubuntu, rejects an fd number above 9
+/// as a syntax error and never attempts the read. Bash accepts it.
 #[cfg(unix)]
 #[test]
 fn run_child_cannot_read_inherited_secret_fd_past_4096() {
     if !kernel_supported() {
+        return;
+    }
+    // A missing bash cannot name this fd. Skipping is not a pass on
+    // Ubuntu or macOS CI, where `/bin/bash` is present.
+    if !Path::new("/bin/bash").is_file() {
         return;
     }
     const HIGH: libc::c_int = 5000;
@@ -679,7 +687,7 @@ fn run_child_cannot_read_inherited_secret_fd_past_4096() {
     assert_eq!(cleared, 0, "clear cloexec");
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
     let script = format!("cat <&{HIGH} >inherited.out; echo $? >inherited.code");
-    let mut cmd = Command::new("/bin/sh");
+    let mut cmd = Command::new("/bin/bash");
     cmd.args(["-c", &script]).current_dir(dir.path());
     let (applied, status) = policy.run_child(cmd).expect("run_child");
     unsafe { libc::close(HIGH) };
