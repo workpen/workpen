@@ -862,6 +862,7 @@ impl KernelPolicy {
                 use std::os::unix::process::CommandExt;
                 cmd.pre_exec(move || {
                     reaper::supervise_or_continue(report_fd)?;
+                    reaper::cloexec_inherited_fds();
                     #[cfg(target_os = "linux")]
                     linux::apply_dest_deny_remounts(&dests, &workspace, require_remount)?;
                     #[cfg(not(target_os = "linux"))]

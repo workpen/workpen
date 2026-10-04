@@ -487,6 +487,36 @@ unsafe extern "C" fn on_stop(_sig: libc::c_int) {
     STOP.store(1, Ordering::Relaxed);
 }
 
+/// Set `FD_CLOEXEC` on inherited descriptors above stdio.
+///
+/// `exec` drops them, so `cat <&3` cannot read a secret the parent
+/// still has open. Closing the descriptor here would also close the
+/// PTY slave and the stdout pipe before Rust `dup2`s them onto stdio.
+/// Descriptors that already have `FD_CLOEXEC` (the spawn error pipe
+/// and the reaper report) are left alone. The scan stops at 4096,
+/// same as [`close_extra_fds`].
+pub(super) fn cloexec_inherited_fds() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 1024,
+        rlim_max: 1024,
+    };
+    unsafe {
+        libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+    }
+    let end = libc::c_int::try_from(limit.rlim_cur.min(4096)).unwrap_or(4096);
+    if end <= 3 {
+        return;
+    }
+    for fd in 3..end {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
 fn close_extra_fds(keep_a: i32, keep_b: i32) {
     let mut limit = libc::rlimit {
         rlim_cur: 1024,
