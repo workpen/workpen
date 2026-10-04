@@ -2,7 +2,7 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, ExitStatus};
 use std::time::{Duration, SystemTime};
 
 use workpen::{
@@ -409,7 +409,7 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
             resolved.display()
         ));
     }
-    let code = child_process_exit_code(status.code());
+    let code = child_process_exit_code(status);
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let _ = std::io::Write::flush(&mut std::io::stderr());
     std::process::exit(code);
@@ -418,10 +418,20 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
 /// Status passed to `process::exit` for the child.
 ///
 /// Windows keeps the full code (`9009` is command not found).
-/// Unix masks to 8 bits in the kernel. Masking here first
-/// turned `256` into `0` on Windows.
-fn child_process_exit_code(code: Option<i32>) -> i32 {
-    code.unwrap_or(1)
+/// A signal has no exit code. Shells report `128+signal`, so
+/// SIGKILL is 137. `None` with no signal stays 1.
+fn child_process_exit_code(status: ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return 128 + sig;
+        }
+    }
+    1
 }
 
 struct RunFlags<'a> {
@@ -1006,12 +1016,35 @@ mod json_escape_tests {
 #[cfg(test)]
 mod child_exit_tests {
     use super::child_process_exit_code;
+    use std::process::ExitStatus;
+
+    fn exited(code: u32) -> ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw((code as i32) << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(code)
+        }
+    }
 
     #[test]
-    fn child_exit_above_255_is_passed_through() {
-        assert_eq!(child_process_exit_code(Some(9009)), 9009);
-        assert_eq!(child_process_exit_code(Some(256)), 256);
-        assert_eq!(child_process_exit_code(Some(2)), 2);
-        assert_eq!(child_process_exit_code(None), 1);
+    fn child_exit_code_is_passed_through() {
+        assert_eq!(child_process_exit_code(exited(2)), 2);
+        // Unix wait status only keeps 8 bits. Windows `code()` can be 9009.
+        #[cfg(windows)]
+        assert_eq!(child_process_exit_code(exited(9009)), 9009);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signaled_child_is_128_plus_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = ExitStatus::from_raw(9);
+        assert_eq!(status.code(), None);
+        assert_eq!(child_process_exit_code(status), 137);
     }
 }
