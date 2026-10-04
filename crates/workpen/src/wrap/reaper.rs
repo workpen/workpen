@@ -19,8 +19,9 @@
 //! outside the recorded set. The host turns that byte into
 //! `KernelError::Descendants`.
 
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 const MAX_PIDS: usize = 128;
@@ -38,9 +39,16 @@ const IDENTITY_POLLS: usize = 4096;
 static STOP: AtomicI32 = AtomicI32::new(0);
 static mut MISSED: u8 = 0;
 
+/// Parent ends of the reaper status pipe. `Send` so a host can finish
+/// on another thread. `armed` is false when no reaper was installed.
+pub(super) struct ReportPipe {
+    read: Option<OwnedFd>,
+    write: Option<OwnedFd>,
+    pub(super) armed: bool,
+}
+
 thread_local! {
-    static REPORT_READ: Cell<i32> = const { Cell::new(-1) };
-    static REPORT_WRITE: Cell<i32> = const { Cell::new(-1) };
+    static STASHED: RefCell<Option<ReportPipe>> = const { RefCell::new(None) };
 }
 
 #[derive(Clone, Copy)]
@@ -136,61 +144,112 @@ enum Remember {
     Full,
 }
 
-/// Parent end of the reaper's one-byte status pipe. `-1` if `pipe` failed.
-pub(super) fn prepare_report() -> i32 {
-    discard_report();
+impl ReportPipe {
+    pub(super) fn write_raw(&self) -> i32 {
+        self.write.as_ref().map(AsRawFd::as_raw_fd).unwrap_or(-1)
+    }
+
+    fn close_write(&mut self) {
+        self.write.take();
+    }
+
+    /// `true` when the reaper reported a fully tracked tree.
+    /// A timeout ignores the byte: the deadline result wins.
+    /// An unarmed pipe is not a miss. Drop closes either way.
+    pub(super) fn tracked(mut self, timed_out: bool) -> bool {
+        if !self.armed {
+            return true;
+        }
+        let read = self.read.take();
+        drop(self.write.take());
+        if timed_out {
+            drop(read);
+            return true;
+        }
+        let Some(read) = read else {
+            return false;
+        };
+        let fd = read.as_raw_fd();
+        let mut buf = [0u8; 1];
+        let n = loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), 1) };
+            if n < 0 && errno() == libc::EINTR {
+                continue;
+            }
+            break n;
+        };
+        drop(read);
+        n == 1 && buf[0] == 0
+    }
+}
+
+impl Drop for ReportPipe {
+    fn drop(&mut self) {
+        self.write.take();
+        self.read.take();
+    }
+}
+
+/// Parent end of the reaper's one-byte status pipe.
+/// `armed` even when `pipe` failed, so finish reports a miss.
+pub(super) fn open_report() -> ReportPipe {
     let mut fds = [0; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return -1;
+        return ReportPipe {
+            read: None,
+            write: None,
+            armed: true,
+        };
     }
-    for fd in fds {
-        set_cloexec(fd);
-    }
+    set_cloexec(fds[0]);
+    set_cloexec(fds[1]);
     set_nonblock(fds[0]);
-    REPORT_READ.set(fds[0]);
-    REPORT_WRITE.set(fds[1]);
-    fds[1]
+    // Safety: `pipe` just created both ends and no other owner exists.
+    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    ReportPipe {
+        read: Some(read),
+        write: Some(write),
+        armed: true,
+    }
+}
+
+pub(super) fn unarmed_report() -> ReportPipe {
+    ReportPipe {
+        read: None,
+        write: None,
+        armed: false,
+    }
+}
+
+/// Same-thread `apply_pre_exec` keeps the pipe here. A second stash
+/// drops the previous pipe. The `Send` report path does not call this.
+pub(super) fn stash_report(report: ReportPipe) {
+    let prev = STASHED.with(|slot| slot.borrow_mut().replace(report));
+    drop(prev);
 }
 
 pub(super) fn close_parent_report_write() {
-    let fd = REPORT_WRITE.replace(-1);
-    if fd >= 0 {
-        unsafe { libc::close(fd) };
-    }
+    STASHED.with(|slot| {
+        if let Some(report) = slot.borrow_mut().as_mut() {
+            report.close_write();
+        }
+    });
 }
 
 pub(super) fn discard_report() {
-    close_parent_report_write();
-    let fd = REPORT_READ.replace(-1);
-    if fd >= 0 {
-        unsafe { libc::close(fd) };
-    }
+    let prev = STASHED.with(|slot| slot.borrow_mut().take());
+    drop(prev);
 }
 
 /// `true` when the reaper reported a fully tracked tree.
 /// A timeout ignores the byte: the deadline result wins.
+/// No stashed pipe is a miss, unless the deadline already fired.
 pub(super) fn take_descendant_report(timed_out: bool) -> bool {
-    let read_fd = REPORT_READ.replace(-1);
-    close_parent_report_write();
-    if timed_out {
-        if read_fd >= 0 {
-            unsafe { libc::close(read_fd) };
-        }
-        return true;
+    match STASHED.with(|slot| slot.borrow_mut().take()) {
+        Some(report) => report.tracked(timed_out),
+        None => timed_out,
     }
-    if read_fd < 0 {
-        return false;
-    }
-    let mut buf = [0u8; 1];
-    let n = loop {
-        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), 1) };
-        if n < 0 && errno() == libc::EINTR {
-            continue;
-        }
-        break n;
-    };
-    unsafe { libc::close(read_fd) };
-    n == 1 && buf[0] == 0
 }
 
 /// Fork a reaper. The command child returns `Ok`. The reaper does not
@@ -198,8 +257,9 @@ pub(super) fn take_descendant_report(timed_out: bool) -> bool {
 ///
 /// Called only from `pre_exec`, which is already the single thread left
 /// after `Command`'s fork. The reaper side uses libc only and `_exit`s.
-/// `report_fd` is the write end, captured by value so the child does not
-/// read the parent's thread-local after this fork.
+/// `report_fd` is the write end, captured by value. The parent's
+/// `OwnedFd` stays in the parent. After `fork` the child has its own
+/// copy of that descriptor.
 pub(super) fn supervise_or_continue(report_fd: i32) -> io::Result<()> {
     // `fork` returns into the command immediately. This process is the
     // reaper, so the subreaper flag has to be set first or a `setsid`
@@ -1412,5 +1472,27 @@ mod tests {
         assert_eq!(n, 2);
         assert!(overflow);
         assert_eq!(&out[..2], &[12, 34]);
+    }
+
+    #[test]
+    fn report_byte_zero_is_tracked_and_one_is_a_miss() {
+        let report = super::open_report();
+        let write = report.write_raw();
+        let ok = [0u8];
+        assert_eq!(unsafe { libc::write(write, ok.as_ptr().cast(), 1) }, 1);
+        assert!(report.tracked(false));
+
+        let report = super::open_report();
+        let write = report.write_raw();
+        let miss = [1u8];
+        assert_eq!(unsafe { libc::write(write, miss.as_ptr().cast(), 1) }, 1);
+        assert!(!report.tracked(false));
+    }
+
+    #[test]
+    fn report_timeout_and_unarmed_pipe_are_not_misses() {
+        let report = super::open_report();
+        assert!(report.tracked(true));
+        assert!(super::unarmed_report().tracked(false));
     }
 }

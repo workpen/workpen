@@ -119,9 +119,92 @@ pub enum KernelError {
     /// live process with the command's name outside that set.
     /// [`KernelPolicy::run_child`] returns this instead of the child
     /// status. Hosts that spawn after [`KernelPolicy::apply_pre_exec`]
-    /// get it from [`KernelPolicy::finish_pre_exec`]. The CLI exits 4.
+    /// get it from [`KernelPolicy::finish_pre_exec`] on that same thread.
+    /// Hosts that wait on another thread, including after `.await`, get
+    /// it from [`PreExecReport::finish`]. The CLI exits 4.
     #[error("kernel wrap did not track every descendant")]
     Descendants,
+}
+
+/// Owns the reaper report for one [`KernelPolicy::apply_pre_exec_report`].
+///
+/// `Send`, so the host can move it across an `.await` or onto another
+/// thread with the child wait. [`Self::finish`] reads the pipe.
+/// [`Self::discard`] and `Drop` close it, so a cancelled task does not
+/// leave the descriptor open. This value is not the thread-local report
+/// used by [`KernelPolicy::finish_pre_exec`].
+#[must_use = "finish the report or drop it to close the reaper pipe"]
+pub struct PreExecReport {
+    #[cfg(unix)]
+    pipe: reaper::ReportPipe,
+    #[cfg(not(unix))]
+    _private: (),
+}
+
+impl PreExecReport {
+    #[cfg(unix)]
+    fn from_pipe(pipe: reaper::ReportPipe) -> Self {
+        Self { pipe }
+    }
+
+    fn unarmed() -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                pipe: reaper::unarmed_report(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self { _private: () }
+        }
+    }
+
+    /// Keep an armed pipe for [`KernelPolicy::finish_pre_exec`].
+    /// An unarmed pipe is not a report, so it is not stored.
+    fn stash(self) {
+        #[cfg(unix)]
+        {
+            let pipe = self.pipe;
+            if pipe.armed {
+                reaper::stash_report(pipe);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self;
+        }
+    }
+
+    /// Read the descendant report.
+    ///
+    /// `Ok(status)` means every descendant was tracked, or no reaper was
+    /// installed. [`KernelError::Descendants`] means the reaper reported
+    /// a miss, the pipe was missing, or it wrote nothing. Pass
+    /// `timed_out: true` when the host deadline already fired. The
+    /// deadline wins and this returns `Ok(status)`.
+    pub fn finish(self, status: ExitStatus, timed_out: bool) -> Result<ExitStatus, KernelError> {
+        #[cfg(unix)]
+        {
+            if self.pipe.tracked(timed_out) {
+                Ok(status)
+            } else {
+                Err(KernelError::Descendants)
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (self, timed_out);
+            Ok(status)
+        }
+    }
+
+    /// Close the reaper pipe without reading it.
+    ///
+    /// Same as dropping the report. Use this when spawn failed.
+    pub fn discard(self) {
+        drop(self);
+    }
 }
 
 /// Merge spawn and DACL-restore results. Timeout stays Timeout.
@@ -666,29 +749,52 @@ impl KernelPolicy {
     /// enter fails.
     ///
     /// The hook forks a reaper. After the host waits for the spawned
-    /// child, call [`Self::finish_pre_exec`]. A miss is
-    /// [`KernelError::Descendants`], not the child status. Call
+    /// child, call [`Self::finish_pre_exec`] on this same thread. A miss
+    /// is [`KernelError::Descendants`], not the child status. Call
     /// [`Self::discard_pre_exec`] when spawn fails or the host does not
     /// wait. [`Self::run_child`] waits and finishes itself.
     ///
     /// The report is one pipe per thread, not per policy value. A second
-    /// `apply_pre_exec` on this thread drops an unread report.
+    /// `apply_pre_exec` on this thread drops an unread report. A wait
+    /// that resumes on another thread, including after `.await`, must
+    /// use [`Self::apply_pre_exec_report`] instead. [`Self::finish_pre_exec`]
+    /// on that other thread is [`KernelError::Descendants`] even when
+    /// the command had no grandchildren.
     pub fn apply_pre_exec(&self, cmd: &mut Command) -> Result<KernelApply, KernelError> {
+        let (applied, report) = self.apply_pre_exec_dests(cmd, Vec::new())?;
+        report.stash();
+        Ok(applied)
+    }
+
+    /// Same hook as [`Self::apply_pre_exec`]. The [`PreExecReport`] owns
+    /// the reaper pipe and is `Send`.
+    ///
+    /// Move the report with the child. [`PreExecReport::finish`] reads
+    /// it on whichever thread resumed. [`PreExecReport::discard`] and
+    /// `Drop` close the pipe. This does not store a thread-local, and it
+    /// does not drop a report the host still holds.
+    pub fn apply_pre_exec_report(
+        &self,
+        cmd: &mut Command,
+    ) -> Result<(KernelApply, PreExecReport), KernelError> {
         self.apply_pre_exec_dests(cmd, Vec::new())
     }
 
     /// Read the descendant report for a child spawned after
-    /// [`Self::apply_pre_exec`].
+    /// [`Self::apply_pre_exec`] on this same thread.
     ///
     /// Call this once, after the host's own wait. `Ok(status)` means the
     /// reaper tracked every descendant. [`KernelError::Descendants`]
     /// means it did not: the report was a miss, the pipe was missing, or
-    /// the reaper wrote nothing. Pass `timed_out: true` when the host's
-    /// deadline already fired. The deadline wins and this returns
-    /// `Ok(status)`, same as [`Self::run_child_timeout`].
+    /// the reaper wrote nothing. That includes calling this on a
+    /// different thread from [`Self::apply_pre_exec`]. Use
+    /// [`PreExecReport::finish`] to read a report that moved. Pass
+    /// `timed_out: true` when the host's deadline already fired. The
+    /// deadline wins and this returns `Ok(status)`, same as
+    /// [`Self::run_child_timeout`].
     ///
     /// Closes the report pipe. Leaving it unread holds that pipe until
-    /// the next [`Self::apply_pre_exec`].
+    /// the next [`Self::apply_pre_exec`] on this thread.
     pub fn finish_pre_exec(
         &self,
         status: ExitStatus,
@@ -706,12 +812,14 @@ impl KernelPolicy {
         }
     }
 
-    /// Drop the descendant report without reading it.
+    /// Drop the thread-local descendant report without reading it.
     ///
     /// Use this when [`Self::apply_pre_exec`] succeeded but the host did
     /// not wait (spawn failed, or the host gave up). The next
     /// `apply_pre_exec` also drops an unread pipe. A later
     /// [`Self::finish_pre_exec`] on this thread then has no report.
+    /// [`PreExecReport::discard`] is the same close for a report the
+    /// host holds.
     pub fn discard_pre_exec(&self) {
         let _ = self;
         #[cfg(unix)]
@@ -722,10 +830,10 @@ impl KernelPolicy {
         &self,
         cmd: &mut Command,
         extra_dests: Vec<PathBuf>,
-    ) -> Result<KernelApply, KernelError> {
+    ) -> Result<(KernelApply, PreExecReport), KernelError> {
         self.dest_deny_command(cmd)?;
         if !kernel_supported() {
-            return Ok(KernelApply::UserspaceOnly);
+            return Ok((KernelApply::UserspaceOnly, PreExecReport::unarmed()));
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
@@ -746,10 +854,10 @@ impl KernelPolicy {
             let require_remount = remount == KernelApply::Applied;
             // Safety: the set and dest list are built in the parent; the hook
             // only applies them and maps failure to io::Error.
-            // The report fd is captured by value. After `fork` the
-            // reaper's address space is a copy, so a parent thread-local
-            // would not be the pipe this process inherited.
-            let report_fd = reaper::prepare_report();
+            // The write fd is captured by value. The parent keeps the
+            // `OwnedFd`. `fork` gives the child its own copy.
+            let report = reaper::open_report();
+            let report_fd = report.write_raw();
             unsafe {
                 use std::os::unix::process::CommandExt;
                 cmd.pre_exec(move || {
@@ -764,12 +872,12 @@ impl KernelPolicy {
                     Ok(())
                 });
             }
-            Ok(remount)
+            Ok((remount, PreExecReport::from_pipe(report)))
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = extra_dests;
-            Ok(KernelApply::UserspaceOnly)
+            Ok((KernelApply::UserspaceOnly, PreExecReport::unarmed()))
         }
     }
 
@@ -807,7 +915,8 @@ impl KernelPolicy {
         let occupy = linux::occupy_missing(&self.occupy_roots(), self.deny_policy.globs())
             .map_err(|e| KernelError::Apply(e.to_string()))?;
         let extra = occupy.paths().to_vec();
-        let applied = self.apply_pre_exec_dests(cmd, extra)?;
+        let (applied, report) = self.apply_pre_exec_dests(cmd, extra)?;
+        report.stash();
         let applied = self
             .require_spawn(applied)
             .inspect_err(|_| reaper::discard_report())?;

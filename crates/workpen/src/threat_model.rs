@@ -80,8 +80,11 @@
 //!   process with the command's name is still outside the recorded set.
 //!   A child the parent already waited for is not. The CLI exits 4 and
 //!   prints `descendants were not fully stopped`. Hosts that spawn
-//!   after `apply_pre_exec` and wait themselves call `finish_pre_exec`
-//!   and match that variant. `discard_pre_exec` drops the report when
+//!   after `apply_pre_exec` and wait on that same thread call
+//!   `finish_pre_exec` and match that variant. A wait that resumes on
+//!   another thread uses [`crate::PreExecReport`] from
+//!   `apply_pre_exec_report` and calls [`crate::PreExecReport::finish`].
+//!   `discard_pre_exec`, or `Drop` on that report, closes the pipe when
 //!   spawn fails.
 //!
 //! # Process hardening
