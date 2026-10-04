@@ -1695,3 +1695,28 @@ fn doctor_live_reports_this_machine() {
         }
     }
 }
+
+/// A command killed by SIGKILL exits 137 from a shell (`128+9`).
+/// Workpen was reporting 1 because the reaper dies by that signal
+/// and `ExitStatus::code` is `None`.
+#[cfg(unix)]
+#[test]
+fn run_killed_child_exits_137() {
+    let dir = TempDir::new().expect("workspace");
+    let out = workpen()
+        .args(["run", "--timeout", "5s", "--root"])
+        .arg(dir.path())
+        .args(["--", "/bin/sh", "-c", "kill -9 $$"])
+        .output()
+        .expect("spawn");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(137),
+        "SIGKILL must be 128+9, stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("failed to spawn"),
+        "a signal is not a spawn failure: {stderr}"
+    );
+}
