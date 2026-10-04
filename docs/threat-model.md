@@ -89,4 +89,4 @@ Match `KernelError`, `DestDenyError`, `CheckDestError`, and
 
 New variants are breaking for exhaustive matches even in 0.x.
 
-0.7.2 is on crates.io; later publishes still wait on a release PR. <!-- x-release-please-version -->
+0.7.3 is on crates.io; later publishes still wait on a release PR. <!-- x-release-please-version -->
