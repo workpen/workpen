@@ -153,13 +153,14 @@ pub fn classify_for_age_gc_with_policy(
             reason: KeepReason::StatusUnreadable,
         };
     }
-    let last_used = worktree_last_used(path).unwrap_or(now);
+    let index = index_file(path);
+    let last_used = last_used_from(path, index.as_deref()).unwrap_or(now);
     if now.duration_since(last_used).unwrap_or_default() < max_age {
         return GcDecision::Keep {
             reason: KeepReason::TooNew,
         };
     }
-    classify_worktree_with_policy(path, false, policy)
+    classify_worktree_with_index(path, false, policy, IndexSource::Ready(index.as_deref()))
 }
 
 /// Remove one worktree after the unique-work check.
@@ -242,6 +243,15 @@ pub fn classify_worktree_with_policy(
     untracked: bool,
     policy: &DenyPolicy,
 ) -> GcDecision {
+    classify_worktree_with_index(path, untracked, policy, IndexSource::Lookup)
+}
+
+fn classify_worktree_with_index(
+    path: &Path,
+    untracked: bool,
+    policy: &DenyPolicy,
+    index: IndexSource<'_>,
+) -> GcDecision {
     if untracked {
         return GcDecision::Keep {
             reason: KeepReason::UntrackedWorktree,
@@ -257,7 +267,7 @@ pub fn classify_worktree_with_policy(
             reason: KeepReason::NotAGitDir,
         };
     }
-    match unique_work_reason(path, policy) {
+    match unique_work_from(path, policy, index) {
         Some(reason) => GcDecision::Keep { reason },
         None => GcDecision::Reclaim {
             saved_refs: Vec::new(),
@@ -288,6 +298,9 @@ pub fn run_gc_with_policy(
         .first()
         .map(|w| w.path.clone())
         .or_else(|| repo_root(cwd).ok());
+    let current = std::env::current_dir().ok();
+    let mut other: Option<Result<Vec<PathBuf>, ()>> = None;
+    let mut reachable_cache: Option<Result<HashSet<String>, ()>> = None;
     let mut rows = Vec::new();
     for wt in &registered {
         if primary.as_ref().is_some_and(|p| paths_eq(p, &wt.path)) {
@@ -302,7 +315,12 @@ pub fn run_gc_with_policy(
             ));
             continue;
         }
-        if worktree_has_live_cwd(&wt.path) {
+        let probed = other.get_or_insert_with(other_process_cwds);
+        let other_view = match probed {
+            Ok(cwds) => Ok(cwds.as_slice()),
+            Err(()) => Err(()),
+        };
+        if worktree_has_live_cwd_from(&wt.path, current.as_deref(), other_view) {
             rows.push((
                 wt.path.clone(),
                 GcDecision::Keep {
@@ -316,16 +334,13 @@ pub fn run_gc_with_policy(
         if let GcDecision::Reclaim { .. } = &decision
             && !cfg.dry_run
         {
-            match save_unique_commits(&wt.path, &cfg.saved_ref_prefix) {
-                Ok(saved) => {
-                    decision = take_if_still_clean(cwd, &wt.path, saved, false, true, policy)?;
-                }
-                Err(_) => {
-                    decision = GcDecision::Keep {
-                        reason: KeepReason::StatusUnreadable,
-                    };
-                }
-            }
+            decision = reclaim_with_saved_refs(
+                cwd,
+                &wt.path,
+                &cfg.saved_ref_prefix,
+                policy,
+                &mut reachable_cache,
+            )?;
         }
         rows.push((wt.path.clone(), decision));
     }
@@ -493,6 +508,8 @@ fn worktree_has_live_cwd_from(
 /// Other-process cwds. `Err` when an expected probe failed.
 /// Windows has no `/proc` and no `lsof`; that is not a probe failure.
 fn other_process_cwds() -> Result<Vec<PathBuf>, ()> {
+    #[cfg(test)]
+    CWD_PROBE_COUNT.with(|slot| slot.set(slot.get().saturating_add(1)));
     #[cfg(target_os = "linux")]
     {
         if let Ok(cwds) = linux_process_cwds() {
@@ -550,8 +567,13 @@ fn lsof_process_cwds() -> Result<Vec<PathBuf>, ()> {
 /// Newest of HEAD committer time (`git log -1 --format=%ct`), index
 /// mtime, and a bounded tree walk. Git CLI, not gix.
 pub fn worktree_last_used(path: &Path) -> Option<SystemTime> {
+    let index = index_file(path);
+    last_used_from(path, index.as_deref())
+}
+
+fn last_used_from(path: &Path, index: Option<&Path>) -> Option<SystemTime> {
     let mut latest = head_commit_time(path);
-    if let Some(t) = index_mtime(path) {
+    if let Some(t) = index_mtime_at(index) {
         latest = Some(latest.map_or(t, |n| n.max(t)));
     }
     if let Ok(Some(t)) = newest_tree_mtime(path) {
@@ -567,6 +589,8 @@ fn head_commit_time(path: &Path) -> Option<SystemTime> {
 }
 
 fn index_file(path: &Path) -> Option<PathBuf> {
+    #[cfg(test)]
+    INDEX_RESOLVE_COUNT.with(|slot| slot.set(slot.get().saturating_add(1)));
     let raw = git(path, &["rev-parse", "--git-path", "index"]).ok()?;
     let index = PathBuf::from(raw.trim());
     Some(if index.is_absolute() {
@@ -576,15 +600,19 @@ fn index_file(path: &Path) -> Option<PathBuf> {
     })
 }
 
-fn index_mtime(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(index_file(path)?)
-        .and_then(|m| m.modified())
-        .ok()
+#[derive(Clone, Copy)]
+enum IndexSource<'a> {
+    Lookup,
+    Ready(Option<&'a Path>),
+}
+
+fn index_mtime_at(index: Option<&Path>) -> Option<SystemTime> {
+    std::fs::metadata(index?).and_then(|m| m.modified()).ok()
 }
 
 /// `git status` refreshes the index. That must not bump last-used.
-fn restore_index_mtime(path: &Path, prev: SystemTime) {
-    let Some(index) = index_file(path) else {
+fn restore_index_mtime_at(index: Option<&Path>, prev: SystemTime) {
+    let Some(index) = index else {
         return;
     };
     if let Ok(file) = std::fs::OpenOptions::new().write(true).open(index) {
@@ -713,7 +741,23 @@ fn is_under_known_cache(root: &Path, file: &Path) -> bool {
 /// `!! target/`, not `!! target/.env`). Other XY statuses under those names
 /// are DirtyWork (tracked dirty cache paths).
 fn unique_work_reason(path: &Path, policy: &DenyPolicy) -> Option<KeepReason> {
-    let index_before = index_mtime(path);
+    unique_work_from(path, policy, IndexSource::Lookup)
+}
+
+fn unique_work_from(
+    path: &Path,
+    policy: &DenyPolicy,
+    source: IndexSource<'_>,
+) -> Option<KeepReason> {
+    let owned = match source {
+        IndexSource::Lookup => index_file(path),
+        IndexSource::Ready(_) => None,
+    };
+    let index = match source {
+        IndexSource::Ready(index) => index,
+        IndexSource::Lookup => owned.as_deref(),
+    };
+    let index_before = index_mtime_at(index);
     let out = match git(
         path,
         &[
@@ -729,7 +773,7 @@ fn unique_work_reason(path: &Path, policy: &DenyPolicy) -> Option<KeepReason> {
         Err(_) => return Some(KeepReason::StatusUnreadable),
     };
     if let Some(prev) = index_before {
-        restore_index_mtime(path, prev);
+        restore_index_mtime_at(index, prev);
     }
     let mut has_unique = false;
     for line in out.lines() {
@@ -779,13 +823,74 @@ fn porcelain_path(line: &str) -> PathBuf {
 }
 
 fn save_unique_commits(path: &Path, prefix: &str) -> Result<Vec<String>, GcError> {
-    let reflog = git(path, &["reflog", "--format=%H"]).map_err(|e| match e {
+    let reflog = reflog_text(path)?;
+    let reachable = reachable_branch_commits(path)?;
+    save_reflog_shas(path, prefix, &reflog, &reachable)
+}
+
+fn reclaim_with_saved_refs(
+    repo: &Path,
+    tree: &Path,
+    prefix: &str,
+    policy: &DenyPolicy,
+    reachable_cache: &mut Option<Result<HashSet<String>, ()>>,
+) -> Result<GcDecision, GcError> {
+    let reflog = match reflog_text(tree) {
+        Ok(text) => text,
+        Err(_) => {
+            return Ok(GcDecision::Keep {
+                reason: KeepReason::StatusUnreadable,
+            });
+        }
+    };
+    let saved = match reachable_cache
+        .get_or_insert_with(|| reachable_branch_commits(repo).map_err(|_| ()))
+    {
+        Ok(set) => match save_reflog_shas(tree, prefix, &reflog, set) {
+            Ok(saved) => saved,
+            Err(_) => {
+                return Ok(GcDecision::Keep {
+                    reason: KeepReason::StatusUnreadable,
+                });
+            }
+        },
+        Err(()) => {
+            return Ok(GcDecision::Keep {
+                reason: KeepReason::StatusUnreadable,
+            });
+        }
+    };
+    take_if_still_clean(repo, tree, saved, false, true, policy)
+}
+
+fn reflog_text(path: &Path) -> Result<String, GcError> {
+    git(path, &["reflog", "--format=%H"]).map_err(|e| match e {
         GcError::Git { detail, .. } => GcError::Git {
             op: "reflog".into(),
             detail,
         },
         other => other,
-    })?;
+    })
+}
+
+/// Commits on local or remote-tracking branches.
+/// Not `--all`: tags and backup refs are outside `branch -a`.
+fn reachable_branch_commits(path: &Path) -> Result<HashSet<String>, GcError> {
+    let out = git(path, &["rev-list", "--branches", "--remotes"])?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|sha| sha.len() >= 7)
+        .map(str::to_owned)
+        .collect())
+}
+
+fn save_reflog_shas(
+    path: &Path,
+    prefix: &str,
+    reflog: &str,
+    reachable: &HashSet<String>,
+) -> Result<Vec<String>, GcError> {
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -799,7 +904,7 @@ fn save_unique_commits(path: &Path, prefix: &str) -> Result<Vec<String>, GcError
         if sha.len() < 7 || !seen.insert(sha.to_owned()) {
             continue;
         }
-        if !commit_is_dangling(path, sha)? {
+        if reachable.contains(sha) {
             continue;
         }
         let refname = format!("{prefix}/{name}/{sha}");
@@ -813,11 +918,6 @@ fn save_unique_commits(path: &Path, prefix: &str) -> Result<Vec<String>, GcError
         saved.push(refname);
     }
     Ok(saved)
-}
-
-fn commit_is_dangling(path: &Path, sha: &str) -> Result<bool, GcError> {
-    let contains = git(path, &["branch", "-a", "--contains", sha])?;
-    Ok(!contains.lines().any(|l| !l.trim().is_empty()))
 }
 
 fn sanitize_ref_component(raw: &str) -> String {
@@ -890,6 +990,8 @@ fn take_if_still_clean(
 #[cfg(test)]
 thread_local! {
     static BEFORE_REMOVE: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
+    static CWD_PROBE_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static INDEX_RESOLVE_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 fn fire_before_remove(path: &Path) {
@@ -1047,19 +1149,121 @@ mod parse_tests {
     }
 
     #[test]
-    fn commit_is_dangling_git_failure_is_not_dangling() {
+    fn reachable_branch_commits_git_failure_stays_an_error() {
         let dir = tempfile::tempdir().expect("tmp");
-        match commit_is_dangling(dir.path(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+        match reachable_branch_commits(dir.path()) {
             Err(GcError::Git { op, .. }) => {
                 assert!(
-                    op.contains("branch"),
-                    "a failed contains check must stay a git error: {op}"
+                    op.contains("rev-list"),
+                    "a failed reachability check must stay a git error: {op}"
                 );
             }
             other => {
-                panic!("git failure must be Err so the sha is not skipped as reachable: {other:?}")
+                panic!("git failure must be Err so commits are not skipped as reachable: {other:?}")
             }
         }
+    }
+
+    #[test]
+    fn age_gc_probes_other_process_cwds_once() {
+        CWD_PROBE_COUNT.with(|slot| slot.set(0));
+        let dir = tempfile::tempdir().expect("tmp");
+        let repo = dir.path().join("origin");
+        std::fs::create_dir(&repo).expect("origin");
+        let git = |cwd: &Path, args: &[&str]| {
+            super::git(cwd, args).unwrap_or_else(|err| panic!("{args:?}: {err:?}"));
+        };
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "dev@example.com"]);
+        git(&repo, &["config", "user.name", "dev"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README"), b"x").expect("readme");
+        git(&repo, &["add", "README"]);
+        git(&repo, &["commit", "-m", "init"]);
+        for name in ["wt-a", "wt-b"] {
+            let wt = dir.path().join(name);
+            git(
+                &repo,
+                &["worktree", "add", wt.to_str().expect("utf8"), "-b", name],
+            );
+        }
+        let cfg = GcConfig {
+            leftover_dir: repo.join(".workpen-worktrees"),
+            saved_ref_prefix: "refs/workpen/reclaimed".into(),
+            max_age: Duration::from_secs(0),
+            dry_run: true,
+            now: SystemTime::now() + Duration::from_secs(10),
+        };
+        let rows = run_gc_with_policy(&repo, &cfg, &DenyPolicy::default()).expect("gc");
+        assert!(rows.len() >= 2, "two linked trees: {rows:?}");
+        let probes = CWD_PROBE_COUNT.with(|slot| slot.get());
+        assert_eq!(
+            probes, 1,
+            "one cwd probe for every linked tree, got {probes}"
+        );
+    }
+
+    #[test]
+    fn age_gc_skips_cwd_probe_when_nothing_is_linked() {
+        CWD_PROBE_COUNT.with(|slot| slot.set(0));
+        let dir = tempfile::tempdir().expect("tmp");
+        let repo = dir.path().join("origin");
+        std::fs::create_dir(&repo).expect("origin");
+        let git = |cwd: &Path, args: &[&str]| {
+            super::git(cwd, args).unwrap_or_else(|err| panic!("{args:?}: {err:?}"));
+        };
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "dev@example.com"]);
+        git(&repo, &["config", "user.name", "dev"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README"), b"x").expect("readme");
+        git(&repo, &["add", "README"]);
+        git(&repo, &["commit", "-m", "init"]);
+        let cfg = GcConfig {
+            leftover_dir: repo.join(".workpen-worktrees"),
+            saved_ref_prefix: "refs/workpen/reclaimed".into(),
+            max_age: Duration::from_secs(0),
+            dry_run: true,
+            now: SystemTime::now() + Duration::from_secs(10),
+        };
+        let rows = run_gc_with_policy(&repo, &cfg, &DenyPolicy::default()).expect("gc");
+        assert!(rows.is_empty(), "primary is not a candidate: {rows:?}");
+        let probes = CWD_PROBE_COUNT.with(|slot| slot.get());
+        assert_eq!(probes, 0, "no linked tree, no cwd probe, got {probes}");
+    }
+
+    #[test]
+    fn classify_age_resolves_index_once() {
+        INDEX_RESOLVE_COUNT.with(|slot| slot.set(0));
+        let dir = tempfile::tempdir().expect("tmp");
+        let repo = dir.path().join("origin");
+        std::fs::create_dir(&repo).expect("origin");
+        let git = |cwd: &Path, args: &[&str]| {
+            super::git(cwd, args).unwrap_or_else(|err| panic!("{args:?}: {err:?}"));
+        };
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "dev@example.com"]);
+        git(&repo, &["config", "user.name", "dev"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README"), b"x").expect("readme");
+        git(&repo, &["add", "README"]);
+        git(&repo, &["commit", "-m", "init"]);
+        let decision = classify_for_age_gc_with_policy(
+            &repo,
+            false,
+            Duration::ZERO,
+            SystemTime::now() + Duration::from_secs(3600),
+            &DenyPolicy::default(),
+        );
+        assert!(
+            matches!(decision, GcDecision::Reclaim { .. }),
+            "old clean repo must reclaim, got {decision:?}"
+        );
+        let resolves = INDEX_RESOLVE_COUNT.with(|slot| slot.get());
+        assert_eq!(
+            resolves, 1,
+            "one index resolve per age check, got {resolves}"
+        );
     }
 
     #[test]
