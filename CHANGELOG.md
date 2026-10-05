@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.4](https://github.com/workpen/workpen/compare/v0.7.3...v0.7.4) (2026-10-05)
+
+
+### Bug Fixes
+
+* print policy usage for policy --help ([#262](https://github.com/workpen/workpen/issues/262)) ([2f9a595](https://github.com/workpen/workpen/commit/2f9a595703b50b631605be9a766e0de5c6db4c6d))
+
 ## [0.7.3](https://github.com/workpen/workpen/compare/v0.7.2...v0.7.3) (2026-10-04)
 
 
