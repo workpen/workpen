@@ -80,25 +80,7 @@ fn copy_winsize(master_fd: RawFd) {
 /// Close `CLOEXEC` fds above stdio. Rust's spawn error pipe is one of
 /// them. Closing it lets the parent return from `spawn` before `exec`.
 fn close_cloexec_fds() {
-    let mut limit = libc::rlimit {
-        rlim_cur: 1024,
-        rlim_max: 1024,
-    };
-    unsafe {
-        libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
-    }
-    let end = libc::c_int::try_from(limit.rlim_cur.min(4096)).unwrap_or(4096);
-    if end <= 3 {
-        return;
-    }
-    for fd in 3..end {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags >= 0 && flags & libc::FD_CLOEXEC != 0 {
-            unsafe {
-                libc::close(fd);
-            }
-        }
-    }
+    super::reaper::close_cloexec_above_stdio();
 }
 
 pub(super) fn attach_pty(cmd: &mut Command, slave: File) -> io::Result<()> {
