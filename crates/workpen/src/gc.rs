@@ -220,15 +220,7 @@ pub fn remove_explicit_with_policy(
                     });
                 }
             };
-            if entry.is_some() {
-                remove_worktree(&repo, path, locked && force)?;
-            } else {
-                std::fs::remove_dir_all(path).map_err(|e| GcError::Git {
-                    op: "leftover rm".into(),
-                    detail: e.to_string(),
-                })?;
-            }
-            Ok(GcDecision::Reclaim { saved_refs: saved })
+            take_if_still_clean(&repo, path, saved, locked && force, entry.is_some(), policy)
         }
     }
 }
@@ -326,8 +318,7 @@ pub fn run_gc_with_policy(
         {
             match save_unique_commits(&wt.path, &cfg.saved_ref_prefix) {
                 Ok(saved) => {
-                    remove_worktree(cwd, &wt.path, false)?;
-                    decision = GcDecision::Reclaim { saved_refs: saved };
+                    decision = take_if_still_clean(cwd, &wt.path, saved, false, true, policy)?;
                 }
                 Err(_) => {
                     decision = GcDecision::Keep {
@@ -869,6 +860,47 @@ fn registry_unreadable(err: GcError) -> GcError {
     }
 }
 
+/// Drop a tree that was clean before the reflog walk.
+///
+/// `git worktree remove --force` deletes files that appeared after that
+/// snapshot. Status is read again immediately before the remove.
+fn take_if_still_clean(
+    repo: &Path,
+    tree: &Path,
+    saved: Vec<String>,
+    unlock: bool,
+    registered: bool,
+    policy: &DenyPolicy,
+) -> Result<GcDecision, GcError> {
+    fire_before_remove(tree);
+    if let Some(reason) = unique_work_reason(tree, policy) {
+        return Ok(GcDecision::Keep { reason });
+    }
+    if registered {
+        remove_worktree(repo, tree, unlock)?;
+    } else {
+        std::fs::remove_dir_all(tree).map_err(|e| GcError::Git {
+            op: "leftover rm".into(),
+            detail: e.to_string(),
+        })?;
+    }
+    Ok(GcDecision::Reclaim { saved_refs: saved })
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_REMOVE: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
+}
+
+fn fire_before_remove(path: &Path) {
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_REMOVE.with(|slot| slot.replace(None)) {
+        hook(path);
+    }
+    #[cfg(not(test))]
+    let _ = path;
+}
+
 fn remove_worktree(repo: &Path, tree: &Path, unlock: bool) -> Result<(), GcError> {
     let path_s = tree
         .to_str()
@@ -952,6 +984,43 @@ mod parse_tests {
         assert_eq!(trees.len(), 2);
         assert!(!trees[0].locked);
         assert!(trees[1].locked);
+    }
+
+    #[test]
+    fn recheck_keeps_a_file_planted_after_the_clean_snapshot() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let repo = dir.path().join("origin");
+        std::fs::create_dir(&repo).expect("origin");
+        let git = |cwd: &Path, args: &[&str]| {
+            super::git(cwd, args).unwrap_or_else(|err| panic!("{args:?}: {err:?}"));
+        };
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "dev@example.com"]);
+        git(&repo, &["config", "user.name", "dev"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README"), b"x").expect("readme");
+        git(&repo, &["add", "README"]);
+        git(&repo, &["commit", "-m", "init"]);
+        let wt = dir.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", wt.to_str().expect("utf8"), "-b", "wt"],
+        );
+        BEFORE_REMOVE.with(|slot| {
+            slot.set(Some(|path| {
+                std::fs::write(path.join("late.txt"), b"late").expect("plant");
+            }));
+        });
+        let decision =
+            super::take_if_still_clean(&repo, &wt, Vec::new(), false, true, &DenyPolicy::default())
+                .expect("take");
+        match decision {
+            GcDecision::Keep {
+                reason: KeepReason::UniqueUntracked,
+            } => {}
+            other => panic!("expected unique untracked, got {other:?}"),
+        }
+        assert!(wt.join("late.txt").is_file(), "late file must survive");
     }
 
     #[test]
