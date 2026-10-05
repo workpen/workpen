@@ -274,7 +274,7 @@ fn run_equals_root_is_unknown_flag() {
 #[test]
 fn run_and_policy_missing_value_names_that_flag() {
     for cmd in ["run", "policy"] {
-        for flag in ["--read", "--write", "--env"] {
+        for flag in ["--read", "--write"] {
             let out = workpen().args([cmd, flag]).output().expect("spawn");
             let err = String::from_utf8_lossy(&out.stderr);
             assert_eq!(
@@ -292,6 +292,13 @@ fn run_and_policy_missing_value_names_that_flag() {
             );
         }
     }
+    let out = workpen().args(["run", "--env"]).output().expect("spawn");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "run --env must exit 2: {err}");
+    assert!(
+        err.contains("missing --env value"),
+        "run --env must name the flag: {err}"
+    );
 }
 
 #[test]
@@ -400,7 +407,73 @@ fn policy_help_names_policy_not_run() {
             !stdout.contains("usage: workpen run"),
             "policy help {args:?} must not print run usage: {stdout}"
         );
+        assert!(
+            stdout.contains("--json"),
+            "policy help {args:?} must name --json: {stdout}"
+        );
     }
+}
+
+#[test]
+fn policy_run_flags_cite_policy_usage() {
+    for args in [
+        vec!["policy", "--verbose"],
+        vec!["policy", "--timeout"],
+        vec!["policy", "--timeout", "1s"],
+        vec!["policy", "--tty"],
+        vec!["policy", "--env"],
+        vec!["policy", "--env", "FOO=bar"],
+        vec!["policy", "--env-clear"],
+        vec!["policy", "--policy"],
+    ] {
+        let out = workpen().args(&args).output().expect("spawn");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "policy {args:?} must exit 2: {err}"
+        );
+        assert!(
+            err.contains("unknown flag") && err.contains("usage: workpen policy"),
+            "policy {args:?} must cite policy usage: {err}"
+        );
+        assert!(
+            !err.contains("usage: workpen run"),
+            "policy {args:?} must not cite run usage: {err}"
+        );
+        assert!(
+            !err.contains("failed to spawn"),
+            "policy {args:?} must not spawn: {err}"
+        );
+    }
+}
+
+#[test]
+fn policy_json_home_refusal_is_json() {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .expect("home")
+        .to_string_lossy()
+        .into_owned();
+    let out = workpen()
+        .args(["policy", "--json", "--root", &home])
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("\"result\":\"denied\""), "{text}");
+    assert!(text.contains("\"kind\":\"path_guard\""), "{text}");
+    assert!(text.contains("\"exit\":3"), "{text}");
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

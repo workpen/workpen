@@ -25,7 +25,7 @@ const TOP_USAGE: &str = "\
 usage: workpen [--version] [--help] <why|run|policy|gc|init|doctor> ...
   why [--root DIR] [--extra-root DIR] PATH
   run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--policy] [--json] [--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...
-  policy [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--] [CMD...]
+  policy [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--json] [--] [CMD...]
   gc  [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]
   init [--root DIR]
   doctor
@@ -245,16 +245,23 @@ usage: workpen run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [-
 [--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...
 The network is blocked unless --net is set. --extra-root and --write are read-write. --read is read-only. Dest-deny runs before the child starts, and on Linux the child is not started when secret names cannot be hidden. --policy prints the jail and does not start the child. Exit 124 means the timeout fired. --env opts a name back in. --env-clear drops inherited names except PATH, then applies every --env. Loaders such as LD_PRELOAD stay removed.";
 
+const POLICY_USAGE: &str = "\
+usage: workpen policy [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--json] [--] [CMD...]";
+
 const POLICY_HELP: &str = "\
-usage: workpen policy [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--] [CMD...]
-Prints the jail and does not start the child. A command after -- is checked only. would-deny names an argv the jail would refuse.";
+usage: workpen policy [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--json] [--] [CMD...]
+Prints the jail and does not start the child. A command after -- is checked only. would-deny names an argv the jail would refuse. --json formats a refusal. --timeout, --tty, --env, and --env-clear are run flags.";
 
 fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
-    let (root, extras, rest) = parse_roots(
-        args,
-        &["--timeout", "--env", "--read", "--write"],
-        &["--tty", "--env-clear", "--policy", "--net", "--json"],
-    )?;
+    let (valued, switches): (&[&str], &[&str]) = if force_report {
+        (&["--read", "--write"], &["--net", "--json"])
+    } else {
+        (
+            &["--timeout", "--env", "--read", "--write"],
+            &["--tty", "--env-clear", "--policy", "--net", "--json"],
+        )
+    };
+    let (root, extras, rest) = parse_roots(args, valued, switches)?;
     if wants_help(&rest) {
         if force_report {
             println!("{POLICY_HELP}");
@@ -263,7 +270,12 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let flags = peel_run_flags(&rest)?;
+    let usage = if force_report {
+        POLICY_USAGE
+    } else {
+        RUN_USAGE
+    };
+    let flags = peel_run_flags(&rest, force_report)?;
     let timeout = flags.timeout;
     let tty = flags.tty;
     let env_clear = flags.env_clear;
@@ -281,7 +293,7 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
     if let Some(flag) = rest.first().filter(|t| t.starts_with('-') && *t != "--") {
-        return Err(format!("unknown flag: {flag} ({RUN_USAGE})"));
+        return Err(format!("unknown flag: {flag} ({usage})"));
     }
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = match resolve_workspace_root(&cwd, &root.to_string_lossy()) {
@@ -455,7 +467,7 @@ struct RunFlags<'a> {
     rest: &'a [String],
 }
 
-fn peel_run_flags(rest: &[String]) -> Result<RunFlags<'_>, String> {
+fn peel_run_flags(rest: &[String], policy_cmd: bool) -> Result<RunFlags<'_>, String> {
     let mut timeout = None;
     let mut tty = false;
     let mut env_clear = false;
@@ -468,6 +480,9 @@ fn peel_run_flags(rest: &[String]) -> Result<RunFlags<'_>, String> {
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
+            "--timeout" | "--tty" | "--env-clear" | "--env" | "--policy" if policy_cmd => {
+                return Err(format!("unknown flag: {} ({POLICY_USAGE})", rest[i]));
+            }
             "--timeout" => {
                 let raw = flag_value(rest, i, "--timeout")?;
                 timeout = Some(parse_max_age(raw).map_err(|e| e.to_string())?);
@@ -1007,6 +1022,24 @@ fn parse_roots(
         break;
     }
     Ok((root, extras, rest))
+}
+
+#[cfg(test)]
+mod policy_usage_tests {
+    use super::{POLICY_HELP, POLICY_USAGE, TOP_USAGE};
+
+    #[test]
+    fn policy_help_and_top_usage_share_the_policy_line() {
+        assert!(
+            POLICY_HELP.starts_with(POLICY_USAGE),
+            "policy help must start with the policy usage line"
+        );
+        let line = POLICY_USAGE.trim_start_matches("usage: workpen ");
+        assert!(
+            TOP_USAGE.contains(line),
+            "top usage must list the same policy flags"
+        );
+    }
 }
 
 #[cfg(test)]
