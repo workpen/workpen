@@ -810,6 +810,7 @@ fn unique_dangling_commit_is_saved_under_prefix() {
     git(&wt, &["commit", "-m", "unique"]);
     let sha = git_out(&wt, &["rev-parse", "HEAD"]).trim().to_owned();
     git(&wt, &["reset", "--hard", "HEAD~1"]);
+    let parent = git_out(&wt, &["rev-parse", "HEAD"]).trim().to_owned();
     let mut gc = cfg(
         &repo,
         Duration::from_secs(0),
@@ -835,6 +836,10 @@ fn unique_dangling_commit_is_saved_under_prefix() {
             .iter()
             .any(|r| r.contains("refs/bline/reclaimed") && r.contains(&sha)),
         "expected saved ref under host prefix: {saved:?}"
+    );
+    assert!(
+        !saved.iter().any(|r| r.contains(&parent)),
+        "commit on a branch must not be backed up: {saved:?}"
     );
     let listed = git_out(&repo, &["show-ref"]);
     assert!(
@@ -1502,6 +1507,43 @@ fn run_gc_reflog_failure_keeps_and_continues() {
         other => panic!("sibling must still reclaim, got {other:?}"),
     }
     assert!(!ok.exists(), "other trees must still reclaim");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_gc_lists_reachable_commits_once() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let leftover = repo.join(".workpen-worktrees");
+    let a = add_leftover_worktree(&repo, &leftover, "rev-a");
+    let b = add_leftover_worktree(&repo, &leftover, "rev-b");
+    let count = std::env::temp_dir().join(format!("workpen-rev-count-{}", std::process::id()));
+    let _ = fs::remove_file(&count);
+    let script = format!(
+        "#!/bin/sh\ncase \" $* \" in\n*\" rev-list \"*) echo rev >> '{}'\n;;\n*\" --contains \"*) echo contains >> '{}'\n;;\nesac\nexec __GIT__ \"$@\"\n",
+        count.display(),
+        count.display()
+    );
+    let now = SystemTime::now() + Duration::from_secs(10);
+    let gc_cfg = cfg(&repo, Duration::from_secs(0), now);
+    let rows = with_git_wrapper(&script, || run_gc(&repo, &gc_cfg)).expect("gc");
+    let text = fs::read_to_string(&count).unwrap_or_default();
+    let _ = fs::remove_file(&count);
+    let rev = text.lines().filter(|line| *line == "rev").count();
+    let contains = text.lines().filter(|line| *line == "contains").count();
+    assert!(
+        rows.iter()
+            .any(|(p, d)| p.file_name() == a.file_name() && matches!(d, GcDecision::Reclaim { .. })),
+        "rev-a reclaim: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(p, d)| p.file_name() == b.file_name() && matches!(d, GcDecision::Reclaim { .. })),
+        "rev-b reclaim: {rows:?}"
+    );
+    assert!(!a.exists() && !b.exists(), "both trees removed");
+    assert_eq!(rev, 1, "one rev-list, log={text:?}");
+    assert_eq!(contains, 0, "no per-sha contains, log={text:?}");
 }
 
 fn configure_identity(cwd: &Path) {
