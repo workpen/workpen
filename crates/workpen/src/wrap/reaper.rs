@@ -487,17 +487,31 @@ unsafe extern "C" fn on_stop(_sig: libc::c_int) {
     STOP.store(1, Ordering::Relaxed);
 }
 
-/// Set `FD_CLOEXEC` on inherited descriptors above stdio.
+/// Exclusive end of a numeric inherited-fd scan.
 ///
-/// `exec` drops them, so `cat <&3` cannot read a secret the parent
-/// still has open. Closing the descriptor here would also close the
-/// PTY slave and the stdout pipe before Rust `dup2`s them onto stdio.
-/// Descriptors that already have `FD_CLOEXEC` (the spawn error pipe
-/// and the reaper report) are left alone. The walk follows the soft
-/// `RLIMIT_NOFILE` and stops at 65536. [`close_extra_fds`] stops at
-/// 4096, which left `cat <&5000` able to read the secret.
-pub(super) fn cloexec_inherited_fds() {
-    const SCAN_CAP: libc::rlim_t = 65536;
+/// The soft limit is the bound. A limit of 65536 visits fd 65535. A
+/// limit of 1048576 visits fd 65536. `RLIM_INFINITY` does not fit in a
+/// descriptor number. The result is then `c_int::MAX`, and
+/// `numeric_scan_end` refuses that walk.
+pub(super) fn inherited_fd_scan_end(rlim_cur: libc::rlim_t) -> libc::c_int {
+    if rlim_cur <= 3 {
+        return 3;
+    }
+    if rlim_cur > libc::c_int::MAX as libc::rlim_t {
+        return libc::c_int::MAX;
+    }
+    libc::c_int::try_from(rlim_cur).unwrap_or(libc::c_int::MAX)
+}
+
+fn numeric_scan_end(rlim_cur: libc::rlim_t) -> Option<libc::c_int> {
+    if rlim_cur > libc::c_int::MAX as libc::rlim_t {
+        None
+    } else {
+        Some(inherited_fd_scan_end(rlim_cur))
+    }
+}
+
+fn soft_nofile() -> libc::rlim_t {
     let mut limit = libc::rlimit {
         rlim_cur: 1024,
         rlim_max: 1024,
@@ -505,38 +519,356 @@ pub(super) fn cloexec_inherited_fds() {
     unsafe {
         libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
     }
-    let end = libc::c_int::try_from(limit.rlim_cur.min(SCAN_CAP)).unwrap_or(65536);
-    if end <= 3 {
-        return;
+    limit.rlim_cur
+}
+
+/// Inclusive ranges passed to `close_range`. Keeps below `first` are
+/// ignored. A keep of `c_int::MAX` has no range above it.
+#[cfg(any(test, target_os = "linux"))]
+fn close_ranges(first: i32, keep_a: i32, keep_b: i32) -> ([(u32, u32); 3], usize) {
+    let mut ranges = [(0u32, 0u32); 3];
+    let mut n = 0usize;
+    if first < 0 {
+        return (ranges, 0);
     }
-    for fd in 3..end {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+    let mut keeps = [keep_a, keep_b];
+    keeps.sort_unstable();
+    let mut cursor = first;
+    for keep in keeps {
+        if keep < cursor {
+            continue;
+        }
+        if keep > cursor {
+            let Ok(start) = u32::try_from(cursor) else {
+                return (ranges, n);
+            };
+            let Ok(last) = u32::try_from(keep - 1) else {
+                return (ranges, n);
+            };
+            ranges[n] = (start, last);
+            n += 1;
+        }
+        cursor = match keep.checked_add(1) {
+            Some(next) => next,
+            None => return (ranges, n),
+        };
+    }
+    if n < ranges.len()
+        && let Ok(start) = u32::try_from(cursor)
+    {
+        ranges[n] = (start, u32::MAX);
+        n += 1;
+    }
+    (ranges, n)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_close_range(first: u32, last: u32, flags: libc::c_int) -> bool {
+    #[cfg(target_env = "gnu")]
+    let rc = unsafe { libc::close_range(first, last, flags) };
+    #[cfg(not(target_env = "gnu"))]
+    let rc = unsafe { libc::syscall(libc::SYS_close_range, first, last, flags) as libc::c_int };
+    rc == 0
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cloexec_from(first: i32) -> bool {
+    let Ok(start) = u32::try_from(first) else {
+        return false;
+    };
+    linux_close_range(start, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as libc::c_int)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_close_from_except(first: i32, keep_a: i32, keep_b: i32) -> bool {
+    let (ranges, n) = close_ranges(first, keep_a, keep_b);
+    ranges
+        .iter()
+        .take(n)
+        .all(|&(start, last)| linux_close_range(start, last, 0))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn parse_fd_name(name: &[u8]) -> Option<i32> {
+    if name.is_empty() {
+        return None;
+    }
+    let mut n: i32 = 0;
+    for byte in name {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add(i32::from(byte - b'0'))?;
+    }
+    Some(n)
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn getdirentries(
+        fd: libc::c_int,
+        buf: *mut libc::c_char,
+        nbytes: libc::c_int,
+        basep: *mut libc::c_long,
+    ) -> libc::ssize_t;
+}
+
+#[cfg(target_os = "macos")]
+fn macos_dirent_name(buf: &[u8], off: usize) -> Option<(usize, &[u8])> {
+    if off + 8 > buf.len() {
+        return None;
+    }
+    let reclen = usize::from(u16::from_le_bytes([buf[off + 4], buf[off + 5]]));
+    if reclen < 8 || off + reclen > buf.len() {
+        return None;
+    }
+    let namlen = usize::from(buf[off + 7]);
+    if namlen > reclen - 8 {
+        return None;
+    }
+    Some((reclen, &buf[off + 8..off + 8 + namlen]))
+}
+
+#[cfg(target_os = "macos")]
+fn walk_dev_fd(mut f: impl FnMut(i32)) -> bool {
+    let dir = unsafe { libc::open(c"/dev/fd".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if dir < 0 {
+        return false;
+    }
+    let mut buf = [0u8; 4096];
+    let mut base: libc::c_long = 0;
+    loop {
+        let nread = unsafe {
+            getdirentries(
+                dir,
+                buf.as_mut_ptr().cast(),
+                buf.len() as libc::c_int,
+                &mut base,
+            )
+        };
+        if nread < 0 {
+            unsafe { libc::close(dir) };
+            return false;
+        }
+        if nread == 0 {
+            break;
+        }
+        let nread = usize::try_from(nread).unwrap_or(0);
+        if nread == 0 || nread > buf.len() {
+            unsafe { libc::close(dir) };
+            return false;
+        }
+        let mut off = 0usize;
+        while off + 8 <= nread {
+            let Some((reclen, name)) = macos_dirent_name(&buf, off) else {
+                unsafe { libc::close(dir) };
+                return false;
+            };
+            if let Some(fd) = parse_fd_name(name)
+                && fd >= 3
+                && fd != dir
+            {
+                f(fd);
             }
+            off += reclen;
+        }
+    }
+    unsafe { libc::close(dir) };
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn walk_proc_fd(mut f: impl FnMut(i32)) -> bool {
+    let dir = unsafe {
+        libc::open(
+            c"/proc/self/fd".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if dir < 0 {
+        return false;
+    }
+    let mut buf = [0u8; 4096];
+    loop {
+        let nread = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                dir,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len() as libc::c_long,
+            )
+        };
+        if nread < 0 {
+            unsafe { libc::close(dir) };
+            return false;
+        }
+        if nread == 0 {
+            break;
+        }
+        let nread = usize::try_from(nread).unwrap_or(usize::MAX);
+        if nread > buf.len() {
+            unsafe { libc::close(dir) };
+            return false;
+        }
+        let mut off = 0usize;
+        while off + 19 <= nread {
+            let reclen = usize::from(u16::from_le_bytes([buf[off + 16], buf[off + 17]]));
+            if reclen < 19 || off + reclen > nread {
+                unsafe { libc::close(dir) };
+                return false;
+            }
+            let name = &buf[off + 19..off + reclen];
+            let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
+            if let Some(fd) = parse_fd_name(&name[..end])
+                && fd >= 3
+                && fd != dir
+            {
+                f(fd);
+            }
+            off += reclen;
+        }
+    }
+    unsafe { libc::close(dir) };
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn walk_open_fds(f: impl FnMut(i32)) -> bool {
+    walk_dev_fd(f)
+}
+
+#[cfg(target_os = "linux")]
+fn walk_open_fds(f: impl FnMut(i32)) -> bool {
+    walk_proc_fd(f)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn walk_open_fds(f: impl FnMut(i32)) -> bool {
+    let _ = f;
+    false
+}
+
+fn mark_listed_fds() -> bool {
+    walk_open_fds(set_cloexec)
+}
+
+fn close_listed_fds(mut pred: impl FnMut(i32) -> bool) -> bool {
+    loop {
+        let mut batch = [0i32; 128];
+        let mut n = 0usize;
+        let mut more = false;
+        let ok = walk_open_fds(|fd| {
+            if !pred(fd) {
+                return;
+            }
+            if n == batch.len() {
+                more = true;
+                return;
+            }
+            batch[n] = fd;
+            n += 1;
+        });
+        if !ok {
+            return false;
+        }
+        if n == 0 {
+            return true;
+        }
+        let mut closed = false;
+        for fd in &batch[..n] {
+            if unsafe { libc::close(*fd) } == 0 {
+                closed = true;
+            }
+        }
+        if !more {
+            return closed;
+        }
+        if !closed {
+            return false;
         }
     }
 }
 
-fn close_extra_fds(keep_a: i32, keep_b: i32) {
-    let mut limit = libc::rlimit {
-        rlim_cur: 1024,
-        rlim_max: 1024,
-    };
-    unsafe {
-        libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit);
+/// Set `FD_CLOEXEC` on inherited descriptors above stdio.
+///
+/// `exec` drops them, so `cat <&3` cannot read a secret the parent
+/// still has open. This runs before the reaper fork, so the report
+/// pipe and Rust's exec-error pipe stay open; only `FD_CLOEXEC` is
+/// set. Linux marks the whole range with `close_range`. Otherwise
+/// every open descriptor is visited. When that list is unavailable,
+/// the soft `RLIMIT_NOFILE` is scanned in full, including descriptor
+/// 65536 when the limit allows it. A limit that does not fit in a
+/// descriptor number fails the spawn.
+pub(super) fn cloexec_inherited_fds() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if linux_cloexec_from(3) {
+        return Ok(());
     }
-    // `RLIM_INFINITY` does not fit a useful scan. The exec-error pipe
-    // is a low fd in practice; cap the walk so spawn stays cheap.
-    let end = libc::c_int::try_from(limit.rlim_cur.min(4096)).unwrap_or(4096);
-    if end <= 3 {
+    if mark_listed_fds() {
+        return Ok(());
+    }
+    let Some(end) = numeric_scan_end(soft_nofile()) else {
+        return Err(io::Error::other(
+            "could not mark inherited descriptors close-on-exec",
+        ));
+    };
+    for fd in 3..end {
+        set_cloexec(fd);
+    }
+    Ok(())
+}
+
+fn close_extra_fds(keep_a: i32, keep_b: i32) {
+    #[cfg(target_os = "linux")]
+    if linux_close_from_except(3, keep_a, keep_b) {
         return;
     }
+    if close_listed_fds(|fd| fd != keep_a && fd != keep_b) {
+        return;
+    }
+    let Some(end) = numeric_scan_end(soft_nofile()) else {
+        for fd in 3..4096 {
+            if fd != keep_a && fd != keep_b {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+        }
+        return;
+    };
     for fd in 3..end {
         if fd == keep_a || fd == keep_b {
             continue;
         }
+        unsafe {
+            libc::close(fd);
+        }
+    }
+}
+
+/// Close descriptors above stdio that already have `FD_CLOEXEC`.
+///
+/// Rust's spawn error pipe is one of them. The PTY hook closes it so
+/// the parent can return from `spawn` before `exec`. This runs after
+/// the sandbox, which can hide `/proc`. The numeric fallback stays at
+/// 4096 so a missing fd list does not walk a million slots. Inherited
+/// secrets are already `FD_CLOEXEC` from `cloexec_inherited_fds`.
+pub(super) fn close_cloexec_above_stdio() {
+    if close_listed_fds(|fd| {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        flags >= 0 && flags & libc::FD_CLOEXEC != 0
+    }) {
+        return;
+    }
+    let end = numeric_scan_end(soft_nofile()).unwrap_or(4096).min(4096);
+    for fd in 3..end {
+        close_if_cloexec(fd);
+    }
+}
+
+fn close_if_cloexec(fd: i32) {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags >= 0 && flags & libc::FD_CLOEXEC != 0 {
         unsafe {
             libc::close(fd);
         }
@@ -1526,5 +1858,167 @@ mod tests {
         let report = super::open_report();
         assert!(report.tracked(true));
         assert!(super::unarmed_report().tracked(false));
+    }
+
+    /// #257 raised a hard cap to 65536 and tested fd 5000. The loop was
+    /// `3..end` with `end = min(soft, 65536)`, so fd 65536 was outside it.
+    /// macOS and Linux CI soft limits sit under that cap, so the branch
+    /// never ran.
+    #[test]
+    fn inherited_fd_scan_includes_the_fd_at_the_old_cap() {
+        assert_eq!(super::inherited_fd_scan_end(1024), 1024);
+        assert_eq!(super::inherited_fd_scan_end(65536), 65536);
+        assert!(!(3..super::inherited_fd_scan_end(65536)).contains(&65536));
+        let end = super::inherited_fd_scan_end(1_048_576);
+        assert_eq!(end, 1_048_576);
+        assert!((3..end).contains(&65536));
+        assert_eq!(
+            super::inherited_fd_scan_end(libc::RLIM_INFINITY),
+            libc::c_int::MAX
+        );
+        assert!(super::numeric_scan_end(libc::RLIM_INFINITY).is_none());
+        assert_eq!(super::numeric_scan_end(1_048_576), Some(1_048_576));
+    }
+
+    #[test]
+    fn close_ranges_skip_keepers_and_a_negative_watch() {
+        let (ranges, n) = super::close_ranges(3, 7, -1);
+        assert_eq!(&ranges[..n], &[(3, 6), (8, u32::MAX)]);
+
+        let (ranges, n) = super::close_ranges(3, 5, 5);
+        assert_eq!(&ranges[..n], &[(3, 4), (6, u32::MAX)]);
+
+        let (ranges, n) = super::close_ranges(3, 3, 4);
+        assert_eq!(&ranges[..n], &[(5, u32::MAX)]);
+
+        let (ranges, n) = super::close_ranges(3, 9, 4);
+        assert_eq!(&ranges[..n], &[(3, 3), (5, 8), (10, u32::MAX)]);
+
+        let (ranges, n) = super::close_ranges(3, libc::c_int::MAX, -1);
+        let last = u32::try_from(libc::c_int::MAX - 1).expect("last");
+        assert_eq!(&ranges[..n], &[(3, last)]);
+    }
+
+    #[test]
+    fn snapshot_lists_an_fd_at_65536() {
+        const HIGH: libc::c_int = 65536;
+        struct Restore(Option<libc::rlimit>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(prev) = self.0 {
+                    unsafe {
+                        libc::setrlimit(libc::RLIMIT_NOFILE, &prev);
+                    }
+                }
+            }
+        }
+        struct Close(Option<libc::c_int>);
+        impl Drop for Close {
+            fn drop(&mut self) {
+                if let Some(fd) = self.0 {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
+            }
+        }
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let need = libc::rlim_t::try_from(HIGH).expect("fd") + 1;
+        let mut restore = Restore(None);
+        if limit.rlim_cur < need {
+            if limit.rlim_max < need {
+                return;
+            }
+            let prev = limit;
+            limit.rlim_cur = need;
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) },
+                0,
+                "setrlimit"
+            );
+            restore.0 = Some(prev);
+        }
+        let low = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(low >= 0, "open");
+        let duped = unsafe { libc::dup2(low, HIGH) };
+        unsafe { libc::close(low) };
+        assert_eq!(duped, HIGH, "dup2");
+        let _held = Close(Some(HIGH));
+        let mut saw = false;
+        assert!(
+            super::walk_open_fds(|fd| {
+                if fd == HIGH {
+                    saw = true;
+                }
+            }),
+            "open-fd list"
+        );
+        assert!(saw, "fd {HIGH} missing from the open-fd list");
+        let _ = restore;
+    }
+
+    /// A full `proc_pidinfo` buffer used to stop the walk at 1024 and
+    /// then refuse an unlimited soft limit. The directory walk has no
+    /// such cap.
+    #[test]
+    fn open_fd_walk_passes_1024_descriptors() {
+        const EXTRA: usize = 1100;
+        struct Restore(Option<libc::rlimit>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(prev) = self.0 {
+                    unsafe {
+                        libc::setrlimit(libc::RLIMIT_NOFILE, &prev);
+                    }
+                }
+            }
+        }
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let need = limit.rlim_cur.saturating_add(EXTRA as libc::rlim_t);
+        let mut restore = Restore(None);
+        if limit.rlim_cur < need {
+            if limit.rlim_max < need {
+                return;
+            }
+            let prev = limit;
+            limit.rlim_cur = need;
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) },
+                0,
+                "setrlimit"
+            );
+            restore.0 = Some(prev);
+        }
+        let mut opened = Vec::with_capacity(EXTRA);
+        for _ in 0..EXTRA {
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            assert!(fd >= 0, "open");
+            opened.push(fd);
+        }
+        let mut n = 0usize;
+        let ok = super::walk_open_fds(|_| n += 1);
+        for fd in opened {
+            unsafe { libc::close(fd) };
+        }
+        let _ = restore;
+        assert!(ok, "open-fd list");
+        assert!(
+            n >= EXTRA,
+            "walk saw {n} fds above stdio, wanted at least {EXTRA}"
+        );
     }
 }

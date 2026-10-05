@@ -62,9 +62,12 @@ The parent is trusted. The child is not.
   uses the platform default temp directory.
 - On Unix, descriptors above stdio that lack `FD_CLOEXEC` get that
   flag before `exec`. An inherited secret fd does not survive into
-  the command (`cat <&3`, including a descriptor above 4096).
-  Standard streams stay open. The scan follows the soft
-  `RLIMIT_NOFILE` and stops at 65536.
+  the command (`cat <&3`, including descriptor 65536 when the soft
+  limit allows it). Standard streams stay open. The walk covers
+  every open descriptor above stdio. When that list is unavailable,
+  a soft `RLIMIT_NOFILE` that fits in a descriptor number is scanned
+  in full. The reaper closes the same descriptors, except its report
+  pipe and its watch.
 - When `run_child` returns successfully, a grandchild that called
   `setsid` is not still running. Linux adopts it with
   `PR_SET_CHILD_SUBREAPER`, set before the command can run, so a

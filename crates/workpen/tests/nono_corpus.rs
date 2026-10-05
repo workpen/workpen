@@ -657,21 +657,11 @@ fn run_child_cannot_read_inherited_secret_fd_past_4096() {
         return;
     }
     const HIGH: libc::c_int = 5000;
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
+    let _lock = nofile_lock();
+    let _limit = match raise_soft_nofile(libc::rlim_t::try_from(HIGH).expect("fd") + 1) {
+        Some(limit) => limit,
+        None => return,
     };
-    let got = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
-    assert_eq!(got, 0, "getrlimit");
-    let need = libc::rlim_t::try_from(HIGH).expect("fd") + 1;
-    if limit.rlim_cur < need {
-        if limit.rlim_max < need {
-            return;
-        }
-        limit.rlim_cur = need;
-        let raised = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
-        assert_eq!(raised, 0, "setrlimit");
-    }
     let dir = workspace();
     let env_path = dir.path().join(".env");
     fs::write(&env_path, "SECRET=1\n").expect("env");
@@ -703,6 +693,211 @@ fn run_child_cannot_read_inherited_secret_fd_past_4096() {
     );
     let code = fs::read_to_string(dir.path().join("inherited.code")).unwrap_or_default();
     assert_ne!(code.trim(), "0", "fd {HIGH} must fail: {code:?}");
+}
+
+/// #257 stopped the walk at 65536 (`for fd in 3..end` with `end` capped).
+/// The regression test used fd 5000, which is inside that cap. CI soft
+/// limits are lower still, so a secret on fd 65536 never ran.
+#[cfg(unix)]
+#[test]
+fn run_child_cannot_read_inherited_secret_fd_at_65536() {
+    if !kernel_supported() || !Path::new("/bin/bash").is_file() {
+        return;
+    }
+    const HIGH: libc::c_int = 65536;
+    let _lock = nofile_lock();
+    let _limit = match raise_soft_nofile(libc::rlim_t::try_from(HIGH).expect("fd") + 1) {
+        Some(limit) => limit,
+        None => return,
+    };
+    let dir = workspace();
+    let _held = hold_secret_fd(&dir, HIGH);
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let script = format!("cat <&{HIGH} >inherited.out; echo $? >inherited.code");
+    let mut cmd = Command::new("/bin/bash");
+    cmd.args(["-c", &script]).current_dir(dir.path());
+    let (applied, status) = policy.run_child(cmd).expect("run_child");
+    assert!(
+        matches!(applied, KernelApply::Applied | KernelApply::RemountSkipped),
+        "{applied:?}"
+    );
+    assert!(status.success(), "wrapper must finish: {status:?}");
+    let leaked = fs::read_to_string(dir.path().join("inherited.out")).unwrap_or_default();
+    assert!(
+        !leaked.contains("SECRET"),
+        "fd {HIGH} must not leak: {leaked:?}"
+    );
+    let code = fs::read_to_string(dir.path().join("inherited.code")).unwrap_or_default();
+    assert_ne!(code.trim(), "0", "fd {HIGH} must fail: {code:?}");
+}
+
+/// The reaper used to stop `close` at 4096, so it kept a high descriptor
+/// until the command exited. `spawn` returns the reaper pid.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn reaper_does_not_keep_inherited_fd_at_65536() {
+    if !kernel_supported() || !Path::new("/bin/bash").is_file() {
+        return;
+    }
+    const HIGH: libc::c_int = 65536;
+    let _lock = nofile_lock();
+    let _limit = match raise_soft_nofile(libc::rlim_t::try_from(HIGH).expect("fd") + 1) {
+        Some(limit) => limit,
+        None => return,
+    };
+    let dir = workspace();
+    let _held = hold_secret_fd(&dir, HIGH);
+    let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
+    let mut cmd = Command::new("/bin/bash");
+    cmd.args(["-c", "sleep 30"]).current_dir(dir.path());
+    let applied = policy.apply_pre_exec(&mut cmd).expect("pre_exec");
+    assert!(
+        matches!(applied, KernelApply::Applied | KernelApply::RemountSkipped),
+        "{applied:?}"
+    );
+    let mut child = cmd.spawn().expect("spawn reaper");
+    let pid = child.id() as libc::pid_t;
+    struct Kill(libc::pid_t);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            if self.0 > 0 {
+                unsafe {
+                    libc::kill(self.0, libc::SIGTERM);
+                }
+            }
+        }
+    }
+    let mut killer = Kill(pid);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last = String::new();
+    let dropped = loop {
+        match open_fds(pid) {
+            Some(fds) if !fds.is_empty() && !fds.contains(&HIGH) => break true,
+            Some(fds) => last = format!("{fds:?}"),
+            None => last = "unreadable".to_string(),
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(dropped, "reaper still holds fd {HIGH}: {last}");
+    killer.0 = 0;
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let status = child.wait().expect("wait reaper");
+    policy
+        .finish_pre_exec(status, false)
+        .expect("reaper report");
+}
+
+#[cfg(unix)]
+fn nofile_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+#[cfg(unix)]
+struct SoftLimit {
+    prev: libc::rlimit,
+}
+
+#[cfg(unix)]
+impl Drop for SoftLimit {
+    fn drop(&mut self) {
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_NOFILE, &self.prev);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn raise_soft_nofile(need: libc::rlim_t) -> Option<SoftLimit> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let got = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    assert_eq!(got, 0, "getrlimit");
+    if limit.rlim_cur < need && limit.rlim_max < need {
+        return None;
+    }
+    let prev = limit;
+    if limit.rlim_cur < need {
+        limit.rlim_cur = need;
+        let raised = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+        assert_eq!(raised, 0, "setrlimit");
+    }
+    Some(SoftLimit { prev })
+}
+
+#[cfg(unix)]
+struct HeldFd(libc::c_int);
+
+#[cfg(unix)]
+impl Drop for HeldFd {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            unsafe {
+                libc::close(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn hold_secret_fd(dir: &TempDir, high: libc::c_int) -> HeldFd {
+    let env_path = dir.path().join(".env");
+    fs::write(&env_path, "SECRET=1\n").expect("env");
+    let file = fs::File::open(&env_path).expect("open secret");
+    use std::os::fd::IntoRawFd;
+    let low = file.into_raw_fd();
+    let duped = unsafe { libc::dup2(low, high) };
+    unsafe { libc::close(low) };
+    assert_eq!(duped, high, "dup2");
+    let flags = unsafe { libc::fcntl(high, libc::F_GETFD) };
+    assert!(flags >= 0, "fcntl getfd");
+    let cleared = unsafe { libc::fcntl(high, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+    assert_eq!(cleared, 0, "clear cloexec");
+    HeldFd(high)
+}
+
+#[cfg(target_os = "macos")]
+fn open_fds(pid: libc::pid_t) -> Option<Vec<i32>> {
+    const SLOT: usize = 8;
+    let mut buf = [0u8; 1024 * SLOT];
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            buf.as_mut_ptr().cast(),
+            buf.len() as libc::c_int,
+        )
+    };
+    if n < SLOT as libc::c_int {
+        return None;
+    }
+    let n = usize::try_from(n).unwrap_or(0);
+    if n > buf.len() || n % SLOT != 0 || n == buf.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n / SLOT);
+    for off in (0..n).step_by(SLOT) {
+        out.push(i32::from_ne_bytes(buf[off..off + 4].try_into().ok()?));
+    }
+    Some(out)
+}
+
+#[cfg(target_os = "linux")]
+fn open_fds(pid: libc::pid_t) -> Option<Vec<i32>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(format!("/proc/{pid}/fd")).ok()? {
+        let name = entry.ok()?.file_name();
+        out.push(name.to_str()?.parse().ok()?);
+    }
+    Some(out)
 }
 
 #[test]
