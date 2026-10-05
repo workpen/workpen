@@ -24,7 +24,7 @@ fn main() -> ExitCode {
 const TOP_USAGE: &str = "\
 usage: workpen [--version] [--help] <why|run|policy|gc|init|doctor> ...
   why [--root DIR] [--extra-root DIR] PATH
-  run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--policy] [--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...
+  run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--policy] [--json] [--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...
   policy [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--] [CMD...]
   gc  [--root DIR] --max-age DUR [--dry-run] [--leftover DIR]
   init [--root DIR]
@@ -245,6 +245,10 @@ usage: workpen run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [-
 [--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...
 The network is blocked unless --net is set. --extra-root and --write are read-write. --read is read-only. Dest-deny runs before the child starts, and on Linux the child is not started when secret names cannot be hidden. --policy prints the jail and does not start the child. Exit 124 means the timeout fired. --env opts a name back in. --env-clear drops inherited names except PATH, then applies every --env. Loaders such as LD_PRELOAD stay removed.";
 
+const POLICY_HELP: &str = "\
+usage: workpen policy [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--] [CMD...]
+Prints the jail and does not start the child. A command after -- is checked only. would-deny names an argv the jail would refuse.";
+
 fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
     let (root, extras, rest) = parse_roots(
         args,
@@ -252,7 +256,11 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
         &["--tty", "--env-clear", "--policy", "--net", "--json"],
     )?;
     if wants_help(&rest) {
-        println!("{RUN_HELP}");
+        if force_report {
+            println!("{POLICY_HELP}");
+        } else {
+            println!("{RUN_HELP}");
+        }
         return Ok(ExitCode::SUCCESS);
     }
     let flags = peel_run_flags(&rest)?;
