@@ -711,7 +711,10 @@ fn run_child_cannot_read_inherited_secret_fd_at_65536() {
         None => return,
     };
     let dir = workspace();
-    let _held = hold_secret_fd(&dir, HIGH);
+    // Same runner cap as the unit walk: rlimit allows the number, dup2 does not.
+    let Some(_held) = hold_secret_fd(&dir, HIGH) else {
+        return;
+    };
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
     let script = format!("cat <&{HIGH} >inherited.out; echo $? >inherited.code");
     let mut cmd = Command::new("/bin/bash");
@@ -746,7 +749,9 @@ fn reaper_does_not_keep_inherited_fd_at_65536() {
         None => return,
     };
     let dir = workspace();
-    let _held = hold_secret_fd(&dir, HIGH);
+    let Some(_held) = hold_secret_fd(&dir, HIGH) else {
+        return;
+    };
     let policy = process_jail(dir.path(), std::iter::empty::<&Path>()).expect("policy");
     let mut cmd = Command::new("/bin/bash");
     cmd.args(["-c", "sleep 30"]).current_dir(dir.path());
@@ -847,7 +852,7 @@ impl Drop for HeldFd {
 }
 
 #[cfg(unix)]
-fn hold_secret_fd(dir: &TempDir, high: libc::c_int) -> HeldFd {
+fn hold_secret_fd(dir: &TempDir, high: libc::c_int) -> Option<HeldFd> {
     let env_path = dir.path().join(".env");
     fs::write(&env_path, "SECRET=1\n").expect("env");
     let file = fs::File::open(&env_path).expect("open secret");
@@ -855,12 +860,21 @@ fn hold_secret_fd(dir: &TempDir, high: libc::c_int) -> HeldFd {
     let low = file.into_raw_fd();
     let duped = unsafe { libc::dup2(low, high) };
     unsafe { libc::close(low) };
-    assert_eq!(duped, high, "dup2");
+    if duped != high {
+        let err = std::io::Error::last_os_error().raw_os_error();
+        if matches!(
+            err,
+            Some(libc::EBADF) | Some(libc::EMFILE) | Some(libc::EINVAL)
+        ) {
+            return None;
+        }
+        panic!("dup2 errno={err:?}");
+    }
     let flags = unsafe { libc::fcntl(high, libc::F_GETFD) };
     assert!(flags >= 0, "fcntl getfd");
     let cleared = unsafe { libc::fcntl(high, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
     assert_eq!(cleared, 0, "clear cloexec");
-    HeldFd(high)
+    Some(HeldFd(high))
 }
 
 #[cfg(target_os = "macos")]
