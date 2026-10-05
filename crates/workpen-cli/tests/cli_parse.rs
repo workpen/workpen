@@ -381,6 +381,29 @@ fn run_help_without_separator_prints_usage() {
 }
 
 #[test]
+fn policy_help_names_policy_not_run() {
+    for args in [vec!["policy", "--help"], vec!["policy", "-h"]] {
+        let out = workpen().args(&args).output().expect("spawn workpen");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "policy help {args:?} must exit 0, stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("usage: workpen policy") && stdout.contains("does not start the child"),
+            "policy help {args:?} must print policy usage: {stdout}"
+        );
+        assert!(
+            !stdout.contains("usage: workpen run"),
+            "policy help {args:?} must not print run usage: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn run_help_after_separator_is_the_child() {
     let out = workpen()
         .args(["run", "--", "--help"])
