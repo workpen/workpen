@@ -23,7 +23,7 @@ an amendment to [CONSTITUTION.md](CONSTITUTION.md).
 ## Releases
 
 Versions follow Conventional Commits via release-please.
-0.7.4 is on crates.io; later publishes still wait on a release PR. <!-- x-release-please-version -->
+0.7.5 is on crates.io; later publishes still wait on a release PR. <!-- x-release-please-version -->
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Escalation
