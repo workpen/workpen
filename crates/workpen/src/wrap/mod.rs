@@ -1604,12 +1604,20 @@ impl KernelPolicy {
             drop(cmd);
             let started = Instant::now();
             let stop = forward_stop();
+            // Linux sends SIGHUP when the last PTY master closes. The
+            // copy thread can drop its master before wait records the
+            // child's exit, which turns a finished `cat` into 129.
+            let master_hold = pty.master.try_clone().map_err(|e| {
+                reaper::discard_report();
+                KernelError::Apply(e.to_string())
+            })?;
             let (out_th, master_write) = pty::pump_master(pty.master, &stop).map_err(|e| {
                 reaper::discard_report();
                 KernelError::Apply(e.to_string())
             })?;
             let _stdin_th = pty::pump_stdin(master_write);
             let (status, mut timed_out) = reap_process_group(&mut child, timeout)?;
+            drop(master_hold);
             if let Some(limit) = timeout {
                 if finish_copies(&stop, Some(out_th), None, started + limit) {
                     timed_out = true;
