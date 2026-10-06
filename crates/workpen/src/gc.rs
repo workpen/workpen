@@ -963,7 +963,8 @@ fn registry_unreadable(err: GcError) -> GcError {
 /// Drop a tree that was clean before the reflog walk.
 ///
 /// `git worktree remove --force` deletes files that appeared after that
-/// snapshot. Status is read again immediately before the remove.
+/// snapshot, and it removes a tree a process has entered. Status and
+/// live cwd are read again immediately before the remove.
 fn take_if_still_clean(
     repo: &Path,
     tree: &Path,
@@ -975,6 +976,11 @@ fn take_if_still_clean(
     fire_before_remove(tree);
     if let Some(reason) = unique_work_reason(tree, policy) {
         return Ok(GcDecision::Keep { reason });
+    }
+    if worktree_has_live_cwd(tree) {
+        return Ok(GcDecision::Keep {
+            reason: KeepReason::LiveCwd,
+        });
     }
     if registered {
         remove_worktree(repo, tree, unlock)?;
@@ -992,6 +998,12 @@ thread_local! {
     static BEFORE_REMOVE: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
     static CWD_PROBE_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static INDEX_RESOLVE_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static LIVE_SLEEPER: std::cell::RefCell<Option<std::process::Child>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn fire_before_remove(path: &Path) {
@@ -1123,6 +1135,76 @@ mod parse_tests {
             other => panic!("expected unique untracked, got {other:?}"),
         }
         assert!(wt.join("late.txt").is_file(), "late file must survive");
+    }
+
+    // fn(&Path) cannot return the child. reap_live_sleeper waits it.
+    #[cfg(unix)]
+    #[allow(clippy::zombie_processes)]
+    fn hold_live_cwd(path: &Path) {
+        let child = Command::new("/bin/sleep")
+            .arg("60")
+            .current_dir(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("sleep");
+        LIVE_SLEEPER.with(|slot| *slot.borrow_mut() = Some(child));
+    }
+
+    #[cfg(unix)]
+    fn reap_live_sleeper() {
+        let child = LIVE_SLEEPER.with(|slot| slot.borrow_mut().take());
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    #[cfg(unix)]
+    struct KillLiveSleeper;
+
+    #[cfg(unix)]
+    impl Drop for KillLiveSleeper {
+        fn drop(&mut self) {
+            reap_live_sleeper();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recheck_keeps_a_live_cwd_that_starts_before_remove() {
+        let _kill = KillLiveSleeper;
+        reap_live_sleeper();
+        let dir = tempfile::tempdir().expect("tmp");
+        let repo = dir.path().join("origin");
+        std::fs::create_dir(&repo).expect("origin");
+        let git = |cwd: &Path, args: &[&str]| {
+            super::git(cwd, args).unwrap_or_else(|err| panic!("{args:?}: {err:?}"));
+        };
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "dev@example.com"]);
+        git(&repo, &["config", "user.name", "dev"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README"), b"x").expect("readme");
+        git(&repo, &["add", "README"]);
+        git(&repo, &["commit", "-m", "init"]);
+        let wt = dir.path().join("wt");
+        git(
+            &repo,
+            &["worktree", "add", wt.to_str().expect("utf8"), "-b", "wt"],
+        );
+        BEFORE_REMOVE.with(|slot| slot.set(Some(hold_live_cwd)));
+        let decision =
+            super::take_if_still_clean(&repo, &wt, Vec::new(), false, true, &DenyPolicy::default())
+                .expect("take");
+        match decision {
+            GcDecision::Keep {
+                reason: KeepReason::LiveCwd,
+            } => {}
+            other => panic!("a cwd that starts before remove must stay, got {other:?}"),
+        }
+        assert!(wt.exists(), "live cwd must not be removed");
     }
 
     #[test]
