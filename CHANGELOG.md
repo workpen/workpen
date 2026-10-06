@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.7.5](https://github.com/workpen/workpen/compare/v0.7.4...v0.7.5) (2026-10-06)
+
+
+### Bug Fixes
+
+* close inherited fds at or above 65536 ([#265](https://github.com/workpen/workpen/issues/265)) ([ed63d93](https://github.com/workpen/workpen/commit/ed63d93a5b63c105604ae7618d67fdeb297afd46))
+* continue a pre-exec SIGSTOP the reaper missed ([#270](https://github.com/workpen/workpen/issues/270)) ([079562d](https://github.com/workpen/workpen/commit/079562dd53119eeb543e9fcdea50c103e470629e))
+* policy errors cite policy usage ([#268](https://github.com/workpen/workpen/issues/268)) ([7f28a26](https://github.com/workpen/workpen/commit/7f28a262282c100a79a2183d721d144b7c48fabe))
+* recheck a live cwd immediately before age gc removes it ([#271](https://github.com/workpen/workpen/issues/271)) ([0fb55fc](https://github.com/workpen/workpen/commit/0fb55fc988e559e3b9c9428bc126caf76e3d2231))
+* recheck worktree status before age gc removes it ([#267](https://github.com/workpen/workpen/issues/267)) ([fd3f842](https://github.com/workpen/workpen/commit/fd3f8425a4e34aa2d5847335c1ee7ed62ec8cfc9))
+* stop a timeout when the stdout reader stalls ([#272](https://github.com/workpen/workpen/issues/272)) ([fd0c00f](https://github.com/workpen/workpen/commit/fd0c00ffe83f1b1198d102c1c39f6e3fcd368527))
+
+
+### Performance Improvements
+
+* probe worktree gc once per reclaim batch ([#269](https://github.com/workpen/workpen/issues/269)) ([6085cd3](https://github.com/workpen/workpen/commit/6085cd3974774733a82d135bb73d6d5ea715f962))
+
 ## [0.7.4](https://github.com/workpen/workpen/compare/v0.7.3...v0.7.4) (2026-10-05)
 
 
