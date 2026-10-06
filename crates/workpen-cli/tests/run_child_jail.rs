@@ -590,6 +590,343 @@ fn run_timeout_streaming_stdout_is_captured() {
     );
 }
 
+/// `.output()` drains stdout, so it never fills the pipe. A reader that
+/// stops without closing must still let `--timeout` exit 124.
+#[cfg(unix)]
+#[test]
+fn run_timeout_exits_when_stdout_is_not_read() {
+    if !python3_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args([
+            "--timeout",
+            "1s",
+            "--",
+            "python3",
+            "-c",
+            "import sys\nwhile True:\n    sys.stdout.buffer.write(b'y'*4096)\n    sys.stdout.buffer.flush()\n",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn workpen");
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() > std::time::Duration::from_secs(4) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("--timeout 1s did not bound workpen while stdout was unread");
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(err) => panic!("try_wait: {err}"),
+        }
+    };
+    let mut err = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        use std::io::Read;
+        let _ = stderr.read_to_end(&mut err);
+    }
+    drop(child.stdout.take());
+    assert_eq!(
+        status.code(),
+        Some(124),
+        "stalled stdout must still exit 124, stderr={}",
+        String::from_utf8_lossy(&err)
+    );
+    let err = String::from_utf8_lossy(&err);
+    assert!(
+        err.contains("deadline"),
+        "timeout must name the deadline: {err}"
+    );
+}
+
+/// macOS `poll` reports `/dev/null` as `POLLNVAL`. The copy must still
+/// finish a finite child instead of closing the pipe and raising SIGPIPE.
+#[cfg(unix)]
+#[test]
+fn run_timeout_devnull_stdout_exits_zero() {
+    if !python3_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let null = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .expect("null");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args([
+            "--timeout",
+            "5s",
+            "--",
+            "python3",
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'x'*200000); sys.stdout.flush()",
+        ])
+        .stdin(Stdio::null())
+        .stdout(null)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn workpen");
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() > std::time::Duration::from_secs(8) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("finite stdout to /dev/null did not exit");
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(err) => panic!("try_wait: {err}"),
+        }
+    };
+    let mut err = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        use std::io::Read;
+        let _ = stderr.read_to_end(&mut err);
+    }
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "devnull stdout must not SIGPIPE the child, stderr={}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
+/// stdout and stderr are one pipe. The deadline line is written to
+/// stderr after the copy stops, so it must not block on that same pipe.
+#[cfg(unix)]
+#[test]
+fn run_timeout_exits_when_stdout_and_stderr_share_a_stalled_pipe() {
+    if !python3_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let (_read, write) = std::io::pipe().expect("pipe");
+    let write_err = write.try_clone().expect("dup stderr");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args([
+            "--timeout",
+            "1s",
+            "--",
+            "python3",
+            "-c",
+            "import sys\nsys.stdout.buffer.write(b'x'*80000); sys.stdout.flush()\nsys.stderr.buffer.write(b'y'*80000); sys.stderr.flush()\n",
+        ])
+        .stdin(Stdio::null())
+        .stdout(write)
+        .stderr(write_err)
+        .spawn()
+        .expect("spawn workpen");
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() > std::time::Duration::from_secs(4) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("--timeout 1s did not bound a shared stdout/stderr pipe");
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(err) => panic!("try_wait: {err}"),
+        }
+    };
+    drop(_read);
+    assert_eq!(
+        status.code(),
+        Some(124),
+        "a shared stalled pipe must still exit 124"
+    );
+}
+
+/// The child can exit before its last bytes fit in our stdout pipe.
+/// The deadline still has to stop that copy. An endless writer hides this.
+#[cfg(unix)]
+#[test]
+fn run_timeout_exits_when_finite_stdout_is_not_read() {
+    if !python3_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args([
+            "--timeout",
+            "1s",
+            "--",
+            "python3",
+            "-c",
+            "import sys; sys.stdout.buffer.write(b'x'*80000); sys.stdout.flush()",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn workpen");
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() > std::time::Duration::from_secs(4) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("--timeout 1s did not bound a finite unread stdout");
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(err) => panic!("try_wait: {err}"),
+        }
+    };
+    let mut err = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        use std::io::Read;
+        let _ = stderr.read_to_end(&mut err);
+    }
+    drop(child.stdout.take());
+    assert_eq!(
+        status.code(),
+        Some(124),
+        "finite unread stdout must still exit 124, stderr={}",
+        String::from_utf8_lossy(&err)
+    );
+    let err = String::from_utf8_lossy(&err);
+    assert!(
+        err.contains("deadline"),
+        "timeout must name the deadline: {err}"
+    );
+}
+
+/// Reading a little and then stopping leaves the pipe only partly free.
+/// A later large flush would block, and the deadline would never land.
+#[cfg(unix)]
+#[test]
+fn run_timeout_exits_when_stdout_reader_stops() {
+    if !python3_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args([
+            "--timeout",
+            "1s",
+            "--",
+            "python3",
+            "-c",
+            "import sys\nwhile True:\n    sys.stdout.buffer.write(b'y'*4096)\n    sys.stdout.buffer.flush()\n",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn workpen");
+    let mut stdout = child.stdout.take().expect("stdout");
+    let mut got = [0u8; 1000];
+    let mut filled = 0usize;
+    while filled < got.len() {
+        use std::io::Read;
+        match stdout.read(&mut got[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) => panic!("read stdout: {err}"),
+        }
+    }
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() > std::time::Duration::from_secs(4) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("--timeout 1s did not bound workpen after stdout reader stopped");
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(err) => panic!("try_wait: {err}"),
+        }
+    };
+    let mut err = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        use std::io::Read;
+        let _ = stderr.read_to_end(&mut err);
+    }
+    drop(stdout);
+    assert_eq!(
+        status.code(),
+        Some(124),
+        "a stopped stdout reader must still exit 124, stderr={}",
+        String::from_utf8_lossy(&err)
+    );
+    let err = String::from_utf8_lossy(&err);
+    assert!(
+        err.contains("deadline"),
+        "timeout must name the deadline: {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn run_tty_timeout_exits_when_stdout_is_not_read() {
+    let _g = PTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if !python3_available() {
+        return;
+    }
+    let dir = TempDir::new().expect("workspace");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_workpen"))
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args([
+            "--tty",
+            "--timeout",
+            "1s",
+            "--",
+            "python3",
+            "-c",
+            "import sys\nwhile True:\n    sys.stdout.buffer.write(b'y'*4096)\n    sys.stdout.buffer.flush()\n",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn workpen");
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() > std::time::Duration::from_secs(4) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("--tty --timeout 1s did not bound workpen while stdout was unread");
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(err) => panic!("try_wait: {err}"),
+        }
+    };
+    let mut err = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        use std::io::Read;
+        let _ = stderr.read_to_end(&mut err);
+    }
+    drop(child.stdout.take());
+    assert_eq!(
+        status.code(),
+        Some(124),
+        "stalled tty stdout must still exit 124, stderr={}",
+        String::from_utf8_lossy(&err)
+    );
+}
+
 /// 32MiB then sleep. Streaming copy must not keep a 32MiB Vec in the parent.
 /// Do not use unbounded `yes` (issue #161).
 #[cfg(unix)]

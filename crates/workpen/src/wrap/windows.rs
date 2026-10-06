@@ -6,7 +6,8 @@ use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use super::{
@@ -170,6 +171,8 @@ struct JobobjectExtendedLimitInformation {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentProcess() -> Handle;
+    fn GetCurrentThread() -> Handle;
+    fn CancelSynchronousIo(h_thread: Handle) -> Bool;
     fn CloseHandle(h_object: Handle) -> Bool;
     fn GetLastError() -> Dword;
     fn SearchPathW(
@@ -889,6 +892,8 @@ fn spawn_prepared_child(
     let thread = CloseOnDrop(info.h_thread);
     // Drain capture pipes before the child runs so a large write cannot
     // fill the pipe and block WaitForSingleObject.
+    let forward_stop = Arc::new(AtomicBool::new(false));
+    let forward_threads = Arc::new(Mutex::new(Vec::<CloseOnDrop>::new()));
     let (stdout_drain, stderr_drain, stdout_fwd, stderr_fwd) = match (capture, forward_dst) {
         (StdioCapture::Collect, _) => (
             stdout_read.map(drain_pipe),
@@ -899,8 +904,22 @@ fn spawn_prepared_child(
         (StdioCapture::Forward, Some((parent_out, parent_err))) => (
             None,
             None,
-            stdout_read.map(|h| drain_forward(h, parent_out)),
-            stderr_read.map(|h| drain_forward(h, parent_err)),
+            stdout_read.map(|h| {
+                drain_forward(
+                    h,
+                    parent_out,
+                    Arc::clone(&forward_stop),
+                    Arc::clone(&forward_threads),
+                )
+            }),
+            stderr_read.map(|h| {
+                drain_forward(
+                    h,
+                    parent_err,
+                    Arc::clone(&forward_stop),
+                    Arc::clone(&forward_threads),
+                )
+            }),
         ),
         (StdioCapture::Forward, None) | (StdioCapture::Inherit, _) => (None, None, None, None),
     };
@@ -935,8 +954,9 @@ fn spawn_prepared_child(
         Some(d) => d.as_millis().min(u32::MAX as u128 - 1) as Dword,
     };
     // SAFETY: process handle stays valid until we return.
+    let started = std::time::Instant::now();
     let wait = unsafe { WaitForSingleObject(process.0, wait_ms) };
-    let timed_out = wait == WAIT_TIMEOUT;
+    let mut timed_out = wait == WAIT_TIMEOUT;
     if timed_out {
         drop(std::mem::replace(
             &mut prepared.job,
@@ -964,8 +984,15 @@ fn spawn_prepared_child(
     if got == 0 {
         let _ = join_drain(stdout_drain);
         let _ = join_drain(stderr_drain);
-        join_copy(stdout_fwd);
-        join_copy(stderr_fwd);
+        let _ = finish_forward(
+            timed_out,
+            &forward_stop,
+            &forward_threads,
+            stdout_fwd,
+            stderr_fwd,
+            started,
+            timeout,
+        );
         return Err(last_error("GetExitCodeProcess"));
     }
     let applied = if prepared.wfp_skipped {
@@ -981,8 +1008,15 @@ fn spawn_prepared_child(
         })
     } else {
         drop((stdout_drain, stderr_drain));
-        join_copy(stdout_fwd);
-        join_copy(stderr_fwd);
+        timed_out |= finish_forward(
+            timed_out,
+            &forward_stop,
+            &forward_threads,
+            stdout_fwd,
+            stderr_fwd,
+            started,
+            timeout,
+        );
         None
     };
     Ok((applied, ExitStatus::from_raw(code), output, timed_out))
@@ -1049,8 +1083,105 @@ fn drain_pipe(handle: CloseOnDrop) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || read_all(handle))
 }
 
-fn drain_forward(src: CloseOnDrop, dst: CloseOnDrop) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || copy_pipe(src, dst))
+fn drain_forward(
+    src: CloseOnDrop,
+    dst: CloseOnDrop,
+    stop: Arc<AtomicBool>,
+    threads: Arc<Mutex<Vec<CloseOnDrop>>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || copy_pipe(src, dst, &stop, &threads))
+}
+
+fn register_forward_thread(threads: &Mutex<Vec<CloseOnDrop>>) {
+    let mut dup = ptr::null_mut();
+    // SAFETY: GetCurrentThread is a pseudo-handle. DuplicateHandle makes
+    // a real handle this thread owns; the pseudo-handle must not be closed.
+    let ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            GetCurrentThread(),
+            GetCurrentProcess(),
+            &mut dup,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok == 0 {
+        return;
+    }
+    let mut guard = threads.lock().unwrap_or_else(|err| err.into_inner());
+    guard.push(CloseOnDrop(dup));
+}
+
+fn forward_done(
+    stdout_fwd: &Option<std::thread::JoinHandle<()>>,
+    stderr_fwd: &Option<std::thread::JoinHandle<()>>,
+) -> bool {
+    let stdout_done = match stdout_fwd {
+        None => true,
+        Some(handle) => handle.is_finished(),
+    };
+    let stderr_done = match stderr_fwd {
+        None => true,
+        Some(handle) => handle.is_finished(),
+    };
+    stdout_done && stderr_done
+}
+
+fn finish_forward(
+    timed_out: bool,
+    stop: &AtomicBool,
+    threads: &Mutex<Vec<CloseOnDrop>>,
+    stdout_fwd: Option<std::thread::JoinHandle<()>>,
+    stderr_fwd: Option<std::thread::JoinHandle<()>>,
+    started: std::time::Instant,
+    timeout: Option<Duration>,
+) -> bool {
+    let mut forced = timed_out;
+    if let Some(limit) = timeout {
+        let deadline = started + limit;
+        while !forward_done(&stdout_fwd, &stderr_fwd) {
+            if std::time::Instant::now() >= deadline {
+                forced = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    if forced {
+        stop.store(true, Ordering::Relaxed);
+        // Cancel is a no-op unless the thread is already inside ReadFile
+        // or WriteFile. Repeat it until the copy is done so a check of
+        // `stop` that lost the race still unblocks.
+        for _ in 0..500 {
+            let registered = {
+                let guard = threads.lock().unwrap_or_else(|err| err.into_inner());
+                for handle in guard.iter() {
+                    // SAFETY: handle is the duplicated copy thread.
+                    unsafe {
+                        CancelSynchronousIo(handle.0);
+                    }
+                }
+                guard.len()
+            };
+            let stdout_done = match &stdout_fwd {
+                None => true,
+                Some(handle) => handle.is_finished(),
+            };
+            let stderr_done = match &stderr_fwd {
+                None => true,
+                Some(handle) => handle.is_finished(),
+            };
+            if (stdout_done && stderr_done) || registered == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    join_copy(stdout_fwd);
+    join_copy(stderr_fwd);
+    forced
 }
 
 fn join_drain(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
@@ -1090,9 +1221,21 @@ fn duplicate_std_handle(std_id: Dword, write: bool) -> Result<CloseOnDrop, Kerne
     Ok(CloseOnDrop(dup))
 }
 
-fn copy_pipe(src: CloseOnDrop, dst: CloseOnDrop) {
+fn copy_pipe(
+    src: CloseOnDrop,
+    dst: CloseOnDrop,
+    stop: &AtomicBool,
+    threads: &Mutex<Vec<CloseOnDrop>>,
+) {
+    register_forward_thread(threads);
+    if stop.load(Ordering::Relaxed) {
+        return;
+    }
     let mut buf = [0u8; 16 * 1024];
     loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         let mut n: Dword = 0;
         // SAFETY: src is a readable pipe we own.
         let ok = unsafe {
@@ -1104,7 +1247,7 @@ fn copy_pipe(src: CloseOnDrop, dst: CloseOnDrop) {
                 ptr::null_mut(),
             )
         };
-        if ok == 0 || n == 0 {
+        if ok == 0 || n == 0 || stop.load(Ordering::Relaxed) {
             break;
         }
         let mut wrote: Dword = 0;

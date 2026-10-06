@@ -135,9 +135,12 @@ pub(super) fn attach_pty(cmd: &mut Command, slave: File) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn pump_master(master: File) -> io::Result<(std::thread::JoinHandle<()>, File)> {
+pub(super) fn pump_master(
+    master: File,
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> io::Result<(std::thread::JoinHandle<()>, File)> {
     let writer = master.try_clone()?;
-    let out = super::copy_pipe(master, std::io::stdout());
+    let out = super::copy_pipe(master, std::io::stdout(), std::sync::Arc::clone(stop));
     Ok((out, writer))
 }
 
