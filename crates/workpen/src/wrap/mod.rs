@@ -16,7 +16,13 @@ use std::ffi::{OsStr, OsString};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+#[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use crate::deny::{
     CheckDestError, DenyPolicy, DestDeny, DestDenyKind, dest_deny_at, dest_deny_glob_only,
@@ -411,11 +417,22 @@ fn wait_child_timeout_forward(
     mut child: std::process::Child,
     timeout: Duration,
 ) -> Result<(std::process::ExitStatus, bool), KernelError> {
-    let stdout = child.stdout.take().map(|p| copy_pipe(p, std::io::stdout()));
-    let stderr = child.stderr.take().map(|p| copy_pipe(p, std::io::stderr()));
-    let (status, timed_out) = wait_until_deadline(&mut child, timeout)?;
-    join_copy(stdout);
-    join_copy(stderr);
+    let started = Instant::now();
+    let stop = forward_stop();
+    let stdout = child
+        .stdout
+        .take()
+        .map(|p| copy_pipe(p, std::io::stdout(), Arc::clone(&stop)));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|p| copy_pipe(p, std::io::stderr(), Arc::clone(&stop)));
+    let (status, mut timed_out) = wait_until_deadline(&mut child, timeout)?;
+    // The child can exit while the last chunk is still stuck on a
+    // reader that stopped. Joining that write would ignore the deadline.
+    if finish_copies(&stop, stdout, stderr, started + timeout) {
+        timed_out = true;
+    }
     Ok((status, timed_out))
 }
 
@@ -429,24 +446,307 @@ fn drain_pipe(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::Joi
 }
 
 #[cfg(unix)]
-fn copy_pipe(
-    mut src: impl std::io::Read + Send + 'static,
-    mut dst: impl std::io::Write + Send + 'static,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            match std::io::Read::read(&mut src, &mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if std::io::Write::write_all(&mut dst, &buf[..n]).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+fn forward_stop() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
+/// Stdout's buffer flushes 8KiB. Linux also reports `POLLOUT` when a
+/// single byte is free, so a blocking `PIPE_BUF` write can still wait.
+#[cfg(unix)]
+fn forward_chunk(fd: std::os::fd::RawFd) -> usize {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: stat is a live object. A regular file never blocks a
+    // short write, so the copy can keep the previous 16KiB chunk.
+    let rc = unsafe { libc::fstat(fd, &mut stat) };
+    if rc == 0 && stat.st_mode & libc::S_IFMT == libc::S_IFREG {
+        16 * 1024
+    } else {
+        512
+    }
+}
+
+#[cfg(unix)]
+enum PollOut {
+    Ready,
+    Later,
+    Stop,
+}
+
+/// One poll. `Later` means the caller should drop any write lock and
+/// try again, so the other stream can use the pipe.
+#[cfg(unix)]
+fn poll_out_once(fd: std::os::fd::RawFd, stop: &AtomicBool) -> PollOut {
+    if stop.load(Ordering::Relaxed) {
+        return PollOut::Stop;
+    }
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: poll_fd is a live one-slot array. The 50ms cap lets the
+    // deadline flag win over a reader that stopped.
+    let rc = unsafe { libc::poll(&mut poll_fd, 1, 50) };
+    if stop.load(Ordering::Relaxed) {
+        return PollOut::Stop;
+    }
+    if rc == 0 {
+        return PollOut::Later;
+    }
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            return PollOut::Later;
+        }
+        return PollOut::Stop;
+    }
+    // macOS kqueue reports `POLLNVAL` for `/dev/null`. The write itself
+    // still succeeds, so treat that as writable.
+    if poll_fd.revents & (libc::POLLNVAL | libc::POLLOUT) != 0 {
+        return PollOut::Ready;
+    }
+    let bad = libc::POLLERR | libc::POLLHUP;
+    if poll_fd.revents & bad != 0 {
+        return PollOut::Stop;
+    }
+    PollOut::Later
+}
+
+/// The deadline line. A full `2>&1` pipe must not block this write.
+pub fn write_timeout_notice() {
+    #[cfg(not(unix))]
+    {
+        eprintln!("child killed after the deadline");
+    }
+    #[cfg(unix)]
+    {
+        let msg = b"child killed after the deadline\n";
+        let fd = std::io::stderr().as_raw_fd();
+        // SAFETY: stderr is open for the life of the process.
+        if unsafe { libc::isatty(fd) } == 1 {
+            eprintln!("child killed after the deadline");
+            return;
+        }
+        let idle = AtomicBool::new(false);
+        for &byte in msg {
+            if !matches!(poll_out_once(fd, &idle), PollOut::Ready) {
+                return;
+            }
+            let buf = [byte];
+            // SAFETY: `buf` is one live byte.
+            let rc = unsafe { libc::write(fd, buf.as_ptr().cast(), 1) };
+            if rc <= 0 {
+                return;
             }
         }
+    }
+}
+
+#[cfg(unix)]
+enum ForwardWrite {
+    Wrote(usize),
+    /// `O_NONBLOCK` refused the write. The pipe has some space, not enough
+    /// for this chunk. Callers must wait before retrying the same bytes.
+    Again,
+}
+
+/// One `write`. `EINTR` retries. `WouldBlock` asks the caller to wait.
+#[cfg(unix)]
+fn write_once(fd: std::os::fd::RawFd, buf: &[u8]) -> Option<ForwardWrite> {
+    loop {
+        // SAFETY: `buf` is a live slice. The length is the byte count.
+        let rc = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if rc > 0 {
+            return Some(ForwardWrite::Wrote(rc as usize));
+        }
+        if rc == 0 {
+            return None;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Some(ForwardWrite::Again);
+        }
+        return None;
+    }
+}
+
+/// `write` while this fd is non-blocking, then put the old flags back.
+///
+/// `toggle` stays false for a terminal. Its stdin and stdout share one
+/// open-file description, so `O_NONBLOCK` on stdout would make stdin
+/// return `EAGAIN`. Pipe ends do not share that description.
+/// Callers hold [`forward_write_lock`] across the poll and this write.
+/// Two threads that both saw `POLLOUT` would otherwise block in `write`
+/// when the pipe has room for only one `PIPE_BUF`.
+#[cfg(unix)]
+fn forward_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+#[cfg(unix)]
+fn write_fd(fd: std::os::fd::RawFd, buf: &[u8], toggle: bool) -> Option<ForwardWrite> {
+    if !toggle {
+        return write_once(fd, buf);
+    }
+    // SAFETY: `F_GETFL` reads this fd's status flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return None;
+    }
+    let added = flags & libc::O_NONBLOCK == 0;
+    if added {
+        // SAFETY: `flags` came from `F_GETFL` on this fd.
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if rc < 0 {
+            return None;
+        }
+    }
+    let write_result = write_once(fd, buf);
+    if added {
+        // SAFETY: restore the flags this function observed.
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    }
+    write_result
+}
+
+/// A second open of the tty. Its `O_NONBLOCK` is not the shell's stdin.
+#[cfg(unix)]
+struct PrivateOut(std::os::fd::RawFd);
+
+#[cfg(unix)]
+impl Drop for PrivateOut {
+    fn drop(&mut self) {
+        // SAFETY: this fd came from `open` below and is still open.
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// Linux `/proc/self/fd` opens a new description. If this platform
+/// instead shares flags with `fd`, restore them and give up.
+#[cfg(target_os = "linux")]
+fn open_private_nonblock(fd: std::os::fd::RawFd) -> Option<PrivateOut> {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: `stat` is a live object. A regular file must keep its
+    // offset, so only pipes and sockets get a second description.
+    let rc = unsafe { libc::fstat(fd, &mut stat) };
+    if rc != 0 {
+        return None;
+    }
+    let kind = stat.st_mode & libc::S_IFMT;
+    if kind != libc::S_IFIFO && kind != libc::S_IFSOCK {
+        return None;
+    }
+    let path = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).ok()?;
+    // SAFETY: `F_GETFL` reads this fd's status flags.
+    let before = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if before < 0 {
+        return None;
+    }
+    // SAFETY: `path` is a NUL-terminated `/proc/self/fd/N`.
+    let opened = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if opened < 0 {
+        return None;
+    }
+    // SAFETY: same fd as `before`.
+    let after = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if before & libc::O_NONBLOCK == 0 && after & libc::O_NONBLOCK != 0 {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, before);
+            libc::close(opened);
+        }
+        return None;
+    }
+    Some(PrivateOut(opened))
+}
+
+#[cfg(unix)]
+fn open_private_tty(fd: std::os::fd::RawFd) -> Option<PrivateOut> {
+    // SAFETY: `isatty` only reads the fd type.
+    if unsafe { libc::isatty(fd) } != 1 {
+        return None;
+    }
+    let mut name = [0 as libc::c_char; 1024];
+    // SAFETY: `name` is a live buffer of that length.
+    let rc = unsafe { libc::ttyname_r(fd, name.as_mut_ptr(), name.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+    // SAFETY: `path` is the NUL-terminated tty name just written.
+    let opened = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if opened < 0 {
+        None
+    } else {
+        Some(PrivateOut(opened))
+    }
+}
+
+#[cfg(unix)]
+fn copy_pipe(
+    mut src: impl std::io::Read + Send + 'static,
+    mut dst: impl std::io::Write + AsRawFd + Send + 'static,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let fd = dst.as_raw_fd();
+        #[cfg(target_os = "linux")]
+        let private = open_private_tty(fd).or_else(|| open_private_nonblock(fd));
+        #[cfg(not(target_os = "linux"))]
+        let private = open_private_tty(fd);
+        let out_fd = private.as_ref().map(|out| out.0).unwrap_or(fd);
+        // macOS `POLLOUT` already means a 512-byte write will not block,
+        // so pipes there do not need `O_NONBLOCK`. Linux falls back to
+        // the toggle only when a private descriptor is unavailable.
+        // SAFETY: `fd` is the destination stdout or stderr handle.
+        let toggle =
+            cfg!(target_os = "linux") && private.is_none() && unsafe { libc::isatty(fd) } != 1;
+        let chunk = forward_chunk(out_fd);
+        // Push any prefix already sitting in the stdout buffer. Later
+        // writes go to the fd, so a drop flush cannot block after stop.
         let _ = std::io::Write::flush(&mut dst);
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let n = match std::io::Read::read(&mut src, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let mut off = 0;
+            while off < n {
+                let _guard = forward_write_lock();
+                match poll_out_once(out_fd, &stop) {
+                    PollOut::Stop => return,
+                    PollOut::Later => continue,
+                    PollOut::Ready => {
+                        let end = off + (n - off).min(chunk);
+                        match write_fd(out_fd, &buf[off..end], toggle) {
+                            Some(ForwardWrite::Wrote(wrote)) if wrote > 0 => off += wrote,
+                            Some(ForwardWrite::Again) => continue,
+                            _ => return,
+                        }
+                    }
+                }
+            }
+        }
+        if !stop.load(Ordering::Relaxed) {
+            let _ = std::io::Write::flush(&mut dst);
+        }
     })
 }
 
@@ -460,6 +760,40 @@ fn join_copy(handle: Option<std::thread::JoinHandle<()>>) {
     if let Some(h) = handle {
         let _ = h.join();
     }
+}
+
+#[cfg(unix)]
+fn copy_finished(handle: &Option<std::thread::JoinHandle<()>>) -> bool {
+    match handle {
+        None => true,
+        Some(handle) => handle.is_finished(),
+    }
+}
+
+/// Stop the copies at `deadline` if a stalled reader is still blocking
+/// them. True means the deadline, not the child, ended the forward.
+#[cfg(unix)]
+fn finish_copies(
+    stop: &AtomicBool,
+    stdout: Option<std::thread::JoinHandle<()>>,
+    stderr: Option<std::thread::JoinHandle<()>>,
+    deadline: Instant,
+) -> bool {
+    let mut forced = false;
+    loop {
+        if copy_finished(&stdout) && copy_finished(&stderr) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            stop.store(true, Ordering::Relaxed);
+            forced = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    join_copy(stdout);
+    join_copy(stderr);
+    forced
 }
 
 /// Inputs for [`doctor_fails`]. Remount is Linux-only. WFP is Windows-only.
@@ -1125,8 +1459,15 @@ impl KernelPolicy {
             cmd.stderr(std::process::Stdio::piped());
             cmd.process_group(0);
             let mut child = spawn_jailed(&mut cmd)?;
-            let stdout = child.stdout.take().map(|p| copy_pipe(p, std::io::stdout()));
-            let stderr = child.stderr.take().map(|p| copy_pipe(p, std::io::stderr()));
+            let stop = forward_stop();
+            let stdout = child
+                .stdout
+                .take()
+                .map(|p| copy_pipe(p, std::io::stdout(), Arc::clone(&stop)));
+            let stderr = child
+                .stderr
+                .take()
+                .map(|p| copy_pipe(p, std::io::stderr(), Arc::clone(&stop)));
             let (status, _) = reap_process_group(&mut child, None)?;
             join_copy(stdout);
             join_copy(stderr);
@@ -1261,13 +1602,29 @@ impl KernelPolicy {
             // Command keeps the slave File after spawn. Linux master
             // read does not EOF while that fd stays open in the parent.
             drop(cmd);
-            let (out_th, master_write) = pty::pump_master(pty.master).map_err(|e| {
+            let started = Instant::now();
+            let stop = forward_stop();
+            // Linux sends SIGHUP when the last PTY master closes. The
+            // copy thread can drop its master before wait records the
+            // child's exit, which turns a finished `cat` into 129.
+            let master_hold = pty.master.try_clone().map_err(|e| {
+                reaper::discard_report();
+                KernelError::Apply(e.to_string())
+            })?;
+            let (out_th, master_write) = pty::pump_master(pty.master, &stop).map_err(|e| {
                 reaper::discard_report();
                 KernelError::Apply(e.to_string())
             })?;
             let _stdin_th = pty::pump_stdin(master_write);
-            let (status, timed_out) = reap_process_group(&mut child, timeout)?;
-            join_copy(Some(out_th));
+            let (status, mut timed_out) = reap_process_group(&mut child, timeout)?;
+            drop(master_hold);
+            if let Some(limit) = timeout {
+                if finish_copies(&stop, Some(out_th), None, started + limit) {
+                    timed_out = true;
+                }
+            } else {
+                join_copy(Some(out_th));
+            }
             Ok((applied, status, timed_out))
         }
         #[cfg(windows)]

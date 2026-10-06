@@ -389,7 +389,7 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
     };
     let (_applied, status, timed_out) = match result {
         Err(KernelError::Timeout) => {
-            eprintln!("child killed after the deadline");
+            workpen::write_timeout_notice();
             return Ok(ExitCode::from(124));
         }
         Err(KernelError::Restore(e)) => {
@@ -420,7 +420,7 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
         Ok(ok) => ok,
     };
     if timed_out {
-        eprintln!("child killed after the deadline");
+        workpen::write_timeout_notice();
         return Ok(ExitCode::from(124));
     }
     if status.code().is_none() && program_outside_roots(&resolved, guard.canon_root(), &presented) {
