@@ -11,7 +11,9 @@
 //! `setsid` grandchild is reparented here even when the command exits
 //! before the first poll. An empty `/proc/.../children` read is not
 //! proof that no child exists. macOS has no subreaper. The reaper
-//! stops the command until a fork watch is armed,
+//! stops the command until a fork watch is armed, then continues it.
+//! A missed wait is continued only while that process is stopped and
+//! has not called exec. The reaper
 //! records descendants from that watch and from walks, and signals those
 //! pids. A pid that does not fit in the recorded set is reported on
 //! `report_fd`. On macOS a fork whose parent has exited is reported
@@ -303,19 +305,30 @@ fn reaper_main(cmd: libc::pid_t, report_fd: i32) -> ! {
     }
     install_stop_handler();
     detach_stdio();
-    let kq = watch_command(cmd, report_fd);
+    let (kq, saw_stop) = watch_command(cmd, report_fd);
     // `Command::spawn` reads a CLOEXEC error pipe until exec. This
     // process does not exec, so close every extra fd or the parent
     // blocks in `spawn` until we exit. Keep the report and the watch.
-    // On macOS the command is still stopped here. Continuing first lets
-    // a setsid child exit during the walk.
+    // On macOS the command stays stopped through this walk when the
+    // watch saw the stop. Continuing first lets a setsid child exit
+    // during the walk. A `SIGCONT` sent before the stop is discarded,
+    // and the later `SIGSTOP` then sticks, so continue only after the
+    // stop was observed.
     close_extra_fds(report_fd, kq);
     #[cfg(target_os = "macos")]
     {
-        unsafe { libc::kill(cmd, libc::SIGCONT) };
+        if saw_stop {
+            unsafe { libc::kill(cmd, libc::SIGCONT) };
+        }
         // Drain while polling. A setsid child can otherwise fork and
-        // lose its parent before the first watch read.
+        // lose its parent before the first watch read. A missed stop
+        // is continued from that poll only while the process is
+        // stopped and has not called exec.
         cache_command_identity(cmd, kq);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = saw_stop;
     }
     drain_proc_events(kq);
     let mut status = 0;
@@ -326,7 +339,10 @@ fn reaper_main(cmd: libc::pid_t, report_fd: i32) -> ! {
         drain_proc_events(kq);
         remember_tree(cmd, kq);
         #[cfg(target_os = "macos")]
-        remember_identity(cmd);
+        {
+            continue_stopped_preexec(cmd);
+            remember_identity(cmd);
+        }
         let waited = unsafe { libc::waitpid(cmd, &mut status, libc::WNOHANG) };
         if waited == cmd {
             finish(cmd, status, report_fd, kq);
@@ -393,7 +409,7 @@ fn exit_like_command(status: libc::c_int) -> ! {
     unsafe { libc::_exit(1) }
 }
 
-fn watch_command(cmd: libc::pid_t, report_fd: i32) -> i32 {
+fn watch_command(cmd: libc::pid_t, report_fd: i32) -> (i32, bool) {
     #[cfg(target_os = "macos")]
     {
         watch_command_macos(cmd, report_fd)
@@ -401,19 +417,22 @@ fn watch_command(cmd: libc::pid_t, report_fd: i32) -> i32 {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (cmd, report_fd);
-        -1
+        (-1, false)
     }
 }
 
 #[cfg(target_os = "macos")]
-fn watch_command_macos(cmd: libc::pid_t, report_fd: i32) -> i32 {
+fn watch_command_macos(cmd: libc::pid_t, report_fd: i32) -> (i32, bool) {
     let Some(status) = wait_until_stopped(cmd) else {
         // No fork watch. Polling alone can miss a setsid child.
+        // Leave the command stopped if it reaches `SIGSTOP` later.
+        // `SIGKILL` from the host stop path still works on a stopped
+        // process. A continue here would be discarded.
         mark_missed();
         if STOP.load(Ordering::Relaxed) != 0 {
             stop_for_signal(cmd, report_fd, -1);
         }
-        return -1;
+        return (-1, false);
     };
     if !libc::WIFSTOPPED(status) {
         finish(cmd, status, report_fd, -1);
@@ -424,17 +443,21 @@ fn watch_command_macos(cmd: libc::pid_t, report_fd: i32) -> i32 {
         if kq >= 0 {
             unsafe { libc::close(kq) };
         }
-        return -1;
+        // The stop was observed. The caller continues after the fd walk.
+        return (-1, true);
     }
-    kq
+    (kq, true)
 }
 
 #[cfg(target_os = "macos")]
 fn wait_until_stopped(cmd: libc::pid_t) -> Option<libc::c_int> {
+    #[cfg(test)]
+    if test_misses_stop() {
+        return None;
+    }
     let mut status = 0;
     loop {
         if STOP.load(Ordering::Relaxed) != 0 {
-            unsafe { libc::kill(cmd, libc::SIGCONT) };
             return None;
         }
         let waited = unsafe { libc::waitpid(cmd, &mut status, libc::WUNTRACED) };
@@ -444,8 +467,36 @@ fn wait_until_stopped(cmd: libc::pid_t) -> Option<libc::c_int> {
         if waited < 0 && errno() == libc::EINTR {
             continue;
         }
-        unsafe { libc::kill(cmd, libc::SIGCONT) };
         return None;
+    }
+}
+
+// Set only on the spawning thread. `Command::spawn` forks that thread,
+// and the reaper forks again, so the flag is visible there. A
+// process-global flag would skip the handshake for every other test.
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static MISS_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn test_misses_stop() -> bool {
+    MISS_STOP.with(|flag| flag.get())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn arm_missed_stop() -> MissedStopGuard {
+    MISS_STOP.with(|flag| flag.set(true));
+    MissedStopGuard
+}
+
+#[cfg(all(test, target_os = "macos"))]
+struct MissedStopGuard;
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for MissedStopGuard {
+    fn drop(&mut self) {
+        MISS_STOP.with(|flag| flag.set(false));
     }
 }
 
@@ -1374,9 +1425,9 @@ fn arm_knote_macos(kq: i32, pid: libc::pid_t) -> bool {
     }
     // A zombie still answers kill(pid, 0), and proc_pidinfo returns
     // nothing. It cannot fork. A pid that is already gone can have
-    // left a setsid child, so that case stays a miss. Do not call
-    // proc_pidinfo on the stopped command: that call does not return
-    // before SIGCONT.
+    // left a setsid child, so that case stays a miss.
+    // PROC_PIDTBSDINFO (flavor 3) does return while the command is
+    // stopped. The pre-exec continue path reads `pbi_status` from it.
     if rc < 0 && errno() == libc::ESRCH {
         let cmd = unsafe { std::ptr::addr_of!(CMD_PID).read() };
         if pid != cmd && proc_info_missing(pid) {
@@ -1643,9 +1694,59 @@ fn reaper_comm() -> Option<[u8; 16]> {
     }
 }
 
+/// `true` when `pbi_status` in a `PROC_PIDTBSDINFO` buffer is `SSTOP`.
+#[cfg(target_os = "macos")]
+fn bsd_status_is_stop(info: &[u8]) -> bool {
+    if info.len() < 8 {
+        return false;
+    }
+    let status = u32::from_ne_bytes(info[4..8].try_into().unwrap_or([0; 4]));
+    status == libc::SSTOP
+}
+
+/// `<sys/proc_info.h>` `PROC_FLAG_EXEC`. `fork` leaves it clear.
+/// Exec sets it on this process only.
+#[cfg(target_os = "macos")]
+const PROC_FLAG_EXEC: u32 = 0x4000;
+
+/// `true` when this `PROC_PIDTBSDINFO` buffer is a pre-exec `SSTOP`.
+#[cfg(target_os = "macos")]
+fn preexec_stop_needs_continue(info: &[u8]) -> bool {
+    if info.len() < 8 || !bsd_status_is_stop(info) {
+        return false;
+    }
+    let flags = u32::from_ne_bytes(info[0..4].try_into().unwrap_or([0; 4]));
+    flags & PROC_FLAG_EXEC == 0
+}
+
+/// `true` when `proc_pidinfo` reports `SSTOP`.
+#[cfg(all(test, target_os = "macos"))]
+fn command_is_stopped(pid: libc::pid_t) -> bool {
+    bsdinfo(pid).is_some_and(|info| bsd_status_is_stop(&info))
+}
+
+/// Continue a pre-exec stop the handshake missed.
+///
+/// A stop after exec stays stopped, including when the command name
+/// still matches this process.
+#[cfg(target_os = "macos")]
+fn continue_stopped_preexec(cmd: libc::pid_t) {
+    if cmd <= 0 {
+        return;
+    }
+    let Some(info) = bsdinfo(cmd) else {
+        return;
+    };
+    if !preexec_stop_needs_continue(&info) {
+        return;
+    }
+    unsafe { libc::kill(cmd, libc::SIGCONT) };
+}
+
 #[cfg(target_os = "macos")]
 fn cache_command_identity(cmd: libc::pid_t, kq: i32) {
     for _ in 0..IDENTITY_POLLS {
+        continue_stopped_preexec(cmd);
         drain_proc_events(kq);
         if identity_ready() {
             return;
@@ -2039,5 +2140,176 @@ mod tests {
             n >= EXTRA,
             "walk saw {n} fds above stdio, wanted at least {EXTRA}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn command_is_stopped_sees_sigstop() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep");
+        let pid = child.id() as libc::pid_t;
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let reap = Reap(child);
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0, "SIGSTOP");
+        let start = std::time::Instant::now();
+        let mut status = 0;
+        let mut waited = 0;
+        while start.elapsed() < std::time::Duration::from_secs(2) {
+            waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+            if waited == pid {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(waited, pid, "sleep did not stop");
+        assert!(libc::WIFSTOPPED(status), "status {status}");
+        assert!(super::command_is_stopped(pid));
+        let info = super::bsdinfo(pid).expect("bsdinfo");
+        assert!(
+            !super::preexec_stop_needs_continue(&info),
+            "stopped /bin/sleep has already exec'd"
+        );
+        drop(reap);
+    }
+
+    /// A `SIGCONT` sent before `raise(SIGSTOP)` is discarded. The stop
+    /// then sticks, `Command::spawn` blocks on the exec pipe, and
+    /// `--timeout` never starts. The flag is on this thread only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn missed_preexec_stop_is_continued() {
+        if !crate::kernel_supported() {
+            return;
+        }
+        let _miss = super::arm_missed_stop();
+        let dir = tempfile::tempdir().expect("temp");
+        let policy = crate::process_jail(dir.path(), std::iter::empty::<&std::path::Path>())
+            .expect("policy");
+        let mut cmd = std::process::Command::new("/bin/echo");
+        cmd.arg("ok");
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let err = policy.run_child(cmd).expect_err("skipped stop watch");
+        assert!(matches!(err, crate::KernelError::Descendants), "{err}");
+    }
+
+    /// After exec, a stop of a command whose 16-byte name still matches
+    /// the reaper must stay stopped. Nested `workpen` is that case.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn post_exec_same_name_stop_stays_stopped() {
+        if !crate::kernel_supported() {
+            return;
+        }
+        let self_info = super::bsdinfo(unsafe { libc::getpid() }).expect("self bsdinfo");
+        let comm = &self_info[48..64];
+        let name_len = comm
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(comm.len());
+        assert!(name_len > 0, "empty command name");
+        let name = std::str::from_utf8(&comm[..name_len]).expect("command name");
+
+        let dir = tempfile::tempdir().expect("temp");
+        let src = dir.path().join("stop.c");
+        let bin = dir.path().join(name);
+        let pidfile = dir.path().join("pid");
+        let marker = dir.path().join("continued");
+        std::fs::write(
+            &src,
+            r#"
+#include <signal.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    FILE *out;
+    if (argc != 3) return 2;
+    out = fopen(argv[1], "w");
+    if (!out) return 3;
+    fprintf(out, "%ld\n", (long)getpid());
+    if (fclose(out) != 0) return 4;
+    raise(SIGSTOP);
+    out = fopen(argv[2], "w");
+    if (!out) return 5;
+    fputs("continued\n", out);
+    fclose(out);
+    return 0;
+}
+"#,
+        )
+        .expect("write helper");
+        let compiled = std::process::Command::new("cc")
+            .arg("-o")
+            .arg(&bin)
+            .arg(&src)
+            .status()
+            .expect("cc");
+        assert!(compiled.success(), "cc {compiled}");
+
+        let dir_path = dir.path().to_path_buf();
+        let bin_path = bin.clone();
+        let pid_path = pidfile.clone();
+        let marker_path = marker.clone();
+        let ran = std::thread::spawn(move || {
+            let policy = crate::process_jail(&dir_path, std::iter::empty::<&std::path::Path>())
+                .expect("policy");
+            let mut cmd = std::process::Command::new(bin_path);
+            cmd.arg(&pid_path);
+            cmd.arg(&marker_path);
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+            policy.run_child(cmd)
+        });
+
+        let start = std::time::Instant::now();
+        let mut cmd_pid = 0;
+        while start.elapsed() < std::time::Duration::from_secs(3) {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<i32>()
+                && pid > 0
+            {
+                cmd_pid = pid;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if cmd_pid == 0 {
+            let outcome = ran.join().expect("run thread");
+            panic!("command never exec'd: {outcome:?}");
+        }
+
+        let watch = std::time::Instant::now();
+        let mut saw_stop = false;
+        while watch.elapsed() < std::time::Duration::from_millis(800) {
+            if marker.exists() {
+                break;
+            }
+            if super::command_is_stopped(cmd_pid) {
+                saw_stop = true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let continued = marker.exists();
+        if super::command_is_stopped(cmd_pid) {
+            saw_stop = true;
+        }
+        let reaper = super::parent_pid(cmd_pid);
+        unsafe {
+            libc::kill(cmd_pid, libc::SIGKILL);
+            if reaper > 1 {
+                libc::kill(reaper, libc::SIGKILL);
+            }
+        }
+        let outcome = ran.join().expect("run thread");
+        assert!(!continued, "post-exec stop was continued: {outcome:?}");
+        assert!(saw_stop, "post-exec stop was not visible: {outcome:?}");
     }
 }
