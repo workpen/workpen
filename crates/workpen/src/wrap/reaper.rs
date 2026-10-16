@@ -11,9 +11,16 @@
 //! `setsid` grandchild is reparented here even when the command exits
 //! before the first poll. An empty `/proc/.../children` read is not
 //! proof that no child exists. macOS has no subreaper. The reaper
-//! stops the command until a fork watch is armed, then continues it.
-//! A missed wait is continued only while that process is stopped and
-//! has not called exec. The reaper
+//! stops the command with `kill(pid, SIGSTOP)` until a fork watch is
+//! armed, then continues it. `raise(SIGSTOP)` is not used: it is
+//! `pthread_kill`, which can stay runnable without `SSTOP` and block
+//! `Command::spawn` on the exec pipe. After the continue, the command
+//! writes one handshake byte before Seatbelt or nono run. If that
+//! byte is still missing when the wait bound passes, the reaper kills
+//! the command so spawn returns. A `--timeout` that expires before
+//! exec is that same kill, and the report byte tells the parent to
+//! exit 124. A missed wait is continued only while that process is
+//! stopped and has not called exec. The reaper
 //! records descendants from that watch and from walks, and signals those
 //! pids. On macOS the report waits until each signaled pid no longer
 //! answers `kill(pid, 0)`. A recorded pid that is still running is
@@ -30,6 +37,7 @@ use std::cell::RefCell;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
 
 const MAX_PIDS: usize = 128;
 const LIST_MAX: usize = 1024;
@@ -46,9 +54,61 @@ const EMPTY_CHILD_POLLS: u32 = 4;
 /// before the reaper runs again, and a zombie no longer answers.
 #[cfg(target_os = "macos")]
 const IDENTITY_POLLS: usize = 4096;
+/// A pre-exec stop that is still invisible after this long is killed.
+/// The handshake byte is written before Seatbelt or nono, so this
+/// bound does not cover a slow sandbox apply. A loaded machine can
+/// take more than a couple of seconds to schedule the stop, so the
+/// bound stays well above that and well under an unbounded spawn.
+#[cfg(target_os = "macos")]
+const PREEXEC_STOP_BOUND_NS: u64 = 30_000_000_000;
+/// Tests that pause instead of stopping use a shorter bound.
+#[cfg(all(test, target_os = "macos"))]
+const PREEXEC_STALL_BOUND_NS: u64 = 1_000_000_000;
+/// Report byte. The parent maps it to a timeout, not a descendant miss.
+#[cfg(target_os = "macos")]
+const REPORT_PREEXEC_DEADLINE: u8 = 2;
 
 static STOP: AtomicI32 = AtomicI32::new(0);
 static mut MISSED: u8 = 0;
+/// Absolute `CLOCK_MONOTONIC` deadline copied from the spawning thread.
+/// Zero means the caller did not set a timeout.
+#[cfg(target_os = "macos")]
+static mut SPAWN_DEADLINE_NS: u64 = 0;
+/// Set when that deadline expires before exec.
+#[cfg(target_os = "macos")]
+static mut SPAWN_DEADLINE_HIT: u8 = 0;
+/// The command was killed before exec. Skip the identity spin.
+#[cfg(target_os = "macos")]
+static mut PREEXEC_KILLED: u8 = 0;
+
+#[cfg(target_os = "macos")]
+thread_local! {
+    static SPAWN_DEADLINE_TLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Remember a timeout across `fork` so the reaper can enforce it
+/// before `Command::spawn` returns. Drop clears this thread only.
+pub(super) struct SpawnDeadlineGuard;
+
+impl Drop for SpawnDeadlineGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        SPAWN_DEADLINE_TLS.with(|cell| cell.set(0));
+    }
+}
+
+pub(super) fn arm_spawn_deadline(limit: Duration) -> SpawnDeadlineGuard {
+    #[cfg(target_os = "macos")]
+    if let Some(now) = mono_ns() {
+        let add = u64::try_from(limit.as_nanos()).unwrap_or(u64::MAX);
+        SPAWN_DEADLINE_TLS.with(|cell| cell.set(now.saturating_add(add)));
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = limit;
+    }
+    SpawnDeadlineGuard
+}
 
 /// Parent ends of the reaper status pipe. `Send` so a host can finish
 /// on another thread. `armed` is false when no reaper was installed.
@@ -170,21 +230,18 @@ impl ReportPipe {
         self.write.take();
     }
 
-    /// `true` when the reaper reported a fully tracked tree.
-    /// A timeout ignores the byte: the deadline result wins.
-    /// An unarmed pipe is not a miss. Drop closes either way.
-    pub(super) fn tracked(mut self, timed_out: bool) -> bool {
+    fn outcome(mut self, timed_out: bool) -> ReportOutcome {
         if !self.armed {
-            return true;
+            return ReportOutcome::Tracked;
         }
         let read = self.read.take();
         drop(self.write.take());
         if timed_out {
             drop(read);
-            return true;
+            return ReportOutcome::Tracked;
         }
         let Some(read) = read else {
-            return false;
+            return ReportOutcome::Miss;
         };
         let fd = read.as_raw_fd();
         let mut buf = [0u8; 1];
@@ -196,8 +253,29 @@ impl ReportPipe {
             break n;
         };
         drop(read);
-        n == 1 && buf[0] == 0
+        if n != 1 {
+            return ReportOutcome::Miss;
+        }
+        match buf[0] {
+            0 => ReportOutcome::Tracked,
+            2 => ReportOutcome::PreexecDeadline,
+            _ => ReportOutcome::Miss,
+        }
     }
+
+    /// `true` when the reaper reported a fully tracked tree.
+    /// A timeout ignores the byte: the deadline result wins.
+    /// An unarmed pipe is not a miss. Drop closes either way.
+    pub(super) fn tracked(self, timed_out: bool) -> bool {
+        self.outcome(timed_out) != ReportOutcome::Miss
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ReportOutcome {
+    Tracked,
+    Miss,
+    PreexecDeadline,
 }
 
 impl Drop for ReportPipe {
@@ -259,13 +337,14 @@ pub(super) fn discard_report() {
     drop(prev);
 }
 
-/// `true` when the reaper reported a fully tracked tree.
+/// One read of the reaper's status byte.
 /// A timeout ignores the byte: the deadline result wins.
 /// No stashed pipe is a miss, unless the deadline already fired.
-pub(super) fn take_descendant_report(timed_out: bool) -> bool {
+pub(super) fn take_report(timed_out: bool) -> ReportOutcome {
     match STASHED.with(|slot| slot.borrow_mut().take()) {
-        Some(report) => report.tracked(timed_out),
-        None => timed_out,
+        Some(report) => report.outcome(timed_out),
+        None if timed_out => ReportOutcome::Tracked,
+        None => ReportOutcome::Miss,
     }
 }
 
@@ -314,23 +393,86 @@ pub(super) fn supervise_or_continue(report_fd: i32, expected_comm: [u8; 16]) -> 
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
+    #[cfg(target_os = "macos")]
+    let hand = macos_handshake_pipe()?;
+    #[cfg(not(target_os = "macos"))]
+    let hand = [-1, -1];
     let pid = unsafe { libc::fork() };
     if pid < 0 {
+        close_pair(hand);
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
         // Stop before any later `pre_exec` hook or the command's own
         // fork. The reaper arms a watch, then continues this process.
+        // `kill` stops the process. `raise(SIGSTOP)` is `pthread_kill`
+        // on this thread, and that call can stay `SRUN` forever, so
+        // the reaper never sees `SSTOP`. The byte after the stop is
+        // how the reaper tells this apart from Seatbelt or nono.
         #[cfg(target_os = "macos")]
         unsafe {
-            libc::raise(libc::SIGSTOP);
+            libc::close(hand[0]);
+            if delay_stop() {
+                let req = libc::timespec {
+                    tv_sec: 2,
+                    tv_nsec: 0,
+                };
+                libc::nanosleep(&req, std::ptr::null_mut());
+            }
+            if !stalled_stop() {
+                libc::kill(libc::getpid(), libc::SIGSTOP);
+            } else {
+                loop {
+                    libc::pause();
+                }
+            }
+            let previous = libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+            let token = [1u8];
+            loop {
+                let n = libc::write(hand[1], token.as_ptr().cast(), 1);
+                if n >= 0 || errno() != libc::EINTR {
+                    break;
+                }
+            }
+            if previous != libc::SIG_ERR {
+                libc::signal(libc::SIGPIPE, previous);
+            }
+            libc::close(hand[1]);
+            if stall_after_handshake() {
+                loop {
+                    libc::pause();
+                }
+            }
         }
         return Ok(());
     }
-    reaper_main(pid, report_fd);
+    if hand[1] >= 0 {
+        unsafe { libc::close(hand[1]) };
+    }
+    reaper_main(pid, report_fd, hand[0]);
 }
 
-fn reaper_main(cmd: libc::pid_t, report_fd: i32) -> ! {
+fn close_pair(fds: [i32; 2]) {
+    for fd in fds {
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_handshake_pipe() -> io::Result<[i32; 2]> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    set_cloexec(fds[0]);
+    set_cloexec(fds[1]);
+    set_nonblock(fds[0]);
+    Ok(fds)
+}
+
+fn reaper_main(cmd: libc::pid_t, report_fd: i32, hand_fd: i32) -> ! {
     // Own process group so a later `killpg` of this pid cannot signal
     // the host. The command already inherited the previous group; PTY
     // `setsid` moves it again.
@@ -343,32 +485,53 @@ fn reaper_main(cmd: libc::pid_t, report_fd: i32) -> ! {
     #[cfg(target_os = "macos")]
     unsafe {
         std::ptr::addr_of_mut!(CMD_PID).write(cmd);
+        capture_spawn_deadline();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = hand_fd;
     }
     install_stop_handler();
     detach_stdio();
     let (kq, saw_stop) = watch_command(cmd, report_fd);
     // `Command::spawn` reads a CLOEXEC error pipe until exec. This
     // process does not exec, so close every extra fd or the parent
-    // blocks in `spawn` until we exit. Keep the report and the watch.
-    // On macOS the command stays stopped through this walk when the
-    // watch saw the stop. Continuing first lets a setsid child exit
-    // during the walk. A `SIGCONT` sent before the stop is discarded,
-    // and the later `SIGSTOP` then sticks, so continue only after the
-    // stop was observed.
-    close_extra_fds(report_fd, kq);
+    // blocks in `spawn` until we exit. Keep the report, the watch,
+    // and the handshake read end. On macOS the command stays stopped
+    // through this walk when the watch saw the stop. Continuing first
+    // lets a setsid child exit during the walk. A `SIGCONT` sent
+    // before the stop is discarded, and the later `SIGSTOP` then
+    // sticks, so continue only after the stop was observed.
+    close_extra_fds(report_fd, kq, hand_fd);
     #[cfg(target_os = "macos")]
     {
         if saw_stop {
             // Exec does not change this start time. Read it before the
             // command can fork, exit, and disappear from `proc_pidinfo`.
             capture_command_start(cmd);
-            unsafe { libc::kill(cmd, libc::SIGCONT) };
+            let expired = mono_ns().is_some_and(user_deadline_reached);
+            if expired {
+                // The fd walk can outlast `--timeout`. Continuing now
+                // would start Seatbelt after the deadline.
+                kill_preexec(cmd, true);
+            } else {
+                unsafe { libc::kill(cmd, libc::SIGCONT) };
+            }
+        }
+        if preexec_killed() {
+            if hand_fd >= 0 {
+                unsafe { libc::close(hand_fd) };
+            }
+        } else {
+            let _ = await_handshake(cmd, hand_fd);
         }
         // Drain while polling. A setsid child can otherwise fork and
         // lose its parent before the first watch read. A missed stop
         // is continued from that poll only while the process is
         // stopped and has not called exec.
-        cache_command_identity(cmd, kq);
+        if !preexec_killed() {
+            cache_command_identity(cmd, kq);
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -384,6 +547,7 @@ fn reaper_main(cmd: libc::pid_t, report_fd: i32) -> ! {
         remember_tree(cmd, kq);
         #[cfg(target_os = "macos")]
         {
+            enforce_user_deadline(cmd);
             continue_stopped_preexec(cmd);
             remember_identity(cmd);
         }
@@ -471,8 +635,11 @@ fn watch_command_macos(cmd: libc::pid_t, report_fd: i32) -> (i32, bool) {
         // No fork watch. Polling alone can miss a setsid child.
         // Leave the command stopped if it reaches `SIGSTOP` later.
         // `SIGKILL` from the host stop path still works on a stopped
-        // process. A continue here would be discarded.
-        mark_missed();
+        // process. A continue here would be discarded. A command this
+        // wait already killed is not an untracked descendant.
+        if !preexec_killed() {
+            mark_missed();
+        }
         if STOP.load(Ordering::Relaxed) != 0 {
             stop_for_signal(cmd, report_fd, -1);
         }
@@ -499,20 +666,181 @@ fn wait_until_stopped(cmd: libc::pid_t) -> Option<libc::c_int> {
     if test_misses_stop() {
         return None;
     }
+    let started = mono_ns().unwrap_or(0);
     let mut status = 0;
     loop {
         if STOP.load(Ordering::Relaxed) != 0 {
             return None;
         }
-        let waited = unsafe { libc::waitpid(cmd, &mut status, libc::WUNTRACED) };
+        let waited = unsafe { libc::waitpid(cmd, &mut status, libc::WNOHANG | libc::WUNTRACED) };
         if waited == cmd {
+            if libc::WIFSTOPPED(status) && mono_ns().is_some_and(user_deadline_reached) {
+                kill_preexec(cmd, true);
+                return None;
+            }
             return Some(status);
         }
         if waited < 0 && errno() == libc::EINTR {
             continue;
         }
+        if waited < 0 {
+            return None;
+        }
+        let Some(now) = mono_ns() else {
+            sleep_scan();
+            continue;
+        };
+        if !preexec_bound_hit(started, now) {
+            sleep_scan();
+            continue;
+        }
+        if let Some(info) = bsdinfo(cmd) {
+            if exec_flag_set(&info) {
+                return None;
+            }
+            if preexec_stop_needs_continue(&info) && !user_deadline_reached(now) {
+                return Some(stopped_wait_status(libc::SIGSTOP));
+            }
+        }
+        // Bound reached and exec is not visible. Kill, including a
+        // stop that showed up only after `--timeout`, and including an
+        // unreadable status. Leaving either one continues the hang.
+        kill_preexec(cmd, user_deadline_reached(now));
         return None;
     }
+}
+
+#[cfg(target_os = "macos")]
+fn await_handshake(cmd: libc::pid_t, hand_fd: i32) -> bool {
+    if hand_fd < 0 {
+        return true;
+    }
+    let started = mono_ns().unwrap_or(0);
+    loop {
+        if STOP.load(Ordering::Relaxed) != 0 {
+            unsafe { libc::close(hand_fd) };
+            return true;
+        }
+        let mut buf = [0u8; 1];
+        let n = unsafe { libc::read(hand_fd, buf.as_mut_ptr().cast(), 1) };
+        if n >= 0 {
+            unsafe { libc::close(hand_fd) };
+            return true;
+        }
+        if errno() == libc::EINTR {
+            continue;
+        }
+        if errno() != libc::EAGAIN && errno() != libc::EWOULDBLOCK {
+            unsafe { libc::close(hand_fd) };
+            return true;
+        }
+        let Some(now) = mono_ns() else {
+            sleep_scan();
+            continue;
+        };
+        if preexec_bound_hit(started, now) {
+            if bsdinfo(cmd).is_some_and(|info| exec_flag_set(&info)) {
+                unsafe { libc::close(hand_fd) };
+                return true;
+            }
+            kill_preexec(cmd, user_deadline_reached(now));
+            unsafe { libc::close(hand_fd) };
+            return false;
+        }
+        if bsdinfo(cmd).is_some_and(|info| preexec_stop_needs_continue(&info)) {
+            unsafe { libc::kill(cmd, libc::SIGCONT) };
+        }
+        sleep_scan();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn enforce_user_deadline(cmd: libc::pid_t) {
+    if preexec_killed() {
+        return;
+    }
+    let Some(now) = mono_ns() else {
+        return;
+    };
+    if !user_deadline_reached(now) {
+        return;
+    }
+    let Some(info) = bsdinfo(cmd) else {
+        return;
+    };
+    if exec_flag_set(&info) {
+        return;
+    }
+    kill_preexec(cmd, true);
+}
+
+#[cfg(target_os = "macos")]
+fn capture_spawn_deadline() {
+    let ns = SPAWN_DEADLINE_TLS.with(|cell| cell.get());
+    unsafe { std::ptr::addr_of_mut!(SPAWN_DEADLINE_NS).write(ns) };
+}
+
+#[cfg(target_os = "macos")]
+fn preexec_killed() -> bool {
+    unsafe { std::ptr::addr_of!(PREEXEC_KILLED).read() != 0 }
+}
+
+#[cfg(target_os = "macos")]
+fn user_deadline_ns() -> u64 {
+    unsafe { std::ptr::addr_of!(SPAWN_DEADLINE_NS).read() }
+}
+
+#[cfg(target_os = "macos")]
+fn user_deadline_reached(now: u64) -> bool {
+    let end = user_deadline_ns();
+    end != 0 && now >= end
+}
+
+#[cfg(target_os = "macos")]
+fn preexec_stop_bound_ns() -> u64 {
+    #[cfg(test)]
+    if stalled_stop() {
+        return PREEXEC_STALL_BOUND_NS;
+    }
+    PREEXEC_STOP_BOUND_NS
+}
+
+#[cfg(target_os = "macos")]
+fn preexec_bound_hit(started: u64, now: u64) -> bool {
+    // An armed `--timeout` is the only cap. The internal bound is for
+    // a run that would otherwise wait forever.
+    if user_deadline_ns() != 0 {
+        return user_deadline_reached(now);
+    }
+    now.saturating_sub(started) >= preexec_stop_bound_ns()
+}
+
+#[cfg(target_os = "macos")]
+fn kill_preexec(cmd: libc::pid_t, user_deadline: bool) {
+    if cmd > 0 {
+        unsafe { libc::kill(cmd, libc::SIGKILL) };
+    }
+    unsafe {
+        std::ptr::addr_of_mut!(PREEXEC_KILLED).write(1);
+        if user_deadline {
+            std::ptr::addr_of_mut!(SPAWN_DEADLINE_HIT).write(1);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn exec_flag_set(info: &[u8]) -> bool {
+    if info.len() < 4 {
+        return false;
+    }
+    let flags = u32::from_ne_bytes(info[0..4].try_into().unwrap_or([0; 4]));
+    flags & PROC_FLAG_EXEC != 0
+}
+
+/// `W_STOPCODE`. `_WSTOPPED` is `0177`.
+#[cfg(target_os = "macos")]
+fn stopped_wait_status(sig: libc::c_int) -> libc::c_int {
+    (sig << 8) | 0o177
 }
 
 // Set only on the spawning thread. `Command::spawn` forks that thread,
@@ -532,6 +860,107 @@ fn test_misses_stop() -> bool {
 fn arm_missed_stop() -> MissedStopGuard {
     MISS_STOP.with(|flag| flag.set(true));
     MissedStopGuard
+}
+
+// The command child pauses instead of stopping. Fork copies this
+// thread's flag. Production builds never set it.
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static STALL_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(target_os = "macos")]
+fn stalled_stop() -> bool {
+    #[cfg(test)]
+    {
+        STALL_STOP.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static STALL_AFTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static DELAY_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(target_os = "macos")]
+fn delay_stop() -> bool {
+    #[cfg(test)]
+    {
+        DELAY_STOP.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+struct DelayStopGuard;
+
+#[cfg(all(test, target_os = "macos"))]
+fn arm_delay_stop() -> DelayStopGuard {
+    DELAY_STOP.with(|flag| flag.set(true));
+    DelayStopGuard
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for DelayStopGuard {
+    fn drop(&mut self) {
+        DELAY_STOP.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn stall_after_handshake() -> bool {
+    #[cfg(test)]
+    {
+        STALL_AFTER.with(|flag| flag.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+struct StallAfterGuard;
+
+#[cfg(all(test, target_os = "macos"))]
+fn arm_stall_after_handshake() -> StallAfterGuard {
+    STALL_AFTER.with(|flag| flag.set(true));
+    StallAfterGuard
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for StallAfterGuard {
+    fn drop(&mut self) {
+        STALL_AFTER.with(|flag| flag.set(false));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+struct StalledStopGuard;
+
+#[cfg(all(test, target_os = "macos"))]
+fn arm_stalled_stop() -> StalledStopGuard {
+    STALL_STOP.with(|flag| flag.set(true));
+    StalledStopGuard
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for StalledStopGuard {
+    fn drop(&mut self) {
+        STALL_STOP.with(|flag| flag.set(false));
+    }
 }
 
 // Skip the post-exec name read, and hide the command's children.
@@ -952,17 +1381,18 @@ pub(super) fn cloexec_inherited_fds() -> io::Result<()> {
     Ok(())
 }
 
-fn close_extra_fds(keep_a: i32, keep_b: i32) {
+fn close_extra_fds(keep_a: i32, keep_b: i32, keep_c: i32) {
     #[cfg(target_os = "linux")]
     if linux_close_from_except(3, keep_a, keep_b) {
         return;
     }
-    if close_listed_fds(|fd| fd != keep_a && fd != keep_b) {
+    let keep = |fd: i32| fd == keep_a || fd == keep_b || fd == keep_c;
+    if close_listed_fds(|fd| !keep(fd)) {
         return;
     }
     let Some(end) = numeric_scan_end(soft_nofile()) else {
         for fd in 3..4096 {
-            if fd != keep_a && fd != keep_b {
+            if !keep(fd) {
                 unsafe {
                     libc::close(fd);
                 }
@@ -971,7 +1401,7 @@ fn close_extra_fds(keep_a: i32, keep_b: i32) {
         return;
     };
     for fd in 3..end {
-        if fd == keep_a || fd == keep_b {
+        if keep(fd) {
             continue;
         }
         unsafe {
@@ -2021,6 +2451,12 @@ fn is_recorded(pid: libc::pid_t) -> bool {
 fn reset_tracking() {
     unsafe {
         std::ptr::addr_of_mut!(MISSED).write(0);
+        #[cfg(target_os = "macos")]
+        {
+            std::ptr::addr_of_mut!(SPAWN_DEADLINE_NS).write(0);
+            std::ptr::addr_of_mut!(SPAWN_DEADLINE_HIT).write(0);
+            std::ptr::addr_of_mut!(PREEXEC_KILLED).write(0);
+        }
         let table = &mut *std::ptr::addr_of_mut!(TABLE);
         table.n = 0;
         #[cfg(target_os = "macos")]
@@ -2184,6 +2620,14 @@ fn mono_ns() -> Option<u64> {
     )
 }
 
+fn report_status_byte() -> u8 {
+    #[cfg(target_os = "macos")]
+    if unsafe { std::ptr::addr_of!(SPAWN_DEADLINE_HIT).read() } != 0 {
+        return REPORT_PREEXEC_DEADLINE;
+    }
+    u8::from(missed())
+}
+
 fn write_report(fd: i32) {
     #[cfg(target_os = "macos")]
     {
@@ -2209,7 +2653,7 @@ fn write_report(fd: i32) {
     if fd < 0 {
         return;
     }
-    let byte = [u8::from(missed())];
+    let byte = [report_status_byte()];
     let mut off = 0usize;
     while off < byte.len() {
         let n = unsafe { libc::write(fd, byte[off..].as_ptr().cast(), byte.len() - off) };
@@ -2294,6 +2738,15 @@ mod tests {
         let miss = [1u8];
         assert_eq!(unsafe { libc::write(write, miss.as_ptr().cast(), 1) }, 1);
         assert!(!report.tracked(false));
+
+        let report = super::open_report();
+        let write = report.write_raw();
+        let deadline = [2u8];
+        assert_eq!(
+            unsafe { libc::write(write, deadline.as_ptr().cast(), 1) },
+            1
+        );
+        assert_eq!(report.outcome(false), super::ReportOutcome::PreexecDeadline);
     }
 
     #[test]
@@ -2534,6 +2987,169 @@ mod tests {
         cmd.stderr(std::process::Stdio::null());
         let err = policy.run_child(cmd).expect_err("skipped stop watch");
         assert!(matches!(err, crate::KernelError::Descendants), "{err}");
+    }
+
+    /// A pre-exec stop that never becomes `SSTOP` used to block
+    /// `Command::spawn` on the exec pipe. `--timeout` never started.
+    /// The reaper kills that process so spawn returns.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stalled_preexec_stop_does_not_block_spawn() {
+        if !crate::kernel_supported() {
+            return;
+        }
+        let _stall = super::arm_stalled_stop();
+        let dir = tempfile::tempdir().expect("temp");
+        let policy = crate::process_jail(dir.path(), std::iter::empty::<&std::path::Path>())
+            .expect("policy");
+        let mut cmd = std::process::Command::new("/bin/echo");
+        cmd.arg("ran");
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let started = std::time::Instant::now();
+        let outcome = policy.run_child(cmd);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "pre-exec stall blocked spawn for {elapsed:?}: {outcome:?}"
+        );
+        match outcome {
+            Ok((_, status)) => {
+                assert!(!status.success(), "stalled command ran: {status}");
+            }
+            Err(crate::KernelError::Descendants) | Err(crate::KernelError::Timeout) => {}
+            Err(err) => panic!("stalled pre-exec returned {err}"),
+        }
+    }
+
+    /// The handshake byte was written, then pre-exec stalled. That is
+    /// the Seatbelt or nono window. `--timeout` still ends the run.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn preexec_after_handshake_times_out() {
+        if !crate::kernel_supported() {
+            return;
+        }
+        let _stall = super::arm_stall_after_handshake();
+        let dir = tempfile::tempdir().expect("temp");
+        let marker = dir.path().join("ran");
+        let policy = crate::process_jail(dir.path(), std::iter::empty::<&std::path::Path>())
+            .expect("policy");
+        let mut cmd = std::process::Command::new("/usr/bin/touch");
+        cmd.arg(&marker);
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let started = std::time::Instant::now();
+        let err = policy
+            .run_child_timeout(cmd, std::time::Duration::from_secs(1))
+            .expect_err("pre-exec past the handshake");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, crate::KernelError::Timeout),
+            "{err} after {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(6),
+            "timeout did not cover post-handshake pre-exec: {elapsed:?}"
+        );
+        assert!(!marker.exists(), "command reached exec: {err}");
+    }
+
+    /// `--timeout` covers the pre-exec stop. A stall must be exit 124,
+    /// not a spawn that waits with no deadline.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stalled_preexec_stop_times_out() {
+        if !crate::kernel_supported() {
+            return;
+        }
+        let _stall = super::arm_stalled_stop();
+        let dir = tempfile::tempdir().expect("temp");
+        let policy = crate::process_jail(dir.path(), std::iter::empty::<&std::path::Path>())
+            .expect("policy");
+        let mut cmd = std::process::Command::new("/bin/echo");
+        cmd.arg("ok");
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let started = std::time::Instant::now();
+        let err = policy
+            .run_child_timeout(cmd, std::time::Duration::from_secs(1))
+            .expect_err("stalled pre-exec");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, crate::KernelError::Timeout),
+            "{err} after {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(6),
+            "timeout did not cover pre-exec: {elapsed:?}"
+        );
+    }
+
+    /// A timeout longer than the no-timeout stop cap must wait for the
+    /// timeout. Killing at the cap used to report descendants.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stalled_preexec_respects_timeout_longer_than_stop_cap() {
+        if !crate::kernel_supported() {
+            return;
+        }
+        let _stall = super::arm_stalled_stop();
+        let dir = tempfile::tempdir().expect("temp");
+        let policy = crate::process_jail(dir.path(), std::iter::empty::<&std::path::Path>())
+            .expect("policy");
+        let mut cmd = std::process::Command::new("/bin/echo");
+        cmd.arg("ok");
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let started = std::time::Instant::now();
+        let err = policy
+            .run_child_timeout(cmd, std::time::Duration::from_secs(3))
+            .expect_err("stalled pre-exec");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, crate::KernelError::Timeout),
+            "{err} after {elapsed:?}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_secs(2),
+            "stopped at the internal cap instead of the timeout: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "timeout did not cover pre-exec: {elapsed:?}"
+        );
+    }
+
+    /// The command sleeps, then stops. The timeout must kill that
+    /// sleep. Waiting for the late stop would continue it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn late_preexec_stop_does_not_outrun_timeout() {
+        if !crate::kernel_supported() {
+            return;
+        }
+        let _delay = super::arm_delay_stop();
+        let dir = tempfile::tempdir().expect("temp");
+        let policy = crate::process_jail(dir.path(), std::iter::empty::<&std::path::Path>())
+            .expect("policy");
+        let mut cmd = std::process::Command::new("/bin/echo");
+        cmd.arg("late");
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let started = std::time::Instant::now();
+        let err = policy
+            .run_child_timeout(cmd, std::time::Duration::from_secs(1))
+            .expect_err("late pre-exec stop");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, crate::KernelError::Timeout),
+            "{err} after {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(1800),
+            "waited for the late stop: {elapsed:?}"
+        );
     }
 
     /// After exec, a stop of a command whose 16-byte name still matches

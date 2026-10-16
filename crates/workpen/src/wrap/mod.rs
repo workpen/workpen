@@ -372,14 +372,27 @@ fn wait_reaped(child: &mut std::process::Child) -> Result<ExitStatus, KernelErro
 
 #[cfg(unix)]
 fn finish_reap(status: ExitStatus, timed_out: bool) -> Result<(ExitStatus, bool), KernelError> {
-    if !reaper::take_descendant_report(timed_out) {
+    let outcome = reaper::take_report(timed_out);
+    if outcome == reaper::ReportOutcome::Miss {
         return Err(KernelError::Descendants);
     }
+    let timed_out = timed_out || outcome == reaper::ReportOutcome::PreexecDeadline;
     Ok((status, timed_out))
 }
 
 #[cfg(unix)]
 fn spawn_jailed(cmd: &mut Command) -> Result<std::process::Child, KernelError> {
+    spawn_jailed_deadline(cmd, None)
+}
+
+/// `timeout` is copied into the forked reaper so a pre-exec stall
+/// cannot outlive it. The guard drops on this thread after spawn.
+#[cfg(unix)]
+fn spawn_jailed_deadline(
+    cmd: &mut Command,
+    timeout: Option<Duration>,
+) -> Result<std::process::Child, KernelError> {
+    let _guard = timeout.map(reaper::arm_spawn_deadline);
     match cmd.spawn() {
         Ok(child) => {
             reaper::close_parent_report_write();
@@ -1414,7 +1427,7 @@ impl KernelPolicy {
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
             cmd.process_group(0);
-            let child = spawn_jailed(&mut cmd)?;
+            let child = spawn_jailed_deadline(&mut cmd, Some(timeout))?;
             let (output, timed_out) = wait_child_timeout_output(child, timeout)?;
             Ok((applied, output, timed_out))
         }
@@ -1529,7 +1542,7 @@ impl KernelPolicy {
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
             cmd.process_group(0);
-            let child = spawn_jailed(&mut cmd)?;
+            let child = spawn_jailed_deadline(&mut cmd, Some(timeout))?;
             let (status, timed_out) = wait_child_timeout_forward(child, timeout)?;
             Ok((applied, status, timed_out))
         }
@@ -1599,7 +1612,7 @@ impl KernelPolicy {
                 reaper::discard_report();
                 KernelError::Apply(e.to_string())
             })?;
-            let mut child = spawn_jailed(&mut cmd)?;
+            let mut child = spawn_jailed_deadline(&mut cmd, timeout)?;
             // The spawned pid is the reaper. Foreground the command
             // after it becomes a session leader. The child also calls
             // tcsetpgrp; this covers the Linux race the other way.
@@ -1653,6 +1666,10 @@ impl KernelPolicy {
 
     /// Spawn `cmd` under the kernel jail and kill it after `timeout`.
     ///
+    /// On macOS the deadline includes pre-exec. A command that has not
+    /// reached exec by then is killed, and this returns
+    /// [`KernelError::Timeout`].
+    ///
     /// Same fail-closed setup as [`Self::run_child`]. Unix places the
     /// child in its own process group and `killpg`s that group when the
     /// leader exits and again on the deadline. A grandchild that called
@@ -1683,7 +1700,7 @@ impl KernelPolicy {
             #[cfg(not(target_os = "linux"))]
             let applied = self.hook_ready(&mut cmd)?;
             cmd.process_group(0);
-            let mut child = spawn_jailed(&mut cmd)?;
+            let mut child = spawn_jailed_deadline(&mut cmd, Some(timeout))?;
             let (status, timed_out) = reap_process_group(&mut child, Some(timeout))?;
             if timed_out {
                 return Err(KernelError::Timeout);
