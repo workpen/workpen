@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.6](https://github.com/workpen/workpen/compare/v0.7.5...v0.7.6) (2026-10-16)
+
+
+### Bug Fixes
+
+* count only worktrees gc did not remove ([#285](https://github.com/workpen/workpen/issues/285)) ([bfbc8a3](https://github.com/workpen/workpen/commit/bfbc8a31269cc915743f12c590ba1a28b35b896f))
+* end a macOS pre-exec stop that never continues ([#290](https://github.com/workpen/workpen/issues/290)) ([3c9eeb0](https://github.com/workpen/workpen/commit/3c9eeb0e7c76e5ed4268699203381f3c8081fab1)), closes [#289](https://github.com/workpen/workpen/issues/289)
+* format a policy refusal as JSON when --json is set ([#286](https://github.com/workpen/workpen/issues/286)) ([382cd55](https://github.com/workpen/workpen/commit/382cd55f06e1dea7a754f7e30e42478725fe348f))
+* honor anchored deny globs and untrimmed roots ([#284](https://github.com/workpen/workpen/issues/284)) ([002abe7](https://github.com/workpen/workpen/commit/002abe75fc5cc050d0fff8af9e40e9bb253129ce))
+* include the escaping path in JSON refusals ([#287](https://github.com/workpen/workpen/issues/287)) ([19f664b](https://github.com/workpen/workpen/commit/19f664bfc41086e9adecaccd434689a9cab1fcda))
+* report a live macOS setsid orphan and commit each gc ref ([#282](https://github.com/workpen/workpen/issues/282)) ([53294e6](https://github.com/workpen/workpen/commit/53294e6d512056e6e14bb80e62efc98488eec7d8))
+* update nono to 0.80.0 ([#278](https://github.com/workpen/workpen/issues/278)) ([1639e34](https://github.com/workpen/workpen/commit/1639e346c304360003104e34b857518073929c64))
+
 ## [0.7.5](https://github.com/workpen/workpen/compare/v0.7.4...v0.7.5) (2026-10-06)
 
 
