@@ -289,8 +289,9 @@ pub fn check_dests(guard: &PathGuard, dests: &[impl AsRef<Path>]) -> Result<(), 
 /// A relative `../ws` becomes the absolute workspace, not a PathGuard escape.
 /// Implicit canonicalize to `/` or the host temp root is refused unless asked.
 pub fn resolve_workspace_root(cwd: &Path, root: &str) -> Result<PathBuf, PathGuardError> {
-    let requested = root.trim();
-    if requested.is_empty() {
+    let requested = root;
+    // Whitespace-only is empty. Do not trim a real name: "trail " is another directory.
+    if requested.trim().is_empty() {
         return Err(PathGuardError::Root(
             "workspace root must not be empty".into(),
         ));

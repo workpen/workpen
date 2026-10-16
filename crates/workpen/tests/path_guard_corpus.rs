@@ -430,6 +430,22 @@ fn resolve_extra_root_pair_presented_tmp_differs_from_canon_on_macos() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn resolve_workspace_root_keeps_a_trailing_space_directory() {
+    let parent = TempDir::new().expect("parent");
+    let plain = parent.path().join("trail");
+    let spaced = parent.path().join("trail ");
+    fs::create_dir(&plain).expect("plain");
+    fs::create_dir(&spaced).expect("spaced");
+    let got =
+        resolve_workspace_root(parent.path(), &spaced.to_string_lossy()).expect("spaced root");
+    let want = dunce::canonicalize(&spaced).expect("canon spaced");
+    let other = dunce::canonicalize(&plain).expect("canon plain");
+    assert_eq!(got, want, "trailing space is a different directory");
+    assert_ne!(got, other);
+}
+
 #[test]
 fn resolve_workspace_root_rejects_empty_missing_and_file() {
     let dir = workspace();
