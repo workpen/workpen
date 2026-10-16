@@ -662,7 +662,19 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
                 }
             }
         }
-        println!("{} leftover worktrees", rows.len());
+        // A real reclaim is gone. Dry-run leaves the directory in place.
+        let remaining = rows
+            .iter()
+            .filter(|(_, decision)| match decision {
+                GcDecision::Reclaim { .. } => dry_run,
+                GcDecision::Keep { .. } => true,
+            })
+            .count();
+        match remaining {
+            0 => println!("no leftover worktrees"),
+            1 => println!("1 leftover worktree"),
+            n => println!("{n} leftover worktrees"),
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
