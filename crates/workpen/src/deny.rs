@@ -270,7 +270,7 @@ pub(crate) fn dest_deny_at(
     dest_deny_at_root(classified, display, policy, None)
 }
 
-fn dest_deny_at_root(
+pub(crate) fn dest_deny_at_root(
     classified: &Path,
     display: String,
     policy: &DenyPolicy,

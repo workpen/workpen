@@ -25,7 +25,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::deny::{
-    CheckDestError, DenyPolicy, DestDeny, DestDenyKind, dest_deny_at, dest_deny_glob_only,
+    CheckDestError, DenyPolicy, DestDeny, DestDenyKind, dest_deny_at, dest_deny_at_root,
+    dest_deny_glob_only,
 };
 
 #[cfg(target_os = "linux")]
@@ -2195,7 +2196,14 @@ pub fn collect_workspace_dest_denies_limited(
 ) -> Result<Vec<DestDeny>, KernelError> {
     let mut out = Vec::new();
     let mut remaining = limit;
-    walk_dest_denies(workspace, policy, &mut out, &mut remaining, limit)?;
+    walk_dest_denies(
+        workspace,
+        Some(workspace),
+        policy,
+        &mut out,
+        &mut remaining,
+        limit,
+    )?;
     Ok(out)
 }
 
@@ -2240,11 +2248,12 @@ fn dest_deny_if_real_dir(
     ft: std::fs::FileType,
     policy: &DenyPolicy,
     out: &mut Vec<DestDeny>,
+    glob_root: Option<&Path>,
 ) -> bool {
     if !ft.is_dir() || ft.is_symlink() {
         return false;
     }
-    if let Some(deny) = dest_deny_at(path, path.display().to_string(), policy) {
+    if let Some(deny) = dest_deny_at_root(path, path.display().to_string(), policy, glob_root) {
         push_dest_deny(out, deny);
     }
     true
@@ -2252,6 +2261,7 @@ fn dest_deny_if_real_dir(
 
 fn walk_dest_denies(
     dir: &Path,
+    glob_root: Option<&Path>,
     policy: &DenyPolicy,
     out: &mut Vec<DestDeny>,
     remaining: &mut usize,
@@ -2277,11 +2287,12 @@ fn walk_dest_denies(
             return Err(dest_deny_walk_cap(dir, limit));
         }
         *remaining -= 1;
-        if dest_deny_if_real_dir(&path, ft, policy, out) {
-            walk_dest_denies(&path, policy, out, remaining, limit)?;
+        if dest_deny_if_real_dir(&path, ft, policy, out, glob_root) {
+            walk_dest_denies(&path, glob_root, policy, out, remaining, limit)?;
             continue;
         }
-        if let Some(deny) = dest_deny_at(&path, path.display().to_string(), policy) {
+        if let Some(deny) = dest_deny_at_root(&path, path.display().to_string(), policy, glob_root)
+        {
             push_dest_deny(out, deny);
         }
     }
@@ -2314,7 +2325,7 @@ fn collect_system_temp_dest_denies(
             continue;
         }
         let ft = ent.file_type().map_err(|e| dest_deny_walk_io(&path, e))?;
-        if dest_deny_if_real_dir(&path, ft, policy, out) {
+        if dest_deny_if_real_dir(&path, ft, policy, out, None) {
             if is_dest_deny_dir_name(name) {
                 walk_temp_dest_denies(&path, policy, out, remaining, limit)?;
             } else {
@@ -2384,7 +2395,7 @@ fn collect_temp_dir_dest_names(
             Ok(ft) => ft,
             Err(_) => continue,
         };
-        if dest_deny_if_real_dir(&path, ft, policy, out) {
+        if dest_deny_if_real_dir(&path, ft, policy, out, None) {
             if is_dest_deny_dir_name(name) {
                 walk_temp_dest_denies(&path, policy, out, remaining, limit)?;
             }
@@ -2431,7 +2442,7 @@ fn walk_temp_dest_denies(
             Ok(ft) => ft,
             Err(_) => continue,
         };
-        if dest_deny_if_real_dir(&path, ft, policy, out) {
+        if dest_deny_if_real_dir(&path, ft, policy, out, None) {
             walk_temp_dest_denies(&path, policy, out, remaining, limit)?;
             continue;
         }
@@ -2467,7 +2478,7 @@ fn walk_cache_dest_denies(
             continue;
         }
         let ft = ent.file_type().map_err(|e| dest_deny_walk_io(&path, e))?;
-        if dest_deny_if_real_dir(&path, ft, policy, out) {
+        if dest_deny_if_real_dir(&path, ft, policy, out, None) {
             walk_cache_dest_denies(&path, policy, out, remaining, limit)?;
             continue;
         }
@@ -2832,7 +2843,14 @@ fn append_extra_dest_denies(
         walk_cache_dest_denies(extra, policy, dest_denies, remaining, DEST_DENY_WALK_LIMIT)?;
         return Ok(());
     }
-    walk_dest_denies(extra, policy, dest_denies, remaining, DEST_DENY_WALK_LIMIT)
+    walk_dest_denies(
+        extra,
+        None,
+        policy,
+        dest_denies,
+        remaining,
+        DEST_DENY_WALK_LIMIT,
+    )
 }
 
 fn add_read_grant(grants: &mut Vec<KernelGrant>, path: &Path) -> Result<(), KernelError> {

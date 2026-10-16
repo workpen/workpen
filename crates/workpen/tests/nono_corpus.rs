@@ -299,6 +299,28 @@ fn collect_workspace_dest_denies_honors_extra_glob() {
     );
 }
 
+#[test]
+fn collect_workspace_dest_denies_honors_anchored_slash_glob() {
+    let dir = workspace();
+    let notes = dir.path().join("notes");
+    fs::create_dir(&notes).expect("notes");
+    fs::write(notes.join("page"), "x\n").expect("page");
+    fs::write(dir.path().join("readme.md"), "ok\n").expect("readme");
+    // Not a default `**/…` row. `notes/**` is anchored at the workspace.
+    let policy = DenyPolicy::new(vec!["notes/**".into()]);
+    let found = collect_workspace_dest_denies(dir.path(), &policy).expect("collect");
+    assert!(
+        found.iter().any(|d| d.path.ends_with("notes/page")),
+        "anchored notes/** must hide the workspace file, not only argv: {found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .all(|d| d.path.file_name().is_none_or(|n| n != "readme.md")),
+        "readme.md is not under notes/: {found:?}"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn run_child_cannot_read_workspace_env_linux() {
