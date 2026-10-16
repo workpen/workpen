@@ -2979,17 +2979,23 @@ int main(int argc, char **argv) {
         if mid == 0 {
             unsafe {
                 libc::close(fds[0]);
+                // The grandchild publishes its pid after setsid. A write
+                // from here races that call, and the flag check fails.
                 let grand = libc::fork();
                 if grand == 0 {
                     if libc::setsid() < 0 {
+                        libc::_exit(1);
+                    }
+                    let bytes = libc::getpid().to_ne_bytes();
+                    let wrote = libc::write(fds[1], bytes.as_ptr().cast(), bytes.len());
+                    if wrote != bytes.len() as isize {
                         libc::_exit(1);
                     }
                     loop {
                         libc::pause();
                     }
                 }
-                let bytes = grand.to_ne_bytes();
-                let _ = libc::write(fds[1], bytes.as_ptr().cast(), bytes.len());
+                libc::close(fds[1]);
                 libc::_exit(0);
             }
         }
