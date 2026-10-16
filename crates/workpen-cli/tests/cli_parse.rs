@@ -302,6 +302,56 @@ fn run_and_policy_missing_value_names_that_flag() {
 }
 
 #[test]
+fn run_env_empty_name_is_usage() {
+    let dir = TempDir::new().expect("workspace");
+    let equals = workpen()
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--env", "=SECRET", "--", "echo", "hello"])
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&equals.stdout);
+    let err = String::from_utf8_lossy(&equals.stderr);
+    assert_eq!(
+        equals.status.code(),
+        Some(2),
+        "run --env =SECRET must exit 2, stdout={stdout} stderr={err}"
+    );
+    assert!(
+        err.contains("--env needs a name"),
+        "run --env =SECRET must name the flag, stdout={stdout} stderr={err}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "run --env =SECRET must not print stdout, stdout={stdout} stderr={err}"
+    );
+
+    let empty = workpen()
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .arg("--env")
+        .arg("")
+        .args(["--", "echo", "hello"])
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&empty.stdout);
+    let err = String::from_utf8_lossy(&empty.stderr);
+    assert_eq!(
+        empty.status.code(),
+        Some(2),
+        "empty --env must exit 2, stdout={stdout} stderr={err}"
+    );
+    assert!(
+        err.contains("--env needs a name"),
+        "empty --env must name the flag, stdout={stdout} stderr={err}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "empty --env must not print stdout, stdout={stdout} stderr={err}"
+    );
+}
+
+#[test]
 fn run_timeout_that_does_not_fit_on_the_clock_exits_2() {
     let dir = TempDir::new().expect("workspace");
     let out = workpen()
@@ -1349,6 +1399,56 @@ fn init_writes_comments_and_does_not_replace_an_existing_file() {
         .expect("spawn");
     assert_eq!(blocked.status.code(), Some(2));
     assert!(nested.path().join("agent.lock").is_dir());
+}
+
+#[test]
+fn init_rejects_extra_root_and_unknown_argument() {
+    let dir = TempDir::new().expect("workspace");
+    let extra = TempDir::new().expect("extra");
+    let out = workpen()
+        .args(["init", "--root"])
+        .arg(dir.path())
+        .arg("--extra-root")
+        .arg(extra.path())
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "init --extra-root must exit 2, stdout={stdout} stderr={err}"
+    );
+    assert!(
+        err.contains("init does not take --extra-root"),
+        "init --extra-root must name the refusal, stdout={stdout} stderr={err}"
+    );
+    assert!(
+        !dir.path().join("agent.lock").exists(),
+        "init --extra-root must not write agent.lock, stdout={stdout} stderr={err}"
+    );
+
+    let dry = workpen()
+        .args(["init", "--root"])
+        .arg(dir.path())
+        .arg("--dry-run")
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&dry.stdout);
+    let err = String::from_utf8_lossy(&dry.stderr);
+    assert_eq!(
+        dry.status.code(),
+        Some(2),
+        "init --dry-run must exit 2, stdout={stdout} stderr={err}"
+    );
+    assert!(
+        err.contains("unknown argument"),
+        "init --dry-run must be an unknown argument, stdout={stdout} stderr={err}"
+    );
+    assert!(
+        !dir.path().join("agent.lock").exists(),
+        "init --dry-run must not write agent.lock, stdout={stdout} stderr={err}"
+    );
 }
 
 #[cfg(unix)]
