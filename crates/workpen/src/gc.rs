@@ -900,6 +900,31 @@ fn reachable_branch_commits(path: &Path) -> Result<HashSet<String>, GcError> {
         .collect())
 }
 
+/// `true` when `token` can sit unquoted in a `git update-ref --stdin` line.
+fn stdin_ref_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|byte| !byte.is_ascii_whitespace() && byte != 0)
+}
+
+fn as_update_ref_error(err: GcError) -> GcError {
+    match err {
+        GcError::Git { detail, .. } => GcError::Git {
+            op: "update-ref".into(),
+            detail,
+        },
+        other => other,
+    }
+}
+
+/// Point `prefix/<worktree>/<sha>` at each unreachable reflog commit.
+///
+/// One `git update-ref --stdin` process commits each ref before the
+/// next update. A later failure leaves the earlier refs in place and
+/// returns [`GcError::Git`]. A bare `--stdin` script is one transaction,
+/// so a later failure would roll those refs back. A ref or SHA that
+/// contains whitespace is written with one argument list per ref.
 fn save_reflog_shas(
     path: &Path,
     prefix: &str,
@@ -922,17 +947,30 @@ fn save_reflog_shas(
         if reachable.contains(sha) {
             continue;
         }
-        let refname = format!("{prefix}/{name}/{sha}");
-        git(path, &["update-ref", &refname, sha]).map_err(|e| match e {
-            GcError::Git { detail, .. } => GcError::Git {
-                op: "update-ref".into(),
-                detail,
-            },
-            other => other,
-        })?;
-        saved.push(refname);
+        saved.push((format!("{prefix}/{name}/{sha}"), sha.to_owned()));
     }
-    Ok(saved)
+    if saved.is_empty() {
+        return Ok(Vec::new());
+    }
+    let batched = saved
+        .iter()
+        .all(|(refname, sha)| stdin_ref_token(refname) && stdin_ref_token(sha));
+    if batched {
+        let mut script = String::new();
+        for (refname, sha) in &saved {
+            script.push_str("start\nupdate ");
+            script.push_str(refname);
+            script.push(' ');
+            script.push_str(sha);
+            script.push_str("\nprepare\ncommit\n");
+        }
+        git_stdin(path, &["update-ref", "--stdin"], &script).map_err(as_update_ref_error)?;
+    } else {
+        for (refname, sha) in &saved {
+            git(path, &["update-ref", refname, sha]).map_err(as_update_ref_error)?;
+        }
+    }
+    Ok(saved.into_iter().map(|(refname, _)| refname).collect())
 }
 
 fn sanitize_ref_component(raw: &str) -> String {
@@ -1076,7 +1114,7 @@ const GIT_FORWARD_ENV: &[&str] = &[
     "HOMEPATH",
 ];
 
-fn git(cwd: &Path, args: &[&str]) -> Result<String, GcError> {
+fn git_command(cwd: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.env_clear();
     for key in GIT_FORWARD_ENV {
@@ -1084,23 +1122,69 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String, GcError> {
             cmd.env(key, v);
         }
     }
-    let out = cmd
-        .env("GIT_TERMINAL_PROMPT", "0")
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| GcError::Git {
-            op: args.join(" "),
-            detail: e.to_string(),
-        })?;
+        .current_dir(cwd);
+    cmd
+}
+
+fn git_text(op: &str, out: std::process::Output) -> Result<String, GcError> {
     if !out.status.success() {
         return Err(GcError::Git {
-            op: args.join(" "),
+            op: op.into(),
             detail: String::from_utf8_lossy(&out.stderr).trim().into(),
         });
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn git(cwd: &Path, args: &[&str]) -> Result<String, GcError> {
+    let op = args.join(" ");
+    let out = git_command(cwd)
+        .args(args)
+        .output()
+        .map_err(|e| GcError::Git {
+            op: op.clone(),
+            detail: e.to_string(),
+        })?;
+    git_text(&op, out)
+}
+
+fn git_stdin(cwd: &Path, args: &[&str], stdin: &str) -> Result<String, GcError> {
+    use std::io::Write;
+    let op = args.join(" ");
+    let mut child = git_command(cwd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| GcError::Git {
+            op: op.clone(),
+            detail: e.to_string(),
+        })?;
+    let write_result = match child.stdin.take() {
+        Some(mut input) => input.write_all(stdin.as_bytes()),
+        None => {
+            let _ = child.wait();
+            return Err(GcError::Git {
+                op,
+                detail: "stdin was not piped".into(),
+            });
+        }
+    };
+    if let Err(err) = write_result {
+        let _ = child.wait();
+        return Err(GcError::Git {
+            op,
+            detail: err.to_string(),
+        });
+    }
+    let out = child.wait_with_output().map_err(|e| GcError::Git {
+        op: op.clone(),
+        detail: e.to_string(),
+    })?;
+    git_text(&op, out)
 }
 
 #[cfg(test)]

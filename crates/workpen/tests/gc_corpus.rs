@@ -1546,6 +1546,141 @@ fn run_gc_lists_reachable_commits_once() {
     assert_eq!(contains, 0, "no per-sha contains, log={text:?}");
 }
 
+#[cfg(unix)]
+fn unreachable_reflog_shas(wt: &Path) -> Vec<String> {
+    let reflog = git_out(wt, &["reflog", "--format=%H"]);
+    let reachable = git_out(wt, &["rev-list", "--branches", "--remotes"]);
+    let reach: Vec<&str> = reachable
+        .lines()
+        .map(str::trim)
+        .filter(|sha| sha.len() >= 7)
+        .collect();
+    let mut seen = Vec::new();
+    let mut out = Vec::new();
+    for sha in reflog.lines() {
+        let sha = sha.trim();
+        if sha.len() < 7 || seen.contains(&sha) {
+            continue;
+        }
+        seen.push(sha);
+        if reach.contains(&sha) {
+            continue;
+        }
+        out.push(sha.to_owned());
+    }
+    out
+}
+
+#[cfg(unix)]
+fn two_unreachable_commits(wt: &Path, marker: &str) -> Vec<String> {
+    fs::write(wt.join("one"), marker.as_bytes()).expect("one");
+    git(wt, &["add", "one"]);
+    git(wt, &["commit", "-m", marker]);
+    fs::write(wt.join("two"), marker.as_bytes()).expect("two");
+    git(wt, &["add", "two"]);
+    git(wt, &["commit", "-m", marker]);
+    git(wt, &["reset", "--hard", "HEAD~2"]);
+    unreachable_reflog_shas(wt)
+}
+
+#[cfg(unix)]
+fn reclaimed_ref(worktree: &str, sha: &str) -> String {
+    format!("refs/workpen/reclaimed/{worktree}/{sha}")
+}
+
+/// Two unreachable reflog commits. Success writes both refs. A failure
+/// on the second update leaves the first ref and keeps the tree.
+#[cfg(unix)]
+#[test]
+fn remove_explicit_keeps_the_first_ref_when_the_second_update_fails() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "two-sha");
+    let shas = two_unreachable_commits(&wt, "keep-both");
+    assert_eq!(
+        shas.len(),
+        2,
+        "need two unreachable reflog shas, got {shas:?}"
+    );
+    match remove_explicit(&wt, "refs/workpen/reclaimed", false) {
+        Ok(GcDecision::Reclaim { saved_refs }) => {
+            assert!(
+                saved_refs.iter().any(|r| r.contains(&shas[0])),
+                "first ref missing from {saved_refs:?}"
+            );
+            assert!(
+                saved_refs.iter().any(|r| r.contains(&shas[1])),
+                "second ref missing from {saved_refs:?}"
+            );
+        }
+        other => panic!("both updates must reclaim, got {other:?}"),
+    }
+    let listed = git_out(&repo, &["show-ref"]);
+    assert!(
+        listed.contains(&reclaimed_ref("two-sha", &shas[0]))
+            && listed.contains(&reclaimed_ref("two-sha", &shas[1])),
+        "both refs must exist after success: {listed}"
+    );
+    assert!(!wt.exists(), "success removes the tree");
+
+    let wt = add_leftover_worktree(&repo, &leftover, "two-sha-fail");
+    let shas = two_unreachable_commits(&wt, "fail-second");
+    assert_eq!(
+        shas.len(),
+        2,
+        "need two unreachable reflog shas, got {shas:?}"
+    );
+    let count = std::env::temp_dir().join(format!("workpen-upref-{}", std::process::id()));
+    let _ = fs::remove_file(&count);
+    let script = r#"#!/bin/sh
+if [ "$1" = "update-ref" ] && [ "$2" = "--stdin" ]; then
+  rewritten=$(mktemp)
+  awk '$1 == "update" { n++; if (n == 2) $3 = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" } { print }' > "$rewritten"
+  __GIT__ "$@" < "$rewritten"
+  status=$?
+  rm -f "$rewritten"
+  exit "$status"
+fi
+if [ "$1" = "update-ref" ]; then
+  n=0
+  if [ -f '__COUNT__' ]; then
+    n=$(cat '__COUNT__')
+  fi
+  n=$((n + 1))
+  printf '%s\n' "$n" > '__COUNT__'
+  if [ "$n" -eq 2 ]; then
+    echo "forced update-ref failure" >&2
+    exit 1
+  fi
+fi
+exec __GIT__ "$@"
+"#
+    .replace("__COUNT__", &count.display().to_string());
+    let got = with_git_wrapper(&script, || {
+        remove_explicit(&wt, "refs/workpen/reclaimed", false)
+    });
+    let _ = fs::remove_file(&count);
+    match got {
+        Ok(GcDecision::Keep {
+            reason: KeepReason::StatusUnreadable,
+        }) => {}
+        other => panic!("second update-ref failure must keep the tree, got {other:?}"),
+    }
+    assert!(wt.exists(), "a partial save must not delete the tree");
+    let listed = git_out(&repo, &["show-ref"]);
+    let first = reclaimed_ref("two-sha-fail", &shas[0]);
+    let second = reclaimed_ref("two-sha-fail", &shas[1]);
+    assert!(
+        listed.contains(&first),
+        "the first ref must remain, got {listed}"
+    );
+    assert!(
+        !listed.contains(&second),
+        "the failed second ref must be absent, got {listed}"
+    );
+}
+
 fn configure_identity(cwd: &Path) {
     git(cwd, &["config", "user.email", "dev@example.com"]);
     git(cwd, &["config", "user.name", "dev"]);
