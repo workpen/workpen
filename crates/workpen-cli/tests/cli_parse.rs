@@ -1148,6 +1148,19 @@ fn existing_file_exec_failure_stays_kernel_wrap() {
 }
 
 #[cfg(unix)]
+fn leaked_scrubbed_token_key(text: &str) -> Option<&str> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        // Whole value, not a substring: GITHUB_HEAD_REF is the branch name.
+        if key.eq_ignore_ascii_case("GITHUB_TOKEN") || value == "fixture" {
+            Some(key)
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(unix)]
 #[test]
 fn run_env_scrubs_tokens_and_keeps_opt_in() {
     let dir = TempDir::new().expect("workspace");
@@ -1164,9 +1177,10 @@ fn run_env_scrubs_tokens_and_keeps_opt_in() {
         "env must run, stderr={}",
         String::from_utf8_lossy(&inherited.stderr)
     );
+    let leaked = leaked_scrubbed_token_key(&text);
     assert!(
-        !text.contains("GITHUB_TOKEN") && !text.contains("fixture"),
-        "inherited token must be absent"
+        leaked.is_none(),
+        "inherited token must be absent, key={leaked:?}"
     );
 
     let argv = workpen()
@@ -1176,9 +1190,10 @@ fn run_env_scrubs_tokens_and_keeps_opt_in() {
         .output()
         .expect("spawn");
     let text = String::from_utf8_lossy(&argv.stdout);
+    let leaked = leaked_scrubbed_token_key(&text);
     assert!(
-        !text.contains("fixture"),
-        "argv env assignment must be stripped"
+        leaked.is_none(),
+        "argv env assignment must be stripped, key={leaked:?}"
     );
 
     let opted = workpen()
