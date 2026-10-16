@@ -15,11 +15,16 @@
 //! A missed wait is continued only while that process is stopped and
 //! has not called exec. The reaper
 //! records descendants from that watch and from walks, and signals those
-//! pids. A pid that does not fit in the recorded set is reported on
-//! `report_fd`. On macOS a fork whose parent has exited is reported
-//! the same way when a live process with that command's name is still
-//! outside the recorded set. The host turns that byte into
-//! `KernelError::Descendants`.
+//! pids. On macOS the report waits until each signaled pid no longer
+//! answers `kill(pid, 0)`. A recorded pid that is still running is
+//! reported too. A pid that does not fit in the recorded set is reported
+//! on `report_fd`. On macOS a fork whose parent has exited is reported
+//! the same way when a live session leader with that command's name
+//! is still outside the recorded set. That process called `setsid`.
+//! The name is read after exec. If that process has already exited,
+//! the name is the program file name and the start time is the one
+//! taken while it was stopped. A child the parent already waited for
+//! is not. The host turns that byte into `KernelError::Descendants`.
 
 use std::cell::RefCell;
 use std::io;
@@ -29,6 +34,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 const MAX_PIDS: usize = 128;
 const LIST_MAX: usize = 1024;
 const SCAN_NS: libc::c_long = 2_000_000;
+/// `kill(pid, 0)` can stay successful after `SIGKILL` until launchd
+/// reaps that pid. A clean report waits this long, then is a miss.
+#[cfg(target_os = "macos")]
+const SETTLE_NS: u64 = 50_000_000;
 /// Empty child-list reads after the command has exited. One snapshot
 /// can miss a grandchild that was reparented in that same exit.
 #[cfg(target_os = "linux")]
@@ -106,8 +115,9 @@ struct PidSet {
 #[cfg(target_os = "macos")]
 static mut CMD_PID: libc::pid_t = 0;
 
-/// Program name captured after exec. The reaper's own name is the
-/// pre-exec image, so it must not be stored here.
+/// Program name used to recognize a reparented child. The post-exec
+/// image is preferred. The reaper's own name is the pre-exec image,
+/// so it must not be stored here.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 struct Identity {
@@ -117,6 +127,11 @@ struct Identity {
     sec: u64,
     usec: u64,
 }
+
+/// File name `exec` will run, truncated to 16 bytes. Set before the
+/// reaper forks. `reset_tracking` does not clear it.
+#[cfg(target_os = "macos")]
+static mut EXPECTED_COMM: [u8; 16] = [0; 16];
 
 #[cfg(target_os = "macos")]
 static mut IDENT: Identity = Identity {
@@ -254,6 +269,24 @@ pub(super) fn take_descendant_report(timed_out: bool) -> bool {
     }
 }
 
+/// Program file name in the shape macOS stores in `pbi_comm`.
+///
+/// The field is 16 bytes. The kernel copies with `strlcpy`, so the
+/// name is at most 15 bytes and the last byte stays NUL. Copying all
+/// 16 file-name bytes leaves no NUL, so that session leader does not
+/// match. A shebang's kernel name is the interpreter. Sealing the
+/// interpreter would match every other session leader with that name,
+/// so this stays the program file name.
+pub(super) fn expected_comm_bytes(program: &std::ffi::OsStr) -> [u8; 16] {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::path::Path::new(program).file_name().unwrap_or(program);
+    let bytes = name.as_bytes();
+    let mut out = [0u8; 16];
+    let n = bytes.len().min(out.len() - 1);
+    out[..n].copy_from_slice(&bytes[..n]);
+    out
+}
+
 /// Fork a reaper. The command child returns `Ok`. The reaper does not
 /// return.
 ///
@@ -262,13 +295,21 @@ pub(super) fn take_descendant_report(timed_out: bool) -> bool {
 /// `report_fd` is the write end, captured by value. The parent's
 /// `OwnedFd` stays in the parent. After `fork` the child has its own
 /// copy of that descriptor.
-pub(super) fn supervise_or_continue(report_fd: i32) -> io::Result<()> {
+pub(super) fn supervise_or_continue(report_fd: i32, expected_comm: [u8; 16]) -> io::Result<()> {
     // `fork` returns into the command immediately. This process is the
     // reaper, so the subreaper flag has to be set first or a `setsid`
     // grandchild whose parent exits in that window is reparented to
     // pid 1. The child list stays empty and the reaper exits 0.
     // The command inherits `has_child_subreaper`, which is what makes
     // the kernel walk up to this process.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        std::ptr::addr_of_mut!(EXPECTED_COMM).write(expected_comm);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = expected_comm;
+    }
     #[cfg(target_os = "linux")]
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
@@ -318,6 +359,9 @@ fn reaper_main(cmd: libc::pid_t, report_fd: i32) -> ! {
     #[cfg(target_os = "macos")]
     {
         if saw_stop {
+            // Exec does not change this start time. Read it before the
+            // command can fork, exit, and disappear from `proc_pidinfo`.
+            capture_command_start(cmd);
             unsafe { libc::kill(cmd, libc::SIGCONT) };
         }
         // Drain while polling. A setsid child can otherwise fork and
@@ -488,6 +532,43 @@ fn test_misses_stop() -> bool {
 fn arm_missed_stop() -> MissedStopGuard {
     MISS_STOP.with(|flag| flag.set(true));
     MissedStopGuard
+}
+
+// Skip the post-exec name read, and hide the command's children.
+// The reaper then has only the program file name to go on. Set on
+// the spawning thread so both forks still see it.
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static SKIP_LIVE_IDENTITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static HIDE_COMMAND_CHILDREN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn skip_live_identity() -> bool {
+    SKIP_LIVE_IDENTITY.with(|flag| flag.get())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+fn hide_command_children() -> bool {
+    HIDE_COMMAND_CHILDREN.with(|flag| flag.get())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+struct UnsampledNameGuard;
+
+#[cfg(all(test, target_os = "macos"))]
+fn arm_unsampled_name() -> UnsampledNameGuard {
+    SKIP_LIVE_IDENTITY.with(|flag| flag.set(true));
+    HIDE_COMMAND_CHILDREN.with(|flag| flag.set(true));
+    UnsampledNameGuard
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl Drop for UnsampledNameGuard {
+    fn drop(&mut self) {
+        SKIP_LIVE_IDENTITY.with(|flag| flag.set(false));
+        HIDE_COMMAND_CHILDREN.with(|flag| flag.set(false));
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1220,6 +1301,13 @@ fn direct_children_macos(pid: libc::pid_t, out: &mut [libc::pid_t]) -> (usize, b
     if out.is_empty() {
         return (0, true);
     }
+    #[cfg(test)]
+    if hide_command_children() {
+        let cmd = unsafe { std::ptr::addr_of!(CMD_PID).read() };
+        if cmd > 0 && pid == cmd {
+            return (0, false);
+        }
+    }
     let n = unsafe {
         proc_listchildpids(
             pid,
@@ -1423,14 +1511,14 @@ fn arm_knote_macos(kq: i32, pid: libc::pid_t) -> bool {
     if rc == 0 || (rc < 0 && errno() == libc::EEXIST) {
         return true;
     }
-    // A zombie still answers kill(pid, 0), and proc_pidinfo returns
-    // nothing. It cannot fork. A pid that is already gone can have
-    // left a setsid child, so that case stays a miss.
-    // PROC_PIDTBSDINFO (flavor 3) does return while the command is
-    // stopped. The pre-exec continue path reads `pbi_status` from it.
+    // A zombie still answers `kill(pid, 0)`, and `proc_pidinfo` returns
+    // nothing. It cannot fork. A pid that is already gone was reaped.
+    // Treating that as a failed watch made `fork` plus `wait` a miss
+    // when the pid disappeared before `kevent`. A `setsid` process it
+    // left is reported by the name scan, as a fork this watch never saw.
     if rc < 0 && errno() == libc::ESRCH {
         let cmd = unsafe { std::ptr::addr_of!(CMD_PID).read() };
-        if pid != cmd && proc_info_missing(pid) {
+        if pid != cmd && (proc_info_missing(pid) || !pid_alive(pid)) {
             return true;
         }
     }
@@ -1510,8 +1598,8 @@ fn on_fork(parent: libc::pid_t, kq: i32, also_exit: bool) {
     if !also_exit && !parent_is_gone(parent) {
         return;
     }
-    // Reparented. Report only a live process that still has this
-    // command's name. Do not signal an unmatched pid.
+    // Reparented. Report only a live session leader that still has
+    // this command's name. Do not signal an unmatched pid.
     if untracked_same_name(parent) {
         mark_missed();
     }
@@ -1561,6 +1649,18 @@ fn start_time(pid: libc::pid_t) -> Option<(u64, u64)> {
     let sec = u64::from_ne_bytes(buf[120..128].try_into().ok()?);
     let usec = u64::from_ne_bytes(buf[128..136].try_into().ok()?);
     Some((sec, usec))
+}
+
+/// `false` when the pid is gone. `EPERM` still counts as alive.
+#[cfg(target_os = "macos")]
+fn pid_alive(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    errno() != libc::ESRCH
 }
 
 #[cfg(target_os = "macos")]
@@ -1650,6 +1750,10 @@ fn identity_ready() -> bool {
 /// command is still alive, and skip the pre-exec image.
 #[cfg(target_os = "macos")]
 fn remember_identity(pid: libc::pid_t) {
+    #[cfg(test)]
+    if skip_live_identity() {
+        return;
+    }
     if pid <= 0 || identity_ready() {
         return;
     }
@@ -1709,6 +1813,11 @@ fn bsd_status_is_stop(info: &[u8]) -> bool {
 #[cfg(target_os = "macos")]
 const PROC_FLAG_EXEC: u32 = 0x4000;
 
+/// `<sys/proc_info.h>` `PROC_FLAG_SLEADER`. `setsid` sets it.
+/// A fork the parent waited for stays in that parent's group.
+#[cfg(target_os = "macos")]
+const PROC_FLAG_SLEADER: u32 = 0x20;
+
 /// `true` when this `PROC_PIDTBSDINFO` buffer is a pre-exec `SSTOP`.
 #[cfg(target_os = "macos")]
 fn preexec_stop_needs_continue(info: &[u8]) -> bool {
@@ -1743,6 +1852,50 @@ fn continue_stopped_preexec(cmd: libc::pid_t) {
     unsafe { libc::kill(cmd, libc::SIGCONT) };
 }
 
+/// Uid and start time of the stopped command, before `SIGCONT`.
+/// Exec does not change the start time. A zero start is left unset
+/// so a later same-named process is not treated as this command's child.
+#[cfg(target_os = "macos")]
+fn capture_command_start(cmd: libc::pid_t) {
+    if identity_ready() {
+        return;
+    }
+    let Some(info) = bsdinfo(cmd) else {
+        return;
+    };
+    let sec = u64::from_ne_bytes(info[120..128].try_into().unwrap_or([0; 8]));
+    let usec = u64::from_ne_bytes(info[128..136].try_into().unwrap_or([0; 8]));
+    if sec == 0 && usec == 0 {
+        return;
+    }
+    unsafe {
+        let ident = &mut *std::ptr::addr_of_mut!(IDENT);
+        ident.uid = u32::from_ne_bytes(info[20..24].try_into().unwrap_or([0; 4]));
+        ident.sec = sec;
+        ident.usec = usec;
+    }
+}
+
+/// Use the program file name when the post-exec name was never read.
+#[cfg(target_os = "macos")]
+fn seal_expected_comm() {
+    if identity_ready() {
+        return;
+    }
+    let expected = unsafe { std::ptr::addr_of!(EXPECTED_COMM).read() };
+    if expected.iter().all(|byte| *byte == 0) {
+        return;
+    }
+    unsafe {
+        let ident = &mut *std::ptr::addr_of_mut!(IDENT);
+        if ident.sec == 0 && ident.usec == 0 {
+            return;
+        }
+        ident.comm = expected;
+        ident.ready = 1;
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn cache_command_identity(cmd: libc::pid_t, kq: i32) {
     for _ in 0..IDENTITY_POLLS {
@@ -1762,14 +1915,35 @@ fn cache_command_identity(cmd: libc::pid_t, kq: i32) {
     }
 }
 
-/// Live launchd child with this command's name, started with the
-/// command, and not already recorded. A full child buffer is a miss:
-/// the orphan may sit past the end.
+/// `pbi_comm` is 16 bytes and is not cleared past the terminating NUL.
+/// Compare the name, not the leftover bytes.
+#[cfg(target_os = "macos")]
+fn same_comm(left: &[u8], right: &[u8]) -> bool {
+    fn name(raw: &[u8]) -> &[u8] {
+        match raw.iter().position(|byte| *byte == 0) {
+            Some(i) => &raw[..i],
+            None => raw,
+        }
+    }
+    let left = name(left);
+    let right = name(right);
+    !left.is_empty() && left == right
+}
+
+/// Live launchd session leader with this command's name, started with
+/// the command. `setsid` is what makes that process a session leader.
+/// A same-group child is not one. A recorded pid is skipped: the exit
+/// path signals those rows, and a mid-run fork note must not stick a
+/// miss for a pid that kill still reaps. A full child buffer is a miss.
+/// The orphan may sit past the end.
 #[cfg(target_os = "macos")]
 fn untracked_same_name(parent: libc::pid_t) -> bool {
     remember_identity(parent);
     let cmd = unsafe { std::ptr::addr_of!(CMD_PID).read() };
     remember_identity(cmd);
+    if !identity_ready() {
+        seal_expected_comm();
+    }
     if !identity_ready() {
         return false;
     }
@@ -1781,14 +1955,21 @@ fn untracked_same_name(parent: libc::pid_t) -> bool {
     let mut kids = [0; 4096];
     let (n, trunc) = direct_children(1, &mut kids);
     for pid in kids.into_iter().take(n) {
-        if pid <= 0 || pid == cmd || pid == me || pid == parent || is_recorded(pid) {
+        if pid <= 0 || pid == cmd || pid == me || pid == parent {
+            continue;
+        }
+        if is_recorded(pid) {
             continue;
         }
         let Some(info) = bsdinfo(pid) else {
             continue;
         };
+        let flags = u32::from_ne_bytes(info[0..4].try_into().unwrap_or([0; 4]));
+        if flags & PROC_FLAG_SLEADER == 0 {
+            continue;
+        }
         let status = u32::from_ne_bytes(info[4..8].try_into().unwrap_or([0; 4]));
-        if status == 5 || &info[48..64] != ident.comm.as_slice() {
+        if status == 5 || !same_comm(&info[48..64], &ident.comm) {
             continue;
         }
         let ouid = u32::from_ne_bytes(info[20..24].try_into().unwrap_or([0; 4]));
@@ -1866,10 +2047,164 @@ fn missed() -> bool {
     unsafe { std::ptr::addr_of!(MISSED).read() != 0 }
 }
 
+/// Signal every recorded pid whose start time still matches, then wait
+/// once. A start of `0,0` is skipped: that row has no identity to tell
+/// a recycled pid apart. An unreadable start is not signaled for the
+/// same reason. A changed start means the pid was reused, so it is
+/// left alone. One deadline covers the whole table. `SIGTERM` stops
+/// the wait so the reaper can still write the report.
+#[cfg(target_os = "macos")]
+fn settle_recorded() {
+    let deadline = mono_ns().map(|now| now.saturating_add(SETTLE_NS));
+    for_each_recorded(|row| {
+        if row_matches_start(row) {
+            unsafe { libc::kill(row.pid, libc::SIGKILL) };
+        }
+    });
+    wait_matching_rows(deadline);
+}
+
+#[cfg(target_os = "macos")]
+fn for_each_recorded(mut body: impl FnMut(Row)) {
+    let n = unsafe { (*std::ptr::addr_of!(TABLE)).n };
+    for i in 0..n {
+        let row = unsafe { (*std::ptr::addr_of!(TABLE)).rows[i] };
+        body(row);
+    }
+    let n = unsafe { (*std::ptr::addr_of!(OVERFLOW)).n };
+    for i in 0..n {
+        let row = unsafe { (*std::ptr::addr_of!(OVERFLOW)).rows[i] };
+        body(row);
+    }
+}
+
+/// Stored start is real and `proc_pidinfo` still reports that same start.
+#[cfg(target_os = "macos")]
+fn row_matches_start(row: Row) -> bool {
+    if row.pid <= 0 || (row.sec == 0 && row.usec == 0) || !pid_alive(row.pid) {
+        return false;
+    }
+    match start_time(row.pid) {
+        Some((sec, usec)) => sec == row.sec && usec == row.usec,
+        None => false,
+    }
+}
+
+/// Still the signaled process, including the window where `kill(pid, 0)`
+/// works and `proc_pidinfo` does not.
+#[cfg(target_os = "macos")]
+fn row_pending(row: Row) -> bool {
+    if row.pid <= 0 || (row.sec == 0 && row.usec == 0) || !pid_alive(row.pid) {
+        return false;
+    }
+    match start_time(row.pid) {
+        Some((sec, usec)) => sec == row.sec && usec == row.usec,
+        None => true,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn any_pending() -> bool {
+    let mut pending = false;
+    for_each_recorded(|row| {
+        if row_pending(row) {
+            pending = true;
+        }
+    });
+    pending
+}
+
+#[cfg(target_os = "macos")]
+fn wait_matching_rows(deadline: Option<u64>) {
+    let mut spins = 0u32;
+    loop {
+        if STOP.load(Ordering::Relaxed) != 0 || !any_pending() {
+            break;
+        }
+        if let Some(end) = deadline {
+            match mono_ns() {
+                Some(now) if now >= end => break,
+                Some(_) => sleep_scan(),
+                None => {
+                    if yield_until_missed(&mut spins) {
+                        return;
+                    }
+                }
+            }
+        } else if yield_until_missed(&mut spins) {
+            return;
+        }
+    }
+    if any_pending() {
+        mark_missed();
+    }
+}
+
+/// A recorded pid with no start time is not signaled. If it is still
+/// running and readable, the report is a miss. A zombie `proc_pidinfo`
+/// cannot describe is not that pid.
+#[cfg(target_os = "macos")]
+fn recorded_left_running() -> bool {
+    let mut left = false;
+    for_each_recorded(|row| {
+        if row.pid <= 0 || row.sec != 0 || row.usec != 0 {
+            return;
+        }
+        if pid_alive(row.pid) && !proc_info_missing(row.pid) {
+            left = true;
+        }
+    });
+    left
+}
+
+#[cfg(target_os = "macos")]
+fn yield_until_missed(spins: &mut u32) -> bool {
+    *spins += 1;
+    if *spins >= 100_000 {
+        mark_missed();
+        return true;
+    }
+    unsafe { libc::sched_yield() };
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn mono_ns() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return None;
+    }
+    Some(
+        (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64),
+    )
+}
+
 fn write_report(fd: i32) {
     #[cfg(target_os = "macos")]
-    if untracked_same_name(0) {
-        mark_missed();
+    {
+        // `SIGKILL` does not reap a launchd child. `kill(pid, 0)` stays
+        // successful until launchd does. A clean report waits that out.
+        // One launchd snapshot can also miss a child that was reparented
+        // in this same exit.
+        settle_recorded();
+        if recorded_left_running() {
+            mark_missed();
+        }
+        for poll in 0..4 {
+            if untracked_same_name(0) {
+                mark_missed();
+                break;
+            }
+            if poll == 3 {
+                break;
+            }
+            sleep_scan();
+        }
     }
     if fd < 0 {
         return;
@@ -2311,5 +2646,405 @@ int main(int argc, char **argv) {
         let outcome = ran.join().expect("run thread");
         assert!(!continued, "post-exec stop was continued: {outcome:?}");
         assert!(saw_stop, "post-exec stop was not visible: {outcome:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn cc_bin(dir: &std::path::Path, name: &str, source: &str) -> Option<std::path::PathBuf> {
+        let src = dir.join(format!("{name}.c"));
+        let bin = dir.join(name);
+        std::fs::write(&src, source).ok()?;
+        let compiled = std::process::Command::new("cc")
+            .arg("-O2")
+            .arg("-o")
+            .arg(&bin)
+            .arg(&src)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()?;
+        compiled.success().then_some(bin)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn expected_comm_matches_kernel_image() {
+        let dir = tempfile::tempdir().expect("temp");
+        let Some(bin) = cc_bin(
+            dir.path(),
+            "wpcommatch",
+            "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n",
+        ) else {
+            return;
+        };
+        let mut child = std::process::Command::new(&bin)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let pid = child.id() as libc::pid_t;
+        let info = super::bsdinfo(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        let info = info.expect("bsdinfo");
+        let want = super::expected_comm_bytes(bin.as_os_str());
+        assert!(
+            super::same_comm(&info[48..64], &want),
+            "kernel comm {:02x?} wanted {:02x?}",
+            &info[48..64],
+            &want
+        );
+        assert!(super::same_comm(b"wpcommatch\0garbage!", &want));
+        // `pbi_comm` keeps 15 bytes plus NUL. A 16-byte file name must
+        // still match the live kernel name, or the unsampled setsid
+        // scan misses that session leader.
+        for name in ["abcdefghijklmnop", "abcdefghijklmnopq"] {
+            let Some(wide) = cc_bin(
+                dir.path(),
+                name,
+                "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n",
+            ) else {
+                return;
+            };
+            let mut wide_child = std::process::Command::new(&wide)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn long name");
+            let wide_pid = wide_child.id() as libc::pid_t;
+            let wide_info = super::bsdinfo(wide_pid);
+            let _ = wide_child.kill();
+            let _ = wide_child.wait();
+            let wide_info = wide_info.expect("bsdinfo");
+            let wide_want = super::expected_comm_bytes(wide.as_os_str());
+            assert!(
+                super::same_comm(&wide_info[48..64], &wide_want),
+                "kernel comm {:02x?} wanted {:02x?} for {name}",
+                &wide_info[48..64],
+                &wide_want
+            );
+        }
+        let long = super::expected_comm_bytes(std::ffi::OsStr::new("abcdefghijklmnopqrstuvwxyz"));
+        assert_eq!(&long[..], b"abcdefghijklmno\0");
+    }
+
+    #[test]
+    fn expected_comm_stores_fifteen_bytes_and_a_nul() {
+        let long = super::expected_comm_bytes(std::ffi::OsStr::new("abcdefghijklmnopqrstuvwxyz"));
+        assert_eq!(&long[..], b"abcdefghijklmno\0");
+    }
+
+    /// No post-exec name, and the command's child list stays empty.
+    /// A `setsid` orphan must not come back as success. A command that
+    /// does not fork must not come back as `Descendants`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unsampled_name_reports_a_setsid_orphan_and_keeps_a_quiet_command() {
+        if !crate::kernel_supported() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp");
+        let Some(quiet) = cc_bin(dir.path(), "wpquietcmd", "int main(void) { return 0; }\n") else {
+            return;
+        };
+        let Some(racer) = cc_bin(
+            dir.path(),
+            "wpracer16",
+            r#"
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    pid_t pid;
+    FILE *handle;
+    int fd;
+    if (argc < 2) return 2;
+    pid = fork();
+    if (pid < 0) return 1;
+    if (pid == 0) {
+        if (setsid() < 0) _exit(1);
+        fd = open("/dev/null", O_RDWR);
+        if (fd >= 0) {
+            dup2(fd, 0);
+            dup2(fd, 1);
+            dup2(fd, 2);
+            if (fd > 2) close(fd);
+        }
+        for (;;) pause();
+    }
+    handle = fopen(argv[1], "w");
+    if (handle == 0) _exit(1);
+    fprintf(handle, "%ld\n", (long)pid);
+    fclose(handle);
+    _exit(0);
+}
+"#,
+        ) else {
+            return;
+        };
+
+        let _guard = super::arm_unsampled_name();
+        let policy = crate::process_jail(dir.path(), std::iter::empty::<&std::path::Path>())
+            .expect("policy");
+        let mut quiet_cmd = std::process::Command::new(&quiet);
+        quiet_cmd
+            .current_dir(dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        policy
+            .apply_pre_exec(&mut quiet_cmd)
+            .expect("quiet pre_exec");
+        let mut quiet_child = match quiet_cmd.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                policy.discard_pre_exec();
+                panic!("quiet spawn: {err}");
+            }
+        };
+        let quiet_status = quiet_child.wait().expect("quiet wait");
+        let quiet_finish = policy
+            .finish_pre_exec(quiet_status, false)
+            .expect("a command that does not fork is not a descendant miss");
+        assert!(quiet_finish.success(), "{quiet_finish}");
+
+        let pid_path = dir.path().join("child.pid");
+        let mut race = std::process::Command::new(&racer);
+        race.current_dir(dir.path())
+            .arg(&pid_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        policy.apply_pre_exec(&mut race).expect("race pre_exec");
+        let mut race_child = match race.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                policy.discard_pre_exec();
+                panic!("race spawn: {err}");
+            }
+        };
+        let race_status = race_child.wait().expect("race wait");
+        let recorded = std::fs::read_to_string(&pid_path).unwrap_or_default();
+        let recorded = recorded.trim().to_string();
+        let alive = !recorded.is_empty()
+            && std::process::Command::new("/bin/kill")
+                .args(["-0", &recorded])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+        let finished = policy.finish_pre_exec(race_status, false);
+        if !recorded.is_empty() {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-9", &recorded])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        assert!(
+            alive,
+            "hiding the command's children must leave pid {recorded} alive"
+        );
+        assert!(
+            matches!(finished, Err(crate::KernelError::Descendants)),
+            "an unreaped setsid child must be Descendants, got {finished:?}"
+        );
+    }
+
+    /// Same missing name sample. The orphan did not call `setsid`, so
+    /// it is not a session leader. It stays alive and is not
+    /// `Descendants`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unsampled_name_keeps_a_non_setsid_orphan() {
+        if !crate::kernel_supported() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp");
+        let Some(plain) = cc_bin(
+            dir.path(),
+            "wpplain16",
+            r#"
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    pid_t pid;
+    FILE *handle;
+    int fd;
+    if (argc < 2) return 2;
+    pid = fork();
+    if (pid < 0) return 1;
+    if (pid == 0) {
+        fd = open("/dev/null", O_RDWR);
+        if (fd >= 0) {
+            dup2(fd, 0);
+            dup2(fd, 1);
+            dup2(fd, 2);
+            if (fd > 2) close(fd);
+        }
+        for (;;) pause();
+    }
+    handle = fopen(argv[1], "w");
+    if (handle == 0) _exit(1);
+    fprintf(handle, "%ld\n", (long)pid);
+    fclose(handle);
+    _exit(0);
+}
+"#,
+        ) else {
+            return;
+        };
+
+        let _guard = super::arm_unsampled_name();
+        let policy = crate::process_jail(dir.path(), std::iter::empty::<&std::path::Path>())
+            .expect("policy");
+        let pid_path = dir.path().join("child.pid");
+        let mut cmd = std::process::Command::new(&plain);
+        cmd.current_dir(dir.path())
+            .arg(&pid_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        policy.apply_pre_exec(&mut cmd).expect("pre_exec");
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                policy.discard_pre_exec();
+                panic!("spawn: {err}");
+            }
+        };
+        let status = child.wait().expect("wait");
+        let recorded = std::fs::read_to_string(&pid_path).unwrap_or_default();
+        let recorded = recorded.trim().to_string();
+        let recorded_pid = recorded.parse::<libc::pid_t>().unwrap_or(0);
+        let alive = recorded_pid > 0
+            && std::process::Command::new("/bin/kill")
+                .args(["-0", &recorded])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+        let leader = super::bsdinfo(recorded_pid).is_some_and(|info| {
+            let flags = u32::from_ne_bytes(info[0..4].try_into().unwrap_or([0; 4]));
+            flags & super::PROC_FLAG_SLEADER != 0
+        });
+        let finished = policy.finish_pre_exec(status, false);
+        if recorded_pid > 0 {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-9", &recorded])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        assert!(
+            alive,
+            "the non-setsid orphan must still be alive, pid {recorded}"
+        );
+        assert!(!leader, "the fixture must not be a session leader");
+        assert!(
+            finished.is_ok(),
+            "a live orphan that did not call setsid must not be Descendants, got {finished:?}"
+        );
+    }
+
+    /// `fork` plus `wait` leaves no pid to watch. That must not fail the
+    /// knote: the parent already reaped the child.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn waited_pid_does_not_fail_the_fork_watch() {
+        let mut status = 0;
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid);
+        let kq = unsafe { libc::kqueue() };
+        assert!(kq >= 0, "kqueue");
+        let armed = super::arm_knote_macos(kq, pid);
+        unsafe { libc::close(kq) };
+        assert!(
+            armed,
+            "a pid the parent already waited for must not fail the watch"
+        );
+    }
+
+    /// A recorded `setsid` orphan is outside `killpg`. The report is
+    /// clean only when that pid is already gone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recorded_live_setsid_orphan_is_not_a_clean_report() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let mid = unsafe { libc::fork() };
+        assert!(mid >= 0, "fork");
+        if mid == 0 {
+            unsafe {
+                libc::close(fds[0]);
+                let grand = libc::fork();
+                if grand == 0 {
+                    if libc::setsid() < 0 {
+                        libc::_exit(1);
+                    }
+                    loop {
+                        libc::pause();
+                    }
+                }
+                let bytes = grand.to_ne_bytes();
+                let _ = libc::write(fds[1], bytes.as_ptr().cast(), bytes.len());
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(fds[1]) };
+        let mut raw = [0u8; std::mem::size_of::<libc::pid_t>()];
+        let n = unsafe { libc::read(fds[0], raw.as_mut_ptr().cast(), raw.len()) };
+        unsafe { libc::close(fds[0]) };
+        assert_eq!(n, raw.len() as isize, "child pid");
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(mid, &mut status, 0) }, mid);
+        let pid = libc::pid_t::from_ne_bytes(raw);
+        struct KillOnDrop(libc::pid_t);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                if self.0 > 0 {
+                    unsafe { libc::kill(self.0, libc::SIGKILL) };
+                }
+            }
+        }
+        let _kill = KillOnDrop(pid);
+        let info = super::bsdinfo(pid).expect("orphan is visible");
+        let flags = u32::from_ne_bytes(info[0..4].try_into().unwrap_or([0; 4]));
+        assert_ne!(
+            flags & super::PROC_FLAG_SLEADER,
+            0,
+            "fixture must be a session leader"
+        );
+        let ppid = libc::pid_t::from_ne_bytes(info[16..20].try_into().unwrap_or([0; 4]));
+        assert_eq!(ppid, 1, "orphan must already belong to launchd");
+        super::reset_tracking();
+        unsafe {
+            let ident = &mut *std::ptr::addr_of_mut!(super::IDENT);
+            ident.comm.copy_from_slice(&info[48..64]);
+            ident.uid = u32::from_ne_bytes(info[20..24].try_into().unwrap_or([0; 4]));
+            ident.sec = u64::from_ne_bytes(info[120..128].try_into().unwrap_or([0; 8]));
+            ident.usec = u64::from_ne_bytes(info[128..136].try_into().unwrap_or([0; 8]));
+            ident.ready = 1;
+        }
+        assert!(super::remember(pid) == super::Remember::Stored);
+        assert!(super::is_recorded(pid));
+        // The fork note can arrive after this pid is recorded and
+        // launchd has adopted it. Killing it at exit must not leave
+        // the miss that scan set.
+        super::on_fork(mid, -1, true);
+        super::write_report(-1);
+        let still = super::pid_alive(pid);
+        let missed = super::missed();
+        super::reset_tracking();
+        assert!(
+            !still,
+            "a recorded setsid orphan must be gone before a clean report"
+        );
+        assert!(
+            !missed,
+            "a recorded setsid orphan that was reaped must not stick as a miss"
+        );
     }
 }

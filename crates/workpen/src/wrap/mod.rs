@@ -121,8 +121,10 @@ pub enum KernelError {
     /// Child finished; DACL restore failed. Hosts match this, not English.
     #[error("kernel wrap restore failed: {0}")]
     Restore(String),
-    /// A descendant pid did not fit in the recorded set, or macOS left a
-    /// live process with the command's name outside that set.
+    /// A descendant pid did not fit in the recorded set, or macOS left
+    /// a recorded pid running. macOS also returns this when a live
+    /// session leader with the command's name is outside that set.
+    /// That session leader called `setsid`.
     /// [`KernelPolicy::run_child`] returns this instead of the child
     /// status. Hosts that spawn after [`KernelPolicy::apply_pre_exec`]
     /// get it from [`KernelPolicy::finish_pre_exec`] on that same thread.
@@ -1192,13 +1194,14 @@ impl KernelPolicy {
             // `OwnedFd`. `fork` gives the child its own copy.
             let report = reaper::open_report();
             let report_fd = report.write_raw();
+            let expected_comm = reaper::expected_comm_bytes(cmd.get_program());
             unsafe {
                 use std::os::unix::process::CommandExt;
                 cmd.pre_exec(move || {
                     // Mark inherited descriptors before the reaper fork so a
                     // soft limit that cannot be covered fails spawn here.
                     reaper::cloexec_inherited_fds()?;
-                    reaper::supervise_or_continue(report_fd)?;
+                    reaper::supervise_or_continue(report_fd, expected_comm)?;
                     #[cfg(target_os = "linux")]
                     linux::apply_dest_deny_remounts(&dests, &workspace, require_remount)?;
                     #[cfg(not(target_os = "linux"))]
