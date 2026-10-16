@@ -269,13 +269,20 @@ pub(super) fn take_descendant_report(timed_out: bool) -> bool {
     }
 }
 
-/// Last path component, truncated to the 16-byte `pbi_comm` field.
+/// Program file name in the shape macOS stores in `pbi_comm`.
+///
+/// The field is 16 bytes. The kernel copies with `strlcpy`, so the
+/// name is at most 15 bytes and the last byte stays NUL. Copying all
+/// 16 file-name bytes leaves no NUL, so that session leader does not
+/// match. A shebang's kernel name is the interpreter. Sealing the
+/// interpreter would match every other session leader with that name,
+/// so this stays the program file name.
 pub(super) fn expected_comm_bytes(program: &std::ffi::OsStr) -> [u8; 16] {
     use std::os::unix::ffi::OsStrExt;
     let name = std::path::Path::new(program).file_name().unwrap_or(program);
     let bytes = name.as_bytes();
     let mut out = [0u8; 16];
-    let n = bytes.len().min(out.len());
+    let n = bytes.len().min(out.len() - 1);
     out[..n].copy_from_slice(&bytes[..n]);
     out
 }
@@ -2686,9 +2693,44 @@ int main(int argc, char **argv) {
             &info[48..64],
             &want
         );
-        let long = super::expected_comm_bytes(std::ffi::OsStr::new("abcdefghijklmnopqrstuvwxyz"));
-        assert_eq!(&long[..], b"abcdefghijklmnop");
         assert!(super::same_comm(b"wpcommatch\0garbage!", &want));
+        // `pbi_comm` keeps 15 bytes plus NUL. A 16-byte file name must
+        // still match the live kernel name, or the unsampled setsid
+        // scan misses that session leader.
+        for name in ["abcdefghijklmnop", "abcdefghijklmnopq"] {
+            let Some(wide) = cc_bin(
+                dir.path(),
+                name,
+                "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n",
+            ) else {
+                return;
+            };
+            let mut wide_child = std::process::Command::new(&wide)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn long name");
+            let wide_pid = wide_child.id() as libc::pid_t;
+            let wide_info = super::bsdinfo(wide_pid);
+            let _ = wide_child.kill();
+            let _ = wide_child.wait();
+            let wide_info = wide_info.expect("bsdinfo");
+            let wide_want = super::expected_comm_bytes(wide.as_os_str());
+            assert!(
+                super::same_comm(&wide_info[48..64], &wide_want),
+                "kernel comm {:02x?} wanted {:02x?} for {name}",
+                &wide_info[48..64],
+                &wide_want
+            );
+        }
+        let long = super::expected_comm_bytes(std::ffi::OsStr::new("abcdefghijklmnopqrstuvwxyz"));
+        assert_eq!(&long[..], b"abcdefghijklmno\0");
+    }
+
+    #[test]
+    fn expected_comm_stores_fifteen_bytes_and_a_nul() {
+        let long = super::expected_comm_bytes(std::ffi::OsStr::new("abcdefghijklmnopqrstuvwxyz"));
+        assert_eq!(&long[..], b"abcdefghijklmno\0");
     }
 
     /// No post-exec name, and the command's child list stays empty.
