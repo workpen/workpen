@@ -90,8 +90,9 @@ spawn-only run is [examples/run-echo.sh](examples/run-echo.sh). On
 Linux, if the kernel cannot hide secret names, `workpen run` does not
 start the child.
 
-`--timeout 1s` stops the command when that time is up. The process
-exits 124. Units are `s`, `m`, `h`, and `d`.
+`--timeout 1s` stops the command when that time is up, including
+startup on macOS. The process exits 124. Units are `s`, `m`, `h`,
+and `d`.
 
 Commands: `why`, `run`, `policy`, `gc`, `init`, `doctor`. `workpen --help` prints usage. `workpen doctor` reports whether this machine can jail a child and does not start one.
 
