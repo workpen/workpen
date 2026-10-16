@@ -31,7 +31,10 @@ fn help_names_why_run_and_gc() {
             stdout.contains("run"),
             "{arg} stdout must name run: {stdout}"
         );
-        assert!(stdout.contains("gc"), "{arg} stdout must name gc: {stdout}");
+        assert!(
+            stdout.contains("gc reclaims"),
+            "{arg} stdout must name gc: {stdout}"
+        );
         assert!(
             stdout.contains("network") && stdout.contains("read-write"),
             "{arg} must describe the network default and extra-root access: {stdout}"
@@ -844,8 +847,9 @@ fn run_short_v_after_command_without_dashdash() {
         "echo -V must run, stdout={stdout} stderr={}",
         String::from_utf8_lossy(&bare.stderr)
     );
-    assert!(
-        stdout.contains("-V"),
+    assert_eq!(
+        stdout.trim(),
+        "-V",
         "echo must print -V, not the workpen version: {stdout}"
     );
     assert!(!stdout.contains(env!("CARGO_PKG_VERSION")));
@@ -1212,7 +1216,7 @@ fn run_env_scrubs_tokens_and_keeps_opt_in() {
         "relative echo after --env-clear must run, stderr={}",
         String::from_utf8_lossy(&cleared.stderr)
     );
-    assert!(stdout.contains("ok"), "{stdout}");
+    assert_eq!(stdout.trim(), "ok", "{stdout}");
 
     let echo_flag = workpen()
         .args(["run", "--root"])

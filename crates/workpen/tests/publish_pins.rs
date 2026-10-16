@@ -169,7 +169,10 @@ fn docs_rs_metadata_enables_nono_and_gc_without_default_features() {
     let manifest = read(&root.join("crates/workpen/Cargo.toml"));
     let docs_rs = section_after(&manifest, "[package.metadata.docs.rs]");
     assert!(
-        docs_rs.contains("nono") && docs_rs.contains("gc"),
+        docs_rs.lines().any(|line| {
+            let trimmed = line.trim();
+            trimmed.contains("nono") && trimmed.contains("\"gc\"")
+        }),
         "docs.rs metadata must enable nono and gc, got {docs_rs}"
     );
     let features = section_after(&manifest, "[features]");
