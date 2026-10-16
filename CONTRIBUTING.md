@@ -46,6 +46,25 @@ Read [CONSTITUTION.md](CONSTITUTION.md) before changing license, org,
 CLI name, or kernel strategy. The CLI name is `workpen`. Do not
 vendor bubblewrap.
 
+## nono dependency
+
+`crates/workpen/Cargo.toml` pins nono with `default-features = false`.
+The CLI enables the `nono` feature. That feature is the kernel wrap.
+Do not drop it, and do not turn nono's default features back on.
+
+`reqwest` is not a package in `Cargo.lock`. `aws-lc-sys` still is.
+nono 0.80 depends on `sigstore-verify` with no feature to omit it, and
+`sigstore-verify` 0.14 enables `rustls-webpki`'s `aws-lc-rs` feature
+with no flag to turn that off. `cargo tree -p workpen-cli -e normal -i
+reqwest --locked` exits non-zero. The same command for `aws-lc-sys`
+exits 0.
+
+Do not fork nono, vendor a stripped copy, or add a `[patch]`. Upstream
+tracking is
+[nolabs-ai/nono#2029](https://github.com/nolabs-ai/nono/issues/2029)
+and
+[nolabs-ai/nono#2030](https://github.com/nolabs-ai/nono/pull/2030).
+
 ## Pull requests
 
 Use a Conventional Commits title (`feat:`, `fix:`, `docs:`, `chore:`).
