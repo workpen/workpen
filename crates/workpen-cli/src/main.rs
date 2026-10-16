@@ -814,6 +814,13 @@ fn check_dest_json(code: u8, err: &CheckDestError) -> String {
             let shown = path.display().to_string();
             json_line("denied", code, Some(&shown), None, Some("path_guard"))
         }
+        CheckDestError::PathGuard(PathGuardError::Denied(deny)) => json_line(
+            "denied",
+            code,
+            Some(&deny.display),
+            None,
+            Some("path_guard"),
+        ),
         CheckDestError::SpecialFile { path, kind } => {
             json_line("denied", code, Some(path), Some(kind), Some("special_file"))
         }

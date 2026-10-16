@@ -1568,7 +1568,8 @@ fn policy_json_names_an_outside_argv_path() {
     assert!(
         line.contains("\"result\":\"denied\"")
             && line.contains("\"exit\":3")
-            && line.contains("\"kind\":\"path_guard\""),
+            && line.contains("\"kind\":\"path_guard\"")
+            && line.contains(shown),
         "{line}"
     );
     assert!(!stdout.contains("OUTSIDE"), "{stdout}");
