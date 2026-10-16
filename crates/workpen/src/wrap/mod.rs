@@ -9,7 +9,11 @@
 //! child hook. Hosts that need a jail on every OS call
 //! [`KernelPolicy::run_child`], which errors instead of spawning when
 //! the kernel cannot apply. The default crate (`default = []`) does not
-//! compile this module.
+//! compile this module. nono is pinned with `default-features = false`.
+//! That build does not depend on `reqwest`. nono still depends on
+//! `sigstore-verify`, which links `aws-lc-sys`. There is no nono feature
+//! that drops `aws-lc-sys`. Do not enable nono's default features, and
+//! do not fork nono.
 
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]

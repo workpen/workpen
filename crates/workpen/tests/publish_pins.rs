@@ -163,6 +163,62 @@ fn publish_status_names_the_manifest_and_keeps_the_release_gate() {
     );
 }
 
+/// `reqwest` must stay out of the locked tree. `aws-lc-sys` stays until
+/// nono can omit `sigstore-verify`. See CONTRIBUTING.md.
+#[test]
+fn cli_lock_omits_reqwest_and_keeps_nono_defaults_off() {
+    let root = repo_root();
+    let manifest = read(&root.join("crates/workpen/Cargo.toml"));
+    let nono = manifest
+        .lines()
+        .find(|line| line.trim_start().starts_with("nono = {"))
+        .expect("unix nono dependency");
+    assert!(
+        nono.contains("optional = true"),
+        "nono must stay optional: {nono}"
+    );
+    assert!(
+        nono.contains("default-features = false"),
+        "nono default features must stay off: {nono}"
+    );
+    assert!(
+        !nono.contains("default-features = true"),
+        "do not turn nono default features on: {nono}"
+    );
+
+    let cli = read(&root.join("crates/workpen-cli/Cargo.toml"));
+    assert!(
+        cli.contains("features = [\"gc\", \"nono\"]"),
+        "the CLI must keep the nono jail"
+    );
+
+    let lock = read(&root.join("Cargo.lock"));
+    assert!(
+        !lock.lines().any(|line| line.trim() == "name = \"reqwest\""),
+        "reqwest is back in Cargo.lock"
+    );
+    assert!(
+        lock.lines()
+            .any(|line| line.trim() == "name = \"aws-lc-sys\""),
+        "aws-lc-sys left the lock; update the CONTRIBUTING nono note"
+    );
+
+    let contributing = read(&root.join("CONTRIBUTING.md"));
+    let note = section_after(&contributing, "## nono dependency");
+    assert!(note.contains("default-features = false"));
+    assert!(note.contains("aws-lc-sys"));
+    assert!(note.contains("https://github.com/nolabs-ai/nono/issues/2029"));
+    assert!(
+        !note.contains("HTTP crates are gone"),
+        "the note must not claim the C toolchain crate is gone"
+    );
+
+    let rustdoc = read(&root.join("crates/workpen/src/wrap/mod.rs"));
+    assert!(rustdoc.contains("does not depend on `reqwest`"));
+    assert!(rustdoc.contains("links `aws-lc-sys`"));
+    assert!(rustdoc.contains("no nono feature"));
+}
+
 #[test]
 fn docs_rs_metadata_enables_nono_and_gc_without_default_features() {
     let root = repo_root();
