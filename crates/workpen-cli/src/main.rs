@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use workpen::{
     CheckDestError, DenyPolicy, DestDenyError, ExtraRootError, GcConfig, GcDecision, KernelError,
-    PathGuard, PathGuardError, check_command_argv, dest_under_root, parse_max_age,
+    PathGuard, PathGuardError, check_command_argv_with_guard, dest_under_root, parse_max_age,
     resolve_extra_root_pair, resolve_workspace_root, run_gc_with_policy,
 };
 
@@ -335,6 +335,11 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
         Err(PathGuardError::Home(path)) => return refuse_home(json, path),
         Err(err) => return Err(err.to_string()),
     };
+    let argv_guard = match argv_path_guard(guard.canon_root(), &extras, &read_canon) {
+        Ok(guard) => guard,
+        Err(PathGuardError::Home(path)) => return refuse_home(json, path),
+        Err(err) => return Err(err.to_string()),
+    };
     let mut jail = match workpen::process_jail(guard.canon_root(), &presented) {
         Ok(policy) => policy.with_require_dest_hide().with_network(!allow_net),
         Err(err @ KernelError::Home(_))
@@ -354,7 +359,8 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
     if report {
         print_policy(&jail, &policy);
         if !cmd.is_empty()
-            && let Err(err) = check_command_argv(cmd, guard.canon_root(), &policy)
+            && let Err(err) =
+                check_command_argv_with_guard(cmd, guard.canon_root(), &policy, Some(&argv_guard))
         {
             if json {
                 println!("{}", check_dest_json(3, &err));
@@ -364,7 +370,9 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    if let Err(err) = check_command_argv(cmd, guard.canon_root(), &policy) {
+    if let Err(err) =
+        check_command_argv_with_guard(cmd, guard.canon_root(), &policy, Some(&argv_guard))
+    {
         return check_dest_status(json, 3, &err);
     }
     let resolved = match resolve_child_program(&cmd[0], guard.canon_root()) {
@@ -774,6 +782,17 @@ fn check_dest_status(json: bool, code: u8, err: &CheckDestError) -> Result<ExitC
         eprintln!("{err}");
         Ok(ExitCode::from(code))
     }
+}
+
+fn argv_path_guard(
+    workspace: &Path,
+    write_extras: &[PathBuf],
+    read_roots: &[PathBuf],
+) -> Result<PathGuard, PathGuardError> {
+    let mut roots = Vec::with_capacity(write_extras.len() + read_roots.len());
+    roots.extend(write_extras.iter().cloned());
+    roots.extend(read_roots.iter().cloned());
+    PathGuard::with_extra_roots(workspace, roots)
 }
 
 fn check_dest_json(code: u8, err: &CheckDestError) -> String {

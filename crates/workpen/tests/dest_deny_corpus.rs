@@ -5,11 +5,12 @@ use std::path::Path;
 
 use workpen::{
     AGENT_LOCK_NAME, AgentLockError, CheckDestError, DenyPolicy, DestDeny, DestDenyError,
-    DestDenyKind, PathGuard, check_command_argv, check_command_dests, check_dest, classify_dest,
-    default_secret_denies, deny_patch_dests, deny_patch_dests_with_display, dest_deny_glob_regex,
-    dest_deny_message, is_env_template_basename, is_path_denied, open_verified_read,
-    path_is_denied_glob, path_is_denied_under_root, path_matches_deny_glob,
-    reject_command_secret_path_tokens, validate_deny_glob, verify_post_open,
+    DestDenyKind, PathGuard, check_command_argv, check_command_argv_with_guard,
+    check_command_dests, check_dest, classify_dest, default_secret_denies, deny_patch_dests,
+    deny_patch_dests_with_display, dest_deny_glob_regex, dest_deny_message,
+    is_env_template_basename, is_path_denied, open_verified_read, path_is_denied_glob,
+    path_is_denied_under_root, path_matches_deny_glob, reject_command_secret_path_tokens,
+    validate_deny_glob, verify_post_open,
 };
 
 /// `matches deny glob **/.env` must not pass when wording only names `**/.env.*`.
@@ -436,6 +437,54 @@ fn check_command_argv_denies_spaced_hardlink_token() {
         }
         other => panic!("expected DestDeny HardlinkSibling, got {other:?}"),
     }
+}
+
+#[test]
+fn check_command_argv_with_guard_refuses_an_outside_path() {
+    let ws = tempfile::tempdir().expect("workspace");
+    let outside = tempfile::tempdir().expect("outside");
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, "OUTSIDE\n").expect("secret");
+    let guard = PathGuard::with_extra_roots(ws.path(), std::iter::empty::<&Path>()).expect("guard");
+    let err = check_command_argv_with_guard(
+        &["/bin/cat", secret.to_str().expect("utf8")],
+        ws.path(),
+        &DenyPolicy::default(),
+        Some(&guard),
+    )
+    .expect_err("outside argv must escape");
+    assert!(
+        matches!(err, CheckDestError::PathGuard(_)),
+        "expected PathGuard, got {err:?}"
+    );
+    let shell = format!("cat {}", secret.display());
+    let err = check_command_argv_with_guard(
+        &["/bin/sh", "-c", shell.as_str()],
+        ws.path(),
+        &DenyPolicy::default(),
+        Some(&guard),
+    )
+    .expect_err("sh -c outside path must escape");
+    assert!(
+        matches!(err, CheckDestError::PathGuard(_)),
+        "expected PathGuard from sh -c, got {err:?}"
+    );
+}
+
+#[test]
+fn check_command_argv_with_guard_allows_an_extra_root() {
+    let ws = tempfile::tempdir().expect("workspace");
+    let extra = tempfile::tempdir().expect("extra");
+    let file = extra.path().join("readme.txt");
+    std::fs::write(&file, "ok\n").expect("readme");
+    let guard = PathGuard::with_extra_roots(ws.path(), [extra.path()]).expect("guard");
+    check_command_argv_with_guard(
+        &["/bin/cat", file.to_str().expect("utf8")],
+        ws.path(),
+        &DenyPolicy::default(),
+        Some(&guard),
+    )
+    .expect("extra-root argv stays allowed");
 }
 
 #[test]
