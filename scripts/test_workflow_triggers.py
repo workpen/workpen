@@ -93,13 +93,23 @@ class WorkflowTriggerTests(unittest.TestCase):
     def test_release_please_uses_app_token(self) -> None:
         text = (WORKFLOWS / "release-please.yml").read_text(encoding="utf-8")
         pin = "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
+        token = "token: ${{ steps.app-token.outputs.token }}"
         self.assertEqual(text.count(pin), 2)
         self.assertEqual(text.count("id: app-token"), 2)
-        self.assertIn("client-id: ${{ vars.AUTO_APPROVE_CLIENT_ID }}", text)
-        self.assertIn("private-key: ${{ secrets.AUTO_APPROVE_PRIVATE_KEY }}", text)
-        self.assertIn("token: ${{ steps.app-token.outputs.token }}", text)
+        self.assertEqual(
+            text.count("client-id: ${{ vars.AUTO_APPROVE_CLIENT_ID }}"), 2
+        )
+        self.assertEqual(
+            text.count("private-key: ${{ secrets.AUTO_APPROVE_PRIVATE_KEY }}"),
+            2,
+        )
+        self.assertEqual(text.count(token), 2)
+        release, sync = text.split("sync-release-pr-versions:", 1)
+        self.assertIn(token, release)
+        self.assertIn(token, sync)
         self.assertNotIn("secrets.GITHUB_TOKEN", text)
         self.assertNotIn("x-access-token:", text)
+        self.assertNotIn("persist-credentials:", text)
 
     def test_auto_merge_skips_release_please_head(self) -> None:
         text = (WORKFLOWS / "auto-approve.yml").read_text(encoding="utf-8")
