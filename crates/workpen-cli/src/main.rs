@@ -356,7 +356,11 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
         if !cmd.is_empty()
             && let Err(err) = check_command_argv(cmd, guard.canon_root(), &policy)
         {
-            println!("would-deny: {err}");
+            if json {
+                println!("{}", check_dest_json(3, &err));
+            } else {
+                println!("would-deny: {err}");
+            }
         }
         return Ok(ExitCode::SUCCESS);
     }
