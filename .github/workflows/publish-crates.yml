@@ -1,5 +1,7 @@
 # Publish on a vX.Y.Z tag via crates.io trusted publishing (OIDC).
 # Do not publish until a human says launch. publish = false until then.
+# The tag push starts this job when release-please uses the
+# workpen-release app. The default Actions token does not.
 name: Publish crates.io
 
 on:

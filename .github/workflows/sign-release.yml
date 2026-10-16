@@ -1,7 +1,8 @@
 # Build the CLI for each Unix triple, attest SLSA provenance, and attach
 # both to the GitHub Release. Scorecard Signed-Releases reads `.intoto.jsonl`
-# assets, not the Attestations API. GITHUB_TOKEN tags do not fire push:tags;
-# release.published from release-please does fire this workflow.
+# assets, not the Attestations API. release-please publishes with the
+# workpen-release app, so this release event starts. The default
+# Actions token does not start it. workflow_dispatch tag= is the fallback.
 # The next published tag packs these archives. v0.6.0 is not re-signed.
 name: Sign release
 
