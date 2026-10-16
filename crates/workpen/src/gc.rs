@@ -1150,8 +1150,35 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String, GcError> {
     git_text(&op, out)
 }
 
+fn join_pipe(
+    op: &str,
+    which: &str,
+    task: std::thread::ScopedJoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<Vec<u8>, GcError> {
+    match task.join() {
+        Ok(Ok(buf)) => Ok(buf),
+        Ok(Err(err)) => Err(GcError::Git {
+            op: op.into(),
+            detail: format!("{which} pipe: {err}"),
+        }),
+        Err(_) => Err(GcError::Git {
+            op: op.into(),
+            detail: format!("{which} reader panicked"),
+        }),
+    }
+}
+
+/// Feed `stdin` to one git process and return its stdout.
+///
+/// Git flushes an ack after each stdin transaction before it reads the
+/// next command. Drain both pipes during the write. Waiting until the
+/// write finishes fills the pipe after a few thousand transactions, and
+/// git stops reading. [`remove_explicit`] and age gc send those
+/// transactions through here. Close stdin before joining the readers.
+/// Joining first deadlocks if git is still waiting for the rest of the
+/// script.
 fn git_stdin(cwd: &Path, args: &[&str], stdin: &str) -> Result<String, GcError> {
-    use std::io::Write;
+    use std::io::{Read, Write};
     let op = args.join(" ");
     let mut child = git_command(cwd)
         .args(args)
@@ -1163,28 +1190,67 @@ fn git_stdin(cwd: &Path, args: &[&str], stdin: &str) -> Result<String, GcError> 
             op: op.clone(),
             detail: e.to_string(),
         })?;
-    let write_result = match child.stdin.take() {
-        Some(mut input) => input.write_all(stdin.as_bytes()),
-        None => {
-            let _ = child.wait();
-            return Err(GcError::Git {
-                op,
-                detail: "stdin was not piped".into(),
-            });
-        }
-    };
-    if let Err(err) = write_result {
+    let Some(mut input) = child.stdin.take() else {
         let _ = child.wait();
         return Err(GcError::Git {
             op,
-            detail: err.to_string(),
+            detail: "stdin was not piped".into(),
         });
-    }
-    let out = child.wait_with_output().map_err(|e| GcError::Git {
-        op: op.clone(),
-        detail: e.to_string(),
-    })?;
-    git_text(&op, out)
+    };
+    let Some(mut stdout_pipe) = child.stdout.take() else {
+        drop(input);
+        let _ = child.wait();
+        return Err(GcError::Git {
+            op,
+            detail: "stdout was not piped".into(),
+        });
+    };
+    let Some(mut stderr_pipe) = child.stderr.take() else {
+        drop(input);
+        drop(stdout_pipe);
+        let _ = child.wait();
+        return Err(GcError::Git {
+            op,
+            detail: "stderr was not piped".into(),
+        });
+    };
+    std::thread::scope(|scope| {
+        let stdout_task = scope.spawn(|| {
+            let mut buf = Vec::new();
+            stdout_pipe.read_to_end(&mut buf).map(|_| buf)
+        });
+        let stderr_task = scope.spawn(|| {
+            let mut buf = Vec::new();
+            stderr_pipe.read_to_end(&mut buf).map(|_| buf)
+        });
+        let write_result = input.write_all(stdin.as_bytes());
+        drop(input);
+        let status = child.wait().map_err(|e| GcError::Git {
+            op: op.clone(),
+            detail: e.to_string(),
+        })?;
+        let stdout_bytes = join_pipe(&op, "stdout", stdout_task)?;
+        let stderr_bytes = join_pipe(&op, "stderr", stderr_task)?;
+        if let Err(err) = write_result {
+            let stderr_detail = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
+            return Err(GcError::Git {
+                op,
+                detail: if stderr_detail.is_empty() {
+                    err.to_string()
+                } else {
+                    stderr_detail
+                },
+            });
+        }
+        git_text(
+            &op,
+            std::process::Output {
+                status,
+                stdout: stdout_bytes,
+                stderr: stderr_bytes,
+            },
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1198,6 +1264,54 @@ mod parse_tests {
         assert_eq!(trees.len(), 2);
         assert!(!trees[0].locked);
         assert!(trees[1].locked);
+    }
+
+    /// Git writes `start: ok`, `prepare: ok`, and `commit: ok` before it
+    /// reads the next transaction. 3000 of those still leave room in the
+    /// stdin pipe after stdout fills. 4000 do not, so a parent that
+    /// finishes the write before it reads never returns.
+    #[test]
+    fn stdin_update_ref_batch_does_not_block_on_ack_lines() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let repo = dir.path().join("origin");
+        std::fs::create_dir(&repo).expect("origin");
+        let git = |args: &[&str]| {
+            super::git(&repo, args).unwrap_or_else(|err| panic!("{args:?}: {err:?}"));
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "dev@example.com"]);
+        git(&["config", "user.name", "dev"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README"), b"x").expect("readme");
+        git(&["add", "README"]);
+        git(&["commit", "-m", "init"]);
+        let sha = super::git(&repo, &["rev-parse", "HEAD"]).expect("sha");
+        let sha = sha.trim();
+        let n = 4000;
+        let mut script = String::new();
+        for i in 0..n {
+            script.push_str("start\nupdate refs/workpen/reclaimed/bulk/");
+            script.push_str(&i.to_string());
+            script.push(' ');
+            script.push_str(sha);
+            script.push_str("\nprepare\ncommit\n");
+        }
+        let repo_call = repo.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = super::git_stdin(&repo_call, &["update-ref", "--stdin"], &script);
+            let _ = tx.send(result);
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(45))
+            .expect("git update-ref --stdin blocked while ok lines filled the pipe");
+        result.expect("batch update-ref");
+        let listed = super::git(&repo, &["show-ref"]).expect("show-ref");
+        let created = listed
+            .lines()
+            .filter(|line| line.contains("refs/workpen/reclaimed/bulk/"))
+            .count();
+        assert_eq!(created, n, "every transaction must create a ref");
     }
 
     #[test]
