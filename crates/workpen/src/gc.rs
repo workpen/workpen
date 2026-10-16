@@ -148,13 +148,16 @@ pub fn classify_for_age_gc_with_policy(
             reason: KeepReason::UntrackedWorktree,
         };
     }
-    if newest_tree_mtime(path).is_err() {
-        return GcDecision::Keep {
-            reason: KeepReason::StatusUnreadable,
-        };
-    }
+    let tree = match newest_tree_mtime(path) {
+        Err(()) => {
+            return GcDecision::Keep {
+                reason: KeepReason::StatusUnreadable,
+            };
+        }
+        Ok(t) => TreeMtime::Ready(t),
+    };
     let index = index_file(path);
-    let last_used = last_used_from(path, index.as_deref()).unwrap_or(now);
+    let last_used = last_used_from(path, index.as_deref(), tree).unwrap_or(now);
     if now.duration_since(last_used).unwrap_or_default() < max_age {
         return GcDecision::Keep {
             reason: KeepReason::TooNew,
@@ -568,15 +571,19 @@ fn lsof_process_cwds() -> Result<Vec<PathBuf>, ()> {
 /// mtime, and a bounded tree walk. Git CLI, not gix.
 pub fn worktree_last_used(path: &Path) -> Option<SystemTime> {
     let index = index_file(path);
-    last_used_from(path, index.as_deref())
+    last_used_from(path, index.as_deref(), TreeMtime::Lookup)
 }
 
-fn last_used_from(path: &Path, index: Option<&Path>) -> Option<SystemTime> {
+fn last_used_from(path: &Path, index: Option<&Path>, tree: TreeMtime) -> Option<SystemTime> {
     let mut latest = head_commit_time(path);
     if let Some(t) = index_mtime_at(index) {
         latest = Some(latest.map_or(t, |n| n.max(t)));
     }
-    if let Ok(Some(t)) = newest_tree_mtime(path) {
+    let walked = match tree {
+        TreeMtime::Lookup => newest_tree_mtime(path).ok().flatten(),
+        TreeMtime::Ready(t) => t,
+    };
+    if let Some(t) = walked {
         latest = Some(latest.map_or(t, |n| n.max(t)));
     }
     latest
@@ -606,6 +613,12 @@ enum IndexSource<'a> {
     Ready(Option<&'a Path>),
 }
 
+#[derive(Clone, Copy)]
+enum TreeMtime {
+    Lookup,
+    Ready(Option<SystemTime>),
+}
+
 fn index_mtime_at(index: Option<&Path>) -> Option<SystemTime> {
     std::fs::metadata(index?).and_then(|m| m.modified()).ok()
 }
@@ -624,6 +637,8 @@ fn restore_index_mtime_at(index: Option<&Path>, prev: SystemTime) {
 /// budget ran out with directories still queued. `DirEntry::metadata`
 /// (lstat); do not switch to `fs::metadata`.
 fn newest_tree_mtime(root: &Path) -> Result<Option<SystemTime>, ()> {
+    #[cfg(test)]
+    TREE_MTIME_COUNT.with(|slot| slot.set(slot.get().saturating_add(1)));
     let mut newest: Option<SystemTime> = None;
     let mut remaining = LAST_USED_WALK_LIMIT;
     let mut queue = std::collections::VecDeque::new();
@@ -998,6 +1013,7 @@ thread_local! {
     static BEFORE_REMOVE: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
     static CWD_PROBE_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static INDEX_RESOLVE_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static TREE_MTIME_COUNT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(all(test, unix))]
@@ -1346,6 +1362,37 @@ mod parse_tests {
             resolves, 1,
             "one index resolve per age check, got {resolves}"
         );
+    }
+
+    #[test]
+    fn classify_age_walks_tree_mtime_once() {
+        TREE_MTIME_COUNT.with(|slot| slot.set(0));
+        let dir = tempfile::tempdir().expect("tmp");
+        let repo = dir.path().join("origin");
+        std::fs::create_dir(&repo).expect("origin");
+        let git = |cwd: &Path, args: &[&str]| {
+            super::git(cwd, args).unwrap_or_else(|err| panic!("{args:?}: {err:?}"));
+        };
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "dev@example.com"]);
+        git(&repo, &["config", "user.name", "dev"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README"), b"x").expect("readme");
+        git(&repo, &["add", "README"]);
+        git(&repo, &["commit", "-m", "init"]);
+        let decision =
+            classify_for_age_gc(&repo, false, Duration::from_secs(86_400), SystemTime::now());
+        assert!(
+            matches!(
+                decision,
+                GcDecision::Keep {
+                    reason: KeepReason::TooNew
+                }
+            ),
+            "fresh tree must stay, got {decision:?}"
+        );
+        let walks = TREE_MTIME_COUNT.with(|slot| slot.get());
+        assert_eq!(walks, 1, "one tree walk per age check, got {walks}");
     }
 
     #[test]
