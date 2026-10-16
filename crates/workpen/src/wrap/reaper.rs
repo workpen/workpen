@@ -15,8 +15,10 @@
 //! A missed wait is continued only while that process is stopped and
 //! has not called exec. The reaper
 //! records descendants from that watch and from walks, and signals those
-//! pids. A pid that does not fit in the recorded set is reported on
-//! `report_fd`. On macOS a fork whose parent has exited is reported
+//! pids. On macOS the report waits until each signaled pid no longer
+//! answers `kill(pid, 0)`. A recorded pid that is still running is
+//! reported too. A pid that does not fit in the recorded set is reported
+//! on `report_fd`. On macOS a fork whose parent has exited is reported
 //! the same way when a live session leader with that command's name
 //! is still outside the recorded set. That process called `setsid`.
 //! The name is read after exec. If that process has already exited,
@@ -32,6 +34,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 const MAX_PIDS: usize = 128;
 const LIST_MAX: usize = 1024;
 const SCAN_NS: libc::c_long = 2_000_000;
+/// `kill(pid, 0)` can stay successful after `SIGKILL` until launchd
+/// reaps that pid. A clean report waits this long, then is a miss.
+#[cfg(target_os = "macos")]
+const SETTLE_NS: u64 = 50_000_000;
 /// Empty child-list reads after the command has exited. One snapshot
 /// can miss a grandchild that was reparented in that same exit.
 #[cfg(target_os = "linux")]
@@ -1918,9 +1924,11 @@ fn same_comm(left: &[u8], right: &[u8]) -> bool {
 }
 
 /// Live launchd session leader with this command's name, started with
-/// the command, and not already recorded. `setsid` is what makes that
-/// process a session leader. A same-group child is not one. A full
-/// child buffer is a miss: the orphan may sit past the end.
+/// the command. `setsid` is what makes that process a session leader.
+/// A same-group child is not one. A recorded pid is skipped: the exit
+/// path signals those rows, and a mid-run fork note must not stick a
+/// miss for a pid that kill still reaps. A full child buffer is a miss.
+/// The orphan may sit past the end.
 #[cfg(target_os = "macos")]
 fn untracked_same_name(parent: libc::pid_t) -> bool {
     remember_identity(parent);
@@ -1940,7 +1948,10 @@ fn untracked_same_name(parent: libc::pid_t) -> bool {
     let mut kids = [0; 4096];
     let (n, trunc) = direct_children(1, &mut kids);
     for pid in kids.into_iter().take(n) {
-        if pid <= 0 || pid == cmd || pid == me || pid == parent || is_recorded(pid) {
+        if pid <= 0 || pid == cmd || pid == me || pid == parent {
+            continue;
+        }
+        if is_recorded(pid) {
             continue;
         }
         let Some(info) = bsdinfo(pid) else {
@@ -2029,10 +2040,164 @@ fn missed() -> bool {
     unsafe { std::ptr::addr_of!(MISSED).read() != 0 }
 }
 
+/// Signal every recorded pid whose start time still matches, then wait
+/// once. A start of `0,0` is skipped: that row has no identity to tell
+/// a recycled pid apart. An unreadable start is not signaled for the
+/// same reason. A changed start means the pid was reused, so it is
+/// left alone. One deadline covers the whole table. `SIGTERM` stops
+/// the wait so the reaper can still write the report.
+#[cfg(target_os = "macos")]
+fn settle_recorded() {
+    let deadline = mono_ns().map(|now| now.saturating_add(SETTLE_NS));
+    for_each_recorded(|row| {
+        if row_matches_start(row) {
+            unsafe { libc::kill(row.pid, libc::SIGKILL) };
+        }
+    });
+    wait_matching_rows(deadline);
+}
+
+#[cfg(target_os = "macos")]
+fn for_each_recorded(mut body: impl FnMut(Row)) {
+    let n = unsafe { (*std::ptr::addr_of!(TABLE)).n };
+    for i in 0..n {
+        let row = unsafe { (*std::ptr::addr_of!(TABLE)).rows[i] };
+        body(row);
+    }
+    let n = unsafe { (*std::ptr::addr_of!(OVERFLOW)).n };
+    for i in 0..n {
+        let row = unsafe { (*std::ptr::addr_of!(OVERFLOW)).rows[i] };
+        body(row);
+    }
+}
+
+/// Stored start is real and `proc_pidinfo` still reports that same start.
+#[cfg(target_os = "macos")]
+fn row_matches_start(row: Row) -> bool {
+    if row.pid <= 0 || (row.sec == 0 && row.usec == 0) || !pid_alive(row.pid) {
+        return false;
+    }
+    match start_time(row.pid) {
+        Some((sec, usec)) => sec == row.sec && usec == row.usec,
+        None => false,
+    }
+}
+
+/// Still the signaled process, including the window where `kill(pid, 0)`
+/// works and `proc_pidinfo` does not.
+#[cfg(target_os = "macos")]
+fn row_pending(row: Row) -> bool {
+    if row.pid <= 0 || (row.sec == 0 && row.usec == 0) || !pid_alive(row.pid) {
+        return false;
+    }
+    match start_time(row.pid) {
+        Some((sec, usec)) => sec == row.sec && usec == row.usec,
+        None => true,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn any_pending() -> bool {
+    let mut pending = false;
+    for_each_recorded(|row| {
+        if row_pending(row) {
+            pending = true;
+        }
+    });
+    pending
+}
+
+#[cfg(target_os = "macos")]
+fn wait_matching_rows(deadline: Option<u64>) {
+    let mut spins = 0u32;
+    loop {
+        if STOP.load(Ordering::Relaxed) != 0 || !any_pending() {
+            break;
+        }
+        if let Some(end) = deadline {
+            match mono_ns() {
+                Some(now) if now >= end => break,
+                Some(_) => sleep_scan(),
+                None => {
+                    if yield_until_missed(&mut spins) {
+                        return;
+                    }
+                }
+            }
+        } else if yield_until_missed(&mut spins) {
+            return;
+        }
+    }
+    if any_pending() {
+        mark_missed();
+    }
+}
+
+/// A recorded pid with no start time is not signaled. If it is still
+/// running and readable, the report is a miss. A zombie `proc_pidinfo`
+/// cannot describe is not that pid.
+#[cfg(target_os = "macos")]
+fn recorded_left_running() -> bool {
+    let mut left = false;
+    for_each_recorded(|row| {
+        if row.pid <= 0 || row.sec != 0 || row.usec != 0 {
+            return;
+        }
+        if pid_alive(row.pid) && !proc_info_missing(row.pid) {
+            left = true;
+        }
+    });
+    left
+}
+
+#[cfg(target_os = "macos")]
+fn yield_until_missed(spins: &mut u32) -> bool {
+    *spins += 1;
+    if *spins >= 100_000 {
+        mark_missed();
+        return true;
+    }
+    unsafe { libc::sched_yield() };
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn mono_ns() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+        return None;
+    }
+    Some(
+        (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64),
+    )
+}
+
 fn write_report(fd: i32) {
     #[cfg(target_os = "macos")]
-    if untracked_same_name(0) {
-        mark_missed();
+    {
+        // `SIGKILL` does not reap a launchd child. `kill(pid, 0)` stays
+        // successful until launchd does. A clean report waits that out.
+        // One launchd snapshot can also miss a child that was reparented
+        // in this same exit.
+        settle_recorded();
+        if recorded_left_running() {
+            mark_missed();
+        }
+        for poll in 0..4 {
+            if untracked_same_name(0) {
+                mark_missed();
+                break;
+            }
+            if poll == 3 {
+                break;
+            }
+            sleep_scan();
+        }
     }
     if fd < 0 {
         return;
@@ -2757,6 +2922,87 @@ int main(int argc, char **argv) {
         assert!(
             armed,
             "a pid the parent already waited for must not fail the watch"
+        );
+    }
+
+    /// A recorded `setsid` orphan is outside `killpg`. The report is
+    /// clean only when that pid is already gone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recorded_live_setsid_orphan_is_not_a_clean_report() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let mid = unsafe { libc::fork() };
+        assert!(mid >= 0, "fork");
+        if mid == 0 {
+            unsafe {
+                libc::close(fds[0]);
+                let grand = libc::fork();
+                if grand == 0 {
+                    if libc::setsid() < 0 {
+                        libc::_exit(1);
+                    }
+                    loop {
+                        libc::pause();
+                    }
+                }
+                let bytes = grand.to_ne_bytes();
+                let _ = libc::write(fds[1], bytes.as_ptr().cast(), bytes.len());
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(fds[1]) };
+        let mut raw = [0u8; std::mem::size_of::<libc::pid_t>()];
+        let n = unsafe { libc::read(fds[0], raw.as_mut_ptr().cast(), raw.len()) };
+        unsafe { libc::close(fds[0]) };
+        assert_eq!(n, raw.len() as isize, "child pid");
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(mid, &mut status, 0) }, mid);
+        let pid = libc::pid_t::from_ne_bytes(raw);
+        struct KillOnDrop(libc::pid_t);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                if self.0 > 0 {
+                    unsafe { libc::kill(self.0, libc::SIGKILL) };
+                }
+            }
+        }
+        let _kill = KillOnDrop(pid);
+        let info = super::bsdinfo(pid).expect("orphan is visible");
+        let flags = u32::from_ne_bytes(info[0..4].try_into().unwrap_or([0; 4]));
+        assert_ne!(
+            flags & super::PROC_FLAG_SLEADER,
+            0,
+            "fixture must be a session leader"
+        );
+        let ppid = libc::pid_t::from_ne_bytes(info[16..20].try_into().unwrap_or([0; 4]));
+        assert_eq!(ppid, 1, "orphan must already belong to launchd");
+        super::reset_tracking();
+        unsafe {
+            let ident = &mut *std::ptr::addr_of_mut!(super::IDENT);
+            ident.comm.copy_from_slice(&info[48..64]);
+            ident.uid = u32::from_ne_bytes(info[20..24].try_into().unwrap_or([0; 4]));
+            ident.sec = u64::from_ne_bytes(info[120..128].try_into().unwrap_or([0; 8]));
+            ident.usec = u64::from_ne_bytes(info[128..136].try_into().unwrap_or([0; 8]));
+            ident.ready = 1;
+        }
+        assert!(super::remember(pid) == super::Remember::Stored);
+        assert!(super::is_recorded(pid));
+        // The fork note can arrive after this pid is recorded and
+        // launchd has adopted it. Killing it at exit must not leave
+        // the miss that scan set.
+        super::on_fork(mid, -1, true);
+        super::write_report(-1);
+        let still = super::pid_alive(pid);
+        let missed = super::missed();
+        super::reset_tracking();
+        assert!(
+            !still,
+            "a recorded setsid orphan must be gone before a clean report"
+        );
+        assert!(
+            !missed,
+            "a recorded setsid orphan that was reaped must not stick as a miss"
         );
     }
 }
