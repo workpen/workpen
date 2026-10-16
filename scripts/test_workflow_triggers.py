@@ -111,6 +111,27 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertNotIn("x-access-token:", text)
         self.assertNotIn("persist-credentials:", text)
 
+    def test_auto_merge_uses_app_token(self) -> None:
+        pin = "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
+        token = "GH_TOKEN: ${{ steps.app-token.outputs.token }}"
+        text = (WORKFLOWS / "auto-approve.yml").read_text(encoding="utf-8")
+        self.assertIn(pin, text)
+        self.assertIn("permission-contents: write", text)
+        merge = text.split("name: Enable auto-merge", 1)[1]
+        self.assertIn(token, merge)
+        self.assertNotIn("secrets.GITHUB_TOKEN", merge)
+        self.assertIn("!startsWith(github.head_ref, 'release-please')", merge)
+        dependabot = (WORKFLOWS / "dependabot-auto-merge.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(pin, dependabot)
+        approve, merge_dep = dependabot.split(
+            "name: Enable auto-merge for patch and minor updates", 1
+        )
+        self.assertIn("secrets.GITHUB_TOKEN", approve)
+        self.assertIn(token, merge_dep)
+        self.assertNotIn("secrets.GITHUB_TOKEN", merge_dep)
+
     def test_auto_merge_skips_release_please_head(self) -> None:
         text = (WORKFLOWS / "auto-approve.yml").read_text(encoding="utf-8")
         self.assertIn("!startsWith(github.head_ref, 'release-please')", text)

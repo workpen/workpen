@@ -47,6 +47,22 @@ jobs:
           contains(github.event.pull_request.labels.*.name, 'autorelease: pending')
         run: |
           echo "Skip hmarr on release-please (bot cannot approve its own PR)"
+      - name: App token for merge
+        if: >-
+          !github.event.pull_request.draft &&
+          !startsWith(github.head_ref, 'release-please') &&
+          !contains(github.event.pull_request.labels.*.name, 'autorelease: pending') &&
+          github.event.pull_request.title != 'chore: amend constitution' &&
+          !startsWith(github.event.pull_request.title, 'release:') &&
+          !startsWith(github.event.pull_request.title, 'chore(release)') &&
+          !startsWith(github.event.pull_request.title, 'publish')
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.AUTO_APPROVE_CLIENT_ID }}
+          private-key: ${{ secrets.AUTO_APPROVE_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
       - name: Enable auto-merge
         if: >-
           !github.event.pull_request.draft &&
@@ -57,7 +73,7 @@ jobs:
           !startsWith(github.event.pull_request.title, 'chore(release)') &&
           !startsWith(github.event.pull_request.title, 'publish')
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
