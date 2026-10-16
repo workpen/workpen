@@ -108,6 +108,16 @@ mod tests {
     }
 
     #[test]
+    fn directory_agent_lock_is_io() {
+        let dir = TempDir::new().expect("tmp");
+        std::fs::create_dir(dir.path().join(AGENT_LOCK_NAME)).expect("dir");
+        match load_agent_lock(dir.path()) {
+            Err(AgentLockError::Io { .. }) => {}
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn trailing_hash_does_not_disable_the_line() {
         let dir = TempDir::new().expect("tmp");
         std::fs::write(dir.path().join(AGENT_LOCK_NAME), "secrets/** # note\n").expect("write");
@@ -191,6 +201,18 @@ mod tests {
                     reason.contains("BOM"),
                     "bom inside glob must be invalid: {reason}"
                 );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nul_byte_in_glob_is_invalid() {
+        let dir = TempDir::new().expect("tmp");
+        std::fs::write(dir.path().join(AGENT_LOCK_NAME), "**/*\0.secret\n").expect("write");
+        match load_agent_lock(dir.path()) {
+            Err(AgentLockError::Invalid { reason, .. }) => {
+                assert!(reason.contains("NUL"), "nul byte must be invalid: {reason}");
             }
             other => panic!("expected Invalid, got {other:?}"),
         }
