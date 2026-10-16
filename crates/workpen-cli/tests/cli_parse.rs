@@ -1545,6 +1545,36 @@ fn policy_prints_jail_without_secret_bytes() {
 }
 
 #[test]
+fn policy_json_formats_a_dest_deny() {
+    let dir = TempDir::new().expect("workspace");
+    std::fs::write(dir.path().join(".env"), b"SECRET=1\n").expect("env");
+    let out = workpen()
+        .args(["policy", "--json", "--root"])
+        .arg(dir.path())
+        .args(["--", ".env"])
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("network: blocked"), "{stdout}");
+    assert!(!stdout.contains("would-deny:"), "{stdout}");
+    assert!(!stdout.contains("SECRET"), "{stdout}");
+    let line = stdout.lines().last().expect("refusal line");
+    assert!(
+        line.contains("\"result\":\"denied\"")
+            && line.contains("\"exit\":3")
+            && line.contains("\"kind\":\"deny_glob\"")
+            && line.contains("\"matched\":\"**/.env\""),
+        "{line}"
+    );
+}
+
+#[test]
 fn policy_net_is_allowed_and_dashdash_net_is_the_child() {
     let dir = TempDir::new().expect("workspace");
     let allowed = workpen()
