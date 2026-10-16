@@ -1,14 +1,18 @@
 # Build the CLI for each Unix triple, attest SLSA provenance, and attach
 # both to the GitHub Release. Scorecard Signed-Releases reads `.intoto.jsonl`
-# assets, not the Attestations API. release-please publishes with the
-# workpen-release app, so this release event starts. The default
-# Actions token does not start it. workflow_dispatch tag= is the fallback.
+# assets, not the Attestations API. Release Please calls this after
+# a person asked to merge the release pull. workflow_dispatch tag=
+# is the fallback. A published-release event is not a second start.
 # The next published tag packs these archives. v0.6.0 is not re-signed.
 name: Sign release
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.5.0)"
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
@@ -17,7 +21,7 @@ on:
         type: string
 
 concurrency:
-  group: sign-release-${{ github.event.release.tag_name || inputs.tag }}
+  group: sign-release-${{ inputs.tag }}
   cancel-in-progress: false
 
 permissions:
@@ -50,7 +54,7 @@ jobs:
       attestations: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      TAG: ${{ inputs.tag }}
       REPO: ${{ github.repository }}
       TARGET: ${{ matrix.target }}
     steps:

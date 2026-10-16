@@ -1,13 +1,15 @@
 # Publish on a vX.Y.Z tag via crates.io trusted publishing (OIDC).
-# Do not publish until a human says launch. publish = false until then.
-# The tag push starts this job when release-please uses the
-# workpen-release app. The default Actions token does not.
+# Release Please calls this after a person asked to merge the
+# release pull. workflow_dispatch tag= is the fallback.
 name: Publish crates.io
 
 on:
-  push:
-    tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:

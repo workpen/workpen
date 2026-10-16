@@ -82,6 +82,11 @@ class WorkflowTriggerTests(unittest.TestCase):
         text = (WORKFLOWS / "release-please.yml").read_text(encoding="utf-8")
         self.assertIn("sync-release-pr-versions:", text)
         self.assertIn("scripts/sync-cargo-lock-workspace-versions.sh", text)
+        self.assertIn("tag_name: ${{ steps.rp.outputs.tag_name }}", text)
+        self.assertIn("needs.release-please.outputs.release_created == 'true'", text)
+        self.assertIn("uses: ./.github/workflows/sign-release.yml", text)
+        self.assertIn("uses: ./.github/workflows/publish-crates.yml", text)
+        self.assertEqual(text.count("tag: ${{ needs.release-please.outputs.tag_name }}"), 2)
         self.assertNotIn("cargo generate-lockfile", text)
         script = (ROOT / "scripts" / "sync-cargo-lock-workspace-versions.sh").read_text(
             encoding="utf-8"
@@ -137,16 +142,18 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertIn("!startsWith(github.head_ref, 'release-please')", text)
         self.assertIn("autorelease: pending", text)
 
-    def test_auto_approve_skips_hmarr_on_release_please(self) -> None:
+    def test_auto_approve_release_please_without_self_approve(self) -> None:
         text = (WORKFLOWS / "auto-approve.yml").read_text(encoding="utf-8")
-        self.assertIn("Skip self-approve on release-please", text)
-        self.assertIn("bot cannot approve its own PR", text)
         approve_idx = text.index("name: Auto-approve PR")
-        skip_idx = text.index("name: Skip self-approve on release-please")
+        skip_idx = text.index("name: Skip self-approve")
+        merge_idx = text.index("name: Enable auto-merge")
         self.assertLess(approve_idx, skip_idx)
         approve_block = text[approve_idx:skip_idx]
-        self.assertIn("!startsWith(github.head_ref, 'release-please')", approve_block)
+        self.assertIn("github-actions[bot]", approve_block)
+        self.assertNotIn("release-please", approve_block)
         self.assertIn("hmarr/auto-approve-action@", approve_block)
+        merge_block = text[merge_idx:]
+        self.assertIn("!startsWith(github.head_ref, 'release-please')", merge_block)
 
     def test_cheap_pr_status_checks_do_not_cancel(self) -> None:
         for name in ("pr-title.yml", "dco.yml"):
@@ -156,8 +163,9 @@ class WorkflowTriggerTests(unittest.TestCase):
     def test_publish_crates_is_tag_or_dispatch(self) -> None:
         text = (WORKFLOWS / "publish-crates.yml").read_text(encoding="utf-8")
         on_block = _on_block(text)
+        self.assertIn("workflow_call:", on_block)
         self.assertIn("workflow_dispatch:", on_block)
-        self.assertIn("tags:", on_block)
+        self.assertNotIn("tags:", on_block)
         self.assertNotIn("pull_request:", on_block)
         self.assertNotIn("branches:", on_block)
         self.assertIn("id-token: write", text)
@@ -219,8 +227,9 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertNotIn("push:", ci_on)
         text = (WORKFLOWS / "sign-release.yml").read_text(encoding="utf-8")
         on_block = _on_block(text)
+        self.assertIn("workflow_call:", on_block)
         self.assertIn("workflow_dispatch:", on_block)
-        self.assertIn("types: [published]", on_block)
+        self.assertNotIn("types: [published]", on_block)
         self.assertNotIn("pull_request:", on_block)
         self.assertNotIn("slsa-github-generator", text)
         top = text.split("\njobs:", 1)[0]
