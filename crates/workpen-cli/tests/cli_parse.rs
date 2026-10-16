@@ -1595,7 +1595,9 @@ fn why_json_names_an_outside_path() {
     );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
-        text.contains("\"kind\":\"path_guard\"") && text.contains(shown),
+        text.contains("\"kind\":\"path_guard\"")
+            && text.contains("secret.txt")
+            && !text.contains("\"path\":null"),
         "{text}"
     );
     assert!(!text.contains("OUTSIDE"), "{text}");
