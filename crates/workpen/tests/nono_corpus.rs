@@ -569,7 +569,7 @@ fn run_child_cannot_read_workspace_env() {
     let code = fs::read_to_string(dir.path().join("readme.code")).expect("readme.code");
     assert_eq!(code.trim(), "0", "cat readme.md must succeed");
     let body = fs::read_to_string(dir.path().join("readme.out")).expect("readme.out");
-    assert!(body.contains("ok"), "readme body={body:?}");
+    assert_eq!(body.trim(), "ok", "readme body={body:?}");
 }
 
 #[cfg(target_os = "macos")]
@@ -2237,7 +2237,7 @@ fn run_child_can_write_inside_workspace() {
     assert_eq!(applied, KernelApply::Applied);
     assert!(status.success(), "inside write must succeed: {status:?}");
     let body = fs::read_to_string(&inside).expect("inside write");
-    assert!(body.contains("ok"), "inside body={body:?}");
+    assert_eq!(body.trim(), "ok", "inside body={body:?}");
 }
 
 #[cfg(windows)]
@@ -2253,7 +2253,7 @@ fn run_child_can_write_inside_workspace() {
     assert_eq!(applied, KernelApply::Applied);
     assert!(status.success(), "inside write must succeed: {status:?}");
     let body = fs::read_to_string(&inside).expect("inside write");
-    assert!(body.contains("ok"), "inside body={body:?}");
+    assert_eq!(body.trim(), "ok", "inside body={body:?}");
 }
 
 #[cfg(windows)]
@@ -2285,7 +2285,7 @@ fn run_child_cannot_read_workspace_env_windows() {
     let (_applied, status) = policy.run_child(allow_cmd).expect("readme");
     assert!(status.success(), "readme wrapper must finish: {status:?}");
     let body = fs::read_to_string(dir.path().join("readme.out")).expect("readme.out");
-    assert!(body.contains("ok"), "readme body={body:?}");
+    assert_eq!(body.trim(), "ok", "readme body={body:?}");
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3731,7 +3731,7 @@ fn run_child_mv_env_does_not_print_secret() {
     let code = fs::read_to_string(dir.path().join("readme.code")).expect("readme.code");
     assert_eq!(code.trim(), "0", "cat readme.md must succeed");
     let body = fs::read_to_string(dir.path().join("readme.out")).expect("readme.out");
-    assert!(body.contains("ok"), "readme body={body:?}");
+    assert_eq!(body.trim(), "ok", "readme body={body:?}");
 }
 
 #[test]

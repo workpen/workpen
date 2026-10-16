@@ -408,7 +408,7 @@ fn run_can_write_inside_workspace() {
         String::from_utf8_lossy(&out.stderr)
     );
     let body = std::fs::read_to_string(&inside).expect("inside write");
-    assert!(body.contains("ok"), "inside body={body:?}");
+    assert_eq!(body.trim(), "ok", "inside body={body:?}");
 }
 
 #[cfg(unix)]
