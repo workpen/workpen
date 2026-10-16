@@ -643,32 +643,18 @@ pub fn check_command_argv(
     root: &Path,
     policy: &DenyPolicy,
 ) -> Result<(), CheckDestError> {
-    check_command_argv_with_guard(cmd, root, policy, None)
-}
-
-/// Same as [`check_command_argv`]. When `guard` is set, an argv path
-/// outside the workspace and its extra roots is a path escape, the same
-/// check `why` uses.
-pub fn check_command_argv_with_guard(
-    cmd: &[impl AsRef<str>],
-    root: &Path,
-    policy: &DenyPolicy,
-    guard: Option<&PathGuard>,
-) -> Result<(), CheckDestError> {
     for (i, token) in cmd.iter().enumerate() {
         let token = token.as_ref();
         if !token.is_empty() && !token.starts_with('-') {
             let dest = dest_under_root(root, token);
-            // argv0 is the program (`/bin/cat`). Path-guard the arguments.
-            let arg_guard = if i == 0 { None } else { guard };
-            check_dest_rooted(&dest.to_string_lossy(), policy, arg_guard, Some(root))?;
+            check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
         }
         if let Some(value) = attached_flag_dest(token) {
             let dest = dest_under_root(root, value);
             check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
         }
         if let Some(body) = shell_c_body(token, cmd.get(i + 1).map(|s| s.as_ref())) {
-            check_command_dests_with_guard(body, root, policy, guard)?;
+            check_command_dests(body, root, policy)?;
         }
         if is_cmd_program(token) || is_powershell_program(token) {
             check_cmd_powershell_remaining_dests(token, &cmd[i + 1..], root, policy)?;
@@ -1282,15 +1268,6 @@ pub fn check_command_dests(
     root: &Path,
     policy: &DenyPolicy,
 ) -> Result<(), CheckDestError> {
-    check_command_dests_with_guard(command, root, policy, None)
-}
-
-fn check_command_dests_with_guard(
-    command: &str,
-    root: &Path,
-    policy: &DenyPolicy,
-    guard: Option<&PathGuard>,
-) -> Result<(), CheckDestError> {
     for (_display, candidate) in command_path_tokens(command) {
         for peeled in peel_shell_parts(&candidate) {
             if peeled.is_empty() {
@@ -1298,14 +1275,14 @@ fn check_command_dests_with_guard(
             }
             if let Some(value) = attached_flag_dest(peeled) {
                 let dest = dest_under_root(root, value);
-                check_dest_rooted(&dest.to_string_lossy(), policy, guard, Some(root))?;
+                check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
                 continue;
             }
             if peeled.starts_with('-') {
                 continue;
             }
             let dest = dest_under_root(root, peeled);
-            check_dest_rooted(&dest.to_string_lossy(), policy, guard, Some(root))?;
+            check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
         }
     }
     check_command_string_env_dests(command, root, policy)

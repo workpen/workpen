@@ -1545,58 +1545,6 @@ fn policy_prints_jail_without_secret_bytes() {
 }
 
 #[test]
-fn policy_json_names_an_outside_argv_path() {
-    let dir = TempDir::new().expect("workspace");
-    let outside = TempDir::new().expect("outside");
-    let secret = outside.path().join("secret.txt");
-    std::fs::write(&secret, b"OUTSIDE\n").expect("secret");
-    let shown = secret.to_str().expect("utf8");
-    let preview = workpen()
-        .args(["policy", "--json", "--root"])
-        .arg(dir.path())
-        .args(["--", "/bin/cat", shown])
-        .output()
-        .expect("spawn");
-    assert_eq!(
-        preview.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&preview.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&preview.stdout);
-    let line = stdout.lines().last().expect("refusal");
-    assert!(
-        line.contains("\"result\":\"denied\"")
-            && line.contains("\"exit\":3")
-            && line.contains("\"kind\":\"path_guard\"")
-            && line.contains(shown),
-        "{line}"
-    );
-    assert!(!stdout.contains("OUTSIDE"), "{stdout}");
-    let run = workpen()
-        .args(["run", "--root"])
-        .arg(dir.path())
-        .args(["--", "/bin/cat", shown])
-        .output()
-        .expect("spawn");
-    assert_eq!(
-        run.status.code(),
-        Some(3),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr)
-    );
-    let err = String::from_utf8_lossy(&run.stderr);
-    assert!(err.contains("path escapes workspace"), "{err}");
-    assert!(!err.contains("Operation not permitted"), "{err}");
-    assert!(
-        run.stdout.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&run.stdout)
-    );
-}
-
-#[test]
 fn policy_json_formats_a_dest_deny() {
     let dir = TempDir::new().expect("workspace");
     std::fs::write(dir.path().join(".env"), b"SECRET=1\n").expect("env");
