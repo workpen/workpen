@@ -1575,6 +1575,35 @@ fn policy_json_formats_a_dest_deny() {
 }
 
 #[test]
+fn why_json_names_an_outside_path() {
+    let dir = TempDir::new().expect("workspace");
+    let outside = TempDir::new().expect("outside");
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, b"OUTSIDE\n").expect("secret");
+    let shown = secret.to_str().expect("utf8");
+    let out = workpen()
+        .args(["why", "--json", "--root"])
+        .arg(dir.path())
+        .arg(shown)
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("\"kind\":\"path_guard\"")
+            && text.contains("secret.txt")
+            && !text.contains("\"path\":null"),
+        "{text}"
+    );
+    assert!(!text.contains("OUTSIDE"), "{text}");
+}
+
+#[test]
 fn policy_net_is_allowed_and_dashdash_net_is_the_child() {
     let dir = TempDir::new().expect("workspace");
     let allowed = workpen()
