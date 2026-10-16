@@ -757,7 +757,7 @@ fn gc_honors_workspace_agent_lock_cache_secret() {
         "gc must not reclaim leftover with agent.lock extra: {combined}"
     );
     assert!(
-        stdout.contains("keep") && stdout.contains("1 leftover worktrees"),
+        stdout.contains("keep") && stdout.contains("1 leftover worktree"),
         "gc must keep the row and print a count: {stdout}"
     );
 }
@@ -1740,8 +1740,76 @@ fn gc_dry_run_reclaim_line_stays() {
         stdout.contains("dry-run: would reclaim"),
         "reclaimable tree must keep the reclaim line: {stdout}"
     );
-    assert!(stdout.contains("1 leftover worktrees"), "{stdout}");
+    assert!(stdout.contains("1 leftover worktree"), "{stdout}");
     assert!(leftover.exists(), "dry-run must not delete the worktree");
+}
+
+#[test]
+fn gc_reclaim_does_not_count_a_removed_worktree() {
+    let repo = init_git_repo();
+    let old = SystemTime::now() - Duration::from_secs(2 * 3600);
+    let unix = old
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("unix")
+        .as_secs()
+        .to_string();
+    let amend = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_AUTHOR_DATE", &unix)
+        .env("GIT_COMMITTER_DATE", &unix)
+        .args(["commit", "--amend", "--no-edit", "--date", &unix])
+        .current_dir(repo.path())
+        .output()
+        .expect("amend");
+    assert!(
+        amend.status.success(),
+        "{}",
+        String::from_utf8_lossy(&amend.stderr)
+    );
+    let leftover_dir = repo.path().join(".workpen-worktrees");
+    std::fs::create_dir_all(&leftover_dir).expect("leftover dir");
+    let leftover = leftover_dir.join("old-clean");
+    git_in(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            leftover.to_str().expect("utf8"),
+            "-b",
+            "old-clean-real",
+        ],
+    );
+    stamp_mtime_tree(&leftover, old);
+    stamp_mtime_tree(&repo.path().join(".git/worktrees"), old);
+    let out = workpen()
+        .args(["gc", "--root"])
+        .arg(repo.path())
+        .args(["--max-age", "1s", "--leftover"])
+        .arg(&leftover_dir)
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("reclaimed "),
+        "old clean worktree must be reclaimed: {stdout}"
+    );
+    assert!(
+        stdout.contains("no leftover worktrees"),
+        "a removed worktree is not still leftover: {stdout}"
+    );
+    assert!(
+        !stdout.contains("1 leftover"),
+        "removed worktree must not be counted: {stdout}"
+    );
+    assert!(!leftover.exists(), "reclaim must remove the worktree");
 }
 
 fn git_in(dir: &Path, args: &[&str]) {
