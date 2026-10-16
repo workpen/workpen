@@ -290,7 +290,8 @@ pub fn check_dests(guard: &PathGuard, dests: &[impl AsRef<Path>]) -> Result<(), 
 /// Implicit canonicalize to `/` or the host temp root is refused unless asked.
 pub fn resolve_workspace_root(cwd: &Path, root: &str) -> Result<PathBuf, PathGuardError> {
     let requested = root;
-    if requested.is_empty() {
+    // Whitespace-only is empty. Do not trim a real name: "trail " is another directory.
+    if requested.trim().is_empty() {
         return Err(PathGuardError::Root(
             "workspace root must not be empty".into(),
         ));
