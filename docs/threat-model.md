@@ -75,9 +75,13 @@ The parent is trusted. The child is not.
   records the command's descendants, including one created by a fork
   the reaper is notified about, and signals those pids. A descendant
   past the recorded set is `KernelError::Descendants`. On macOS a
-  fork whose parent has exited is that error when a live process with
-  the command's name is still outside the recorded set. A child the
-  parent already waited for is not. The CLI exits 4 and prints
+  fork whose parent has exited is that error when a live session
+  leader with the command's name is still outside the recorded set.
+  That process called `setsid`. That name is read after exec. When
+  the command has already exited, the name is the program's file
+  name and the start time is the one taken while the process was
+  stopped. A child the parent already waited for is not. The CLI
+  exits 4 and prints
   `descendants were not fully stopped`. Hosts that spawn after
   `apply_pre_exec` and wait on that same thread call `finish_pre_exec`
   and match that variant. A wait that resumes on another thread uses
