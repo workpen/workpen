@@ -147,6 +147,27 @@ mod tests {
                 explain(std::path::Path::new("/dev/null"), &policy, None),
                 Why::Allowed
             );
+            let guard = PathGuard::new(
+                dir.path(),
+                crate::guard::AbsolutePathPolicy::AllowIfContained,
+            )
+            .expect("guard");
+            assert_eq!(
+                explain(std::path::Path::new("/dev/null"), &policy, Some(&guard)),
+                Why::Allowed,
+                "a workspace guard must not hide that /dev/null is allowed"
+            );
+        }
+        if std::path::Path::new("/dev/zero").exists() {
+            let guard = PathGuard::new(
+                dir.path(),
+                crate::guard::AbsolutePathPolicy::AllowIfContained,
+            )
+            .expect("guard");
+            match explain(std::path::Path::new("/dev/zero"), &policy, Some(&guard)) {
+                Why::SpecialFile { kind, .. } => assert_eq!(kind, "device"),
+                other => panic!("guarded /dev/zero must be SpecialFile, got {other:?}"),
+            }
         }
         if std::path::Path::new("/dev/zero").exists() {
             match explain(std::path::Path::new("/dev/zero"), &policy, None) {
