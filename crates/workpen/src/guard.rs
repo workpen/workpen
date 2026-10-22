@@ -550,9 +550,30 @@ fn chain_has_symlink(path: &Path) -> bool {
 }
 
 fn inside_any_root(path: &Path, roots: &[PathBuf]) -> bool {
-    roots
-        .iter()
-        .any(|root| path == root || path.starts_with(root))
+    let path = strip_verbatim_disk(path);
+    roots.iter().any(|root| {
+        let root = strip_verbatim_disk(root);
+        path == root || path.starts_with(&root)
+    })
+}
+
+/// `dunce` keeps the `\\?\` prefix when the final name is reserved
+/// (`CON`, `NUL`). The workspace root does not have that prefix, so
+/// the literal file would look like an escape.
+fn strip_verbatim_disk(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            if let Some(unc) = rest.strip_prefix(r"UNC\") {
+                return PathBuf::from(format!(r"\\{unc}"));
+            }
+            if rest.as_bytes().get(1) == Some(&b':') {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    path.to_path_buf()
 }
 
 /// One `read_link` hop, then the remaining components. Absolute link
