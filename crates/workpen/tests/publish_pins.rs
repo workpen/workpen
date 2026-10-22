@@ -41,6 +41,39 @@ fn package_version(manifest: &str) -> String {
     panic!("[package] version missing");
 }
 
+fn lock_package_versions(lock: &str, name: &str) -> Vec<String> {
+    let needle = format!("name = \"{name}\"");
+    let mut versions = Vec::new();
+    let mut matched = false;
+    for line in lock.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[[package]]" {
+            matched = false;
+            continue;
+        }
+        if trimmed == needle {
+            matched = true;
+            continue;
+        }
+        if matched && let Some(rest) = trimmed.strip_prefix("version = \"") {
+            let version = rest.strip_suffix('"').unwrap_or(rest);
+            versions.push(version.to_string());
+            matched = false;
+        }
+    }
+    versions
+}
+
+fn version_at_least(version: &str, major: u64, minor: u64, patch: u64) -> bool {
+    let mut parts = version.split(['.', '-', '+']);
+    let parse = |part: Option<&str>| part.unwrap_or("0").parse::<u64>().unwrap_or(0);
+    (
+        parse(parts.next()),
+        parse(parts.next()),
+        parse(parts.next()),
+    ) >= (major, minor, patch)
+}
+
 fn major_minor(version: &str) -> String {
     let mut parts = version.split('.');
     let major = parts.next().unwrap_or("");
@@ -201,6 +234,14 @@ fn cli_lock_omits_reqwest_and_keeps_nono_defaults_off() {
         lock.lines()
             .any(|line| line.trim() == "name = \"aws-lc-sys\""),
         "aws-lc-sys left the lock; update the CONTRIBUTING nono note"
+    );
+    let webpki = lock_package_versions(&lock, "rustls-webpki");
+    assert!(!webpki.is_empty(), "rustls-webpki left the lock");
+    assert!(
+        webpki
+            .iter()
+            .all(|version| version_at_least(version, 0, 103, 16)),
+        "rustls-webpki {webpki:?} accepts distrusted emSign intermediates (RUSTSEC-2026-0382)"
     );
 
     let contributing = read(&root.join("CONTRIBUTING.md"));
