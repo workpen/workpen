@@ -1348,6 +1348,26 @@ fn validate_deny_glob_rejects_brace_backslash_empty_segment() {
 }
 
 #[test]
+fn many_stars_in_one_segment_do_not_hang() {
+    let pattern = format!("{}z", "*".repeat(20));
+    let name = "a".repeat(24);
+    let started = std::time::Instant::now();
+    assert!(
+        !path_matches_deny_glob(&pattern, &name),
+        "stars plus a missing literal must not match"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(200),
+        "twenty stars must stay cheap, took {:?}",
+        started.elapsed()
+    );
+    assert!(path_matches_deny_glob("a*b*c", "axbyc"));
+    assert!(path_matches_deny_glob("*a*b", "ab"));
+    assert!(path_matches_deny_glob("***", "hello"));
+    assert!(!path_matches_deny_glob("*z", "aaaa"));
+}
+
+#[test]
 fn dest_deny_glob_regex_interior_double_star_matches_nested_and_zero_segments() {
     let glob = "src/**/*.pem";
     assert!(

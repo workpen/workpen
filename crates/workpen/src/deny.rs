@@ -1879,22 +1879,34 @@ fn glob_segment(pat: &str, text: &str) -> bool {
     match_star(pat.as_bytes(), text.as_bytes())
 }
 
+/// `*` is the only wildcard. One saved star keeps this linear in the
+/// pattern and the text. The recursive split of every star is exponential:
+/// twenty stars and a final `z` never returns on a short name.
 fn match_star(pat: &[u8], text: &[u8]) -> bool {
-    match pat.split_first() {
-        None => text.is_empty(),
-        Some((&b'*', rest)) => {
-            for i in 0..=text.len() {
-                if match_star(rest, &text[i..]) {
-                    return true;
-                }
-            }
-            false
+    let mut pat_i = 0;
+    let mut text_i = 0;
+    let mut star_pat: Option<usize> = None;
+    let mut star_text = 0;
+    while text_i < text.len() {
+        if pat_i < pat.len() && pat[pat_i] == b'*' {
+            star_pat = Some(pat_i);
+            star_text = text_i;
+            pat_i += 1;
+        } else if pat_i < pat.len() && pat[pat_i] == text[text_i] {
+            pat_i += 1;
+            text_i += 1;
+        } else if let Some(saved) = star_pat {
+            star_text += 1;
+            text_i = star_text;
+            pat_i = saved + 1;
+        } else {
+            return false;
         }
-        Some((p, prest)) => match text.split_first() {
-            Some((t, trest)) if p == t => match_star(prest, trest),
-            _ => false,
-        },
     }
+    while pat_i < pat.len() && pat[pat_i] == b'*' {
+        pat_i += 1;
+    }
+    pat_i == pat.len()
 }
 
 #[derive(Debug)]
