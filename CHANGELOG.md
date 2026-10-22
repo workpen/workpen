@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.7](https://github.com/workpen/workpen/compare/v0.7.6...v0.7.7) (2026-10-22)
+
+
+### Bug Fixes
+
+* dest-deny assignment values and refuse non-UTF-8 paths ([#299](https://github.com/workpen/workpen/issues/299)) ([c4ad815](https://github.com/workpen/workpen/commit/c4ad815cbaeb6000cee6aa9d65cc2fdadbe4ed9f))
+* reject distrusted webpki intermediates ([#297](https://github.com/workpen/workpen/issues/297)) ([dbe8ab7](https://github.com/workpen/workpen/commit/dbe8ab7a9a51502d6ef4c5553f171be073b8fa26))
+* why agrees with run on /dev/null and devices ([#300](https://github.com/workpen/workpen/issues/300)) ([6157414](https://github.com/workpen/workpen/commit/61574143738c6d0b3edbf06fafaeccc1af00414d))
+
 ## [0.7.6](https://github.com/workpen/workpen/compare/v0.7.5...v0.7.6) (2026-10-16)
 
 
