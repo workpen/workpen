@@ -151,6 +151,8 @@ pub enum CheckDestError {
     Directory { path: String },
     #[error("open failed: {0}")]
     Io(String),
+    #[error("command argument is not valid UTF-8")]
+    NonUtf8,
 }
 
 impl std::fmt::Display for DestDeny {

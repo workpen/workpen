@@ -183,6 +183,24 @@ fn check_dests_escape_is_denied() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn check_dests_refuses_non_utf8_path() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = workspace();
+    let guard = PathGuard::new(dir.path(), AbsolutePathPolicy::AllowIfContained).expect("guard");
+    let bad = Path::new(OsStr::from_bytes(b"link\xff"));
+    let err = check_dests(&guard, &[bad]).expect_err("non-utf8 path must be refused");
+    match err {
+        PathGuardError::Denied(deny) => assert_eq!(deny.kind, PathGuardKind::Escape),
+        other => panic!("expected Escape, got {other:?}"),
+    }
+    check_dests(&guard, &[Path::new("ok.txt")])
+        .expect("utf-8 path inside the workspace stays allowed");
+}
+
 #[test]
 fn builder_default_rejects_absolute_even_inside_workspace() {
     let dir = workspace();

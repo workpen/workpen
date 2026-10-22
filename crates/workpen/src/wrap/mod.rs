@@ -1765,7 +1765,9 @@ impl KernelPolicy {
     ///
     /// Relative dests resolve against `cmd.current_dir()` when set, else
     /// the first ReadWrite grant. Same rules as
-    /// [`crate::check_command_argv`] on program plus args. Hosts that
+    /// [`crate::check_command_argv`] on program plus args. A program or
+    /// argument that is not valid UTF-8 is [`KernelError::DestDeny`]
+    /// of [`CheckDestError::NonUtf8`] before spawn. Hosts that
     /// jail writes in a capture dir still dest-deny argv against the
     /// user cwd when they set `current_dir`. Hosts that cannot use
     /// [`Self::run_child`] call this, then [`Self::apply_pre_exec`]
@@ -1781,16 +1783,25 @@ impl KernelPolicy {
         let workspace = from_cwd.or(from_grant).ok_or_else(|| {
             KernelError::Apply("dest-deny argv needs a current_dir or ReadWrite grant".into())
         })?;
-        let argv = command_argv(cmd);
+        let argv = command_argv(cmd)?;
         crate::check_command_argv(&argv, workspace, &self.deny_policy)?;
         Ok(())
     }
 }
 
-fn command_argv(cmd: &Command) -> Vec<String> {
-    let mut out = vec![cmd.get_program().to_string_lossy().into_owned()];
-    out.extend(cmd.get_args().map(|a| a.to_string_lossy().into_owned()));
-    out
+fn command_argv(cmd: &Command) -> Result<Vec<String>, CheckDestError> {
+    let mut out = Vec::with_capacity(1 + cmd.get_args().len());
+    out.push(utf8_arg(cmd.get_program())?);
+    for arg in cmd.get_args() {
+        out.push(utf8_arg(arg)?);
+    }
+    Ok(out)
+}
+
+fn utf8_arg(arg: &OsStr) -> Result<String, CheckDestError> {
+    arg.to_str()
+        .map(str::to_owned)
+        .ok_or(CheckDestError::NonUtf8)
 }
 
 /// Win32 `ERROR_ACCESS_DENIED`. Package WFP filters need an elevated token.
