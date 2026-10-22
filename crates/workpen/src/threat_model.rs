@@ -69,6 +69,17 @@
 //! * Wrapper skip is `timeout`, `nohup`, `nice`, `time`, and `stdbuf`.
 //! * The child environment removes `TMPDIR`, `TEMP`, and `TMP`. The
 //!   child uses the platform default temp directory.
+//! * On Windows, [`crate::check_dest`] and [`crate::explain`] treat
+//!   `CON`, `PRN`, `AUX`, `NUL`, `COM1` through `COM9`, `LPT1` through
+//!   `LPT9`, `CONIN$`, and `CONOUT$` as devices. That includes the
+//!   `\\.\` and `\\?\` device forms and a normal path whose final
+//!   component is one of those names. A trailing colon, `::`, and
+//!   `CON: :` still count. `NUL` stays allowed, the same
+//!   null-device grant as `/dev/null`. `explain` reports `allowed`.
+//!   The other names are [`crate::CheckDestError::SpecialFile`] and
+//!   [`crate::Why::SpecialFile`]. `NUL.txt` stays an ordinary path.
+//!   An extended `\\?\` path with a drive or UNC prefix is a literal
+//!   path, not that device.
 //! * On Unix, descriptors above stdio that lack `FD_CLOEXEC` get that
 //!   flag before `exec`. An inherited secret fd does not survive into
 //!   the command (`cat <&3`, including descriptor 65536 when the soft

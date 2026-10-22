@@ -1985,3 +1985,308 @@ fn file_inside_denied_directory_is_denied() {
         "children of a dotenv template name stay allowed"
     );
 }
+
+#[cfg(windows)]
+fn opens_reserved_device(path: &str) -> bool {
+    let owned = path.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let device = match std::fs::File::open(&owned) {
+            Ok(file) => file.metadata().is_err(),
+            Err(_) => false,
+        };
+        let _ = tx.send(device);
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(800))
+        .unwrap_or(true)
+}
+
+#[cfg(windows)]
+fn assert_windows_device(path: &str) {
+    let policy = DenyPolicy::default();
+    match check_dest(path, &policy, None) {
+        Err(CheckDestError::SpecialFile { kind, path: got }) => {
+            assert_eq!(kind, "device", "{path}");
+            assert_eq!(
+                got, path,
+                "device error must name the path that was checked"
+            );
+        }
+        other => panic!("{path} must be SpecialFile, got {other:?}"),
+    }
+}
+
+#[cfg(windows)]
+fn assert_windows_null(path: &str) {
+    let policy = DenyPolicy::default();
+    check_dest(path, &policy, None)
+        .unwrap_or_else(|err| panic!("{path} must stay the null device, got {err}"));
+    let why = workpen::explain(Path::new(path), &policy, None);
+    assert_eq!(
+        why,
+        workpen::Why::Allowed,
+        "{path} explain must allow the null device"
+    );
+    assert_eq!(
+        why.message(),
+        "allowed",
+        "NUL explain text is the null-device grant, same as /dev/null"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn check_dest_windows_nul_stays_the_null_device() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let nul = dir.path().join("NUL");
+    for path in [
+        "NUL",
+        "nul",
+        "Nul",
+        r"\\.\NUL",
+        r"\\.\nul",
+        r"\\?\NUL",
+        "//./NUL",
+        "//?/NUL",
+        r"\\.\NUL\",
+        "NUL.",
+        "NUL...",
+        "NUL:",
+        "NUL ",
+        "NUL::",
+        "NUL: :",
+        "NUL : :",
+        r".\NUL",
+        r"foo\..\NUL",
+    ] {
+        assert_windows_null(path);
+    }
+    assert_windows_null(&nul.to_string_lossy());
+    assert_windows_null(&nul.display().to_string().replace('\\', "/"));
+    assert_windows_null(&dir.path().join("sub").join("NUL").to_string_lossy());
+    assert_windows_null(&dir.path().join("NUL.").to_string_lossy());
+    assert_windows_null(&dir.path().join("NUL ").to_string_lossy());
+
+    let readme = dir.path().join("readme.txt");
+    std::fs::write(&readme, b"hello").expect("readme");
+    let policy = DenyPolicy::default();
+    check_dest(&readme.to_string_lossy(), &policy, None).expect("readme in the same directory");
+    std::fs::write(dir.path().join(".env"), b"SECRET=1\n").expect(".env");
+    match check_dest(&dir.path().join(".env").to_string_lossy(), &policy, None) {
+        Err(CheckDestError::DestDeny(DestDenyError::Denied(d))) => {
+            assert_eq!(d.kind, DestDenyKind::DenyGlob);
+        }
+        other => panic!(".env beside NUL must stay dest-deny, got {other:?}"),
+    }
+    match check_dest(
+        &dir.path().join(".env").join("NUL").to_string_lossy(),
+        &policy,
+        None,
+    ) {
+        Err(CheckDestError::DestDeny(DestDenyError::Denied(_))) => {}
+        other => panic!("NUL under .env must stay dest-deny, got {other:?}"),
+    }
+    match check_dest(
+        &dir.path().join(".env").join("CON").to_string_lossy(),
+        &policy,
+        None,
+    ) {
+        Err(CheckDestError::DestDeny(DestDenyError::Denied(_))) => {}
+        other => panic!("CON under .env must stay dest-deny, got {other:?}"),
+    }
+
+    let nul_txt = dir.path().join("NUL.txt");
+    check_dest(&nul_txt.to_string_lossy(), &policy, None).expect("NUL.txt is not the device");
+    match std::fs::File::open(&nul_txt) {
+        Err(err) => assert_eq!(err.raw_os_error(), Some(2), "NUL.txt open: {err}"),
+        Ok(_) => panic!("NUL.txt must not open the null device"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn check_dest_windows_reserved_names_are_devices() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for path in [
+        "CON",
+        "con",
+        "PRN",
+        "AUX",
+        "COM1",
+        "COM9",
+        "LPT1",
+        "LPT9",
+        "CONIN$",
+        "CONOUT$",
+        "conin$",
+        "CON.",
+        "CON ",
+        "CON:",
+        "CON .",
+        "CON::",
+        "CON: :",
+        "CON:  :",
+        "CON : :",
+        "PRN::",
+        "AUX::",
+        "COM1::",
+        "LPT1::",
+        "CONIN$::",
+        "CONOUT$::",
+        "CONIN$: :",
+        "CONOUT$: :",
+        r"\\.\CON",
+        r"\\?\CON",
+        r"\\.\con",
+        "//./CON",
+        "//?/PRN",
+        r"\\.\COM1",
+        r"\\?\LPT1",
+    ] {
+        assert_windows_device(path);
+    }
+    for name in ["CON", "PRN", "AUX", "COM1", "LPT9", "CON.", "CONIN$"] {
+        assert_windows_device(&dir.path().join(name).to_string_lossy());
+    }
+    assert_windows_device(&dir.path().join("nested").join("COM1").to_string_lossy());
+    let policy = DenyPolicy::default();
+    check_dest(&dir.path().join("COM0").to_string_lossy(), &policy, None)
+        .expect("COM0 is not a reserved device");
+    check_dest(&dir.path().join("COM10").to_string_lossy(), &policy, None)
+        .expect("COM10 is not a reserved device");
+    check_dest(&dir.path().join("LPT0").to_string_lossy(), &policy, None)
+        .expect("LPT0 is not a reserved device");
+    check_dest(&dir.path().join("CON.txt").to_string_lossy(), &policy, None)
+        .expect("CON.txt is not the console");
+    for ordinary in [
+        "CON:::",
+        "CON:: ",
+        "CON::.",
+        "CON:: :",
+        "CON: ::",
+        r"\\.\CON::",
+        r"\\?\CON::",
+    ] {
+        match check_dest(ordinary, &policy, None) {
+            Ok(_) => {}
+            Err(err) => panic!("{ordinary} must stay an ordinary path, got {err}"),
+        }
+        assert!(
+            !opens_reserved_device(ordinary),
+            "{ordinary} must not open a reserved device"
+        );
+    }
+    assert!(
+        opens_reserved_device("NUL::"),
+        "NUL:: is the null device and stays allowed"
+    );
+    assert_windows_device(&dir.path().join("CON::").to_string_lossy());
+    check_dest(
+        &dir.path().join("readme.txt").to_string_lossy(),
+        &policy,
+        None,
+    )
+    .expect("readme beside a device name stays allowed");
+}
+
+#[cfg(windows)]
+#[test]
+fn check_dest_windows_extended_literal_is_a_real_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let policy = DenyPolicy::default();
+    let con = dir.path().join("CON");
+    let nul = dir.path().join("NUL");
+    let literal_con = format!(r"\\?\{}", con.display());
+    let literal_nul = format!(r"\\?\{}", nul.display());
+    std::fs::write(&literal_con, b"real-con").expect("literal CON");
+    std::fs::write(&literal_nul, b"literal-bytes").expect("literal NUL");
+
+    assert_windows_device(&con.to_string_lossy());
+    assert_windows_null(&nul.to_string_lossy());
+    let nul_bytes = std::fs::read(&nul).expect("open normal NUL");
+    assert!(
+        nul_bytes.is_empty(),
+        "a normal path ending in NUL is the null device, got {nul_bytes:?}"
+    );
+
+    check_dest(&literal_con, &policy, None).expect("\\\\?\\ CON is the literal file");
+    check_dest(&literal_nul, &policy, None).expect("\\\\?\\ NUL is the literal file");
+    assert_eq!(
+        std::fs::read(&literal_con).expect("read literal CON"),
+        b"real-con"
+    );
+    assert_eq!(
+        std::fs::read(&literal_nul).expect("read literal NUL"),
+        b"literal-bytes"
+    );
+    std::fs::remove_file(&literal_con).expect("remove literal CON");
+    std::fs::remove_file(&literal_nul).expect("remove literal NUL");
+}
+
+#[cfg(windows)]
+#[test]
+fn check_dest_windows_guard_names_the_device() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outside = tempfile::tempdir().expect("outside");
+    let readme = dir.path().join("readme.txt");
+    std::fs::write(&readme, b"ok").expect("readme");
+    let guard =
+        PathGuard::new(dir.path(), workpen::AbsolutePathPolicy::AllowIfContained).expect("guard");
+    let policy = DenyPolicy::default();
+    check_dest(&readme.to_string_lossy(), &policy, Some(&guard)).expect("readme inside");
+    check_dest(
+        &dir.path().join("NUL").to_string_lossy(),
+        &policy,
+        Some(&guard),
+    )
+    .expect("NUL stays allowed when a guard is set");
+    assert_eq!(
+        workpen::explain(dir.path().join("NUL").as_path(), &policy, Some(&guard)),
+        workpen::Why::Allowed
+    );
+    match check_dest(
+        &outside.path().join("CON").to_string_lossy(),
+        &policy,
+        Some(&guard),
+    ) {
+        Err(CheckDestError::SpecialFile { kind, .. }) => assert_eq!(kind, "device"),
+        other => panic!("guarded CON must be the device, not an escape: {other:?}"),
+    }
+    match workpen::explain(outside.path().join("CON").as_path(), &policy, Some(&guard)) {
+        workpen::Why::SpecialFile { kind, .. } => assert_eq!(kind, "device"),
+        other => panic!("explain CON must be SpecialFile, got {other:?}"),
+    }
+    let outside_readme = outside.path().join("readme.txt");
+    std::fs::write(&outside_readme, b"no").expect("outside");
+    match check_dest(&outside_readme.to_string_lossy(), &policy, Some(&guard)) {
+        Err(CheckDestError::PathGuard(_)) => {}
+        other => panic!("an ordinary outside file must still escape: {other:?}"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn check_command_argv_windows_con_is_device_and_nul_stays_allowed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("readme.txt"), b"ok").expect("readme");
+    std::fs::write(dir.path().join(".env"), b"SECRET=1\n").expect(".env");
+    let policy = DenyPolicy::default();
+    match check_command_argv(&["cmd", "/c", "type", "CON"], dir.path(), &policy) {
+        Err(CheckDestError::SpecialFile { kind, .. }) => assert_eq!(kind, "device"),
+        other => panic!("argv CON must be SpecialFile, got {other:?}"),
+    }
+    check_command_argv(&["cmd", "/c", "type", "NUL"], dir.path(), &policy)
+        .expect("argv NUL stays allowed");
+    match check_command_argv(&["cmd", "/c", "type", "CON::"], dir.path(), &policy) {
+        Err(CheckDestError::SpecialFile { kind, .. }) => assert_eq!(kind, "device"),
+        other => panic!("argv CON:: must be SpecialFile, got {other:?}"),
+    }
+    check_command_argv(&["cmd", "/c", "type", "NUL::"], dir.path(), &policy)
+        .expect("argv NUL:: stays allowed");
+    check_command_argv(&["cmd", "/c", "type", "readme.txt"], dir.path(), &policy)
+        .expect("argv readme stays allowed");
+    match check_command_argv(&["cmd", "/c", "type", ".env"], dir.path(), &policy) {
+        Err(CheckDestError::DestDeny(_)) => {}
+        other => panic!("argv .env must stay dest-deny, got {other:?}"),
+    }
+}
