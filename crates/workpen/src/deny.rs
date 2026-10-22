@@ -144,6 +144,8 @@ pub enum CheckDestError {
     PathGuard(#[from] PathGuardError),
     #[error("path contains a NUL byte")]
     Nul,
+    /// Fifo, socket, or device. `/dev/null` and Windows `NUL` are not
+    /// this error. They stay allowed.
     #[error("refuse special file ({kind}): {path}")]
     SpecialFile { path: String, kind: &'static str },
     /// Read helper only. [`check_dest`] still allows directories.
@@ -315,8 +317,21 @@ pub fn dest_deny_message(path: &Path, display: &str, policy: &DenyPolicy) -> Opt
 ///
 /// `guard: None` dest-denies raw and, if the path exists, dest-denies the
 /// cwd-joined canonicalize. Does not treat cwd as a workspace root.
-/// Rejects NUL and existing fifo / socket / device. Does not peel.
+/// Rejects a NUL byte and an existing fifo, socket, or device. Does not peel.
 /// Does not refuse directories (write dests). See [`open_verified_read`].
+///
+/// On Windows, `CON`, `PRN`, `AUX`, `NUL`, `COM1` through `COM9`, `LPT1`
+/// through `LPT9`, `CONIN$`, and `CONOUT$` are devices. That includes the
+/// `\\.\` and `\\?\` device forms (`\\.\NUL`, `\\?\CON`) and a normal path
+/// whose final component is one of those names. Trailing spaces, dots, and
+/// a trailing colon still count (`NUL.`, `CON:`), as do `::` and a colon
+/// with spaces before a second colon (`CON::`, `CON: :`). `CON:::` does not.
+/// `NUL` stays allowed.
+/// That is the null-device grant, the same way `/dev/null` stays allowed.
+/// [`crate::explain`] reports `allowed`. The other names are
+/// [`CheckDestError::SpecialFile`]. A suffixed name such as `NUL.txt` stays
+/// an ordinary path. An extended `\\?\` or `\\.\` path that continues with
+/// a drive or UNC prefix is a literal path, not that device.
 pub fn check_dest(
     path: &str,
     policy: &DenyPolicy,
@@ -340,19 +355,28 @@ fn check_dest_rooted(
         return Err(CheckDestError::DestDeny(DestDenyError::Denied(deny)));
     }
 
-    // Argv checks this path with no PathGuard, so `run` allows
-    // `/dev/null` and refuses other devices. Apply that before a
-    // workspace guard can report Escape instead.
+    // Before the workspace guard, so `why` agrees with `run`.
+    // `/dev/null` and Windows `NUL` stay allowed. Other devices are
+    // special files, not "path escapes workspace".
     #[cfg(unix)]
     if is_null_device(raw) {
         return Ok(raw.to_path_buf());
+    }
+    #[cfg(windows)]
+    if let Some(kind) = windows_device_kind(path) {
+        return match kind {
+            WinDev::Null => Ok(raw.to_path_buf()),
+            WinDev::Other => Err(CheckDestError::SpecialFile {
+                path: path.to_owned(),
+                kind: "device",
+            }),
+        };
     }
 
     let resolved = match guard {
         Some(g) => match g.check(raw) {
             Ok(checked) => checked,
             Err(err) => {
-                #[cfg(unix)]
                 reject_special_file(raw)?;
                 return Err(err.into());
             }
@@ -458,8 +482,134 @@ fn reject_special_file(path: &Path) -> Result<(), CheckDestError> {
             });
         }
     }
-    let _ = path;
+    #[cfg(windows)]
+    {
+        if let Some(text) = path.to_str()
+            && windows_device_kind(text) == Some(WinDev::Other)
+        {
+            return Err(CheckDestError::SpecialFile {
+                path: path.display().to_string(),
+                kind: "device",
+            });
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+    }
     Ok(())
+}
+
+/// `NUL` is the null-device grant. The other names are devices.
+/// `\\?\C:\dir\NUL` is a literal file. `\\?\NUL` is the device.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WinDev {
+    Null,
+    Other,
+}
+
+#[cfg(windows)]
+fn windows_device_kind(text: &str) -> Option<WinDev> {
+    if let Some(rest) = device_namespace_body(text) {
+        let rest = rest.trim_end_matches(['\\', '/']);
+        if rest.contains('\\') || rest.contains('/') {
+            return None;
+        }
+        return reserved_device_name(rest);
+    }
+    let component = text.rsplit(['\\', '/']).next().unwrap_or(text);
+    reserved_device_name(component).or_else(|| reserved_two_colons(component))
+}
+
+/// Body after `\\.\`, `\\?\`, `//./`, or `//?/`.
+#[cfg(windows)]
+fn device_namespace_body(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 4 {
+        return None;
+    }
+    let sep = bytes[0];
+    if (sep != b'\\' && sep != b'/') || bytes[1] != sep || bytes[3] != sep {
+        return None;
+    }
+    let mark = bytes[2].to_ascii_lowercase();
+    if mark != b'.' && mark != b'?' {
+        return None;
+    }
+    Some(&text[4..])
+}
+
+#[cfg(windows)]
+fn reserved_device_name(component: &str) -> Option<WinDev> {
+    let trimmed = component.trim_end_matches([' ', '.']);
+    let name = match trimmed.strip_suffix(':') {
+        Some(head) => {
+            let head = head.trim_end_matches([' ', '.']);
+            if head.is_empty() || head.contains(':') || head.contains('.') {
+                trimmed
+            } else {
+                head
+            }
+        }
+        None => trimmed,
+    };
+    classify_reserved(name)
+}
+
+/// `CON::` and `CON: :` still open the console. One `strip_suffix(':')`
+/// leaves the other colon, and `run` joins the token onto the workspace
+/// before this check, so the final component is the spelling the child opens.
+/// `CON:::` and a trailing space or dot after `::` stay ordinary.
+/// Device-namespace paths do not use this rule (`\\.\CON::` is not the console).
+#[cfg(windows)]
+fn reserved_two_colons(component: &str) -> Option<WinDev> {
+    if let Some(head) = component.strip_suffix("::") {
+        if head.is_empty() || head.ends_with([' ', '.', ':']) {
+            return None;
+        }
+        return classify_reserved(head);
+    }
+    let bytes = component.as_bytes();
+    let mut i = bytes.len();
+    if i == 0 || bytes[i - 1] != b':' {
+        return None;
+    }
+    i -= 1;
+    if i == 0 || bytes[i - 1] != b' ' {
+        return None;
+    }
+    while i > 0 && bytes[i - 1] == b' ' {
+        i -= 1;
+    }
+    if i == 0 || bytes[i - 1] != b':' {
+        return None;
+    }
+    i -= 1;
+    while i > 0 && bytes[i - 1] == b' ' {
+        i -= 1;
+    }
+    classify_reserved(&component[..i])
+}
+
+#[cfg(windows)]
+fn classify_reserved(name: &str) -> Option<WinDev> {
+    if name.is_empty() || name.contains('.') || name.contains(':') || name.contains(' ') {
+        return None;
+    }
+    match name.to_ascii_uppercase().as_str() {
+        "NUL" => Some(WinDev::Null),
+        "CON" | "PRN" | "AUX" | "CONIN$" | "CONOUT$" => Some(WinDev::Other),
+        other => {
+            let rest = other
+                .strip_prefix("COM")
+                .or_else(|| other.strip_prefix("LPT"))?;
+            match rest.as_bytes() {
+                [digit] if (b'1'..=b'9').contains(digit) => Some(WinDev::Other),
+                _ => None,
+            }
+        }
+    }
 }
 
 /// Unix inode/dev; Windows file index + volume serial.

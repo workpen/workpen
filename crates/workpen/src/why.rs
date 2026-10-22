@@ -1,8 +1,12 @@
 //! Combined dest-deny + PathGuard explanation.
 //!
 //! [`explain`] follows [`crate::check_dest`], including fifo, socket,
-//! and device. `/dev/null` stays allowed. The CLI `why` command still
-//! uses `check_dest` under `--root`.
+//! and device. `/dev/null` stays allowed. On Windows, `NUL` stays
+//! allowed. That is the null-device grant, including `\\.\NUL`,
+//! `\\?\NUL`, and a path whose final component is `NUL`. [`explain`]
+//! reports `allowed`. `CON` and the other reserved device names are
+//! [`Why::SpecialFile`]. The CLI `why` command still uses `check_dest`
+//! under `--root`.
 
 use std::path::Path;
 
@@ -17,7 +21,8 @@ pub enum Why {
     PathGuard(PathGuardDeny),
     EmptyPath,
     /// Fifo, socket, or device. Same text as [`crate::CheckDestError::SpecialFile`].
-    /// `/dev/null` stays [`Why::Allowed`].
+    /// `/dev/null` and Windows `NUL` stay [`Why::Allowed`]. `explain`
+    /// reports `allowed` for that null-device grant.
     SpecialFile {
         path: String,
         kind: &'static str,
@@ -178,6 +183,59 @@ mod tests {
         let readme = dir.path().join("readme.md");
         std::fs::write(&readme, "ok\n").expect("readme");
         assert_eq!(explain(&readme, &policy, None), Why::Allowed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explain_windows_nul_is_the_null_device_grant() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let policy = DenyPolicy::default();
+        let nul = dir.path().join("NUL");
+        let readme = dir.path().join("readme.txt");
+        std::fs::write(&readme, b"ok\n").expect("readme");
+        std::fs::write(dir.path().join(".env"), b"SECRET=1\n").expect(".env");
+        for path in [
+            std::path::Path::new("NUL"),
+            std::path::Path::new(r"\\.\NUL"),
+            std::path::Path::new(r"\\?\NUL"),
+            nul.as_path(),
+        ] {
+            let why = explain(path, &policy, None);
+            assert_eq!(why, Why::Allowed, "{path:?}");
+            assert_eq!(
+                why.message(),
+                "allowed",
+                "explain text for NUL is the null-device grant"
+            );
+        }
+        let guard = PathGuard::new(
+            dir.path(),
+            crate::guard::AbsolutePathPolicy::AllowIfContained,
+        )
+        .expect("guard");
+        assert_eq!(
+            explain(&nul, &policy, Some(&guard)),
+            Why::Allowed,
+            "a workspace guard must not hide that NUL is allowed"
+        );
+        match explain(Path::new("CON"), &policy, None) {
+            Why::SpecialFile { kind, .. } => assert_eq!(kind, "device"),
+            other => panic!("CON must be SpecialFile, got {other:?}"),
+        }
+        let con_msg = explain(Path::new(r"\\.\CON"), &policy, None).message();
+        assert!(
+            con_msg.contains("refuse special file (device)"),
+            "CON explain must match check_dest: {con_msg}"
+        );
+        match explain(&dir.path().join("CON"), &policy, Some(&guard)) {
+            Why::SpecialFile { kind, .. } => assert_eq!(kind, "device"),
+            other => panic!("guarded path ending in CON must be SpecialFile, got {other:?}"),
+        }
+        assert_eq!(explain(&readme, &policy, None), Why::Allowed);
+        match explain(&dir.path().join(".env"), &policy, None) {
+            Why::DestDeny(_) => {}
+            other => panic!(".env beside NUL must stay dest-deny, got {other:?}"),
+        }
     }
 
     #[test]

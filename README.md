@@ -90,6 +90,14 @@ spawn-only run is [examples/run-echo.sh](examples/run-echo.sh). On
 Linux, if the kernel cannot hide secret names, `workpen run` does not
 start the child.
 
+On Windows, `why` and `run` treat `CON`, `PRN`, `AUX`, `COM1` through
+`COM9`, `LPT1` through `LPT9`, `CONIN$`, and `CONOUT$` as devices,
+including `\\.\` and `\\?\` forms and a path whose last name is one of
+those. A trailing colon still counts (`CON:`, `CON::`). `NUL` stays
+allowed, the same way `/dev/null` does on Unix.
+`explain` reports allowed for that null device. `NUL.txt` stays an
+ordinary file.
+
 `--timeout 1s` stops the command when that time is up, including
 startup on macOS. The process exits 124. Units are `s`, `m`, `h`,
 and `d`.

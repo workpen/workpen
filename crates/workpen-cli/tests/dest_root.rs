@@ -431,6 +431,168 @@ fn why_allows_dev_null_that_run_can_read() {
     );
 }
 
+#[cfg(windows)]
+fn output_within(cmd: &mut Command, limit: std::time::Duration) -> std::process::Output {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn workpen");
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    pipe.read_to_end(&mut stdout).expect("stdout");
+                }
+                if let Some(mut pipe) = child.stderr.take() {
+                    pipe.read_to_end(&mut stderr).expect("stderr");
+                }
+                return std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                };
+            }
+            Ok(None) if start.elapsed() < limit => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                panic!("workpen did not exit within {limit:?}");
+            }
+            Err(err) => panic!("wait: {err}"),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn why_allows_windows_nul_and_refuses_con() {
+    let ws = TempDir::new().expect("workspace");
+    std::fs::write(ws.path().join("readme.txt"), b"ok\n").expect("readme");
+    std::fs::write(ws.path().join(".env"), b"SECRET=1\n").expect(".env");
+    let nul = workpen()
+        .args(["why", "--root"])
+        .arg(ws.path())
+        .arg(ws.path().join("NUL"))
+        .output()
+        .expect("spawn why NUL");
+    let nul_out = String::from_utf8_lossy(&nul.stdout);
+    let nul_err = String::from_utf8_lossy(&nul.stderr);
+    assert!(
+        nul.status.success(),
+        "why NUL must allow the null device: stdout={nul_out} stderr={nul_err}"
+    );
+    assert!(
+        nul_out.contains("allowed") && nul_out.to_ascii_lowercase().contains("nul"),
+        "why NUL must say allowed: {nul_out}"
+    );
+
+    let con = workpen()
+        .args(["why", "--root"])
+        .arg(ws.path())
+        .arg(ws.path().join("CON"))
+        .output()
+        .expect("spawn why CON");
+    let con_out = String::from_utf8_lossy(&con.stdout);
+    assert_eq!(
+        con.status.code(),
+        Some(1),
+        "stdout={con_out} stderr={}",
+        String::from_utf8_lossy(&con.stderr)
+    );
+    assert!(
+        con_out.contains("refuse special file (device)"),
+        "why CON must name the device: {con_out}"
+    );
+
+    let con_json = workpen()
+        .args(["why", "--json", "--root"])
+        .arg(ws.path())
+        .arg(r"\\.\CON")
+        .output()
+        .expect("spawn why json CON");
+    let json = String::from_utf8_lossy(&con_json.stdout);
+    assert_eq!(con_json.status.code(), Some(1), "{json}");
+    assert!(
+        json.contains("special_file") && json.contains("device"),
+        "why --json CON must name the device kind: {json}"
+    );
+
+    let readme = workpen()
+        .args(["why", "--root"])
+        .arg(ws.path())
+        .arg("readme.txt")
+        .output()
+        .expect("spawn why readme");
+    assert!(
+        readme.status.success(),
+        "readme in the same directory stays allowed: stdout={} stderr={}",
+        String::from_utf8_lossy(&readme.stdout),
+        String::from_utf8_lossy(&readme.stderr)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn run_refuses_windows_con_and_allows_nul() {
+    let ws = TempDir::new().expect("workspace");
+    let comspec =
+        std::env::var_os("COMSPEC").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into());
+    let con = output_within(
+        workpen()
+            .arg("run")
+            .arg("--root")
+            .arg(ws.path())
+            .arg("--")
+            .arg(&comspec)
+            .args(["/C", "type", "CON"]),
+        std::time::Duration::from_secs(20),
+    );
+    let con_err = String::from_utf8_lossy(&con.stderr);
+    let con_out = String::from_utf8_lossy(&con.stdout);
+    assert_eq!(
+        con.status.code(),
+        Some(3),
+        "run CON must refuse before the console is opened: stdout={con_out} stderr={con_err}"
+    );
+    assert!(
+        con_err.contains("refuse special file (device)"),
+        "run CON must name the device: stdout={con_out} stderr={con_err}"
+    );
+
+    let nul = output_within(
+        workpen()
+            .arg("run")
+            .arg("--root")
+            .arg(ws.path())
+            .arg("--")
+            .arg(&comspec)
+            .args(["/C", "type", "NUL"]),
+        std::time::Duration::from_secs(30),
+    );
+    let nul_out = String::from_utf8_lossy(&nul.stdout);
+    let nul_err = String::from_utf8_lossy(&nul.stderr);
+    let nul_text = format!("{nul_out}{nul_err}");
+    assert!(
+        !nul_text.contains("refuse special file"),
+        "run NUL must stay the null-device grant: stdout={nul_out} stderr={nul_err}"
+    );
+    // The AppContainer may deny the device open after the child starts.
+    // That is not check_dest refusing NUL.
+    assert!(
+        nul.status.success() || nul_text.contains("Access is denied"),
+        "run NUL must start the child: stdout={nul_out} stderr={nul_err}"
+    );
+}
+
 #[test]
 fn why_plain_file_under_root_is_allowed() {
     let (ws, cwd) = workspace_with_env_hardlink();

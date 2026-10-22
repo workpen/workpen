@@ -60,6 +60,16 @@ The parent is trusted. The child is not.
 - Wrapper skip is `timeout`, `nohup`, `nice`, `time`, and `stdbuf`.
 - The child environment removes `TMPDIR`, `TEMP`, and `TMP`. The child
   uses the platform default temp directory.
+- On Windows, `check_dest` and `explain` treat `CON`, `PRN`, `AUX`,
+  `NUL`, `COM1` through `COM9`, `LPT1` through `LPT9`, `CONIN$`, and
+  `CONOUT$` as devices. That includes the `\\.\` and `\\?\` device
+  forms and a normal path whose final component is one of those names.
+  A trailing colon, `::`, and `CON: :` still count. `NUL` stays allowed,
+  the same null-device grant as `/dev/null`.
+  `explain` reports `allowed`. The other names are
+  `CheckDestError::SpecialFile` and `Why::SpecialFile`. `NUL.txt` stays
+  an ordinary path. An extended `\\?\` path with a drive or UNC prefix
+  is a literal path, not that device.
 - On Unix, descriptors above stdio that lack `FD_CLOEXEC` get that
   flag before `exec`. An inherited secret fd does not survive into
   the command (`cat <&3`, including descriptor 65536 when the soft
