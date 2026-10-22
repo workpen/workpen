@@ -214,7 +214,10 @@ fn ancestor_inside_workspace(dir: &Path, root: &Path) -> bool {
             continue;
         }
         let prefix = format!("{root_s}/");
-        if dir_s.len() > prefix.len() && dir_s[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+        if dir_s.len() > prefix.len()
+            && dir_s.is_char_boundary(prefix.len())
+            && dir_s[..prefix.len()].eq_ignore_ascii_case(&prefix)
+        {
             return true;
         }
     }
@@ -1680,10 +1683,36 @@ fn case_fold_regex_letters(s: &str) -> String {
 
 pub fn path_matches_deny_glob(pattern: &str, path: &str) -> bool {
     let pattern = normalize_glob_text(pattern);
-    let path = normalize_glob_text(path);
+    let path = windows_secret_spelling(&normalize_glob_text(path));
     let pat: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match_glob_segments(&pat, &segs)
+}
+
+/// Win32 opens `name.`, `name `, and `name::$DATA` as `name`.
+/// An extended `//?/` path is the literal spelling.
+fn windows_secret_spelling(path: &str) -> String {
+    #[cfg(not(windows))]
+    {
+        return path.to_string();
+    }
+    #[cfg(windows)]
+    {
+        if path.starts_with("//?/") {
+            return path.to_string();
+        }
+        let (dir, name) = match path.rfind('/') {
+            Some(i) => (&path[..=i], &path[i + 1..]),
+            None => ("", path),
+        };
+        let name = name.trim_end_matches([' ', '.']);
+        let name = name.split(':').next().unwrap_or(name);
+        let name = name.trim_end_matches([' ', '.']);
+        if name.is_empty() {
+            return path.to_string();
+        }
+        format!("{dir}{name}")
+    }
 }
 
 pub fn path_is_denied_glob(globs: &[String], path: &str) -> bool {
@@ -1786,7 +1815,10 @@ fn strip_prefix_path(path: &str, root: &str) -> Option<String> {
         return Some(String::new());
     }
     let prefix = format!("{root}/");
-    if path.len() >= prefix.len() && path[..prefix.len()].eq_ignore_ascii_case(&prefix) {
+    if path.len() >= prefix.len()
+        && path.is_char_boundary(prefix.len())
+        && path[..prefix.len()].eq_ignore_ascii_case(&prefix)
+    {
         return Some(path[prefix.len()..].to_string());
     }
     None
@@ -1854,25 +1886,40 @@ fn normalize_glob_text(s: &str) -> String {
 }
 
 fn match_glob_segments(pat: &[&str], path: &[&str]) -> bool {
-    match (pat.split_first(), path.split_first()) {
-        (None, None) => true,
-        (None, Some(_)) => false,
-        (Some((&"**", rest)), _) => {
-            if rest.is_empty() {
-                return true;
-            }
-            for i in 0..=path.len() {
-                if match_glob_segments(rest, &path[i..]) {
-                    return true;
-                }
-            }
-            false
-        }
-        (Some((p, prest)), Some((h, hrest))) => {
-            glob_segment(p, h) && match_glob_segments(prest, hrest)
-        }
-        (Some(_), None) => false,
+    let mut memo = vec![None; (pat.len() + 1) * (path.len() + 1)];
+    match_glob_at(pat, path, &mut memo, 0, 0)
+}
+
+/// Repeated `**` segments are exponential without this table.
+/// Fifteen `**` plus a final `z` did not return on a 25-segment path.
+fn match_glob_at(
+    pat: &[&str],
+    path: &[&str],
+    memo: &mut [Option<bool>],
+    pat_i: usize,
+    path_i: usize,
+) -> bool {
+    let slot = pat_i * (path.len() + 1) + path_i;
+    if let Some(done) = memo[slot] {
+        return done;
     }
+    let matched = match pat.get(pat_i) {
+        None => path_i == path.len(),
+        Some(&"**") => {
+            if pat_i + 1 == pat.len() {
+                true
+            } else {
+                (path_i..=path.len()).any(|next| match_glob_at(pat, path, memo, pat_i + 1, next))
+            }
+        }
+        Some(segment) => {
+            path_i < path.len()
+                && glob_segment(segment, path[path_i])
+                && match_glob_at(pat, path, memo, pat_i + 1, path_i + 1)
+        }
+    };
+    memo[slot] = Some(matched);
+    matched
 }
 
 fn glob_segment(pat: &str, text: &str) -> bool {
