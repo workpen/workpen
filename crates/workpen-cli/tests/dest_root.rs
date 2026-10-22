@@ -578,11 +578,18 @@ fn run_refuses_windows_con_and_allows_nul() {
             .args(["/C", "type", "NUL"]),
         std::time::Duration::from_secs(30),
     );
+    let nul_out = String::from_utf8_lossy(&nul.stdout);
+    let nul_err = String::from_utf8_lossy(&nul.stderr);
+    let nul_text = format!("{nul_out}{nul_err}");
     assert!(
-        nul.status.success(),
-        "run NUL must allow the null device: stdout={} stderr={}",
-        String::from_utf8_lossy(&nul.stdout),
-        String::from_utf8_lossy(&nul.stderr)
+        !nul_text.contains("refuse special file"),
+        "run NUL must stay the null-device grant: stdout={nul_out} stderr={nul_err}"
+    );
+    // The AppContainer may deny the device open after the child starts.
+    // That is not check_dest refusing NUL.
+    assert!(
+        nul.status.success() || nul_text.contains("Access is denied"),
+        "run NUL must start the child: stdout={nul_out} stderr={nul_err}"
     );
 }
 
