@@ -2211,6 +2211,27 @@ fn check_dest_windows_extended_literal_is_a_real_file() {
 
     check_dest(&literal_con, &policy, None).expect("\\\\?\\ CON is the literal file");
     check_dest(&literal_nul, &policy, None).expect("\\\\?\\ NUL is the literal file");
+    let guard =
+        PathGuard::new(dir.path(), workpen::AbsolutePathPolicy::AllowIfContained).expect("guard");
+    let guarded = check_dest(&literal_con, &policy, Some(&guard))
+        .expect("verbatim CON inside the workspace is not an escape");
+    assert!(
+        guarded.display().to_string().starts_with(r"\\?\"),
+        "the allowed path must stay verbatim so it is not the console: {}",
+        guarded.display()
+    );
+    assert_eq!(
+        std::fs::read(&guarded).expect("read guarded literal CON"),
+        b"real-con"
+    );
+    let outside = tempfile::tempdir().expect("outside");
+    let outside_con = format!(r"\\?\{}", outside.path().join("CON").display());
+    std::fs::write(&outside_con, b"no").expect("outside literal CON");
+    match check_dest(&outside_con, &policy, Some(&guard)) {
+        Err(CheckDestError::PathGuard(_)) => {}
+        other => panic!("verbatim CON outside the workspace must still escape: {other:?}"),
+    }
+    std::fs::remove_file(&outside_con).expect("remove outside literal CON");
     assert_eq!(
         std::fs::read(&literal_con).expect("read literal CON"),
         b"real-con"

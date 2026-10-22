@@ -526,6 +526,26 @@ fn why_allows_windows_nul_and_refuses_con() {
         "why --json CON must name the device kind: {json}"
     );
 
+    let literal_con = format!(r"\\?\{}", ws.path().join("CON").display());
+    std::fs::write(&literal_con, b"real-con").expect("literal CON");
+    let literal = workpen()
+        .args(["why", "--root"])
+        .arg(ws.path())
+        .arg(&literal_con)
+        .output()
+        .expect("spawn why literal CON");
+    let literal_out = String::from_utf8_lossy(&literal.stdout);
+    let literal_err = String::from_utf8_lossy(&literal.stderr);
+    assert!(
+        literal.status.success(),
+        "why on a verbatim CON file inside the workspace must allow it: stdout={literal_out} stderr={literal_err}"
+    );
+    assert!(
+        literal_out.contains("allowed") && literal_out.contains(r"\\?\"),
+        "why must keep the verbatim path: {literal_out}"
+    );
+    let _ = std::fs::remove_file(&literal_con);
+
     let readme = workpen()
         .args(["why", "--root"])
         .arg(ws.path())
