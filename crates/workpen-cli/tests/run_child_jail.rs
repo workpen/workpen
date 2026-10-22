@@ -1310,7 +1310,7 @@ fn run_inserts_noprofile_so_env_login_bash_skips_home_profile() {
 
 #[cfg(unix)]
 #[test]
-fn run_drops_env_argv_bash_env_assignment() {
+fn run_refuses_env_argv_bash_env_assignment() {
     let env_bin = ["/usr/bin/env", "/bin/env"]
         .into_iter()
         .find(|p| std::path::Path::new(p).is_file());
@@ -1336,19 +1336,21 @@ fn run_drops_env_argv_bash_env_assignment() {
         ])
         .output()
         .expect("spawn workpen");
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            err.contains("remount unavailable"),
-            "env without denied assignment must run or refuse remount skip: status={:?} stderr={err}",
-            out.status
-        );
-        return;
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "env BASH_ENV=.env must dest-deny before spawn: status={:?} stderr={err}",
+        out.status
+    );
     assert!(
-        !stdout.contains(".env"),
-        "env BASH_ENV=.env must be dropped: {stdout:?}"
+        err.contains(".env") && err.contains("deny"),
+        "refusal must name the dest-deny path: {err}"
+    );
+    assert!(
+        !err.contains("SECRET") && !String::from_utf8_lossy(&out.stdout).contains("SECRET"),
+        "denied argv must not print the secret: stdout={} stderr={err}",
+        String::from_utf8_lossy(&out.stdout)
     );
 }
 

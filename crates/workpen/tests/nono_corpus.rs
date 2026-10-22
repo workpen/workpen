@@ -3331,6 +3331,31 @@ fn dest_deny_command_is_public_and_matches_run_child() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn dest_deny_command_refuses_non_utf8_arg() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = workspace();
+    let policy = match process_jail(dir.path(), std::iter::empty::<&Path>()) {
+        Ok(policy) => policy,
+        Err(_) => return,
+    };
+    let mut bad = Command::new("cat");
+    bad.arg(OsStr::from_bytes(b"notes\xff"))
+        .current_dir(dir.path());
+    match policy.dest_deny_command(&bad) {
+        Err(KernelError::DestDeny(CheckDestError::NonUtf8)) => {}
+        other => panic!("non-utf8 argv must be DestDeny NonUtf8, got {other:?}"),
+    }
+    let mut ok = Command::new("echo");
+    ok.arg("ok").current_dir(dir.path());
+    policy
+        .dest_deny_command(&ok)
+        .expect("utf-8 echo is allowed");
+}
+
 #[test]
 fn dest_deny_command_uses_command_current_dir_not_rw_grant() {
     let root = workspace();

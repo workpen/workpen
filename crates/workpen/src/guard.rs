@@ -178,8 +178,17 @@ impl PathGuard {
         }
     }
 
+    /// Resolve one dest. A path that is not valid UTF-8 is
+    /// [`PathGuardKind::Escape`]. The lossy name is not scanned.
     pub fn check(&self, path: &Path) -> Result<PathBuf, PathGuardError> {
-        self.check_path(&path.to_string_lossy())
+        let Some(raw) = path.to_str() else {
+            return Err(PathGuardError::Denied(PathGuardDeny {
+                kind: PathGuardKind::Escape,
+                path: path.to_path_buf(),
+                display: path.to_string_lossy().into_owned(),
+            }));
+        };
+        self.check_path(raw)
     }
 
     /// Content ops. Follows the final component.

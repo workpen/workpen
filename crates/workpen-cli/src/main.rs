@@ -808,9 +808,10 @@ fn check_dest_json(code: u8, err: &CheckDestError) -> String {
         CheckDestError::DestDeny(_) | CheckDestError::PathGuard(_) => {
             json_line("denied", code, None, None, Some("path_guard"))
         }
-        CheckDestError::Nul | CheckDestError::Directory { .. } | CheckDestError::Io(_) => {
-            json_line("denied", code, None, None, None)
-        }
+        CheckDestError::Nul
+        | CheckDestError::Directory { .. }
+        | CheckDestError::Io(_)
+        | CheckDestError::NonUtf8 => json_line("denied", code, None, None, None),
     }
 }
 

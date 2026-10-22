@@ -8,7 +8,7 @@
 [![Security](https://github.com/workpen/workpen/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/workpen/workpen/actions/workflows/security.yml)
 [![crates.io](https://img.shields.io/crates/v/workpen?logo=rust)](https://crates.io/crates/workpen)
 [![docs.rs](https://img.shields.io/docsrs/workpen?logo=docs.rs)](https://docs.rs/workpen)
-[![Release](https://img.shields.io/github/v/release/workpen/workpen?logo=github&sort=semver)](https://github.com/workpen/workpen/releases/latest)
+[![Release](https://img.shields.io/github/v/release/workpen/workpen?logo=github)](https://github.com/workpen/workpen/releases/latest)
 
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](./LICENSE)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/14736/badge)](https://www.bestpractices.dev/projects/14736)
