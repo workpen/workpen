@@ -353,9 +353,7 @@ fn check_dest_rooted(
             Ok(checked) => checked,
             Err(err) => {
                 #[cfg(unix)]
-                if let Err(special) = reject_special_file(raw) {
-                    return Err(special);
-                }
+                reject_special_file(raw)?;
                 return Err(err.into());
             }
         },
