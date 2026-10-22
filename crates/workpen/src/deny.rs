@@ -636,8 +636,9 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// after an ASCII-letter cluster when that remainder starts with `.`
 /// `/` or `~`. `-areadme.md` and `-color` stay allowed. `--color=always`
 /// and `--jobs=4` stay allowed when the suffix is not a dest-deny name.
-/// Does not dest-deny a flattened join of all argv. Does not dest-deny
-/// a following separate token unless that token is already a raw dest.
+/// A non-flag `NAME=value` dest-denies the value. Does not dest-deny a
+/// flattened join of all argv. Does not dest-deny a following separate
+/// token unless that token is already a raw dest.
 pub fn check_command_argv(
     cmd: &[impl AsRef<str>],
     root: &Path,
@@ -648,6 +649,10 @@ pub fn check_command_argv(
         if !token.is_empty() && !token.starts_with('-') {
             let dest = dest_under_root(root, token);
             check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
+            if let Some(value) = assignment_dest_value(token) {
+                let dest = dest_under_root(root, value);
+                check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
+            }
         }
         if let Some(value) = attached_flag_dest(token) {
             let dest = dest_under_root(root, value);
@@ -994,6 +999,26 @@ fn attached_flag_dest(token: &str) -> Option<&str> {
     None
 }
 
+/// Value after the first `=` on a non-flag token.
+///
+/// Empty tokens and tokens that start with `-` are ignored
+/// (`--file=.env` stays on [`attached_flag_dest`]). One matching
+/// quote pair around the value is stripped. An empty value is ignored.
+fn assignment_dest_value(token: &str) -> Option<&str> {
+    if token.is_empty() || token.starts_with('-') {
+        return None;
+    }
+    let (_, mut value) = token.split_once('=')?;
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 {
+        let quote = bytes[0];
+        if (quote == b'\'' || quote == b'"') && bytes[bytes.len() - 1] == quote {
+            value = &value[1..bytes.len() - 1];
+        }
+    }
+    if value.is_empty() { None } else { Some(value) }
+}
+
 #[cfg(feature = "nono")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CmdWrapper {
@@ -1283,6 +1308,10 @@ pub fn check_command_dests(
             }
             let dest = dest_under_root(root, peeled);
             check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
+            if let Some(value) = assignment_dest_value(peeled) {
+                let dest = dest_under_root(root, value);
+                check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
+            }
         }
     }
     check_command_string_env_dests(command, root, policy)
@@ -2145,6 +2174,11 @@ fn candidate_is_denied(candidate: &str, policy: &DenyPolicy) -> bool {
             continue;
         }
         if is_path_denied(Path::new(peeled), policy) {
+            return true;
+        }
+        if let Some(value) = assignment_dest_value(peeled)
+            && is_path_denied(Path::new(value), policy)
+        {
             return true;
         }
         if let Some((_, after)) = peeled.rsplit_once(':') {

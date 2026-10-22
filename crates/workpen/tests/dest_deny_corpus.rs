@@ -611,6 +611,85 @@ fn check_command_argv_denies_env_split_string_and_file() {
 }
 
 #[test]
+fn check_command_argv_denies_assignment_values() {
+    let ws = tempfile::tempdir().expect("workspace");
+    let env = ws.path().join(".env");
+    std::fs::write(&env, "SECRET=1\n").expect("write .env");
+    std::fs::hard_link(&env, ws.path().join("notes.txt")).expect("hardlink");
+    std::fs::write(ws.path().join("readme.md"), "ok\n").expect("write readme");
+    let policy = DenyPolicy::default();
+    let root = ws.path();
+
+    let err = check_command_argv(&["env", "FOO=notes.txt", "bash"], root, &policy)
+        .expect_err("FOO=notes.txt must dest-deny the hardlink value");
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(
+                d.kind,
+                DestDenyKind::HardlinkSibling,
+                "FOO=notes.txt must be HardlinkSibling, got {:?}",
+                d.kind
+            );
+        }
+        other => panic!("expected DestDeny HardlinkSibling, got {other:?}"),
+    }
+    for body in [
+        "BASH_ENV=notes.txt bash -c true",
+        "ENV=notes.txt bash -c true",
+        "PYTHONSTARTUP=notes.txt python -c true",
+    ] {
+        let err = check_command_argv(&["bash", "-c", body], root, &policy).expect_err(body);
+        match err {
+            CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+                assert_eq!(
+                    d.kind,
+                    DestDenyKind::HardlinkSibling,
+                    "{body} must be HardlinkSibling, got {:?}",
+                    d.kind
+                );
+            }
+            other => panic!("expected DestDeny HardlinkSibling for {body}, got {other:?}"),
+        }
+    }
+    let err = check_command_argv(&["bash", "-c", "FOO=.env cat"], root, &policy)
+        .expect_err("FOO=.env must DenyGlob");
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(
+                d.kind,
+                DestDenyKind::DenyGlob,
+                "FOO=.env must be DenyGlob, got {:?}",
+                d.kind
+            );
+        }
+        other => panic!("expected DestDeny DenyGlob, got {other:?}"),
+    }
+    reject_command_secret_path_tokens("FOO=.env", &policy).expect_err("FOO=.env token must deny");
+    reject_command_secret_path_tokens("bash -c 'FOO=\".env\"'", &policy)
+        .expect_err("quoted assignment value must deny");
+
+    check_command_argv(&["env", "FOO=readme.md", "bash"], root, &policy)
+        .expect("FOO=readme.md stays allowed");
+    check_command_argv(&["env", "FOO=1", "bash"], root, &policy).expect("FOO=1 stays allowed");
+    reject_command_secret_path_tokens("echo FOO=bar", &policy).expect("FOO=bar stays allowed");
+    reject_command_secret_path_tokens("cat .env.example", &policy)
+        .expect(".env.example stays allowed");
+    let err = check_command_argv(&["env", "-S", "BASH_ENV=.env", "bash"], root, &policy)
+        .expect_err("env -S BASH_ENV=.env must still dest-deny");
+    match err {
+        CheckDestError::DestDeny(DestDenyError::Denied(d)) => {
+            assert_eq!(
+                d.kind,
+                DestDenyKind::DenyGlob,
+                "env -S BASH_ENV=.env must stay DenyGlob, got {:?}",
+                d.kind
+            );
+        }
+        other => panic!("expected DestDeny DenyGlob for env -S BASH_ENV=.env, got {other:?}"),
+    }
+}
+
+#[test]
 fn check_command_argv_denies_env_flags_after_timeout_nohup_nice() {
     let ws = tempfile::tempdir().expect("workspace");
     std::fs::write(ws.path().join(".env"), "SECRET=1\n").expect("write .env");
