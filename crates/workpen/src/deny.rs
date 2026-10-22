@@ -340,8 +340,23 @@ fn check_dest_rooted(
         return Err(CheckDestError::DestDeny(DestDenyError::Denied(deny)));
     }
 
+    // Argv checks this path with no PathGuard, so `run` allows
+    // `/dev/null` and refuses other devices. Apply that before a
+    // workspace guard can report Escape instead.
+    #[cfg(unix)]
+    if is_null_device(raw) {
+        return Ok(raw.to_path_buf());
+    }
+
     let resolved = match guard {
-        Some(g) => g.check(raw)?,
+        Some(g) => match g.check(raw) {
+            Ok(checked) => checked,
+            Err(err) => {
+                #[cfg(unix)]
+                reject_special_file(raw)?;
+                return Err(err.into());
+            }
+        },
         None => {
             let joined = if raw.is_absolute() {
                 raw.to_path_buf()

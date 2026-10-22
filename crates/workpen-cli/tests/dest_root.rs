@@ -391,6 +391,46 @@ fn run_allows_dev_null() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn why_allows_dev_null_that_run_can_read() {
+    let ws = TempDir::new().expect("workspace");
+    if !std::path::Path::new("/dev/null").exists() {
+        return;
+    }
+    let out = workpen()
+        .args(["why", "--root"])
+        .arg(ws.path())
+        .arg("/dev/null")
+        .output()
+        .expect("spawn workpen");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "why /dev/null must allow the null device run already reads: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("allowed") && stdout.contains("/dev/null"),
+        "why /dev/null must say allowed: {stdout}"
+    );
+    if !std::path::Path::new("/dev/zero").exists() {
+        return;
+    }
+    let zero = workpen()
+        .args(["why", "--root"])
+        .arg(ws.path())
+        .arg("/dev/zero")
+        .output()
+        .expect("spawn workpen");
+    let zero_out = String::from_utf8_lossy(&zero.stdout);
+    assert_eq!(zero.status.code(), Some(1), "{zero_out}");
+    assert!(
+        zero_out.contains("refuse special file (device)"),
+        "why /dev/zero must name the device, not a workspace escape: {zero_out}"
+    );
+}
+
 #[test]
 fn why_plain_file_under_root_is_allowed() {
     let (ws, cwd) = workspace_with_env_hardlink();
