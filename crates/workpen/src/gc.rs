@@ -1,7 +1,7 @@
 //! Fail-closed leftover worktree age GC. Feature-gated (`gc`).
 //!
-//! Unique-work is `git status --porcelain=v1 -uall --ignored` (with
-//! `status.showUntrackedFiles=all`). Last-used is `git log -1
+//! Unique-work is `git status --porcelain=v1 --ignored=matching`.
+//! Last-used is `git log -1
 //! --format=%ct`, the index mtime, and a bounded tree walk. Both clocks
 //! are git CLI. There is no `gix` path in v1.
 
@@ -762,10 +762,10 @@ fn is_under_known_cache(root: &Path, file: &Path) -> bool {
     is_age_cache_dir_name(&name.to_string_lossy())
 }
 
-/// Unique-work is `git status --porcelain=v1 -uall --ignored`. Git CLI, not gix.
-/// Porcelain `??` / `!!` under a first-component cache dir name is not unique
-/// work unless a deny-glob name exists in that tree (git often lists only
-/// `!! target/`, not `!! target/.env`). Other XY statuses under those names
+/// Unique-work is `git status --porcelain=v1 --ignored=matching`. Git CLI, not gix.
+/// Matching mode prints `!! target/` instead of every file under it. Porcelain
+/// `??` / `!!` under a first-component cache dir name is not unique work unless
+/// a deny-glob name exists in that tree. Other XY statuses under those names
 /// are DirtyWork (tracked dirty cache paths).
 fn unique_work_reason(path: &Path, policy: &DenyPolicy) -> Option<KeepReason> {
     unique_work_from(path, policy, IndexSource::Lookup)
@@ -785,17 +785,7 @@ fn unique_work_from(
         IndexSource::Lookup => owned.as_deref(),
     };
     let index_before = index_mtime_at(index);
-    let out = match git(
-        path,
-        &[
-            "-c",
-            "status.showUntrackedFiles=all",
-            "status",
-            "--porcelain=v1",
-            "-uall",
-            "--ignored",
-        ],
-    ) {
+    let out = match git(path, &["status", "--porcelain=v1", "--ignored=matching"]) {
         Ok(s) => s,
         Err(_) => return Some(KeepReason::StatusUnreadable),
     };
