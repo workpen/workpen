@@ -1348,6 +1348,71 @@ fn validate_deny_glob_rejects_brace_backslash_empty_segment() {
 }
 
 #[test]
+fn many_stars_in_one_segment_do_not_hang() {
+    let pattern = format!("{}z", "*".repeat(20));
+    let name = "a".repeat(24);
+    let started = std::time::Instant::now();
+    assert!(
+        !path_matches_deny_glob(&pattern, &name),
+        "stars plus a missing literal must not match"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(200),
+        "twenty stars must stay cheap, took {:?}",
+        started.elapsed()
+    );
+    assert!(path_matches_deny_glob("a*b*c", "axbyc"));
+    assert!(path_matches_deny_glob("*a*b", "ab"));
+    assert!(path_matches_deny_glob("***", "hello"));
+    assert!(!path_matches_deny_glob("*z", "aaaa"));
+}
+
+#[test]
+fn emoji_workspace_root_does_not_panic() {
+    let denied = path_is_denied_under_root(
+        &["**/.env".to_string()],
+        "/😀/file",
+        std::path::Path::new("/é"),
+    );
+    assert!(!denied);
+}
+
+#[test]
+fn many_double_stars_do_not_hang() {
+    let pattern = format!("{}/z", ["**"; 15].join("/"));
+    let path = (0..25)
+        .map(|i| format!("s{i}"))
+        .collect::<Vec<_>>()
+        .join("/");
+    let started = std::time::Instant::now();
+    assert!(!path_matches_deny_glob(&pattern, &path));
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(200),
+        "fifteen ** segments must stay cheap, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_trailing_dot_space_and_data_stream_match_secret_globs() {
+    assert!(path_matches_deny_glob("*.pem", "secret.pem."));
+    assert!(path_matches_deny_glob("*.pem", "secret.pem "));
+    assert!(path_matches_deny_glob("**/*.pem", "dir/secret.pem::$DATA"));
+    assert!(path_matches_deny_glob("id_rsa", "id_rsa."));
+    assert!(!path_matches_deny_glob("*.pem", r"\\?\C:\ws\secret.pem."));
+    let policy = DenyPolicy::default();
+    match check_dest("secret.pem.", &policy, None) {
+        Err(CheckDestError::DestDeny(_)) => {}
+        other => panic!("secret.pem. must be dest-deny, got {other:?}"),
+    }
+    match check_dest("id_rsa.", &policy, None) {
+        Err(CheckDestError::DestDeny(_)) => {}
+        other => panic!("id_rsa. must be dest-deny, got {other:?}"),
+    }
+}
+
+#[test]
 fn dest_deny_glob_regex_interior_double_star_matches_nested_and_zero_segments() {
     let glob = "src/**/*.pem";
     assert!(

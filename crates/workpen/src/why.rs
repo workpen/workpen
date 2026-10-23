@@ -3,8 +3,11 @@
 //! [`explain`] follows [`crate::check_dest`], including fifo, socket,
 //! and device. `/dev/null` stays allowed. On Windows, `NUL` stays
 //! allowed. That is the null-device grant, including `\\.\NUL`,
-//! `\\?\NUL`, and a path whose final component is `NUL`. [`explain`]
-//! reports `allowed`. `CON` and the other reserved device names are
+//! `\\?\NUL`, and a normal path whose final component is `NUL`.
+//! [`explain`] reports `allowed`. An extended `\\?\` path with a
+//! drive or UNC prefix is a literal file, not that device.
+//! `\\?\C:\dir\NUL` and `\\?\C:\dir\CON` stay ordinary. `CON` and
+//! the other reserved names on a normal path are
 //! [`Why::SpecialFile`]. The CLI `why` command still uses `check_dest`
 //! under `--root`.
 
@@ -22,7 +25,8 @@ pub enum Why {
     EmptyPath,
     /// Fifo, socket, or device. Same text as [`crate::CheckDestError::SpecialFile`].
     /// `/dev/null` and Windows `NUL` stay [`Why::Allowed`]. `explain`
-    /// reports `allowed` for that null-device grant.
+    /// reports `allowed` for that null-device grant. An extended
+    /// `\\?\` drive path is a literal file, not this error.
     SpecialFile {
         path: String,
         kind: &'static str,
