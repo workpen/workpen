@@ -990,6 +990,12 @@ fn age_uses_tree_mtime_not_root_only() {
         return;
     }
     fs::write(wt.join("nested.txt"), b"new").expect("nested");
+    // The write updates the worktree directory mtime. Stamp that back
+    // so TooNew can only come from the nested file.
+    assert!(
+        stamp(&wt) && stamp(&index),
+        "restamp the worktree directory and index after the nested write"
+    );
     match classify_for_age_gc(&wt, false, Duration::from_secs(60 * 60), SystemTime::now()) {
         GcDecision::Keep {
             reason: KeepReason::TooNew,
