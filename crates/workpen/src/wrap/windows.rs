@@ -971,9 +971,7 @@ fn spawn_prepared_child(
             reap = unsafe { WaitForSingleObject(process.0, 5_000) };
         }
         if reap != WAIT_OBJECT_0 {
-            return Err(KernelError::Apply(
-                "timeout kill left process still active".into(),
-            ));
+            return Err(KernelError::Timeout);
         }
     } else if wait == WAIT_FAILED || wait != WAIT_OBJECT_0 {
         return Err(last_error("WaitForSingleObject"));
@@ -993,6 +991,9 @@ fn spawn_prepared_child(
             started,
             timeout,
         );
+        if timed_out {
+            return Err(KernelError::Timeout);
+        }
         return Err(last_error("GetExitCodeProcess"));
     }
     let applied = if prepared.wfp_skipped {
