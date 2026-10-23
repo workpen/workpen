@@ -831,9 +831,10 @@ fn copy_pipe(
                         match push_nonblock(&buf[off..n], chunk, |slice| {
                             write_fd(out_fd, slice, toggle)
                         }) {
-                            PushNonblock::Wrote(wrote) if wrote > 0 => off += wrote,
-                            PushNonblock::Wait => continue,
+                            // A match guard is not exhaustive, so zero is its own arm.
                             PushNonblock::Wrote(0) | PushNonblock::Stop => return,
+                            PushNonblock::Wait => continue,
+                            PushNonblock::Wrote(wrote) => off += wrote,
                         }
                     }
                 }
