@@ -162,7 +162,12 @@ fn cmd_init(args: &[String]) -> Result<ExitCode, String> {
             ));
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.to_string()),
+        Err(err) => {
+            return Err(format!(
+                "cannot inspect agent.lock at {}: {err}",
+                path.display()
+            ));
+        }
     }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -175,11 +180,22 @@ fn cmd_init(args: &[String]) -> Result<ExitCode, String> {
                     path.display()
                 )
             } else {
-                err.to_string()
+                format!("cannot create agent.lock at {}: {err}", path.display())
             }
         })?;
-    std::io::Write::write_all(&mut file, AGENT_LOCK_TEMPLATE.as_bytes())
-        .map_err(|e| e.to_string())?;
+    if let Err(err) = std::io::Write::write_all(&mut file, AGENT_LOCK_TEMPLATE.as_bytes()) {
+        return Err(match std::fs::remove_file(&path) {
+            Ok(()) => format!(
+                "could not write the agent.lock template at {}: {err}",
+                path.display()
+            ),
+            Err(remove_err) => format!(
+                "could not write the agent.lock template at {}: {err}; left {} in place ({remove_err})",
+                path.display(),
+                path.display()
+            ),
+        });
+    }
     println!("wrote {}", path.display());
     Ok(ExitCode::SUCCESS)
 }

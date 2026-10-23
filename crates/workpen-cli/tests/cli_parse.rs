@@ -12,6 +12,76 @@ fn workpen() -> Command {
 }
 
 #[test]
+fn init_names_an_existing_lock_and_a_new_file() {
+    let ws = tempfile::tempdir().expect("workspace");
+    let ws_arg = ws.path().to_string_lossy().into_owned();
+    let lock = ws.path().join("agent.lock");
+    std::fs::write(&lock, "keep-me\n").expect("seed");
+    let again = workpen()
+        .args(["init", "--root", &ws_arg])
+        .output()
+        .expect("spawn workpen");
+    let err = String::from_utf8_lossy(&again.stderr);
+    let out = String::from_utf8_lossy(&again.stdout);
+    assert_eq!(again.status.code(), Some(2), "{err}");
+    assert!(
+        err.contains("already exists") && err.contains("does not change"),
+        "{err}"
+    );
+    assert!(!out.contains("wrote"), "{out}");
+    assert_eq!(std::fs::read_to_string(&lock).expect("read"), "keep-me\n");
+    std::fs::remove_file(&lock).expect("remove seed");
+    let created = workpen()
+        .args(["init", "--root", &ws_arg])
+        .output()
+        .expect("spawn workpen");
+    let created_out = String::from_utf8_lossy(&created.stdout);
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert!(created_out.contains("wrote"), "{created_out}");
+    let body = std::fs::read_to_string(&lock).expect("template");
+    assert!(body.contains("secrets/**"), "{body}");
+}
+
+#[cfg(windows)]
+#[test]
+fn init_does_not_follow_an_agent_lock_junction() {
+    let ws = tempfile::tempdir().expect("workspace");
+    let outside = tempfile::tempdir().expect("outside");
+    let link = ws.path().join("agent.lock");
+    let status = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(&link)
+        .arg(outside.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("mklink");
+    assert!(status.success(), "mklink {status}");
+    let ws_arg = ws.path().to_string_lossy().into_owned();
+    let out = workpen()
+        .args(["init", "--root", &ws_arg])
+        .output()
+        .expect("spawn workpen");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(
+        err.contains("symlink") && err.contains("does not follow"),
+        "{err}"
+    );
+    assert!(
+        std::fs::read_dir(outside.path())
+            .expect("outside")
+            .next()
+            .is_none(),
+        "init must not create a file through the junction"
+    );
+}
+
+#[test]
 fn read_inside_workspace_is_refused() {
     let ws = tempfile::tempdir().expect("workspace");
     let secrets = ws.path().join("secrets");
