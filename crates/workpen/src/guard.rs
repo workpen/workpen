@@ -504,6 +504,12 @@ fn walk_guarded(start: &Path, roots: &[PathBuf]) -> Result<PathBuf, PathGuardKin
     Err(PathGuardKind::Escape)
 }
 
+fn root_component_len(path: &Path) -> usize {
+    path.components()
+        .take_while(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+        .count()
+}
+
 fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -512,6 +518,10 @@ fn normalize_lexical(path: &Path) -> PathBuf {
             Component::RootDir => out.push(component.as_os_str()),
             Component::CurDir => {}
             Component::ParentDir => {
+                // `/..` stays `/`. Popping the root makes the rest relative.
+                if out.has_root() && out.components().count() <= root_component_len(&out) {
+                    continue;
+                }
                 let _ = out.pop();
             }
             Component::Normal(name) => out.push(name),

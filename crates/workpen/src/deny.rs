@@ -198,8 +198,11 @@ fn ancestor_deny_glob(path: &Path, policy: &DenyPolicy, root: Option<&Path>) -> 
         {
             break;
         }
-        if let Some(glob) = first_matching_deny_glob_under(policy.globs(), &path_as_glob(dir), root)
-        {
+        if let Some(glob) = deny_glob_name(first_matching_deny_glob_under(
+            policy.globs(),
+            &path_as_glob(dir),
+            root,
+        )) {
             return Some(glob);
         }
         let next = dir.parent();
@@ -234,7 +237,11 @@ fn classify_dest_hit_root(
     policy: &DenyPolicy,
     root: Option<&Path>,
 ) -> Option<DestDenyHit> {
-    if let Some(glob) = first_matching_deny_glob_under(policy.globs(), &path_as_glob(path), root) {
+    if let Some(glob) = deny_glob_name(first_matching_deny_glob_under(
+        policy.globs(),
+        &path_as_glob(path),
+        root,
+    )) {
         return Some(DestDenyHit {
             kind: DestDenyKind::DenyGlob,
             matched: Some(glob),
@@ -243,8 +250,11 @@ fn classify_dest_hit_root(
 
     let canon = std::fs::canonicalize(path).ok();
     if let Some(canon) = &canon
-        && let Some(glob) =
-            first_matching_deny_glob_under(policy.globs(), &path_as_glob(canon), root)
+        && let Some(glob) = deny_glob_name(first_matching_deny_glob_under(
+            policy.globs(),
+            &path_as_glob(canon),
+            root,
+        ))
     {
         return Some(DestDenyHit {
             kind: DestDenyKind::DenyGlob,
@@ -1725,7 +1735,12 @@ pub fn path_is_denied_glob(globs: &[String], path: &str) -> bool {
 }
 
 fn first_matching_deny_glob(globs: &[String], path: &str) -> Option<String> {
-    first_matching_deny_glob_under(globs, path, None).filter(|g| g != "..")
+    deny_glob_name(first_matching_deny_glob_under(globs, path, None))
+}
+
+/// `".."` means the path left the workspace. It is not a deny glob.
+fn deny_glob_name(glob: Option<String>) -> Option<String> {
+    glob.filter(|name| name != "..")
 }
 
 /// Glob match for `path` relative to `root` when `root` is set.
@@ -1786,9 +1801,8 @@ fn lexical_absolute(path: &str) -> Option<String> {
             continue;
         }
         if seg == ".." {
-            if segs.pop().is_none() && absolute {
-                return None;
-            }
+            // `/..` stays at the filesystem root.
+            let _ = segs.pop();
             continue;
         }
         segs.push(seg);
