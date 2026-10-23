@@ -1530,6 +1530,9 @@ fn create_kill_job() -> Result<CloseOnDrop, KernelError> {
 }
 
 fn environment_block(cmd: &Command) -> Vec<u16> {
+    // `env_clear` is invisible here, and it hides `env_remove`. Callers
+    // that clear the child environment must `env_remove` each inherited
+    // name without calling `env_clear` first.
     let mut pairs: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     let mut explicit_keep = Vec::new();
     for (key, value) in cmd.get_envs() {
@@ -1790,5 +1793,59 @@ mod ace_tests {
             "first dest must not keep a leftover DENY ACE after rollback"
         );
         drop(sid);
+    }
+}
+
+#[cfg(test)]
+mod env_block_tests {
+    use super::environment_block;
+    use std::process::Command;
+
+    fn block_has_key(block: &[u16], key: &str) -> bool {
+        let mut entry = Vec::new();
+        for unit in block {
+            if *unit == 0 {
+                if entry.is_empty() {
+                    break;
+                }
+                let text = String::from_utf16_lossy(&entry);
+                if text
+                    .split_once('=')
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case(key))
+                {
+                    return true;
+                }
+                entry.clear();
+            } else {
+                entry.push(*unit);
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn env_remove_drops_an_inherited_name() {
+        let Some((key, _)) = std::env::vars_os().find(|(name, _)| {
+            let name = name.to_string_lossy();
+            !name.eq_ignore_ascii_case("PATH") && !name.eq_ignore_ascii_case("SystemRoot")
+        }) else {
+            return;
+        };
+        let name = key.to_string_lossy().into_owned();
+        let mut cmd = Command::new("cmd");
+        for (inherited, _) in std::env::vars_os() {
+            cmd.env_remove(inherited);
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            cmd.env("PATH", path);
+        }
+        let block = environment_block(&cmd);
+        assert!(
+            !block_has_key(&block, &name),
+            "{name} stayed in the child block after env_remove"
+        );
+        if std::env::var_os("PATH").is_some() {
+            assert!(block_has_key(&block, "PATH"), "PATH was not restored");
+        }
     }
 }
