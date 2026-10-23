@@ -1138,8 +1138,8 @@ mod child_exit_tests {
 
 #[cfg(test)]
 mod spawn_failure_tests {
-    use super::{program_outside_roots, spawn_failure_message};
-    use std::path::{Path, PathBuf};
+    use super::spawn_failure_message;
+    use std::path::Path;
     use workpen::KernelError;
 
     #[test]
@@ -1168,6 +1168,9 @@ mod spawn_failure_tests {
     #[cfg(windows)]
     #[test]
     fn windows_system_root_is_not_outside() {
+        use super::program_outside_roots;
+        use std::path::PathBuf;
+
         let Some(system_root) = std::env::var_os("SystemRoot") else {
             return;
         };
