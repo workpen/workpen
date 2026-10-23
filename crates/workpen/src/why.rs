@@ -15,7 +15,7 @@ use std::path::Path;
 
 use crate::check_dest;
 use crate::deny::{CheckDestError, DenyPolicy, DestDeny, DestDenyError};
-use crate::guard::{PathGuard, PathGuardDeny, PathGuardError, PathGuardKind};
+use crate::guard::{PathGuard, PathGuardDeny, PathGuardError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Why {
@@ -31,6 +31,8 @@ pub enum Why {
         path: String,
         kind: &'static str,
     },
+    /// Same sentence as [`crate::check_dest`]. Not a workspace escape.
+    Reported(String),
 }
 
 impl Why {
@@ -41,13 +43,14 @@ impl Why {
             Why::PathGuard(d) => d.message(),
             Why::EmptyPath => PathGuardError::EmptyPath.to_string(),
             Why::SpecialFile { path, kind } => format!("refuse special file ({kind}): {path}"),
+            Why::Reported(text) => text.clone(),
         }
     }
 }
 
 pub fn explain(path: &Path, policy: &DenyPolicy, guard: Option<&PathGuard>) -> Why {
     let Some(raw) = path.to_str() else {
-        return Why::PathGuard(escape_why(path));
+        return Why::Reported(CheckDestError::NonUtf8.to_string());
     };
     match check_dest(raw, policy, guard) {
         Ok(_) => Why::Allowed,
@@ -55,22 +58,7 @@ pub fn explain(path: &Path, policy: &DenyPolicy, guard: Option<&PathGuard>) -> W
         Err(CheckDestError::PathGuard(PathGuardError::EmptyPath)) => Why::EmptyPath,
         Err(CheckDestError::PathGuard(PathGuardError::Denied(deny))) => Why::PathGuard(deny),
         Err(CheckDestError::SpecialFile { path, kind }) => Why::SpecialFile { path, kind },
-        Err(
-            CheckDestError::DestDeny(_)
-            | CheckDestError::PathGuard(_)
-            | CheckDestError::Nul
-            | CheckDestError::Directory { .. }
-            | CheckDestError::Io(_)
-            | CheckDestError::NonUtf8,
-        ) => Why::PathGuard(escape_why(path)),
-    }
-}
-
-fn escape_why(path: &Path) -> PathGuardDeny {
-    PathGuardDeny {
-        kind: PathGuardKind::Escape,
-        path: path.to_path_buf(),
-        display: path.display().to_string(),
+        Err(err) => Why::Reported(err.to_string()),
     }
 }
 
@@ -263,5 +251,60 @@ mod tests {
                 "empty path must not claim escape: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn dotdot_outside_is_escape_not_a_deny_glob() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let extras: [&std::path::Path; 0] = [];
+        let guard = PathGuard::with_extra_roots(dir.path(), extras).expect("guard");
+        let outside = dir.path().join("..").join("notes-outside.txt");
+        match check_dest(
+            &outside.to_string_lossy(),
+            &DenyPolicy::default(),
+            Some(&guard),
+        ) {
+            Err(CheckDestError::PathGuard(err)) => {
+                let msg = err.to_string();
+                assert!(msg.contains("escapes workspace"), "{msg}");
+                assert!(!msg.contains("deny glob"), "{msg}");
+            }
+            other => panic!("a .. path outside the workspace must escape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dotdot_back_inside_is_allowed() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let readme = dir.path().join("readme.md");
+        std::fs::write(&readme, "ok\n").expect("readme");
+        let name = dir.path().file_name().expect("name");
+        let dotted = dir.path().join("..").join(name).join("readme.md");
+        let extras: [&std::path::Path; 0] = [];
+        let guard = PathGuard::with_extra_roots(dir.path(), extras).expect("guard");
+        check_dest(
+            &dotted.to_string_lossy(),
+            &DenyPolicy::default(),
+            Some(&guard),
+        )
+        .unwrap_or_else(|err| panic!("a .. path back inside must be allowed, got {err}"));
+    }
+
+    #[test]
+    fn explain_absolute_inside_is_not_escape() {
+        let dir = tempfile::tempdir().expect("workspace");
+        let readme = dir.path().join("readme.md");
+        std::fs::write(&readme, "ok\n").expect("readme");
+        let guard = PathGuard::builder(dir.path()).build().expect("guard");
+        let msg = explain(&readme, &DenyPolicy::default(), Some(&guard)).message();
+        assert!(msg.contains("absolute paths are not allowed"), "{msg}");
+        assert!(!msg.contains("escapes workspace"), "{msg}");
+    }
+
+    #[test]
+    fn explain_nul_is_not_escape() {
+        let msg = explain(std::path::Path::new("a\0b"), &DenyPolicy::default(), None).message();
+        assert!(msg.contains("NUL"), "{msg}");
+        assert!(!msg.contains("escapes workspace"), "{msg}");
     }
 }
