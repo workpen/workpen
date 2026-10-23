@@ -565,9 +565,83 @@ pub fn write_timeout_notice() {
 #[cfg(unix)]
 enum ForwardWrite {
     Wrote(usize),
-    /// `O_NONBLOCK` refused the write. The pipe has some space, not enough
-    /// for this chunk. Callers must wait before retrying the same bytes.
+    /// `O_NONBLOCK` refused the write. Linux `POLLOUT` means one byte
+    /// fits, so retrying this chunk spins. Callers write one byte or wait.
     Again,
+}
+
+#[cfg(unix)]
+enum PushNonblock {
+    Wrote(usize),
+    Wait,
+    Stop,
+}
+
+/// Write up to `chunk` bytes. On `EAGAIN`, write one byte. A second
+/// refusal waits. It does not retry the same chunk.
+#[cfg(unix)]
+fn push_nonblock(
+    buf: &[u8],
+    chunk: usize,
+    mut write: impl FnMut(&[u8]) -> Option<ForwardWrite>,
+) -> PushNonblock {
+    if buf.is_empty() {
+        return PushNonblock::Wrote(0);
+    }
+    let take = buf.len().min(chunk.max(1));
+    match write(&buf[..take]) {
+        Some(ForwardWrite::Wrote(n)) if n > 0 => PushNonblock::Wrote(n),
+        Some(ForwardWrite::Again) if take > 1 => match write(&buf[..1]) {
+            Some(ForwardWrite::Wrote(n)) if n > 0 => PushNonblock::Wrote(n),
+            Some(ForwardWrite::Again) => PushNonblock::Wait,
+            _ => PushNonblock::Stop,
+        },
+        Some(ForwardWrite::Again) => PushNonblock::Wait,
+        _ => PushNonblock::Stop,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod push_nonblock_tests {
+    use super::{ForwardWrite, PushNonblock, push_nonblock};
+
+    #[test]
+    fn short_pipe_writes_one_byte_instead_of_retrying_the_chunk() {
+        let data = vec![7u8; 2_000];
+        let mut off = 0;
+        let mut big_writes = 0u32;
+        let mut steps = 0u32;
+        while off < data.len() {
+            steps += 1;
+            assert!(steps < 10_000, "forward spun without progress");
+            match push_nonblock(&data[off..], 512, |slice| {
+                if slice.len() > 1 {
+                    big_writes += 1;
+                    Some(ForwardWrite::Again)
+                } else {
+                    Some(ForwardWrite::Wrote(1))
+                }
+            }) {
+                PushNonblock::Wrote(n) => off += n,
+                PushNonblock::Wait => panic!("one free byte must be written"),
+                PushNonblock::Stop => panic!("forward stopped"),
+            }
+        }
+        assert_eq!(off, data.len());
+        assert!(big_writes < 5_000, "chunk retries ran away: {big_writes}");
+    }
+
+    #[test]
+    fn one_byte_refusal_waits_instead_of_another_chunk() {
+        let mut calls = 0u32;
+        let step = push_nonblock(&[0u8; 512], 512, |slice| {
+            calls += 1;
+            assert!(slice.len() <= 512);
+            Some(ForwardWrite::Again)
+        });
+        assert!(matches!(step, PushNonblock::Wait));
+        assert_eq!(calls, 2, "one chunk attempt, then one byte, then wait");
+    }
 }
 
 /// One `write`. `EINTR` retries. `WouldBlock` asks the caller to wait.
@@ -754,11 +828,13 @@ fn copy_pipe(
                     PollOut::Stop => return,
                     PollOut::Later => continue,
                     PollOut::Ready => {
-                        let end = off + (n - off).min(chunk);
-                        match write_fd(out_fd, &buf[off..end], toggle) {
-                            Some(ForwardWrite::Wrote(wrote)) if wrote > 0 => off += wrote,
-                            Some(ForwardWrite::Again) => continue,
-                            _ => return,
+                        match push_nonblock(&buf[off..n], chunk, |slice| {
+                            write_fd(out_fd, slice, toggle)
+                        }) {
+                            // A match guard is not exhaustive, so zero is its own arm.
+                            PushNonblock::Wrote(0) | PushNonblock::Stop => return,
+                            PushNonblock::Wait => continue,
+                            PushNonblock::Wrote(wrote) => off += wrote,
                         }
                     }
                 }
@@ -952,6 +1028,9 @@ pub fn process_jail_with_policy(
     for dir in system_read_dirs() {
         add_read_if_dir(&mut grants, &dir);
     }
+    // One hardlink-directory scan for the workspace and every extra root.
+    #[cfg(unix)]
+    let _hardlink_scans = crate::deny::HardlinkScanScope::new();
     let mut dest_denies = collect_workspace_dest_denies(workspace.as_ref(), policy)?;
     let mut remaining = DEST_DENY_WALK_LIMIT;
     for extra in &extras {
@@ -2206,7 +2285,8 @@ const DEST_DENY_CACHE_DIR_NAMES: &[&str] =
     &["target", "node_modules", ".venv", "dist", "__pycache__"];
 
 /// Existing dest-deny files and glob directories under `workspace`,
-/// including hardlink siblings.
+/// including hardlink siblings. Each directory is read once per call,
+/// not once per hardlinked name.
 ///
 /// Does not apply the jail. Does not follow directory symlinks. Does
 /// not descend `.git`. Cache trees are walked for dest-deny glob names
@@ -2226,6 +2306,8 @@ pub fn collect_workspace_dest_denies_limited(
     policy: &DenyPolicy,
     limit: usize,
 ) -> Result<Vec<DestDeny>, KernelError> {
+    #[cfg(unix)]
+    let _hardlink_scans = crate::deny::HardlinkScanScope::new();
     let mut out = Vec::new();
     let mut remaining = limit;
     walk_dest_denies(
@@ -2858,6 +2940,8 @@ fn append_extra_dest_denies(
     dest_denies: &mut Vec<DestDeny>,
     remaining: &mut usize,
 ) -> Result<(), KernelError> {
+    #[cfg(unix)]
+    let _hardlink_scans = crate::deny::HardlinkScanScope::new();
     if is_system_read_extra(extra) {
         return Ok(());
     }

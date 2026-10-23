@@ -5,6 +5,11 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(unix)]
+use std::cell::{Cell, RefCell};
+#[cfg(unix)]
+use std::collections::HashMap;
+
 use crate::agent_lock::{AgentLockError, load_agent_lock};
 use crate::guard::{PathGuard, PathGuardError};
 
@@ -2018,6 +2023,150 @@ fn hardlink_sibling_hit(
 }
 
 #[cfg(unix)]
+#[derive(Clone)]
+struct SiblingSeen {
+    dev: u64,
+    ino: u64,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+enum ParentScan {
+    Entries(Vec<SiblingSeen>),
+    Unreadable,
+}
+
+#[cfg(unix)]
+enum ParentStep {
+    Next,
+    Break,
+    Deny,
+}
+
+#[cfg(unix)]
+struct ParentFold {
+    step: ParentStep,
+    found_add: u64,
+    best: Option<(usize, String)>,
+}
+
+#[cfg(unix)]
+thread_local! {
+    static HARDLINK_SCAN_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static HARDLINK_PARENT_SCANS: RefCell<Option<HashMap<PathBuf, ParentScan>>> =
+        const { RefCell::new(None) };
+    static HARDLINK_DIR_READS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Shares parent-directory hardlink scans for one `run` collect.
+/// Nested collects keep the outer map. Dropping the outermost scope
+/// drops it, so a later `why` scans its own parent again.
+#[cfg(unix)]
+pub(crate) struct HardlinkScanScope;
+
+#[cfg(unix)]
+impl HardlinkScanScope {
+    pub(crate) fn new() -> Self {
+        HARDLINK_SCAN_DEPTH.with(|depth| {
+            if depth.get() == 0 {
+                HARDLINK_PARENT_SCANS.with(|scans| *scans.borrow_mut() = Some(HashMap::new()));
+            }
+            depth.set(depth.get() + 1);
+        });
+        Self
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HardlinkScanScope {
+    fn drop(&mut self) {
+        HARDLINK_SCAN_DEPTH.with(|depth| {
+            let next = depth.get().saturating_sub(1);
+            depth.set(next);
+            if next == 0 {
+                HARDLINK_PARENT_SCANS.with(|scans| *scans.borrow_mut() = None);
+            }
+        });
+    }
+}
+
+#[cfg(unix)]
+fn note_hardlink_dir_read() {
+    HARDLINK_DIR_READS.with(|n| n.set(n.get().saturating_add(1)));
+}
+
+#[cfg(all(unix, test))]
+fn reset_hardlink_dir_reads() {
+    HARDLINK_DIR_READS.with(|n| n.set(0));
+}
+
+#[cfg(all(unix, test))]
+fn hardlink_dir_reads() -> u32 {
+    HARDLINK_DIR_READS.with(|n| n.get())
+}
+
+#[cfg(unix)]
+fn read_parent_siblings(parent: &Path) -> ParentScan {
+    use std::os::unix::fs::MetadataExt;
+
+    note_hardlink_dir_read();
+    let entries = match std::fs::read_dir(parent) {
+        Ok(rd) => rd,
+        Err(_) => return ParentScan::Unreadable,
+    };
+    let mut seen = Vec::new();
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        let sibling_meta = match std::fs::symlink_metadata(&entry_path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if sibling_meta.file_type().is_dir() {
+            continue;
+        }
+        seen.push(SiblingSeen {
+            dev: sibling_meta.dev(),
+            ino: sibling_meta.ino(),
+            path: entry_path,
+        });
+    }
+    ParentScan::Entries(seen)
+}
+
+#[cfg(unix)]
+fn with_parent_siblings<R>(parent: &Path, f: impl FnOnce(&ParentScan) -> R) -> R {
+    let in_scope = HARDLINK_PARENT_SCANS.with(|slot| slot.borrow().is_some());
+    if !in_scope {
+        let scan = read_parent_siblings(parent);
+        return f(&scan);
+    }
+    let hit = HARDLINK_PARENT_SCANS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|map| map.contains_key(parent))
+    });
+    if hit {
+        return HARDLINK_PARENT_SCANS.with(|slot| {
+            let borrowed = slot.borrow();
+            let scan = borrowed
+                .as_ref()
+                .and_then(|map| map.get(parent))
+                .unwrap_or(&ParentScan::Unreadable);
+            f(scan)
+        });
+    }
+    let scan = read_parent_siblings(parent);
+    let result = f(&scan);
+    HARDLINK_PARENT_SCANS.with(|slot| {
+        if let Some(map) = slot.borrow_mut().as_mut() {
+            map.insert(parent.to_path_buf(), scan);
+        }
+    });
+    result
+}
+
+#[cfg(unix)]
 fn hardlink_sibling_hit_unix(
     path: &Path,
     canon: Option<&Path>,
@@ -2055,24 +2204,40 @@ fn hardlink_sibling_hit_unix(
     let mut found = 0u64;
     let mut best: Option<(usize, String)> = None;
     for parent in &parents {
-        let entries = match std::fs::read_dir(parent) {
-            Ok(rd) => rd,
-            Err(_) if best.is_some() => break,
-            Err(_) => return HardlinkHit::Denied { sibling: None },
-        };
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            let sibling_meta = match std::fs::symlink_metadata(&entry_path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if sibling_meta.dev() != meta.dev() || sibling_meta.ino() != meta.ino() {
-                continue;
+        let folded = with_parent_siblings(parent, |scan| match scan {
+            ParentScan::Unreadable => ParentFold {
+                step: if best.is_some() {
+                    ParentStep::Break
+                } else {
+                    ParentStep::Deny
+                },
+                found_add: 0,
+                best,
+            },
+            ParentScan::Entries(entries) => {
+                let mut found_add = 0u64;
+                for sibling in entries {
+                    if sibling.dev != meta.dev() || sibling.ino != meta.ino() {
+                        continue;
+                    }
+                    found_add += 1;
+                    if let Some(rank) = denied_basename_rank(policy.globs(), &sibling.path, root) {
+                        best = prefer_sibling(best, rank);
+                    }
+                }
+                ParentFold {
+                    step: ParentStep::Next,
+                    found_add,
+                    best,
+                }
             }
-            found += 1;
-            if let Some(rank) = denied_basename_rank(policy.globs(), &entry_path, root) {
-                best = prefer_sibling(best, rank);
-            }
+        });
+        found += folded.found_add;
+        best = folded.best;
+        match folded.step {
+            ParentStep::Next => {}
+            ParentStep::Break => break,
+            ParentStep::Deny => return HardlinkHit::Denied { sibling: None },
         }
     }
     if let Some((_, sibling)) = best {
@@ -2587,6 +2752,71 @@ mod classify_hardlink_tests {
             None,
             &policy
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_directory_is_scanned_once_inside_a_collect_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plain = dir.path().join("plain.txt");
+        std::fs::write(&plain, b"ok").expect("plain");
+        for i in 0..24 {
+            std::fs::hard_link(&plain, dir.path().join(format!("link-{i}"))).expect("link");
+        }
+        std::fs::hard_link(&plain, dir.path().join(".env")).expect("secret name");
+        let policy = DenyPolicy::default();
+        reset_hardlink_dir_reads();
+        {
+            let _scope = HardlinkScanScope::new();
+            for i in 0..24 {
+                let path = dir.path().join(format!("link-{i}"));
+                assert!(
+                    hardlink_sibling_denied(&path, None, &policy),
+                    "link-{i} shares an inode with .env"
+                );
+            }
+        }
+        let scoped = hardlink_dir_reads();
+        assert!(
+            scoped <= 2,
+            "one collect scans the directory once, got {scoped}"
+        );
+        // A slash glob that is not `**/` is suppressed while the path is
+        // outside `root`, and matches the absolute path with no root.
+        // The cached directory must be ranked again for that second root.
+        // The scan stores the canonical parent, so the glob uses that spelling.
+        let outside = tempfile::tempdir().expect("outside root");
+        let canon_dir = std::fs::canonicalize(dir.path()).expect("canon dir");
+        let slash = path_as_glob(&canon_dir.join(".env"));
+        let custom = DenyPolicy::new(vec![slash]);
+        reset_hardlink_dir_reads();
+        {
+            let _scope = HardlinkScanScope::new();
+            assert!(
+                classify_dest_hit_root(&plain, &custom, Some(outside.path())).is_none(),
+                "outside a non-** slash glob the hardlink is not a secret yet"
+            );
+            let reads = hardlink_dir_reads();
+            assert!(
+                classify_dest_hit_root(&plain, &custom, None).is_some(),
+                "the same scan must dest-deny plain.txt once the root is unset"
+            );
+            assert_eq!(
+                hardlink_dir_reads(),
+                reads,
+                "the second root reuses the directory read"
+            );
+        }
+        reset_hardlink_dir_reads();
+        for i in 0..24 {
+            let path = dir.path().join(format!("link-{i}"));
+            assert!(hardlink_sibling_denied(&path, None, &policy));
+        }
+        let unscoped = hardlink_dir_reads();
+        assert!(
+            unscoped >= 24,
+            "without a collect scope each name scans the directory, got {unscoped}"
+        );
     }
 
     #[test]
