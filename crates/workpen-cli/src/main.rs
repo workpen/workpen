@@ -573,13 +573,29 @@ fn parse_env_set(raw: &str) -> Result<(String, String), String> {
 
 fn apply_child_env(child: &mut Command, env_clear: bool, env_sets: &[(String, String)]) {
     if env_clear {
-        child.env_clear();
-        if let Some(path) = std::env::var_os("PATH") {
-            child.env("PATH", path);
+        // Unix `env_clear` is enough. Windows CreateProcess only sees
+        // `get_envs`, and `env_clear` hides later `env_remove` calls,
+        // so each inherited name is removed on its own.
+        #[cfg(not(windows))]
+        {
+            child.env_clear();
+            if let Some(path) = std::env::var_os("PATH") {
+                child.env("PATH", path);
+            }
         }
         #[cfg(windows)]
-        if let Some(root) = std::env::var_os("SystemRoot") {
-            child.env("SystemRoot", &root);
+        {
+            let path = std::env::var_os("PATH");
+            let system_root = std::env::var_os("SystemRoot");
+            for (key, _) in std::env::vars_os() {
+                child.env_remove(&key);
+            }
+            if let Some(path) = path {
+                child.env("PATH", path);
+            }
+            if let Some(root) = system_root {
+                child.env("SystemRoot", root);
+            }
         }
     }
     for (name, value) in env_sets {
@@ -1183,5 +1199,31 @@ mod spawn_failure_tests {
             !program_outside_roots(&cmd, ws.path(), &[]),
             "{cmd:?} under {system_root:?}"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn env_clear_removes_inherited_names() {
+        use std::process::Command;
+
+        let mut cmd = Command::new("cmd");
+        super::apply_child_env(&mut cmd, true, &[]);
+        let mut removed_user = false;
+        let mut path_kept = false;
+        for (key, value) in cmd.get_envs() {
+            let name = key.to_string_lossy();
+            if name.eq_ignore_ascii_case("USERNAME") && value.is_none() {
+                removed_user = true;
+            }
+            if name.eq_ignore_ascii_case("PATH") && value.is_some() {
+                path_kept = true;
+            }
+        }
+        if std::env::var_os("USERNAME").is_some() {
+            assert!(removed_user, "USERNAME was not removed");
+        }
+        if std::env::var_os("PATH").is_some() {
+            assert!(path_kept, "PATH was not restored");
+        }
     }
 }
