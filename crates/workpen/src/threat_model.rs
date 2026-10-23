@@ -50,13 +50,19 @@
 //!   dest-deny name level. A hardlink under a deeper ordinary dir is
 //!   not remounted. Path remount does not hide other hardlinks to the
 //!   same inode. Userspace [`crate::check_dest`] still dest-denies
-//!   hardlink siblings when the host calls it. In-child open of a
-//!   planted `/tmp/proj/sub/leaked` is the same class as post-create.
+//!   hardlink siblings when the host calls it. A workspace `run` reads
+//!   each hardlink directory once, not once per name.
+//!   In-child open of a planted `/tmp/proj/sub/leaked` is the same
+//!   class as post-create.
 //! * Windows WFP ran. Win32 5 is `WfpSkipped`. AppContainer is still
 //!   the net deny. Do not revert that skip.
 //! * Renaming the dest-deny parent is in scope. Parent-rename of a
 //!   dest-deny ancestor (`mv workspace out`) is out of scope. Leaf
 //!   `mv .env leaked` is a Seatbelt last-match contract on macOS.
+//! * Linux stdout forwarding writes one byte when a larger write
+//!   returns `EAGAIN`. A pipe with a few free bytes does not spin.
+//!   A reader that stops still fills the pipe, and `--timeout` ends
+//!   that forward.
 //! * Windows `Stdio::piped` on `run_child` captures stdout. The child
 //!   inherits the handle or gets NUL. Hosts that need captured stdout
 //!   call [`crate::KernelPolicy::run_child_output`].
