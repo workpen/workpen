@@ -677,7 +677,11 @@ fn gc_leftover_flag_as_value_is_missing() {
     );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !err.contains("unknown") || !err.contains("7d"),
+        err.contains("missing --leftover value"),
+        "gc --leftover --max-age must say the leftover value is missing: {err}"
+    );
+    assert!(
+        !err.contains("unknown"),
         "missing --leftover value must not call 7d unknown: {err}"
     );
 }
@@ -2030,10 +2034,12 @@ fn doctor_live_reports_this_machine() {
             assert_eq!(out.status.code(), Some(1), "{stdout} {stderr}");
         } else {
             assert!(out.status.success(), "{stdout} {stderr}");
+            assert!(stdout.contains("kernel: supported"), "{stdout}");
             assert!(
                 stdout.contains("wfp: skipped") || stdout.contains("wfp: applied"),
                 "{stdout}"
             );
+            assert!(stdout.contains("network: blocked"), "{stdout}");
         }
     }
 }
