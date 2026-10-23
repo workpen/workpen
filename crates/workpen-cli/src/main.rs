@@ -415,11 +415,11 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
         | Err(err @ KernelError::Home(_))
         | Err(err @ KernelError::FsRoot(_)) => return refuse_kernel(json, err),
         Err(e) => {
-            let mut msg = format!("failed to spawn {}: {e}", resolved.display());
-            if program_outside_roots(&resolved, guard.canon_root(), &presented) {
-                msg.push_str("; pass --extra-root for that directory if the program should run");
-            }
-            return Err(msg);
+            return Err(spawn_failure_message(
+                &resolved,
+                &e,
+                program_outside_roots(&resolved, guard.canon_root(), &presented),
+            ));
         }
         Ok(ok) => ok,
     };
@@ -427,12 +427,8 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
         workpen::write_timeout_notice();
         return Ok(ExitCode::from(124));
     }
-    if status.code().is_none() && program_outside_roots(&resolved, guard.canon_root(), &presented) {
-        return Err(format!(
-            "failed to spawn {}: kernel wrap apply failed: program is outside the readable roots; pass --extra-root for that directory if the program should run",
-            resolved.display()
-        ));
-    }
+    // A signal is 128+signal. The child was spawned, so this is not a
+    // failed spawn and not a request for --extra-root.
     let code = child_process_exit_code(status);
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let _ = std::io::Write::flush(&mut std::io::stderr());
@@ -861,6 +857,26 @@ fn version_flag_before_child(cmd: &[String]) -> bool {
     )
 }
 
+/// Permission failures outside the workspace can be a missing readable
+/// root. Other spawn errors keep their own sentence.
+fn extra_root_hint(err: &workpen::KernelError) -> bool {
+    let workpen::KernelError::Apply(msg) = err else {
+        return false;
+    };
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("not permitted")
+        || lower.contains("permission denied")
+        || lower.contains("access is denied")
+}
+
+fn spawn_failure_message(program: &Path, err: &workpen::KernelError, outside: bool) -> String {
+    let mut msg = format!("failed to spawn {}: {err}", program.display());
+    if outside && extra_root_hint(err) {
+        msg.push_str("; pass --extra-root for that directory if the program should run");
+    }
+    msg
+}
+
 /// Find the program in the parent. A slash path is relative to the child cwd.
 /// A bare name uses the parent's `PATH`, keeping the first match's spelling.
 fn program_outside_roots(program: &Path, root: &Path, extras: &[PathBuf]) -> bool {
@@ -883,6 +899,12 @@ fn program_outside_roots(program: &Path, root: &Path, extras: &[PathBuf]) -> boo
         "/usr/local",
     ] {
         bases.push(PathBuf::from(dir));
+    }
+    #[cfg(windows)]
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        let path = PathBuf::from(system_root);
+        // Match the `\\?\` prefix canonicalize adds on this path.
+        bases.push(std::fs::canonicalize(&path).unwrap_or(path));
     }
     !bases.iter().any(|base| canon.starts_with(base))
 }
@@ -1111,5 +1133,55 @@ mod child_exit_tests {
         let status = ExitStatus::from_raw(9);
         assert_eq!(status.code(), None);
         assert_eq!(child_process_exit_code(status), 137);
+    }
+}
+
+#[cfg(test)]
+mod spawn_failure_tests {
+    use super::spawn_failure_message;
+    use std::path::Path;
+    use workpen::KernelError;
+
+    #[test]
+    fn permission_outside_roots_names_extra_root() {
+        let msg = spawn_failure_message(
+            Path::new("/opt/tool"),
+            &KernelError::Apply("Operation not permitted".into()),
+            true,
+        );
+        assert!(msg.contains("pass --extra-root"), "{msg}");
+        assert!(msg.contains("not permitted"), "{msg}");
+    }
+
+    #[test]
+    fn missing_interpreter_is_not_an_extra_root_refusal() {
+        let msg = spawn_failure_message(
+            Path::new("/opt/tool"),
+            &KernelError::Apply("No such file or directory".into()),
+            true,
+        );
+        assert!(msg.contains("No such file"), "{msg}");
+        assert!(!msg.contains("pass --extra-root"), "{msg}");
+        assert!(!msg.contains("readable roots"), "{msg}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_root_is_not_outside() {
+        use super::program_outside_roots;
+        use std::path::PathBuf;
+
+        let Some(system_root) = std::env::var_os("SystemRoot") else {
+            return;
+        };
+        let cmd = PathBuf::from(&system_root).join("System32").join("cmd.exe");
+        if !cmd.is_file() {
+            return;
+        }
+        let ws = tempfile::tempdir().expect("workspace");
+        assert!(
+            !program_outside_roots(&cmd, ws.path(), &[]),
+            "{cmd:?} under {system_root:?}"
+        );
     }
 }
