@@ -1692,10 +1692,6 @@ pub fn path_matches_deny_glob(pattern: &str, path: &str) -> bool {
 /// Win32 opens `name.`, `name `, and `name::$DATA` as `name`.
 /// An extended `//?/` path is the literal spelling.
 fn windows_secret_spelling(path: &str) -> String {
-    #[cfg(not(windows))]
-    {
-        return path.to_string();
-    }
     #[cfg(windows)]
     {
         if path.starts_with("//?/") {
@@ -1712,6 +1708,10 @@ fn windows_secret_spelling(path: &str) -> String {
             return path.to_string();
         }
         format!("{dir}{name}")
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string()
     }
 }
 
