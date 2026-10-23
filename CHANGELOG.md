@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.7.8](https://github.com/workpen/workpen/compare/v0.7.7...v0.7.8) (2026-10-23)
+
+
+### Bug Fixes
+
+* do not list every ignored file during gc ([#315](https://github.com/workpen/workpen/issues/315)) ([45aa0b4](https://github.com/workpen/workpen/commit/45aa0b489ad5d577362c168960a33d99480a3623))
+* do not spin on a short pipe or rescan hardlink names ([#309](https://github.com/workpen/workpen/issues/309)) ([c6ec0df](https://github.com/workpen/workpen/commit/c6ec0dfa52d28eb9a8a4df4f2cd31458b139a5b9))
+* honor --env-clear in the Windows child environment ([#314](https://github.com/workpen/workpen/issues/314)) ([3834ad6](https://github.com/workpen/workpen/commit/3834ad655796d335662005c6ae71142ec6f6e175))
+* keep a timeout and a signal distinct from a failed spawn ([#313](https://github.com/workpen/workpen/issues/313)) ([70432db](https://github.com/workpen/workpen/commit/70432dbf6a11991b5092af3987a816da361dfad5))
+* keep a verbatim reserved name inside its workspace ([#304](https://github.com/workpen/workpen/issues/304)) ([88aa886](https://github.com/workpen/workpen/commit/88aa8869d7964151e522a14c810f0ee698670066))
+* keep deny matching bounded and honest on Windows ([#308](https://github.com/workpen/workpen/issues/308)) ([263b1d9](https://github.com/workpen/workpen/commit/263b1d99b51155103151ae5d9b1cf120ecd741ff))
+* name agent.lock when init cannot create it ([#317](https://github.com/workpen/workpen/issues/317)) ([86b7b75](https://github.com/workpen/workpen/commit/86b7b756afa264e19f02b0d1420506f393ae8deb))
+* reclaim a large build cache and a linked target directory ([#311](https://github.com/workpen/workpen/issues/311)) ([c2d3770](https://github.com/workpen/workpen/commit/c2d3770ded75ddd90ba9aab7a25b2d54b1d68d94))
+* refuse a --read directory inside a writable root ([#316](https://github.com/workpen/workpen/issues/316)) ([461046d](https://github.com/workpen/workpen/commit/461046d44b4e5bd6b48aeb9832fd83ea7c67a162))
+* refuse Windows reserved device names in check_dest ([#302](https://github.com/workpen/workpen/issues/302)) ([7edb7b6](https://github.com/workpen/workpen/commit/7edb7b6cbdd5bbc4bd73f872450ad96fbd92f06a))
+* say escape for dotdot and keep explain on the real refusal ([#312](https://github.com/workpen/workpen/issues/312)) ([35ec4c3](https://github.com/workpen/workpen/commit/35ec4c3b14b6d15793288b05ef1c90860ca1fa8f))
+
 ## [0.7.7](https://github.com/workpen/workpen/compare/v0.7.6...v0.7.7) (2026-10-22)
 
 
