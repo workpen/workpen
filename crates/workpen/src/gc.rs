@@ -687,15 +687,27 @@ fn is_age_cache_dir_name(name: &str) -> bool {
 /// Porcelain often lists only `!! target/`, not `!! target/.env`.
 /// Cache walk matches deny globs only (full path and basename). It does
 /// not apply dest-deny hardlink / incomplete-nlink fail-closed, and it
-/// does not follow directory symlinks out of the cache tree.
+/// does not follow a directory symlink out of the cache tree.
+/// The cache directory itself being a symlink is not a secret.
+/// Hitting the entry cap is not a secret either. A build cache is
+/// larger than the cap, and treating that as a secret would keep
+/// every leftover that has one.
 fn cache_tree_has_denied_name(root: &Path, rel: &Path, policy: &DenyPolicy) -> bool {
-    if cache_path_denied_glob(policy, rel) {
-        return true;
-    }
     let Some(std::path::Component::Normal(name)) = rel.components().next() else {
         return false;
     };
     let start = root.join(name);
+    // `git status` follows a cache-root junction and can list `target/.env`.
+    // That name is outside the worktree. Do not treat it as unique work.
+    if std::fs::symlink_metadata(&start)
+        .ok()
+        .is_some_and(|meta| meta.file_type().is_symlink())
+    {
+        return false;
+    }
+    if cache_path_denied_glob(policy, rel) {
+        return true;
+    }
     let mut remaining = LAST_USED_WALK_LIMIT;
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(start);
@@ -709,7 +721,7 @@ fn cache_tree_has_denied_name(root: &Path, rel: &Path, policy: &DenyPolicy) -> b
         };
         for entry in rd.flatten() {
             if remaining == 0 {
-                return true;
+                return false;
             }
             remaining -= 1;
             let p = entry.path();
@@ -728,7 +740,7 @@ fn cache_tree_has_denied_name(root: &Path, rel: &Path, policy: &DenyPolicy) -> b
             }
         }
     }
-    !queue.is_empty()
+    false
 }
 
 fn cache_path_denied_glob(policy: &DenyPolicy, path: &Path) -> bool {
@@ -791,6 +803,7 @@ fn unique_work_from(
         restore_index_mtime_at(index, prev);
     }
     let mut has_unique = false;
+    let mut seen_cache = HashSet::new();
     for line in out.lines() {
         if line.is_empty() {
             continue;
@@ -798,7 +811,12 @@ fn unique_work_from(
         let rel = porcelain_path(line);
         if line.starts_with("??") || line.starts_with("!!") {
             if is_under_known_cache(path, &path.join(&rel)) {
-                if cache_tree_has_denied_name(path, &rel, policy) {
+                let cache_name = rel
+                    .components()
+                    .next()
+                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if seen_cache.insert(cache_name) && cache_tree_has_denied_name(path, &rel, policy) {
                     has_unique = true;
                 }
                 continue;

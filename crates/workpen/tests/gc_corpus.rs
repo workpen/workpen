@@ -799,6 +799,75 @@ fn cache_dir_symlink_to_outside_env_is_reclaimable() {
     }
 }
 
+fn link_dir(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link);
+        false
+    }
+}
+
+#[test]
+fn cache_root_link_to_outside_env_is_reclaimable() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"target\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore target"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "cache-root-link");
+    let outside = repo
+        .parent()
+        .expect("temp parent")
+        .join("outside-cache-root");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::write(outside.join(".env"), b"SECRET=1\n").expect("outside env");
+    assert!(
+        link_dir(&outside, &wt.join("target")),
+        "link target/ at the outside directory"
+    );
+    match classify_worktree(&wt, false) {
+        GcDecision::Reclaim { .. } => {}
+        other => panic!("target symlink to an outside .env must Reclaim, got {other:?}"),
+    }
+}
+
+#[test]
+fn large_cache_without_a_secret_is_reclaimable() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    fs::write(repo.join(".gitignore"), b"target\n").expect("gitignore");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "ignore target"]);
+    let leftover = repo.join(".workpen-worktrees");
+    let wt = add_leftover_worktree(&repo, &leftover, "cache-cap");
+    let target = wt.join("target");
+    fs::create_dir_all(&target).expect("target");
+    for n in 0..4097 {
+        fs::write(target.join(format!("f{n}.rlib")), b"obj").expect("rlib");
+    }
+    match classify_worktree(&wt, false) {
+        GcDecision::Reclaim { .. } => {}
+        other => panic!("a build cache past the walk cap must Reclaim, got {other:?}"),
+    }
+}
+
 #[test]
 fn unique_dangling_commit_is_saved_under_prefix() {
     let fx = init_repo();
