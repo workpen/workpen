@@ -12,6 +12,37 @@ fn workpen() -> Command {
 }
 
 #[test]
+fn read_inside_workspace_is_refused() {
+    let ws = tempfile::tempdir().expect("workspace");
+    let secrets = ws.path().join("secrets");
+    std::fs::create_dir(&secrets).expect("secrets");
+    let outside = tempfile::tempdir().expect("outside");
+    let ws_arg = ws.path().to_string_lossy().into_owned();
+    let secrets_arg = secrets.to_string_lossy().into_owned();
+    let outside_arg = outside.path().to_string_lossy().into_owned();
+    let nested = workpen()
+        .args(["policy", "--root", &ws_arg, "--read", &secrets_arg])
+        .output()
+        .expect("spawn workpen");
+    let err = String::from_utf8_lossy(&nested.stderr);
+    assert_eq!(nested.status.code(), Some(3), "{err}");
+    assert!(
+        err.contains("still be writable"),
+        "nested --read must say it would still be writable: {err}"
+    );
+    let outer = workpen()
+        .args(["policy", "--root", &ws_arg, "--read", &outside_arg])
+        .output()
+        .expect("spawn workpen");
+    let outer_err = String::from_utf8_lossy(&outer.stderr);
+    assert!(
+        outer.status.success(),
+        "a --read directory outside the workspace must be accepted: {outer_err}"
+    );
+    assert!(!outer_err.contains("still be writable"), "{outer_err}");
+}
+
+#[test]
 fn help_names_why_run_and_gc() {
     for arg in ["help", "--help", "-h"] {
         let out = workpen().arg(arg).output().expect("spawn workpen");

@@ -243,7 +243,7 @@ usage: workpen run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [-
 const RUN_HELP: &str = "\
 usage: workpen run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--policy] [--json] \
 [--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...
-The network is blocked unless --net is set. --extra-root and --write are read-write. --read is read-only. Dest-deny runs before the child starts, and on Linux the child is not started when secret names cannot be hidden. --policy prints the jail and does not start the child. Exit 124 means the timeout fired. --env opts a name back in. --env-clear drops inherited names except PATH, then applies every --env. Loaders such as LD_PRELOAD stay removed.";
+The network is blocked unless --net is set. --extra-root and --write are read-write. --read is read-only. A --read directory inside the workspace or another writable directory is refused, because it would still be writable. Dest-deny runs before the child starts, and on Linux the child is not started when secret names cannot be hidden. --policy prints the jail and does not start the child. Exit 124 means the timeout fired. --env opts a name back in. --env-clear drops inherited names except PATH, then applies every --env. Loaders such as LD_PRELOAD stay removed.";
 
 const POLICY_USAGE: &str = "\
 usage: workpen policy [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--json] [--] [CMD...]";
@@ -319,6 +319,21 @@ fn cmd_run(args: &[String], force_report: bool) -> Result<ExitCode, String> {
         match resolve_extra_root_pair(&cwd, &read.to_string_lossy()) {
             Ok((_shown, canon)) => read_canon.push(canon),
             Err(err) => return finish_extra(err, true, json, 3),
+        }
+    }
+    let mut writable = vec![root.clone()];
+    writable.extend(extras.iter().cloned());
+    for read in &read_canon {
+        if let Some(parent) = writable.iter().find(|dir| read.starts_with(dir)) {
+            eprintln!(
+                "--read {} is inside writable directory {}; it would still be writable",
+                read.display(),
+                parent.display()
+            );
+            if json {
+                return json_guard(3, read);
+            }
+            return Ok(ExitCode::from(3));
         }
     }
     let cmd = if rest.first().map(String::as_str) == Some("--") {
