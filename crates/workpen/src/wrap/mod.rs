@@ -1405,7 +1405,8 @@ impl KernelPolicy {
                     "write-restricted token is not available".into(),
                 ));
             }
-            windows::spawn_write_restricted(self, &cmd, None)
+            let mut cmd = cmd;
+            windows::spawn_write_restricted(self, &mut cmd, None)
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -1463,7 +1464,8 @@ impl KernelPolicy {
                     "write-restricted token is not available".into(),
                 ));
             }
-            windows::spawn_write_restricted_output(self, &cmd, None).map(|(a, o, _)| (a, o))
+            let mut cmd = cmd;
+            windows::spawn_write_restricted_output(self, &mut cmd, None).map(|(a, o, _)| (a, o))
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -1517,7 +1519,8 @@ impl KernelPolicy {
                     "write-restricted token is not available".into(),
                 ));
             }
-            windows::spawn_write_restricted_output(self, &cmd, Some(timeout))
+            let mut cmd = cmd;
+            windows::spawn_write_restricted_output(self, &mut cmd, Some(timeout))
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -1580,7 +1583,8 @@ impl KernelPolicy {
                     "write-restricted token is not available".into(),
                 ));
             }
-            windows::spawn_write_restricted_forward(self, &cmd, None).map(|(a, s, _)| (a, s))
+            let mut cmd = cmd;
+            windows::spawn_write_restricted_forward(self, &mut cmd, None).map(|(a, s, _)| (a, s))
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -1632,7 +1636,8 @@ impl KernelPolicy {
                     "write-restricted token is not available".into(),
                 ));
             }
-            windows::spawn_write_restricted_forward(self, &cmd, Some(timeout))
+            let mut cmd = cmd;
+            windows::spawn_write_restricted_forward(self, &mut cmd, Some(timeout))
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -1793,7 +1798,8 @@ impl KernelPolicy {
                     "write-restricted token is not available".into(),
                 ));
             }
-            windows::spawn_write_restricted(self, &cmd, Some(timeout))
+            let mut cmd = cmd;
+            windows::spawn_write_restricted(self, &mut cmd, Some(timeout))
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -1999,6 +2005,62 @@ pub fn scrub_child_command(cmd: &mut Command) {
             cmd.env_remove(key);
         }
     }
+}
+
+/// Pairs for the Windows environment block.
+///
+/// `Command::get_envs` omits inherited names after `env_clear`, and
+/// `env_remove` after `env_clear` does not record the name. A fresh
+/// `env_remove` is listed only when the child still inherits.
+#[cfg(any(windows, test))]
+fn child_env_pairs(cmd: &mut Command) -> Vec<(OsString, OsString)> {
+    let cleared = command_clears_env(cmd);
+    let mut pairs: Vec<(OsString, OsString)> = if cleared {
+        Vec::new()
+    } else {
+        std::env::vars_os().collect()
+    };
+    let mut explicit_keep = Vec::new();
+    for (key, value) in cmd.get_envs() {
+        pairs.retain(|(existing, _)| !env_key_eq(existing, key));
+        if let Some(value) = value
+            && !is_child_env_loader(key)
+        {
+            explicit_keep.push(key.to_os_string());
+            pairs.push((key.to_os_string(), value.to_os_string()));
+        }
+    }
+    pairs.retain(|(key, _)| {
+        !is_denied_child_env(key) || explicit_keep.iter().any(|keep| env_key_eq(keep, key))
+    });
+    pairs
+}
+
+#[cfg(any(windows, test))]
+fn command_clears_env(cmd: &mut Command) -> bool {
+    let sentinel = fresh_clear_probe(cmd);
+    cmd.env_remove(&sentinel);
+    !cmd.get_envs().any(|(key, _)| env_key_eq(key, &sentinel))
+}
+
+#[cfg(any(windows, test))]
+fn fresh_clear_probe(cmd: &Command) -> OsString {
+    let mut n = 0u32;
+    loop {
+        let name = OsString::from(format!("WP_ENV_CLEAR_PROBE_{n}"));
+        let in_cmd = cmd.get_envs().any(|(key, _)| env_key_eq(key, &name));
+        let in_parent = std::env::vars_os().any(|(key, _)| env_key_eq(&key, &name));
+        if !in_cmd && !in_parent {
+            return name;
+        }
+        n += 1;
+    }
+}
+
+#[cfg(any(windows, test))]
+fn env_key_eq(left: &OsStr, right: &OsStr) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
 /// Insert `--noprofile` and `--norc` after argv0 when the program is bash.
@@ -3089,6 +3151,77 @@ mod timeout_deadline_tests {
         assert!(
             matches!(err, KernelError::Apply(ref msg) if msg.contains("does not fit")),
             "{err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod child_env_pairs_tests {
+    use super::{child_env_pairs, is_denied_child_env};
+    use std::ffi::OsString;
+    use std::process::Command;
+
+    fn inherited_marker() -> Option<(OsString, OsString)> {
+        std::env::vars_os().find(|(name, value)| {
+            !value.is_empty()
+                && !is_denied_child_env(name)
+                && !name.to_string_lossy().eq_ignore_ascii_case("PATH")
+                && !name.to_string_lossy().eq_ignore_ascii_case("SystemRoot")
+        })
+    }
+
+    fn has_key(pairs: &[(OsString, OsString)], key: &str) -> bool {
+        pairs
+            .iter()
+            .any(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case(key))
+    }
+
+    #[test]
+    fn env_clear_drops_inherited_names_and_keeps_explicit_inserts() {
+        let Some((key, _)) = inherited_marker() else {
+            return;
+        };
+        let name = key.to_string_lossy().into_owned();
+        let mut cmd = Command::new("cmd");
+        cmd.env_clear();
+        if let Some(path) = std::env::var_os("PATH") {
+            cmd.env("PATH", path);
+        }
+        cmd.env("CUSTOM_API_KEY", "kept-explicit");
+        cmd.env("LD_PRELOAD", "/tmp/nope");
+        let pairs = child_env_pairs(&mut cmd);
+        assert!(!has_key(&pairs, &name), "{name} stayed after env_clear");
+        assert!(
+            !has_key(&pairs, "SystemRoot"),
+            "SystemRoot stayed without being set again"
+        );
+        if std::env::var_os("PATH").is_some() {
+            assert!(has_key(&pairs, "PATH"), "explicit PATH was dropped");
+        }
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| k == "CUSTOM_API_KEY" && v == "kept-explicit"),
+            "explicit CUSTOM_API_KEY was dropped after env_clear"
+        );
+        assert!(
+            !has_key(&pairs, "LD_PRELOAD"),
+            "loader must stay dropped after env_clear"
+        );
+    }
+
+    #[test]
+    fn inherited_name_stays_without_env_clear() {
+        let Some(path) = std::env::var_os("PATH") else {
+            return;
+        };
+        let mut cmd = Command::new("cmd");
+        let pairs = child_env_pairs(&mut cmd);
+        assert!(
+            pairs.iter().any(
+                |(key, value)| key.to_string_lossy().eq_ignore_ascii_case("PATH") && value == &path
+            ),
+            "PATH was dropped from an inheriting command"
         );
     }
 }
