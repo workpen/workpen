@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.7.9](https://github.com/workpen/workpen/compare/v0.7.8...v0.7.9) (2026-11-05)
+
+
+### Bug Fixes
+
+* age-gc only worktrees under the leftover directory ([#328](https://github.com/workpen/workpen/issues/328)) ([8c688e4](https://github.com/workpen/workpen/commit/8c688e440c9f5dc7315fbf10890bf1f881baaee2))
+* **deny:** do not treat cargo coreutils as a hardlink sibling ([#325](https://github.com/workpen/workpen/issues/325)) ([5483903](https://github.com/workpen/workpen/commit/5483903c7440e1535fe07015109d0397deab6cab)), closes [#323](https://github.com/workpen/workpen/issues/323)
+* refuse an unset --env name ([#327](https://github.com/workpen/workpen/issues/327)) ([1c43609](https://github.com/workpen/workpen/commit/1c436094f232e781e6a3592d542a8f2d33eaf31a))
+* **wrap:** honor Command::env_clear on Windows ([#322](https://github.com/workpen/workpen/issues/322)) ([fc6f125](https://github.com/workpen/workpen/commit/fc6f125f37a39542f04ea5fb374d31aec3a998cc))
+
 ## [0.7.8](https://github.com/workpen/workpen/compare/v0.7.7...v0.7.8) (2026-10-23)
 
 
