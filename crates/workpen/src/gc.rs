@@ -278,9 +278,10 @@ fn classify_worktree_with_index(
     }
 }
 
-/// List registered worktrees, skip primary checkout, skip locked / live cwd,
-/// classify the rest. Untracked leftovers under `leftover_dir` are reported
-/// as Keep(UntrackedWorktree) and never removed by age gc.
+/// Age-gc registered worktrees under `leftover_dir`. Skip the primary
+/// checkout, locked worktrees, and a live cwd. A registered worktree
+/// outside `leftover_dir` is left alone. Untracked directories under
+/// `leftover_dir` are Keep(UntrackedWorktree) and never removed.
 ///
 /// Uses [`DenyPolicy::default()`]. Hosts with extras should call
 /// [`run_gc_with_policy`].
@@ -307,6 +308,9 @@ pub fn run_gc_with_policy(
     let mut rows = Vec::new();
     for wt in &registered {
         if primary.as_ref().is_some_and(|p| paths_eq(p, &wt.path)) {
+            continue;
+        }
+        if !path_is_same_or_parent(&cfg.leftover_dir, &wt.path) {
             continue;
         }
         if wt.locked {
@@ -1484,15 +1488,17 @@ mod parse_tests {
         std::fs::write(repo.join("README"), b"x").expect("readme");
         git(&repo, &["add", "README"]);
         git(&repo, &["commit", "-m", "init"]);
+        let leftover = repo.join(".workpen-worktrees");
+        std::fs::create_dir_all(&leftover).expect("leftover dir");
         for name in ["wt-a", "wt-b"] {
-            let wt = dir.path().join(name);
+            let wt = leftover.join(name);
             git(
                 &repo,
                 &["worktree", "add", wt.to_str().expect("utf8"), "-b", name],
             );
         }
         let cfg = GcConfig {
-            leftover_dir: repo.join(".workpen-worktrees"),
+            leftover_dir: leftover,
             saved_ref_prefix: "refs/workpen/reclaimed".into(),
             max_age: Duration::from_secs(0),
             dry_run: true,
@@ -1504,6 +1510,67 @@ mod parse_tests {
         assert_eq!(
             probes, 1,
             "one cwd probe for every linked tree, got {probes}"
+        );
+    }
+
+    #[test]
+    fn age_gc_leaves_a_registered_worktree_outside_leftover_dir() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let repo = dir.path().join("origin");
+        std::fs::create_dir(&repo).expect("origin");
+        let git = |cwd: &Path, args: &[&str]| {
+            super::git(cwd, args).unwrap_or_else(|err| panic!("{args:?}: {err:?}"));
+        };
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "dev@example.com"]);
+        git(&repo, &["config", "user.name", "dev"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README"), b"x").expect("readme");
+        git(&repo, &["add", "README"]);
+        git(&repo, &["commit", "-m", "init"]);
+        let sibling = dir.path().join("feature");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                sibling.to_str().expect("utf8"),
+                "-b",
+                "feature",
+            ],
+        );
+        let leftover = repo.join(".workpen-worktrees");
+        std::fs::create_dir_all(&leftover).expect("leftover dir");
+        let inside = leftover.join("old");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                inside.to_str().expect("utf8"),
+                "-b",
+                "old",
+            ],
+        );
+        let cfg = GcConfig {
+            leftover_dir: leftover,
+            saved_ref_prefix: "refs/workpen/reclaimed".into(),
+            max_age: Duration::from_secs(0),
+            dry_run: false,
+            now: SystemTime::now() + Duration::from_secs(10),
+        };
+        let rows = run_gc_with_policy(&repo, &cfg, &DenyPolicy::default()).expect("gc");
+        assert!(
+            sibling.exists(),
+            "a registered worktree outside .workpen-worktrees must stay"
+        );
+        assert!(
+            !rows.iter().any(|(path, _)| super::paths_eq(path, &sibling)),
+            "gc must not list the outside worktree: {rows:?}"
+        );
+        assert!(
+            !inside.exists(),
+            "an old worktree under leftover_dir must go"
         );
     }
 
