@@ -2071,6 +2071,8 @@ thread_local! {
     static HARDLINK_PARENT_SCANS: RefCell<Option<HashMap<PathBuf, ParentScan>>> =
         const { RefCell::new(None) };
     static HARDLINK_DIR_READS: Cell<u32> = const { Cell::new(0) };
+    #[cfg(test)]
+    static TEST_LINK_DIRS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Shares parent-directory hardlink scans for one `run` collect.
@@ -2218,34 +2220,7 @@ fn hardlink_sibling_hit_unix(
     let mut found = 0u64;
     let mut best: Option<(usize, String)> = None;
     for parent in &parents {
-        let folded = with_parent_siblings(parent, |scan| match scan {
-            ParentScan::Unreadable => ParentFold {
-                step: if best.is_some() {
-                    ParentStep::Break
-                } else {
-                    ParentStep::Deny
-                },
-                found_add: 0,
-                best,
-            },
-            ParentScan::Entries(entries) => {
-                let mut found_add = 0u64;
-                for sibling in entries {
-                    if sibling.dev != meta.dev() || sibling.ino != meta.ino() {
-                        continue;
-                    }
-                    found_add += 1;
-                    if let Some(rank) = denied_basename_rank(policy.globs(), &sibling.path, root) {
-                        best = prefer_sibling(best, rank);
-                    }
-                }
-                ParentFold {
-                    step: ParentStep::Next,
-                    found_add,
-                    best,
-                }
-            }
-        });
+        let folded = fold_link_parent(parent, meta.dev(), meta.ino(), policy, root, best, true);
         found += folded.found_add;
         best = folded.best;
         match folded.step {
@@ -2260,10 +2235,106 @@ fn hardlink_sibling_hit_unix(
         };
     }
     if found < nlink {
+        for parent in extra_link_dirs() {
+            let key = std::fs::canonicalize(&parent).unwrap_or(parent);
+            if parents.iter().any(|seen| seen == &key) {
+                continue;
+            }
+            parents.push(key.clone());
+            let folded = fold_link_parent(&key, meta.dev(), meta.ino(), policy, root, best, false);
+            found += folded.found_add;
+            best = folded.best;
+            if best.is_some() || found >= nlink {
+                break;
+            }
+        }
+    }
+    if let Some((_, sibling)) = best {
+        return HardlinkHit::Denied {
+            sibling: Some(sibling),
+        };
+    }
+    if found < nlink {
         HardlinkHit::Denied { sibling: None }
     } else {
         HardlinkHit::Allowed
     }
+}
+
+/// PATH plus the Ubuntu cargo coreutils multicall directory.
+///
+/// A multicall `echo` is one inode with a name in `/usr/bin` and another
+/// under `/usr/lib/cargo/bin/coreutils`. The parents of one path do not
+/// list every name. An unseen name still denies when those directories
+/// do not account for `nlink`.
+#[cfg(unix)]
+fn extra_link_dirs() -> Vec<PathBuf> {
+    #[cfg(test)]
+    {
+        let hooked = TEST_LINK_DIRS.with(|dirs| dirs.borrow().clone());
+        if !hooked.is_empty() {
+            return hooked;
+        }
+    }
+    let mut dirs = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    for extra in [
+        "/bin",
+        "/usr/bin",
+        "/usr/lib/cargo/bin",
+        "/usr/lib/cargo/bin/coreutils",
+    ] {
+        dirs.push(PathBuf::from(extra));
+    }
+    dirs
+}
+
+#[cfg(unix)]
+fn fold_link_parent(
+    parent: &Path,
+    dev: u64,
+    ino: u64,
+    policy: &DenyPolicy,
+    root: Option<&Path>,
+    best: Option<(usize, String)>,
+    missing_denies: bool,
+) -> ParentFold {
+    with_parent_siblings(parent, |scan| match scan {
+        ParentScan::Unreadable => {
+            let step = if missing_denies && best.is_none() {
+                ParentStep::Deny
+            } else if missing_denies {
+                ParentStep::Break
+            } else {
+                ParentStep::Next
+            };
+            ParentFold {
+                step,
+                found_add: 0,
+                best,
+            }
+        }
+        ParentScan::Entries(entries) => {
+            let mut found_add = 0u64;
+            let mut best = best;
+            for sibling in entries {
+                if sibling.dev != dev || sibling.ino != ino {
+                    continue;
+                }
+                found_add += 1;
+                if let Some(rank) = denied_basename_rank(policy.globs(), &sibling.path, root) {
+                    best = prefer_sibling(best, rank);
+                }
+            }
+            ParentFold {
+                step: ParentStep::Next,
+                found_add,
+                best,
+            }
+        }
+    })
 }
 
 #[cfg(unix)]
@@ -2830,6 +2901,58 @@ mod classify_hardlink_tests {
         assert!(
             unscoped >= 24,
             "without a collect scope each name scans the directory, got {unscoped}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multicall_names_in_another_directory_are_not_a_denied_sibling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lib = dir.path().join("coreutils");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&lib).expect("lib");
+        std::fs::create_dir(&bin).expect("bin");
+        let echo_lib = lib.join("echo");
+        std::fs::write(&echo_lib, b"echo").expect("echo");
+        std::fs::hard_link(&echo_lib, lib.join("sleep")).expect("sleep");
+        std::fs::hard_link(&echo_lib, lib.join("printenv")).expect("printenv");
+        let echo_bin = bin.join("echo");
+        std::fs::hard_link(&echo_lib, &echo_bin).expect("bin echo");
+        let policy = DenyPolicy::default();
+        assert_eq!(
+            classify_dest(&echo_bin, &policy),
+            Some(DestDenyKind::HardlinkSibling),
+            "unseen multicall names must still fail closed"
+        );
+        TEST_LINK_DIRS.with(|dirs| dirs.borrow_mut().push(lib.clone()));
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                TEST_LINK_DIRS.with(|dirs| dirs.borrow_mut().clear());
+            }
+        }
+        let _clear = ClearHook;
+        assert_eq!(
+            classify_dest(&echo_bin, &policy),
+            None,
+            "scanning the other multicall directory must allow echo"
+        );
+        std::fs::hard_link(&echo_lib, lib.join(".env")).expect("secret name");
+        assert_eq!(
+            classify_dest(&echo_bin, &policy),
+            Some(DestDenyKind::HardlinkSibling),
+            "a .env name on the multicall inode must stay denied"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn program_link_dirs_include_cargo_coreutils() {
+        let dirs = extra_link_dirs();
+        assert!(
+            dirs.iter()
+                .any(|dir| dir == Path::new("/usr/lib/cargo/bin/coreutils")),
+            "ubuntu multicall dir missing from the hardlink scan"
         );
     }
 
