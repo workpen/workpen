@@ -52,12 +52,15 @@ vendor bubblewrap.
 The CLI enables the `nono` feature. That feature is the kernel wrap.
 Do not drop it, and do not turn nono's default features back on.
 
-`reqwest` is not a package in `Cargo.lock`. `aws-lc-sys` still is.
-nono 0.80 depends on `sigstore-verify` with no feature to omit it, and
-`sigstore-verify` 0.14 enables `rustls-webpki`'s `aws-lc-rs` feature
-with no flag to turn that off. `cargo tree -p workpen-cli -e normal -i
-reqwest --locked` exits non-zero. The same command for `aws-lc-sys`
-exits 0.
+`reqwest` and `aws-lc-sys` are not packages in `Cargo.lock`.
+nono 0.81 still depends on `sigstore-verify` 0.15.1, and nono has no
+feature to omit it. `sigstore-verify` 0.15 dropped `rustls-webpki`'s
+`aws-lc-rs` feature, so `aws-lc-sys` left the lock. `rustls-webpki`
+0.103.16 stays, through `ring`.
+`cargo tree -p workpen-cli -e normal -i reqwest --locked` exits
+non-zero. The same command for `aws-lc-sys` exits non-zero.
+`cargo tree -p workpen-cli -e normal -i sigstore-verify --locked`
+still prints `nono`.
 
 Do not fork nono, vendor a stripped copy, or add a `[patch]`. Upstream
 tracking is

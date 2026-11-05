@@ -196,8 +196,8 @@ fn publish_status_names_the_manifest_and_keeps_the_release_gate() {
     );
 }
 
-/// `reqwest` must stay out of the locked tree. `aws-lc-sys` stays until
-/// nono can omit `sigstore-verify`. See CONTRIBUTING.md.
+/// `reqwest` and `aws-lc-sys` must stay out of the locked tree.
+/// `sigstore-verify` stays until nono can omit it. See CONTRIBUTING.md.
 #[test]
 fn cli_lock_omits_reqwest_and_keeps_nono_defaults_off() {
     let root = repo_root();
@@ -231,9 +231,15 @@ fn cli_lock_omits_reqwest_and_keeps_nono_defaults_off() {
         "reqwest is back in Cargo.lock"
     );
     assert!(
-        lock.lines()
+        !lock
+            .lines()
             .any(|line| line.trim() == "name = \"aws-lc-sys\""),
-        "aws-lc-sys left the lock; update the CONTRIBUTING nono note"
+        "aws-lc-sys is back in the lock; update the CONTRIBUTING nono note"
+    );
+    assert!(
+        lock.lines()
+            .any(|line| line.trim() == "name = \"sigstore-verify\""),
+        "sigstore-verify left the lock; update the CONTRIBUTING nono note"
     );
     let webpki = lock_package_versions(&lock, "rustls-webpki");
     assert!(!webpki.is_empty(), "rustls-webpki left the lock");
@@ -251,12 +257,12 @@ fn cli_lock_omits_reqwest_and_keeps_nono_defaults_off() {
     assert!(note.contains("https://github.com/nolabs-ai/nono/issues/2029"));
     assert!(
         !note.contains("HTTP crates are gone"),
-        "the note must not claim the C toolchain crate is gone"
+        "the note must not claim the HTTP crates are gone"
     );
 
     let rustdoc = read(&root.join("crates/workpen/src/wrap/mod.rs"));
     assert!(rustdoc.contains("does not depend on `reqwest`"));
-    assert!(rustdoc.contains("links `aws-lc-sys`"));
+    assert!(rustdoc.contains("does not link `aws-lc-sys`"));
     assert!(rustdoc.contains("no nono feature"));
 }
 
