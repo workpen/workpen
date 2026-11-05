@@ -456,6 +456,34 @@ fn run_env_empty_name_is_usage() {
 }
 
 #[test]
+fn run_env_unset_name_is_usage() {
+    let dir = TempDir::new().expect("workspace");
+    let name = "WORKPEN_UNSET_ENV_PROBE";
+    let out = workpen()
+        .env_remove(name)
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--env", name, "--", "echo", "hello"])
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "unset --env must exit 2, stdout={stdout} stderr={err}"
+    );
+    assert!(
+        err.contains(&format!("--env {name} is not set")),
+        "unset --env must name the missing variable, stdout={stdout} stderr={err}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "unset --env must not print stdout, stdout={stdout} stderr={err}"
+    );
+}
+
+#[test]
 fn run_timeout_that_does_not_fit_on_the_clock_exits_2() {
     let dir = TempDir::new().expect("workspace");
     let out = workpen()
