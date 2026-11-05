@@ -259,7 +259,7 @@ usage: workpen run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [-
 const RUN_HELP: &str = "\
 usage: workpen run [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--policy] [--json] \
 [--timeout DUR] [--tty] [--env NAME[=VALUE]] [--env-clear] [--] CMD...
-The network is blocked unless --net is set. --extra-root and --write are read-write. --read is read-only. A --read directory inside the workspace or another writable directory is refused, because it would still be writable. Dest-deny runs before the child starts, and on Linux the child is not started when secret names cannot be hidden. --policy prints the jail and does not start the child. Exit 124 means the timeout fired. --env opts a name back in. --env-clear drops inherited names except PATH, then applies every --env. Loaders such as LD_PRELOAD stay removed.";
+The network is blocked unless --net is set. --extra-root and --write are read-write. --read is read-only. A --read directory inside the workspace or another writable directory is refused, because it would still be writable. Dest-deny runs before the child starts, and on Linux the child is not started when secret names cannot be hidden. --policy prints the jail and does not start the child. Exit 124 means the timeout fired. --env opts a name back in. A name with no equals sign must already be set. --env-clear drops inherited names except PATH, then applies every --env. Loaders such as LD_PRELOAD stay removed.";
 
 const POLICY_USAGE: &str = "\
 usage: workpen policy [--root DIR] [--extra-root DIR] [--read DIR] [--write DIR] [--net] [--json] [--] [CMD...]";
@@ -598,7 +598,8 @@ fn parse_env_set(raw: &str) -> Result<(String, String), String> {
     if raw.is_empty() {
         return Err(format!("--env needs a name ({RUN_USAGE})"));
     }
-    let value = std::env::var(raw).unwrap_or_default();
+    let value = std::env::var(raw)
+        .map_err(|_| format!("--env {raw} is not set in the parent ({RUN_USAGE})"))?;
     Ok((raw.to_string(), value))
 }
 
