@@ -11,9 +11,9 @@
 //! the kernel cannot apply. The default crate (`default = []`) does not
 //! compile this module. nono is pinned with `default-features = false`.
 //! That build does not depend on `reqwest`. nono still depends on
-//! `sigstore-verify`, which links `aws-lc-sys`. There is no nono feature
-//! that drops `aws-lc-sys`. Do not enable nono's default features, and
-//! do not fork nono.
+//! `sigstore-verify` 0.15.1, which does not link `aws-lc-sys`. There is
+//! no nono feature that drops `sigstore-verify`. Do not enable nono's
+//! default features, and do not fork nono.
 
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
