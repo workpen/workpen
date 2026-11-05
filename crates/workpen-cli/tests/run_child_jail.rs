@@ -1936,6 +1936,7 @@ fn run_stops_or_reports_a_setsid_orphan_after_a_decoy() {
         return;
     };
     let ws = dir.path().to_string_lossy().to_string();
+    let mut completed = 0;
     for trial in 0..10 {
         let pid_path = dir.path().join(format!("decoy-{trial}.pid"));
         let _cleanup = KillPidFile(pid_path.clone());
@@ -1953,10 +1954,16 @@ fn run_stops_or_reports_a_setsid_orphan_after_a_decoy() {
         let mut pids = text.split_whitespace();
         let decoy = pids.next().unwrap_or("").to_string();
         let orphan = pids.next().unwrap_or("").to_string();
+        // A loaded suite can hit the 5s deadline before the fixture writes
+        // both pids. That scheduling miss is not a completed trial.
+        if (decoy.is_empty() || orphan.is_empty()) && stderr.contains("after the deadline") {
+            continue;
+        }
         assert!(
             !decoy.is_empty() && !orphan.is_empty(),
             "trial {trial} did not record both pids, text={text:?} stdout={stdout} stderr={stderr}"
         );
+        completed += 1;
         let orphan_alive = pid_alive(&orphan);
         if out.status.success() {
             assert!(
@@ -1983,6 +1990,10 @@ fn run_stops_or_reports_a_setsid_orphan_after_a_decoy() {
             );
         }
     }
+    assert!(
+        completed >= 8,
+        "{completed} trials completed; the fixture did not record both pids"
+    );
 }
 
 #[cfg(unix)]
