@@ -89,7 +89,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # ubuntu-latest is Ubuntu 26 (image 20261025). /bin/echo is the
+        # cargo coreutils multicall, so dest-deny calls it a hardlink
+        # sibling. #323 tracks that image.
+        os: [ubuntu-24.04, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     permissions:

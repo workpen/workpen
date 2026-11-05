@@ -10,10 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use super::{
-    KernelAccess, KernelApply, KernelError, KernelPolicy, combine_spawn_restore,
-    is_denied_child_env,
-};
+use super::{KernelAccess, KernelApply, KernelError, KernelPolicy, combine_spawn_restore};
 
 #[path = "windows_net.rs"]
 mod windows_net;
@@ -549,7 +546,7 @@ enum StdioCapture {
 
 pub(super) fn spawn_write_restricted(
     policy: &KernelPolicy,
-    cmd: &Command,
+    cmd: &mut Command,
     timeout: Option<Duration>,
 ) -> Result<(KernelApply, ExitStatus), KernelError> {
     let (applied, status, _, timed_out) =
@@ -562,7 +559,7 @@ pub(super) fn spawn_write_restricted(
 
 pub(super) fn spawn_write_restricted_output(
     policy: &KernelPolicy,
-    cmd: &Command,
+    cmd: &mut Command,
     timeout: Option<Duration>,
 ) -> Result<(KernelApply, std::process::Output, bool), KernelError> {
     let (applied, status, output, timed_out) =
@@ -580,7 +577,7 @@ pub(super) fn spawn_write_restricted_output(
 
 pub(super) fn spawn_write_restricted_forward(
     policy: &KernelPolicy,
-    cmd: &Command,
+    cmd: &mut Command,
     timeout: Option<Duration>,
 ) -> Result<(KernelApply, ExitStatus, bool), KernelError> {
     let (applied, status, _, timed_out) =
@@ -590,7 +587,7 @@ pub(super) fn spawn_write_restricted_forward(
 
 fn spawn_write_restricted_io(
     policy: &KernelPolicy,
-    cmd: &Command,
+    cmd: &mut Command,
     timeout: Option<Duration>,
     capture: StdioCapture,
 ) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>, bool), KernelError> {
@@ -788,7 +785,7 @@ fn open_nul(write: bool) -> Result<CloseOnDrop, KernelError> {
 
 fn spawn_prepared(
     mut prepared: Prepared,
-    cmd: &Command,
+    cmd: &mut Command,
     timeout: Option<Duration>,
     capture: StdioCapture,
 ) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>, bool), KernelError> {
@@ -811,7 +808,7 @@ fn spawn_prepared(
 
 fn spawn_prepared_child(
     prepared: &mut Prepared,
-    cmd: &Command,
+    cmd: &mut Command,
     timeout: Option<Duration>,
     capture: StdioCapture,
 ) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>, bool), KernelError> {
@@ -1529,24 +1526,8 @@ fn create_kill_job() -> Result<CloseOnDrop, KernelError> {
     Ok(job)
 }
 
-fn environment_block(cmd: &Command) -> Vec<u16> {
-    // `env_clear` is invisible here, and it hides `env_remove`. Callers
-    // that clear the child environment must `env_remove` each inherited
-    // name without calling `env_clear` first.
-    let mut pairs: Vec<(OsString, OsString)> = std::env::vars_os().collect();
-    let mut explicit_keep = Vec::new();
-    for (key, value) in cmd.get_envs() {
-        pairs.retain(|(k, _)| !env_key_eq(k, key));
-        if let Some(value) = value {
-            if !super::is_child_env_loader(key) {
-                explicit_keep.push(key.to_os_string());
-                pairs.push((key.to_os_string(), value.to_os_string()));
-            }
-        }
-    }
-    pairs.retain(|(k, _)| {
-        !is_denied_child_env(k) || explicit_keep.iter().any(|keep| env_key_eq(keep, k))
-    });
+fn environment_block(cmd: &mut Command) -> Vec<u16> {
+    let pairs = super::child_env_pairs(cmd);
     let mut out = Vec::new();
     for (key, value) in pairs {
         out.extend(key.encode_wide());
@@ -1559,11 +1540,6 @@ fn environment_block(cmd: &Command) -> Vec<u16> {
     }
     out.push(0);
     out
-}
-
-fn env_key_eq(left: &OsStr, right: &OsStr) -> bool {
-    left.to_string_lossy()
-        .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
 fn wrap_command_line(
@@ -1839,13 +1815,46 @@ mod env_block_tests {
         if let Some(path) = std::env::var_os("PATH") {
             cmd.env("PATH", path);
         }
-        let block = environment_block(&cmd);
+        let block = environment_block(&mut cmd);
         assert!(
             !block_has_key(&block, &name),
             "{name} stayed in the child block after env_remove"
         );
         if std::env::var_os("PATH").is_some() {
             assert!(block_has_key(&block, "PATH"), "PATH was not restored");
+        }
+    }
+
+    #[test]
+    fn env_clear_drops_an_inherited_name() {
+        let Some((key, _)) = std::env::vars_os().find(|(name, _)| {
+            let name = name.to_string_lossy();
+            !name.eq_ignore_ascii_case("PATH") && !name.eq_ignore_ascii_case("SystemRoot")
+        }) else {
+            return;
+        };
+        let name = key.to_string_lossy().into_owned();
+        let mut cmd = Command::new("cmd");
+        cmd.env_clear();
+        if let Some(path) = std::env::var_os("PATH") {
+            cmd.env("PATH", path);
+        }
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            cmd.env("SystemRoot", root);
+        }
+        let block = environment_block(&mut cmd);
+        assert!(
+            !block_has_key(&block, &name),
+            "{name} stayed in the child block after env_clear"
+        );
+        if std::env::var_os("PATH").is_some() {
+            assert!(block_has_key(&block, "PATH"), "PATH was not restored");
+        }
+        if std::env::var_os("SystemRoot").is_some() {
+            assert!(
+                block_has_key(&block, "SystemRoot"),
+                "SystemRoot was not restored"
+            );
         }
     }
 }

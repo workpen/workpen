@@ -604,9 +604,9 @@ fn parse_env_set(raw: &str) -> Result<(String, String), String> {
 
 fn apply_child_env(child: &mut Command, env_clear: bool, env_sets: &[(String, String)]) {
     if env_clear {
-        // Unix `env_clear` is enough. Windows CreateProcess only sees
-        // `get_envs`, and `env_clear` hides later `env_remove` calls,
-        // so each inherited name is removed on its own.
+        // Unix `env_clear` is enough. On Windows, `env_clear` hides a
+        // later `env_remove` from `get_envs`, so each inherited name is
+        // removed on its own. The jail also honors `env_clear` itself.
         #[cfg(not(windows))]
         {
             child.env_clear();
