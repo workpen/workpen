@@ -748,7 +748,7 @@ fn allow_session_object_create(sid: Handle) -> Result<Vec<AclRestore>, KernelErr
         | DIRECTORY_CREATE_SUBDIRECTORY;
     let mut guards = Vec::new();
     for path in object_namespace_dirs() {
-        if let Ok(guard) = set_named_ace(
+        match set_named_ace(
             &path,
             SE_KERNEL_OBJECT,
             sid,
@@ -756,21 +756,28 @@ fn allow_session_object_create(sid: Handle) -> Result<Vec<AclRestore>, KernelErr
             GRANT_ACCESS,
             NO_INHERITANCE,
         ) {
-            guards.push(guard);
+            Ok(guard) => guards.push(guard),
+            Err(err) => eprintln!("workpen: namespace ACE skipped: {err}"),
         }
     }
     Ok(guards)
 }
 
 fn object_namespace_dirs() -> Vec<Vec<u16>> {
-    let mut paths = vec![wide_os(OsStr::new(r"\BaseNamedObjects"))];
+    let mut names = vec![
+        r"\BaseNamedObjects".to_string(),
+        "BaseNamedObjects".to_string(),
+    ];
     let mut session = 0u32;
     let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
     if ok != 0 {
-        let path = format!("\\Sessions\\{session}\\BaseNamedObjects");
-        paths.push(wide_os(OsStr::new(&path)));
+        names.push(format!("\\Sessions\\{session}\\BaseNamedObjects"));
+        names.push(format!("Sessions\\{session}\\BaseNamedObjects"));
     }
-    paths
+    names
+        .into_iter()
+        .map(|name| wide_os(OsStr::new(&name)))
+        .collect()
 }
 
 /// Process-lifetime AppContainer for [`super::KernelPolicy::spawn_reexec`].

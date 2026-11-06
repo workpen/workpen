@@ -227,15 +227,9 @@ fn windows_workspace_jail_denies_profile_secret_dirs() {
                 secret.display()
             );
         }
-        let sleeper = ws.path().join("sleep.cmd");
-        fs::write(&sleeper, b"@echo off\r\nping -n 30 127.0.0.1 >nul\r\n").expect("sleeper");
+        let sleeper = compile_sleeper(ws.path());
         let err = policy
-            .run_child_timeout(
-                com(|command| {
-                    command.arg("/C").arg(&sleeper);
-                }),
-                Duration::from_secs(1),
-            )
+            .run_child_timeout(Command::new(&sleeper), Duration::from_secs(1))
             .expect_err("timeout");
         assert!(
             matches!(err, workpen::KernelError::Timeout),
@@ -553,7 +547,7 @@ fn windows_jail_child_cannot_use_clipboard_or_parent_console() {
             let (_applied, output) = policy
                 .run_child_output({
                     let mut command = Command::new(&probe);
-                    command.current_dir(ws.path()).arg("con");
+                    command.current_dir(ws.path()).arg("console-probe");
                     command
                 })
                 .unwrap_or_else(|err| panic!("blocked={blocked} con probe: {err}"));
@@ -634,7 +628,7 @@ fn compile_ui_probe(dir: &Path) -> PathBuf {
 const UI_PROBE: &str = r#"
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
-    if mode == "con" {
+    if mode == "console-probe" {
         let wrote = write_conout();
         std::fs::write("con.txt", if wrote { "con-write" } else { "con-fail" }).expect("report");
         return;
