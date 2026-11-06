@@ -142,8 +142,9 @@ in one page is [docs/threat-model.md](docs/threat-model.md).
   drops. `strict` and `read-only` can read the workspace
   (`read_only` cannot write it), `SystemRoot`, `System32`, and
   `ProgramFiles`. `prepare_reexec` keeps network open for a host
-  that re-execs into one long-lived jail. A jailed child does not
-  attach to the parent console, and it cannot use the clipboard.
+  that re-execs into one long-lived jail. A jailed child cannot
+  use the clipboard. It still inherits the parent console when
+  the parent has one.
 
 ## Contributing
 

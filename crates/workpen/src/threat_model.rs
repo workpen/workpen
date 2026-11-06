@@ -70,14 +70,14 @@
 //!   `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`, and `.kube`
 //!   with the restricted SID and restores those ACLs when the jail
 //!   drops. Missing names are skipped. It does not walk the profile.
-//! * A jailed Windows child inherits the parent console and can use
-//!   the clipboard. It is created with `CREATE_NO_WINDOW`, so it does
-//!   not attach to that console. It cannot read or write the
-//!   clipboard, change system parameters, or exit Windows.
-//!   `JOB_OBJECT_UILIMIT_HANDLES` is not set: it blocks USER handles
-//!   owned outside the job, including the parent console, and MSYS
-//!   init exits `0xC0000142`. Captured stdout and stderr are pipes
-//!   and still work.
+//! * A jailed Windows child cannot use the parent console or the
+//!   clipboard. Clipboard read and write, system parameters, and
+//!   ExitWindows are blocked. The child still inherits the parent
+//!   console when the parent has one. `JOB_OBJECT_UILIMIT_HANDLES`
+//!   is not set: it blocks USER handles owned outside the job, and
+//!   MSYS init exits `0xC0000142`. `CREATE_NO_WINDOW` is not set:
+//!   it hangs console programs such as `cmd`. Captured stdout and
+//!   stderr are pipes and still work.
 //! * `strict` and `read-only` on Windows can read the whole disk.
 //!   They can read the workspace (`read-only` cannot write it),
 //!   `SystemRoot`, `System32`, and `ProgramFiles`. Other paths are

@@ -638,12 +638,15 @@ fn windows_jail_child_cannot_use_clipboard_or_parent_console() {
     with_jail_lock(|| {
         let ws = TempDir::new().expect("workspace");
         let probe = compile_ui_probe(ws.path());
-        assert!(
-            ensure_parent_console(),
-            "AllocConsole failed, so the parent-console check would be a skip"
-        );
-        let previous = console_title();
-        set_console_title("workpen-parent");
+        // GitHub-hosted Windows has no window station, so AllocConsole
+        // fails. The probe still has to open CONOUT$. A parent with no
+        // console must see con-fail. A parent with a console must keep
+        // its title and must not show the marker.
+        let have_console = ensure_parent_console();
+        let previous = have_console.then(|| console_title()).flatten();
+        if have_console {
+            set_console_title("workpen-parent");
+        }
         for blocked in [false, true] {
             let policy = process_jail(ws.path(), std::iter::empty::<&Path>())
                 .expect("jail")
@@ -665,15 +668,22 @@ fn windows_jail_child_cannot_use_clipboard_or_parent_console() {
                 "blocked={blocked} marker reached the captured pipe"
             );
             let report = fs::read_to_string(ws.path().join("con.txt")).unwrap_or_default();
-            assert_eq!(
-                console_title().as_deref(),
-                Some("workpen-parent"),
-                "blocked={blocked} child changed the parent console title, report={report}"
-            );
-            assert!(
-                !parent_console_contains("WPCONMARK"),
-                "blocked={blocked} child wrote the parent console, report={report}"
-            );
+            if have_console {
+                assert_eq!(
+                    console_title().as_deref(),
+                    Some("workpen-parent"),
+                    "blocked={blocked} child changed the parent console title, report={report}"
+                );
+                assert!(
+                    !parent_console_contains("WPCONMARK"),
+                    "blocked={blocked} child wrote the parent console, report={report}"
+                );
+            } else {
+                assert!(
+                    report.contains("con-fail"),
+                    "blocked={blocked} child opened CONOUT$ with no parent console, report={report}"
+                );
+            }
         }
         if let Some(title) = previous {
             set_console_title(&title);

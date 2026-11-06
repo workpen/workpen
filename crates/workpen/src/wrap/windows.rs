@@ -48,10 +48,6 @@ const SE_FILE_OBJECT: u32 = 1;
 const DACL_SECURITY_INFORMATION: Dword = 0x4;
 const CREATE_SUSPENDED: Dword = 0x0000_0004;
 const CREATE_UNICODE_ENVIRONMENT: Dword = 0x0000_0400;
-/// The child must not attach to the parent console. `CREATE_NO_WINDOW`
-/// does that. `JOB_OBJECT_UILIMIT_HANDLES` stays off: it blocks USER
-/// handles owned outside the job, and MSYS init then exits `0xC0000142`.
-const CREATE_NO_WINDOW: Dword = 0x0800_0000;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: Dword = 0x2000;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
 const TOKEN_PRIMARY: u32 = 1;
@@ -705,9 +701,7 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
     let mut acl_guards = grant_write_aces(&rw_grant_paths(policy), sid.0)?;
     acl_guards.extend(deny_dest_aces(&dest_deny_paths(policy), world.0)?);
     acl_guards.extend(deny_dest_aces(&profile_secret_paths(), sid.0)?);
-    if let Some(guard) = allow_session_object_create(sid.0)? {
-        acl_guards.push(guard);
-    }
+    acl_guards.extend(allow_session_object_create(sid.0)?);
     let token = create_write_restricted_token(sid.0).map_err(prefix_apply("token setup"))?;
     let job = create_kill_job().map_err(prefix_apply("job setup"))?;
     Ok(Prepared {
@@ -797,32 +791,46 @@ fn profile_secret_paths() -> Vec<PathBuf> {
     .collect()
 }
 
-/// Let the restricting SID create objects in this session's
-/// `BaseNamedObjects`. MSYS `DllMain` creates a named section there.
-/// Without this ACE the write-restricted check fails inside the DLL
-/// and Git `usr\bin` exits `0xC0000142`. The ACE is restored with the
-/// other jail ACLs. A failure here does not fail the spawn: System32
-/// tools do not need the section.
-fn allow_session_object_create(sid: Handle) -> Result<Option<AclRestore>, KernelError> {
-    let Some(path) = session_object_dir() else {
-        return Ok(None);
-    };
-    match set_named_ace(
-        &path,
-        SE_KERNEL_OBJECT,
-        sid,
-        DIRECTORY_CREATE_OBJECT | DIRECTORY_QUERY | DIRECTORY_TRAVERSE,
-        GRANT_ACCESS,
-        NO_INHERITANCE,
-    ) {
-        Ok(guard) => Ok(Some(guard)),
-        Err(_) => Ok(None),
+/// Let the restricting SID create objects in the session namespace and
+/// in `\BaseNamedObjects`. MSYS `DllMain` calls `NtCreateDirectoryObject`
+/// on `\BaseNamedObjects\msys-*`. That needs
+/// `DIRECTORY_CREATE_SUBDIRECTORY`, not only `DIRECTORY_CREATE_OBJECT`.
+/// `0xC0000022` is that deny. The ACEs are restored with the other jail
+/// ACLs. A failure here does not fail the spawn: System32 tools do not
+/// need the section.
+fn allow_session_object_create(sid: Handle) -> Result<Vec<AclRestore>, KernelError> {
+    let rights = DIRECTORY_QUERY
+        | DIRECTORY_TRAVERSE
+        | DIRECTORY_CREATE_OBJECT
+        | DIRECTORY_CREATE_SUBDIRECTORY;
+    let mut guards = Vec::new();
+    for path in object_namespace_dirs() {
+        if let Ok(guard) = set_named_ace(
+            &path,
+            SE_KERNEL_OBJECT,
+            sid,
+            rights,
+            GRANT_ACCESS,
+            NO_INHERITANCE,
+        ) {
+            guards.push(guard);
+        }
     }
+    Ok(guards)
 }
 
 const DIRECTORY_QUERY: Dword = 0x0001;
 const DIRECTORY_TRAVERSE: Dword = 0x0002;
 const DIRECTORY_CREATE_OBJECT: Dword = 0x0004;
+const DIRECTORY_CREATE_SUBDIRECTORY: Dword = 0x0008;
+
+fn object_namespace_dirs() -> Vec<Vec<u16>> {
+    let mut paths = vec![wide_os(OsStr::new(r"\BaseNamedObjects"))];
+    if let Some(session) = session_object_dir() {
+        paths.push(session);
+    }
+    paths
+}
 
 fn session_object_dir() -> Option<Vec<u16>> {
     let mut session = 0u32;
@@ -1072,7 +1080,7 @@ fn spawn_prepared_child(
             ptr::null_mut(),
             ptr::null_mut(),
             1,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
             env_block.as_mut_ptr().cast(),
             cwd_ptr,
             &mut startup,
