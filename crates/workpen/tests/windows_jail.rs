@@ -536,6 +536,7 @@ fn windows_jail_child_cannot_use_clipboard_or_parent_console() {
         // console must see con-fail. A parent with a console must keep
         // its title and must not show the marker.
         let have_console = ensure_parent_console();
+        let interactive = have_console;
         let previous = have_console.then(|| console_title()).flatten();
         if have_console {
             set_console_title("workpen-parent");
@@ -597,7 +598,7 @@ fn windows_jail_child_cannot_use_clipboard_or_parent_console() {
             .expect("clip probe");
         assert!(output.status.success(), "{}", output_text(&output));
         let report = fs::read_to_string(ws.path().join("clip.txt")).unwrap_or_default();
-        if parent_has_console() {
+        if interactive {
             assert!(
                 report.contains("clip-fail"),
                 "child clipboard open must fail, report={report}"
