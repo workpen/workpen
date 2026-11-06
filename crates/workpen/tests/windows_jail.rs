@@ -713,6 +713,8 @@ fn compile_ui_probe(dir: &Path) -> PathBuf {
     let status = Command::new("rustc")
         .arg("-o")
         .arg(&exe)
+        .arg("-l")
+        .arg("user32")
         .arg(&src)
         .status()
         .expect("rustc");
@@ -923,6 +925,7 @@ fn set_console_title(title: &str) {
 }
 
 fn set_clipboard_sentinel(text: &str) -> bool {
+    #[link(name = "user32")]
     unsafe extern "system" {
         fn OpenClipboard(hwnd: *mut u8) -> i32;
         fn EmptyClipboard() -> i32;
@@ -959,6 +962,7 @@ fn set_clipboard_sentinel(text: &str) -> bool {
 }
 
 fn read_clipboard_text() -> Option<String> {
+    #[link(name = "user32")]
     unsafe extern "system" {
         fn OpenClipboard(hwnd: *mut u8) -> i32;
         fn GetClipboardData(format: u32) -> *mut u8;
