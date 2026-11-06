@@ -48,6 +48,10 @@ const SE_FILE_OBJECT: u32 = 1;
 const DACL_SECURITY_INFORMATION: Dword = 0x4;
 const CREATE_SUSPENDED: Dword = 0x0000_0004;
 const CREATE_UNICODE_ENVIRONMENT: Dword = 0x0000_0400;
+/// The child must not attach to the parent console. `CREATE_NO_WINDOW`
+/// does that. `JOB_OBJECT_UILIMIT_HANDLES` stays off: it blocks USER
+/// handles owned outside the job, and MSYS init then exits `0xC0000142`.
+const CREATE_NO_WINDOW: Dword = 0x0800_0000;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: Dword = 0x2000;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
 const TOKEN_PRIMARY: u32 = 1;
@@ -1068,7 +1072,7 @@ fn spawn_prepared_child(
             ptr::null_mut(),
             ptr::null_mut(),
             1,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
             env_block.as_mut_ptr().cast(),
             cwd_ptr,
             &mut startup,

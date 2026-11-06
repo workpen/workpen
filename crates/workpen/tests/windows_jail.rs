@@ -6,11 +6,12 @@
 
 use std::fs;
 use std::io::Read;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use workpen::{
@@ -61,6 +62,16 @@ fn git_cat() -> Option<PathBuf> {
         candidates.push(PathBuf::from(root).join(r"Git\usr\bin\cat.exe"));
     }
     candidates.into_iter().find(|path| path.is_file())
+}
+
+/// Read `path` without putting it on argv. Argv dest-deny would
+/// refuse `.env` and `.ssh` before the ACL jail runs.
+fn type_hidden(path: &Path) -> Command {
+    com(|command| {
+        command
+            .env("WP_READ", path)
+            .args(["/C", "type \"%WP_READ%\""]);
+    })
 }
 
 fn output_text(output: &std::process::Output) -> String {
@@ -181,11 +192,8 @@ fn windows_workspace_jail_denies_profile_secret_dirs() {
                 .any(|c| c == b"workspace-ok")
         );
         for secret in &secrets {
-            let script = format!("type {}", secret.display());
             let (_applied, output) = policy
-                .run_child_output(com(|command| {
-                    command.args(["/C", &script]);
-                }))
+                .run_child_output(type_hidden(secret))
                 .unwrap_or_else(|err| panic!("spawn type {}: {err}", secret.display()));
             assert!(
                 !output.status.success(),
@@ -241,6 +249,167 @@ fn windows_workspace_jail_denies_profile_secret_dirs() {
             );
         }
     });
+}
+
+#[test]
+fn windows_jail_restores_dest_deny_ace() {
+    with_jail_lock(|| {
+        let ws = TempDir::new().expect("workspace");
+        let env = ws.path().join(".env");
+        fs::write(&env, b"dest-deny-bytes").expect("env");
+        let policy = process_jail(ws.path(), std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_network(false);
+        let (_applied, output) = policy
+            .run_child_output(type_hidden(&env))
+            .expect("type .env");
+        assert!(
+            !output.status.success(),
+            "child must not read dest-deny .env: {}",
+            output_text(&output)
+        );
+        assert!(
+            !output
+                .stdout
+                .windows(b"dest-deny-bytes".len())
+                .any(|chunk| chunk == b"dest-deny-bytes"),
+            "dest-deny bytes leaked: {}",
+            output_text(&output)
+        );
+        assert_eq!(
+            fs::read(&env).expect("parent read after child"),
+            b"dest-deny-bytes",
+            "dest-deny ACE must be restored after the child exits"
+        );
+    });
+}
+
+#[test]
+fn windows_network_jail_outbound_connect_fails() {
+    with_jail_lock(|| {
+        let ws = TempDir::new().expect("workspace");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+        let port = listener.local_addr().expect("addr").port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_thread = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                accepted_thread.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8];
+                let _ = stream.read(&mut buf);
+            }
+        });
+        TcpStream::connect(("127.0.0.1", port)).expect("parent connects");
+        let start = Instant::now();
+        while accepted.load(Ordering::SeqCst) < 1 && start.elapsed() < Duration::from_secs(2) {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the listener must accept the parent before the jailed connect"
+        );
+        let connector = compile_blocked_connector(ws.path(), port);
+        let policy = process_jail(ws.path(), std::iter::empty::<&Path>()).expect("jail");
+        for _ in 0..2 {
+            let (applied, output) = policy
+                .run_child_output(Command::new(&connector))
+                .expect("spawn blocked connect");
+            assert!(
+                !output.status.success(),
+                "outbound connect must fail ({applied:?}): {}",
+                output_text(&output)
+            );
+            assert!(
+                output_text(&output).contains("connect-fail"),
+                "expected connect-fail, not a skip path ({applied:?}): {}",
+                output_text(&output)
+            );
+        }
+        assert_eq!(
+            windows_appcontainer_creates(),
+            1,
+            "two blocked connects must share one profile"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "a jailed connect must not reach the listener"
+        );
+    });
+}
+
+fn compile_blocked_connector(dir: &Path, port: u16) -> PathBuf {
+    let src = dir.join("connect_blocked.rs");
+    let exe = dir.join("connect_blocked.exe");
+    fs::write(
+        &src,
+        format!(
+            r#"fn main() {{
+    match std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:{port}".parse().unwrap(),
+        std::time::Duration::from_secs(3),
+    ) {{
+        Ok(_) => {{}}
+        Err(err) => {{
+            eprintln!("connect-fail {{err}}");
+            std::process::exit(1);
+        }}
+    }}
+}}
+"#
+        ),
+    )
+    .expect("src");
+    let status = Command::new("rustc")
+        .arg("-o")
+        .arg(&exe)
+        .arg(&src)
+        .status()
+        .expect("rustc");
+    assert!(status.success(), "rustc connect_blocked.exe");
+    exe
+}
+
+#[test]
+fn windows_jail_job_close_kills_child() {
+    with_jail_lock(|| {
+        let ws = TempDir::new().expect("workspace");
+        let sleeper = compile_sleeper(ws.path());
+        for blocked in [false, true] {
+            let policy = process_jail(ws.path(), std::iter::empty::<&Path>())
+                .expect("jail")
+                .with_network(blocked);
+            let err = policy
+                .run_child_timeout(Command::new(&sleeper), Duration::from_secs(1))
+                .expect_err("timeout");
+            assert!(
+                matches!(err, workpen::KernelError::Timeout),
+                "blocked={blocked} job close must kill the child, got {err}"
+            );
+        }
+    });
+}
+
+fn compile_sleeper(dir: &Path) -> PathBuf {
+    let src = dir.join("sleep30.rs");
+    let exe = dir.join("sleep30.exe");
+    fs::write(
+        &src,
+        "fn main() { std::thread::sleep(std::time::Duration::from_secs(30)); }\n",
+    )
+    .expect("sleeper src");
+    let status = Command::new("rustc")
+        .arg("-o")
+        .arg(&exe)
+        .arg(&src)
+        .status()
+        .expect("rustc");
+    assert!(status.success(), "rustc sleep30.exe");
+    exe
 }
 
 #[test]
@@ -400,10 +569,7 @@ fn windows_reexec_jail_allows_network_and_denies_secrets() {
         }));
         assert!(!marker.exists(), "re-exec jail must not write outside");
         let (_applied, denied) = jail
-            .spawn_output(com(|command| {
-                let script = format!("type {}", secret.display());
-                command.args(["/C", &script]);
-            }))
+            .spawn_output(type_hidden(&secret))
             .expect("type secret");
         assert!(!denied.status.success(), "{}", output_text(&denied));
         assert!(
@@ -472,32 +638,53 @@ fn windows_jail_child_cannot_use_clipboard_or_parent_console() {
     with_jail_lock(|| {
         let ws = TempDir::new().expect("workspace");
         let probe = compile_ui_probe(ws.path());
-        let policy = process_jail(ws.path(), std::iter::empty::<&Path>())
-            .expect("jail")
-            .with_network(false);
-        if let Some(previous) = console_title() {
-            set_console_title("workpen-parent");
+        assert!(
+            ensure_parent_console(),
+            "AllocConsole failed, so the parent-console check would be a skip"
+        );
+        let previous = console_title();
+        set_console_title("workpen-parent");
+        for blocked in [false, true] {
+            let policy = process_jail(ws.path(), std::iter::empty::<&Path>())
+                .expect("jail")
+                .with_network(blocked);
             let (_applied, output) = policy
                 .run_child_output({
                     let mut command = Command::new(&probe);
-                    command.current_dir(ws.path()).arg("title");
+                    command.current_dir(ws.path()).arg("con");
                     command
                 })
-                .expect("title probe");
-            assert!(output.status.success(), "probe: {}", output_text(&output));
-            let now = console_title().unwrap_or_default();
-            assert_eq!(
-                now, "workpen-parent",
-                "child must not retitle the parent console, got {now}"
+                .unwrap_or_else(|err| panic!("blocked={blocked} con probe: {err}"));
+            assert!(
+                output.status.success(),
+                "blocked={blocked} probe: {}",
+                output_text(&output)
             );
-            set_console_title(&previous);
-        } else {
-            eprintln!("skip: no parent console");
+            assert!(
+                !output_text(&output).contains("WPCONMARK"),
+                "blocked={blocked} marker reached the captured pipe"
+            );
+            let report = fs::read_to_string(ws.path().join("con.txt")).unwrap_or_default();
+            assert_eq!(
+                console_title().as_deref(),
+                Some("workpen-parent"),
+                "blocked={blocked} child changed the parent console title, report={report}"
+            );
+            assert!(
+                !parent_console_contains("WPCONMARK"),
+                "blocked={blocked} child wrote the parent console, report={report}"
+            );
         }
-        if !set_clipboard_sentinel("workpen-sentinel") {
-            eprintln!("skip: clipboard is not available");
-            return;
+        if let Some(title) = previous {
+            set_console_title(&title);
         }
+        let policy = process_jail(ws.path(), std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_network(false);
+        assert!(
+            set_clipboard_sentinel("workpen-sentinel"),
+            "clipboard is not available; a skip would not prove the deny"
+        );
         let (_applied, output) = policy
             .run_child_output({
                 let mut command = Command::new(&probe);
@@ -536,24 +723,184 @@ fn compile_ui_probe(dir: &Path) -> PathBuf {
 const UI_PROBE: &str = r#"
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
-    if mode == "title" {
-        let title: Vec<u16> = "workpen-child-pwned".encode_utf16().chain(std::iter::once(0)).collect();
-        unsafe { SetConsoleTitleW(title.as_ptr()); }
+    if mode == "con" {
+        let wrote = write_conout();
+        std::fs::write("con.txt", if wrote { "con-write" } else { "con-fail" }).expect("report");
         return;
     }
     let fail = unsafe { OpenClipboard(std::ptr::null_mut()) } == 0;
     if !fail {
         unsafe { CloseClipboard(); }
     }
-    let path = std::path::Path::new("clip.txt");
-    std::fs::write(path, if fail { "clip-fail" } else { "clip-ok" }).expect("report");
+    std::fs::write("clip.txt", if fail { "clip-fail" } else { "clip-ok" }).expect("report");
 }
+
+fn write_conout() -> bool {
+    let mut name: Vec<u16> = "CONOUT$".encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            name.as_mut_ptr(),
+            0x4000_0000,
+            0x1 | 0x2,
+            std::ptr::null_mut(),
+            3,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == (-1isize as *mut u8) {
+        return false;
+    }
+    let msg: Vec<u16> = "WPCONMARK".encode_utf16().collect();
+    let mut wrote = 0u32;
+    let ok = unsafe {
+        WriteConsoleW(
+            handle,
+            msg.as_ptr(),
+            msg.len() as u32,
+            &mut wrote,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    ok != 0
+}
+
 unsafe extern "system" {
-    fn SetConsoleTitleW(title: *const u16) -> i32;
+    fn CreateFileW(
+        name: *mut u16,
+        access: u32,
+        share: u32,
+        sec: *mut u8,
+        disp: u32,
+        flags: u32,
+        template: *mut u8,
+    ) -> *mut u8;
+    fn WriteConsoleW(
+        handle: *mut u8,
+        buf: *const u16,
+        len: u32,
+        wrote: *mut u32,
+        reserved: *mut u8,
+    ) -> i32;
+    fn CloseHandle(handle: *mut u8) -> i32;
     fn OpenClipboard(hwnd: *mut u8) -> i32;
     fn CloseClipboard() -> i32;
 }
 "#;
+
+fn ensure_parent_console() -> bool {
+    unsafe extern "system" {
+        fn GetConsoleWindow() -> *mut u8;
+        fn AllocConsole() -> i32;
+    }
+    if !unsafe { GetConsoleWindow() }.is_null() {
+        return true;
+    }
+    unsafe { AllocConsole() != 0 }
+}
+
+fn parent_console_contains(marker: &str) -> bool {
+    read_parent_console().contains(marker)
+}
+
+fn read_parent_console() -> String {
+    #[repr(C)]
+    struct Coord {
+        x: i16,
+        y: i16,
+    }
+    #[repr(C)]
+    struct SmallRect {
+        left: i16,
+        top: i16,
+        right: i16,
+        bottom: i16,
+    }
+    #[repr(C)]
+    struct ConsoleScreenBufferInfo {
+        size: Coord,
+        cursor: Coord,
+        attributes: u16,
+        window: SmallRect,
+        maximum: Coord,
+    }
+    unsafe extern "system" {
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            sec: *mut u8,
+            disp: u32,
+            flags: u32,
+            template: *mut u8,
+        ) -> *mut u8;
+        fn GetConsoleScreenBufferInfo(handle: *mut u8, info: *mut ConsoleScreenBufferInfo) -> i32;
+        fn ReadConsoleOutputCharacterW(
+            handle: *mut u8,
+            buf: *mut u16,
+            len: u32,
+            coord: Coord,
+            read: *mut u32,
+        ) -> i32;
+        fn CloseHandle(handle: *mut u8) -> i32;
+    }
+    let name: Vec<u16> = "CONOUT$".encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            0x8000_0000,
+            0x1 | 0x2,
+            std::ptr::null_mut(),
+            3,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(
+        handle, -1isize as *mut u8,
+        "parent could not open CONOUT$ after AllocConsole"
+    );
+    let mut info = ConsoleScreenBufferInfo {
+        size: Coord { x: 0, y: 0 },
+        cursor: Coord { x: 0, y: 0 },
+        attributes: 0,
+        window: SmallRect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        },
+        maximum: Coord { x: 0, y: 0 },
+    };
+    let info_ok = unsafe { GetConsoleScreenBufferInfo(handle, &mut info) };
+    assert_ne!(info_ok, 0, "GetConsoleScreenBufferInfo");
+    let width = i32::from(info.size.x).max(1);
+    let rows = i32::from(info.cursor.y).max(0) + 1;
+    let mut units = Vec::new();
+    for row in 0..rows {
+        let mut buf = vec![0u16; width as usize];
+        let mut read = 0u32;
+        let ok = unsafe {
+            ReadConsoleOutputCharacterW(
+                handle,
+                buf.as_mut_ptr(),
+                width as u32,
+                Coord {
+                    x: 0,
+                    y: row as i16,
+                },
+                &mut read,
+            )
+        };
+        if ok == 0 {
+            break;
+        }
+        units.extend_from_slice(&buf[..read as usize]);
+    }
+    unsafe { CloseHandle(handle) };
+    String::from_utf16_lossy(&units)
+}
 
 fn console_title() -> Option<String> {
     unsafe extern "system" {
