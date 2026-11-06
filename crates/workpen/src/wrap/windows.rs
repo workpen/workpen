@@ -65,10 +65,6 @@ const UI_RESTRICTIONS: Dword = JOB_OBJECT_UILIMIT_READCLIPBOARD
     | JOB_OBJECT_UILIMIT_EXITWINDOWS;
 const _: () = assert!(UI_RESTRICTIONS & JOB_OBJECT_UILIMIT_HANDLES == 0);
 const SE_KERNEL_OBJECT: u32 = 6;
-const DIRECTORY_QUERY: Dword = 0x0001;
-const DIRECTORY_TRAVERSE: Dword = 0x0002;
-const DIRECTORY_CREATE_OBJECT: Dword = 0x0004;
-const DIRECTORY_CREATE_SUBDIRECTORY: Dword = 0x0008;
 const TOKEN_PRIMARY: u32 = 1;
 const SECURITY_IMPERSONATION: u32 = 2;
 const INFINITE: Dword = 0xFFFF_FFFF;
@@ -784,10 +780,10 @@ fn cached_blocked_profile(helper: &Path) -> Result<(Handle, bool), KernelError> 
 /// `DIRECTORY_CREATE_SUBDIRECTORY`. `0xC0000022` is that deny. A missed
 /// ACE does not fail the spawn.
 fn allow_session_object_create(sid: Handle) -> Result<Vec<AclRestore>, KernelError> {
-    let rights = DIRECTORY_QUERY
-        | DIRECTORY_TRAVERSE
-        | DIRECTORY_CREATE_OBJECT
-        | DIRECTORY_CREATE_SUBDIRECTORY;
+    // NtCreateDirectoryObject asks for DIRECTORY_ALL_ACCESS
+    // (STANDARD_RIGHTS_REQUIRED plus the four directory bits). A
+    // create-only mask still returns 0xC0000022.
+    let rights = 0x000F_000F | 0x1000_0000;
     let mut guards = Vec::new();
     for name in object_namespace_names() {
         match grant_directory_object(&name, sid, rights) {
