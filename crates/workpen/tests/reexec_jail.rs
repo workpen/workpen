@@ -8,6 +8,9 @@
 //!
 //! Unix `spawn_reexec` returns [`workpen::KernelError::Apply`] and does
 //! not start the child.
+//!
+//! The jailed process is this test binary's `reexec_probe_child` test.
+//! A harness-free binary cannot answer nextest's `--list` request.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,14 +18,18 @@ use std::time::Duration;
 
 use workpen::{KernelError, KernelPolicy, process_jail, reexec_profile_creates};
 
-fn main() {
-    if std::env::var_os("WORKPEN_REEXEC_PROBE").is_some() {
-        std::process::exit(probe());
+#[test]
+fn reexec_jail() {
+    parent().unwrap_or_else(|err| panic!("FAIL: {err}"));
+}
+
+/// Jailed body. A normal test run does not enter it.
+#[test]
+fn reexec_probe_child() {
+    if std::env::var_os("WORKPEN_REEXEC_PROBE").is_none() {
+        return;
     }
-    if let Err(err) = parent() {
-        eprintln!("FAIL: {err}");
-        std::process::exit(1);
-    }
+    assert_eq!(probe(), 0);
 }
 
 fn parent() -> Result<(), String> {
@@ -66,8 +73,13 @@ fn windows_parent() -> Result<(), String> {
     let fast = jail(rw.path())?.with_network(false);
     let mut cmd = Command::new(comspec());
     cmd.args(["/C", "echo hi"]).current_dir(rw.path());
-    fast.run_child(cmd)
+    let (_applied, output) = fast
+        .run_child_output(cmd)
         .map_err(|err| format!("workspace run_child: {err}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    if !text.contains("hi") {
+        return Err(format!("workspace run_child did not echo hi: {text:?}"));
+    }
     if reexec_profile_creates() != 0 {
         return Err("run_child created the re-exec profile".into());
     }
@@ -76,8 +88,7 @@ fn windows_parent() -> Result<(), String> {
     let gone_policy = jail(gone.path())?;
     let marker = gone.path().join("should-not-run");
     std::fs::remove_dir_all(gone.path()).map_err(|err| err.to_string())?;
-    let mut cmd = Command::new(std::env::current_exe().map_err(|err| err.to_string())?);
-    cmd.env("WORKPEN_REEXEC_PROBE", "1");
+    let cmd = probe_command()?;
     match gone_policy.spawn_reexec(cmd) {
         Err(KernelError::Apply(_)) => {}
         Ok(_) => return Err("missing workspace still started a child".into()),
@@ -123,6 +134,15 @@ fn windows_parent() -> Result<(), String> {
 }
 
 #[cfg(windows)]
+fn probe_command() -> Result<Command, String> {
+    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let mut cmd = Command::new(exe);
+    cmd.args(["--exact", "reexec_probe_child", "--nocapture"])
+        .env("WORKPEN_REEXEC_PROBE", "1");
+    Ok(cmd)
+}
+
+#[cfg(windows)]
 fn run_probe(
     rw: &Path,
     outside: &Path,
@@ -131,10 +151,8 @@ fn run_probe(
     port: u16,
     policy: &KernelPolicy,
 ) -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
-    let mut cmd = Command::new(exe);
+    let mut cmd = probe_command()?;
     cmd.current_dir(rw)
-        .env("WORKPEN_REEXEC_PROBE", "1")
         .env("WORKPEN_REEXEC_RW", rw)
         .env("WORKPEN_REEXEC_OUT", outside)
         .env("WORKPEN_REEXEC_HIDDEN", hidden)

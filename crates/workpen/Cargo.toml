@@ -40,7 +40,6 @@ required-features = ["nono"]
 
 [[test]]
 name = "reexec_jail"
-harness = false
 required-features = ["nono"]
 
 [package.metadata.docs.rs]
