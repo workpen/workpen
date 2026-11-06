@@ -83,6 +83,7 @@ fn windows_parent() -> Result<(), String> {
     if reexec_profile_creates() != 0 {
         return Err("run_child created the re-exec profile".into());
     }
+    stage("missing workspace");
 
     let gone = tempfile::tempdir().map_err(|err| err.to_string())?;
     let gone_policy = jail(gone.path())?;
@@ -108,7 +109,9 @@ fn windows_parent() -> Result<(), String> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|err| err.to_string())?;
     let port = listener.local_addr().map_err(|err| err.to_string())?.port();
     let policy = jail(rw.path())?;
+    stage("first probe");
     let first = run_probe(rw.path(), outside.path(), &hidden, &sys, port, &policy)?;
+    stage("first probe done");
     assert_probe(&first, rw.path(), outside.path(), &hidden)?;
     let created = reexec_profile_creates();
     if created == 0 {
@@ -286,9 +289,20 @@ fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key).map(PathBuf::from)
 }
 
+fn stage(msg: &str) {
+    println!("reexec stage: {msg}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
 fn tcp_ok(addr: &str, secs: u64) -> bool {
-    let Ok(addr) = addr.parse() else {
+    let Ok(addr) = addr.parse::<std::net::SocketAddr>() else {
         return false;
     };
-    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(secs)).is_ok()
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ok = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(secs)).is_ok();
+        let _ = tx.send(ok);
+    });
+    rx.recv_timeout(Duration::from_secs(secs.saturating_add(2)))
+        .unwrap_or(false)
 }

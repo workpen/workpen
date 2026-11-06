@@ -843,6 +843,11 @@ fn grant_package_read(
     sid: Handle,
     guards: &mut Vec<AclRestore>,
 ) -> Result<(), KernelError> {
+    // Do not call SetNamedSecurityInfo on System32 or Program Files.
+    // A runner can block that write until the test is killed.
+    if is_system_root_grant(path) {
+        return Ok(());
+    }
     let inherit = if path.is_dir() {
         SUB_CONTAINERS_AND_OBJECTS_INHERIT
     } else {
@@ -880,20 +885,8 @@ fn grant_program_execute(
         Err(err) if acl_is_access_denied(&err) && is_system_path(program) => {}
         Err(err) => return Err(err),
     }
-    let Some(dir) = program.parent() else {
-        return Ok(());
-    };
-    match set_acl_entry(
-        dir,
-        sid,
-        GENERIC_READ | GENERIC_EXECUTE,
-        GRANT_ACCESS,
-        SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-    ) {
-        Ok(guard) => guards.push(guard),
-        Err(err) if acl_is_access_denied(&err) && is_system_path(dir) => {}
-        Err(err) => return Err(err),
-    }
+    // A directory ACE does not grant existing DLLs. Skip the parent so
+    // a large deps folder is not rewritten.
     Ok(())
 }
 
@@ -909,6 +902,25 @@ fn acl_is_access_denied(err: &KernelError) -> bool {
         KernelError::Apply(msg) => msg.contains("(win32 5)"),
         _ => false,
     }
+}
+
+/// The read roots [`super::system_read_dirs`] adds. Not a subdirectory
+/// the host passed itself.
+fn is_system_root_grant(path: &Path) -> bool {
+    let path = normalize_win_path(path);
+    let mut roots = Vec::new();
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        let root = PathBuf::from(root);
+        roots.push(normalize_win_path(&root));
+        roots.push(normalize_win_path(&root.join("System32")));
+        roots.push(normalize_win_path(&root.join("SysWOW64")));
+    }
+    for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(root) = std::env::var_os(key) {
+            roots.push(normalize_win_path(Path::new(&root)));
+        }
+    }
+    roots.iter().any(|root| path == *root)
 }
 
 fn is_system_path(path: &Path) -> bool {
@@ -2066,6 +2078,15 @@ mod ace_tests {
         assert!(
             super::is_system_path(Path::new(&verbatim)),
             "{verbatim} should match SystemRoot"
+        );
+        assert!(
+            super::is_system_root_grant(Path::new(&verbatim)),
+            "{verbatim} is a system read root"
+        );
+        let nested = format!(r"\\?\{root}\System32\drivers");
+        assert!(
+            !super::is_system_root_grant(Path::new(&nested)),
+            "a subdirectory still needs its own ACE"
         );
         assert!(!super::is_system_path(Path::new(
             r"C:\workpen-not-a-system-dir"
