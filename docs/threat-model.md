@@ -49,8 +49,8 @@ The parent is trusted. The child is not.
 - Windows WFP ran. Win32 5 is `WfpSkipped`. AppContainer is still on.
   Network-blocked commands in one process share one AppContainer and
   one dynamic WFP session. `workspace` (`with_network(false)`) does
-  not create either. `shutdown_process_jail` deletes the profile.
-  Dynamic filters die with the session.
+  not create either. `shutdown_process_jail` deletes that blocked
+  profile. Dynamic filters die with the session.
 - `DISABLE_MAX_PRIVILEGE` removed `SeChangeNotifyPrivilege`. That
   flag keeps traverse checking and drops `SeDebugPrivilege`,
   `SeBackupPrivilege`, `SeRestorePrivilege`, `SeTakeOwnershipPrivilege`,
@@ -72,11 +72,10 @@ The parent is trusted. The child is not.
   can read the workspace (`read-only` cannot write it), `SystemRoot`,
   `System32`, and `ProgramFiles`. Other paths are not readable.
   `workspace` is unchanged except the profile-secret list above.
-- A long-lived Windows re-exec jail is per command. A host prepares
-  one with `prepare_reexec` and spawns into it. Network stays open.
-  The profile-secret directories stay unreadable. Filesystem root and
-  home are refused as read-write roots. `workspace` `run_child` is a
-  different path.
+- `spawn_reexec` blocked the network. That call keeps outbound network
+  open (internet client capability, no WFP BLOCK) and reuses one
+  AppContainer in the process. `Applied` there means the container is
+  up. `run_child` is unchanged.
 - Renaming the dest-deny parent is in scope. Parent-rename is out of
   scope. Leaf `mv .env leaked` is a macOS last-match contract.
 - Windows `Stdio::piped` on `run_child` captures stdout for the host.

@@ -59,7 +59,8 @@
 //!   in one process share one AppContainer and one dynamic WFP
 //!   session. `workspace` (`with_network(false)`) does not create
 //!   either. [`shutdown_process_jail`](crate::shutdown_process_jail)
-//!   deletes the profile. Dynamic filters die with the session.
+//!   deletes that blocked profile. Dynamic filters die with the
+//!   session.
 //! * `DISABLE_MAX_PRIVILEGE` removed `SeChangeNotifyPrivilege`.
 //!   That flag keeps traverse checking and drops `SeDebugPrivilege`,
 //!   `SeBackupPrivilege`, `SeRestorePrivilege`,
@@ -83,11 +84,11 @@
 //!   `SystemRoot`, `System32`, and `ProgramFiles`. Other paths are
 //!   not readable. `workspace` is unchanged except the profile-secret
 //!   list above.
-//! * [`ReexecJail`](crate::ReexecJail) is per command. A host can
-//!   prepare one long-lived Windows jail and re-exec into it. Network
-//!   stays open. The profile-secret directories stay unreadable.
-//!   Filesystem root and home are refused as read-write roots.
-//!   `workspace` `run_child` is a different path.
+//! * [`crate::KernelPolicy::spawn_reexec`] blocked the network. That
+//!   call keeps outbound network open (internet client capability, no
+//!   WFP BLOCK) and reuses one AppContainer in the process.
+//!   [`crate::KernelApply::Applied`] there means the container is up.
+//!   [`crate::KernelPolicy::run_child`] is unchanged.
 //! * Renaming the dest-deny parent is in scope. Parent-rename of a
 //!   dest-deny ancestor (`mv workspace out`) is out of scope. Leaf
 //!   `mv .env leaked` is a Seatbelt last-match contract on macOS.

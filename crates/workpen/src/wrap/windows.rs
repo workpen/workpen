@@ -6,7 +6,7 @@ use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -50,6 +50,25 @@ const CREATE_SUSPENDED: Dword = 0x0000_0004;
 const CREATE_UNICODE_ENVIRONMENT: Dword = 0x0000_0400;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: Dword = 0x2000;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+const JOB_OBJECT_BASIC_UI_RESTRICTIONS: u32 = 4;
+const JOB_OBJECT_UILIMIT_HANDLES: Dword = 0x0000_0001;
+const JOB_OBJECT_UILIMIT_READCLIPBOARD: Dword = 0x0000_0002;
+const JOB_OBJECT_UILIMIT_WRITECLIPBOARD: Dword = 0x0000_0004;
+const JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS: Dword = 0x0000_0008;
+const JOB_OBJECT_UILIMIT_EXITWINDOWS: Dword = 0x0000_0080;
+/// Clipboard, system parameters, and ExitWindows. Not HANDLES:
+/// that flag blocks USER handles owned outside the job, and MSYS
+/// `DllMain` then exits `0xC0000142`.
+const UI_RESTRICTIONS: Dword = JOB_OBJECT_UILIMIT_READCLIPBOARD
+    | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
+    | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
+    | JOB_OBJECT_UILIMIT_EXITWINDOWS;
+const _: () = assert!(UI_RESTRICTIONS & JOB_OBJECT_UILIMIT_HANDLES == 0);
+const SE_KERNEL_OBJECT: u32 = 6;
+const DIRECTORY_QUERY: Dword = 0x0001;
+const DIRECTORY_TRAVERSE: Dword = 0x0002;
+const DIRECTORY_CREATE_OBJECT: Dword = 0x0004;
+const DIRECTORY_CREATE_SUBDIRECTORY: Dword = 0x0008;
 const TOKEN_PRIMARY: u32 = 1;
 const SECURITY_IMPERSONATION: u32 = 2;
 const INFINITE: Dword = 0xFFFF_FFFF;
@@ -64,21 +83,6 @@ const DUPLICATE_SAME_ACCESS: Dword = 0x0000_0002;
 const GENERIC_READ: Dword = 0x8000_0000;
 const GENERIC_WRITE: Dword = 0x4000_0000;
 const GENERIC_EXECUTE: Dword = 0x2000_0000;
-const SE_KERNEL_OBJECT: u32 = 6;
-const JOB_OBJECT_BASIC_UI_RESTRICTIONS: u32 = 4;
-const JOB_OBJECT_UILIMIT_HANDLES: Dword = 0x0000_0001;
-const JOB_OBJECT_UILIMIT_READCLIPBOARD: Dword = 0x0000_0002;
-const JOB_OBJECT_UILIMIT_WRITECLIPBOARD: Dword = 0x0000_0004;
-const JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS: Dword = 0x0000_0008;
-const JOB_OBJECT_UILIMIT_EXITWINDOWS: Dword = 0x0000_0080;
-/// Clipboard, system parameters, and ExitWindows. Not HANDLES:
-/// that flag blocks USER handles owned outside the job, including
-/// the parent console, and MSYS `DllMain` then exits `0xC0000142`.
-const UI_RESTRICTIONS: Dword = JOB_OBJECT_UILIMIT_READCLIPBOARD
-    | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
-    | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
-    | JOB_OBJECT_UILIMIT_EXITWINDOWS;
-const _: () = assert!(UI_RESTRICTIONS & JOB_OBJECT_UILIMIT_HANDLES == 0);
 const FILE_SHARE_READ: Dword = 0x0001;
 const FILE_SHARE_WRITE: Dword = 0x0002;
 const OPEN_EXISTING: Dword = 3;
@@ -91,19 +95,6 @@ struct SidIdentifierAuthority {
 #[repr(C)]
 struct SidAndAttributes {
     sid: Handle,
-    attributes: Dword,
-}
-
-#[repr(C)]
-struct Luid {
-    low_part: Dword,
-    high_part: i32,
-}
-
-#[repr(C)]
-#[cfg_attr(not(test), allow(dead_code))]
-struct LuidAndAttributes {
-    luid: Luid,
     attributes: Dword,
 }
 
@@ -194,11 +185,16 @@ struct JobobjectExtendedLimitInformation {
     peak_job_memory_used: usize,
 }
 
+#[repr(C)]
+struct JobobjectBasicUiRestrictions {
+    ui_restrictions_class: Dword,
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentProcess() -> Handle;
-    fn GetCurrentProcessId() -> Dword;
-    fn ProcessIdToSessionId(dw_process_id: Dword, p_session_id: *mut Dword) -> Bool;
+    fn GetCurrentProcessId() -> u32;
+    fn ProcessIdToSessionId(process_id: u32, session_id: *mut u32) -> i32;
     fn GetCurrentThread() -> Handle;
     fn CancelSynchronousIo(h_thread: Handle) -> Bool;
     fn CloseHandle(h_object: Handle) -> Bool;
@@ -347,25 +343,6 @@ unsafe extern "system" {
         old_acl: Handle,
         new_acl: *mut Handle,
     ) -> Dword;
-    fn GetTokenInformation(
-        token_handle: Handle,
-        token_information_class: u32,
-        token_information: *mut core::ffi::c_void,
-        token_information_length: Dword,
-        return_length: *mut Dword,
-    ) -> Bool;
-    fn SetTokenInformation(
-        token_handle: Handle,
-        token_information_class: u32,
-        token_information: *mut core::ffi::c_void,
-        token_information_length: Dword,
-    ) -> Bool;
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn LookupPrivilegeValueW(
-        lp_system_name: *const u16,
-        lp_name: *const u16,
-        lp_luid: *mut Luid,
-    ) -> Bool;
 }
 
 #[link(name = "kernel32")]
@@ -496,7 +473,7 @@ impl AclRestore {
         if self.restored {
             return Ok(());
         }
-        // SAFETY: `path` is a NUL-terminated object name; `dacl` is from the saved SD.
+        // SAFETY: `path` is a NUL-terminated file path; `dacl` is from the saved SD.
         let err = unsafe {
             SetNamedSecurityInfoW(
                 self.path.as_mut_ptr(),
@@ -523,10 +500,10 @@ impl Drop for AclRestore {
     }
 }
 
-// Propagate restore errors. Drop only eprintln-swallows leftovers.
+// Unwind in reverse. Two ACEs on one path each saved the DACL from
+// before that ACE. Restoring the later save first would put the earlier
+// ACE back. Drop only eprintln-swallows leftovers.
 fn restore_guards(guards: &mut [AclRestore]) -> Result<(), KernelError> {
-    // Later ACEs saved the DACL that already included earlier ACEs.
-    // Restore the last write first so the original DACL is what remains.
     for guard in guards.iter_mut().rev() {
         guard.restore()?;
     }
@@ -626,51 +603,6 @@ pub(super) fn spawn_write_restricted_output(
     ))
 }
 
-pub(super) fn spawn_reexec(
-    policy: &KernelPolicy,
-    cmd: &mut Command,
-    timeout: Option<Duration>,
-) -> Result<(KernelApply, ExitStatus), KernelError> {
-    let (applied, status, _, timed_out) =
-        spawn_reexec_io(policy, cmd, timeout, StdioCapture::Inherit)?;
-    if timed_out {
-        return Err(KernelError::Timeout);
-    }
-    Ok((applied, status))
-}
-
-pub(super) fn spawn_reexec_output(
-    policy: &KernelPolicy,
-    cmd: &mut Command,
-    timeout: Option<Duration>,
-) -> Result<(KernelApply, std::process::Output, bool), KernelError> {
-    let (applied, status, output, timed_out) =
-        spawn_reexec_io(policy, cmd, timeout, StdioCapture::Collect)?;
-    Ok((
-        applied,
-        output.unwrap_or_else(|| std::process::Output {
-            status,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        }),
-        timed_out,
-    ))
-}
-
-fn spawn_reexec_io(
-    policy: &KernelPolicy,
-    cmd: &mut Command,
-    timeout: Option<Duration>,
-    capture: StdioCapture,
-) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>, bool), KernelError> {
-    let prepared = prepare_contained(policy, windows_net::ContainerKind::Allowed)?;
-    spawn_prepared(prepared, cmd, timeout, capture)
-}
-
-pub(super) fn shutdown_jail_cache() {
-    windows_net::shutdown_cache();
-}
-
 pub(super) fn spawn_write_restricted_forward(
     policy: &KernelPolicy,
     cmd: &mut Command,
@@ -696,11 +628,17 @@ fn spawn_write_restricted_io(
 }
 
 fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelError> {
+    let rw_paths = rw_grant_paths(policy);
+    if rw_paths.is_empty() && read_grant_paths(policy).is_empty() {
+        return Err(KernelError::Apply(
+            "write-restricted spawn needs a read or read-write grant".into(),
+        ));
+    }
     let sid = RestrictedSid::new()?;
     let world = WorldSid::new()?;
-    let mut acl_guards = grant_write_aces(&rw_grant_paths(policy), sid.0)?;
+    let mut acl_guards = grant_write_aces(&rw_paths, sid.0)?;
     acl_guards.extend(deny_dest_aces(&dest_deny_paths(policy), world.0)?);
-    acl_guards.extend(deny_dest_aces(&profile_secret_paths(), sid.0)?);
+    acl_guards.extend(deny_dest_aces(&profile_secret_dirs(), sid.0)?);
     acl_guards.extend(allow_session_object_create(sid.0)?);
     let token = create_write_restricted_token(sid.0).map_err(prefix_apply("token setup"))?;
     let job = create_kill_job().map_err(prefix_apply("job setup"))?;
@@ -717,18 +655,10 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
 }
 
 fn prepare_network_blocked(policy: &KernelPolicy) -> Result<Prepared, KernelError> {
-    prepare_contained(policy, windows_net::ContainerKind::Blocked)
-}
-
-fn prepare_contained(
-    policy: &KernelPolicy,
-    kind: windows_net::ContainerKind,
-) -> Result<Prepared, KernelError> {
-    let anchor = container_anchor(policy)?;
-    let helper = windows_net::HelperFile::install(&anchor).map_err(prefix_apply("net helper"))?;
-    let (package, wfp_skipped) =
-        windows_net::acquire(kind, helper.path()).map_err(prefix_apply("AppContainer profile"))?;
-    let package_sid = package.as_handle();
+    let workspace = container_anchor(policy)?;
+    let helper =
+        windows_net::HelperFile::install(&workspace).map_err(prefix_apply("net helper"))?;
+    let (package_sid, wfp_skipped) = cached_blocked_profile(helper.path())?;
     let mut prepared = prepare_write_restricted(policy)?;
     for path in rw_grant_paths(policy) {
         grant_package_root(&path, package_sid, &mut prepared.acl_guards)?;
@@ -741,7 +671,7 @@ fn prepare_contained(
         .extend(deny_dest_aces(&dest_deny_paths(policy), package_sid)?);
     prepared
         .acl_guards
-        .extend(deny_dest_aces(&profile_secret_paths(), package_sid)?);
+        .extend(deny_dest_aces(&profile_secret_dirs(), package_sid)?);
     prepared.acl_guards.push(set_acl_entry(
         helper.path(),
         package_sid,
@@ -749,10 +679,7 @@ fn prepare_contained(
         GRANT_ACCESS,
         NO_INHERITANCE,
     )?);
-    prepared.wfp_skipped = match kind {
-        windows_net::ContainerKind::Blocked => wfp_skipped,
-        windows_net::ContainerKind::Allowed => false,
-    };
+    prepared.wfp_skipped = wfp_skipped;
     prepared.token = wrap_appcontainer_token(prepared.token, package_sid)?;
     prepared.helper = Some(helper.path().to_path_buf());
     prepared._net = Some(NetGuards { _helper: helper });
@@ -766,38 +693,54 @@ fn container_anchor(policy: &KernelPolicy) -> Result<PathBuf, KernelError> {
     read_grant_paths(policy)
         .into_iter()
         .next()
-        .ok_or_else(|| KernelError::Apply("container jail needs a read or read-write grant".into()))
+        .ok_or_else(|| KernelError::Apply("network deny needs a read or read-write grant".into()))
 }
 
-/// `.ssh`, `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`, `.kube`
-/// under `%USERPROFILE%`. Missing directories are skipped by
-/// [`deny_dest_aces`]. This does not walk the profile.
-fn profile_secret_paths() -> Vec<PathBuf> {
-    let Some(root) = std::env::var_os("USERPROFILE") else {
-        return Vec::new();
-    };
-    let root = PathBuf::from(root);
-    [
-        ".ssh",
-        ".aws",
-        ".gnupg",
-        ".azure",
-        r".config\gh",
-        ".docker",
-        ".kube",
-    ]
-    .into_iter()
-    .map(|rel| root.join(rel))
-    .collect()
+struct BlockedSlot {
+    profile: windows_net::AppContainerProfile,
+    wfp: Option<windows_net::WfpSession>,
 }
 
-/// Let the restricting SID create objects in the session namespace and
-/// in `\BaseNamedObjects`. MSYS `DllMain` calls `NtCreateDirectoryObject`
-/// on `\BaseNamedObjects\msys-*`. That needs
-/// `DIRECTORY_CREATE_SUBDIRECTORY`, not only `DIRECTORY_CREATE_OBJECT`.
-/// `0xC0000022` is that deny. The ACEs are restored with the other jail
-/// ACLs. A failure here does not fail the spawn: System32 tools do not
-/// need the section.
+// SAFETY: the profile and WFP engine are owned by this slot. The mutex
+// is the only share. Drop closes them.
+unsafe impl Send for BlockedSlot {}
+
+static BLOCKED: Mutex<Option<BlockedSlot>> = Mutex::new(None);
+static BLOCKED_CREATES: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn appcontainer_creates() -> u32 {
+    u32::try_from(BLOCKED_CREATES.load(Ordering::Relaxed)).unwrap_or(u32::MAX)
+}
+
+pub(super) fn reset_appcontainer_creates() {
+    BLOCKED_CREATES.store(0, Ordering::Relaxed);
+}
+
+pub(super) fn shutdown_jail_cache() {
+    let mut slot = BLOCKED.lock().unwrap_or_else(|err| err.into_inner());
+    *slot = None;
+}
+
+fn cached_blocked_profile(helper: &Path) -> Result<(Handle, bool), KernelError> {
+    let mut slot = BLOCKED.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(existing) = slot.as_ref() {
+        return Ok((existing.profile.sid(), existing.wfp.is_none()));
+    }
+    let pid = unsafe { GetCurrentProcessId() };
+    BLOCKED_CREATES.fetch_add(1, Ordering::Relaxed);
+    let profile = windows_net::AppContainerProfile::create_stable(&format!("wpnh.b.{pid}"))
+        .map_err(prefix_apply("AppContainer profile"))?;
+    let wfp = windows_net::WfpSession::apply(profile.sid(), helper)
+        .map_err(prefix_apply("WFP package filter"))?;
+    let sid = profile.sid();
+    let skipped = wfp.is_none();
+    *slot = Some(BlockedSlot { profile, wfp });
+    Ok((sid, skipped))
+}
+
+/// `NtCreateDirectoryObject` on `\BaseNamedObjects` needs
+/// `DIRECTORY_CREATE_SUBDIRECTORY`. `0xC0000022` is that deny. A missed
+/// ACE does not fail the spawn.
 fn allow_session_object_create(sid: Handle) -> Result<Vec<AclRestore>, KernelError> {
     let rights = DIRECTORY_QUERY
         | DIRECTORY_TRAVERSE
@@ -819,28 +762,328 @@ fn allow_session_object_create(sid: Handle) -> Result<Vec<AclRestore>, KernelErr
     Ok(guards)
 }
 
-const DIRECTORY_QUERY: Dword = 0x0001;
-const DIRECTORY_TRAVERSE: Dword = 0x0002;
-const DIRECTORY_CREATE_OBJECT: Dword = 0x0004;
-const DIRECTORY_CREATE_SUBDIRECTORY: Dword = 0x0008;
-
 fn object_namespace_dirs() -> Vec<Vec<u16>> {
     let mut paths = vec![wide_os(OsStr::new(r"\BaseNamedObjects"))];
-    if let Some(session) = session_object_dir() {
-        paths.push(session);
+    let mut session = 0u32;
+    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+    if ok != 0 {
+        let path = format!("\\Sessions\\{session}\\BaseNamedObjects");
+        paths.push(wide_os(OsStr::new(&path)));
     }
     paths
 }
 
-fn session_object_dir() -> Option<Vec<u16>> {
-    let mut session = 0u32;
-    // SAFETY: current process id is valid.
-    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
-    if ok == 0 {
-        return None;
+/// Process-lifetime AppContainer for [`super::KernelPolicy::spawn_reexec`].
+///
+/// The package sid stays valid until process exit. Callers copy the
+/// pointer out of the mutex and must not free it.
+struct ReexecSlot {
+    package: Handle,
+    capability: Handle,
+    _profile: windows_net::AppContainerProfile,
+    _capability: CapabilitySid,
+}
+
+// SAFETY: both SIDs are owned by this slot and freed only when the slot
+// drops at process exit. The mutex publishes the slot; callers only read
+// the pointer values.
+unsafe impl Send for ReexecSlot {}
+
+static REEXEC: Mutex<Option<ReexecSlot>> = Mutex::new(None);
+static REEXEC_CREATES: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn reexec_profile_creates() -> u64 {
+    REEXEC_CREATES.load(Ordering::Relaxed)
+}
+
+struct CapabilitySid(Handle);
+
+impl CapabilitySid {
+    /// `S-1-15-3-1`, the internet client capability. Not a profile-read
+    /// capability and not private-network.
+    fn internet_client() -> Result<Self, KernelError> {
+        let authority = SidIdentifierAuthority {
+            value: [0, 0, 0, 0, 0, 15],
+        };
+        let mut sid = ptr::null_mut();
+        // SAFETY: `authority` lives for the call. Subauthorities 3, 1 are
+        // SECURITY_CAPABILITY_BASE_RID and internet client.
+        let ok =
+            unsafe { AllocateAndInitializeSid(&authority, 2, 3, 1, 0, 0, 0, 0, 0, 0, &mut sid) };
+        if ok == 0 || sid.is_null() {
+            return Err(last_error("AllocateAndInitializeSid"));
+        }
+        Ok(Self(sid))
     }
-    let path = format!("\\Sessions\\{session}\\BaseNamedObjects");
-    Some(wide_os(OsStr::new(&path)))
+}
+
+impl Drop for CapabilitySid {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` came from AllocateAndInitializeSid.
+            unsafe {
+                FreeSid(self.0);
+            }
+            self.0 = ptr::null_mut();
+        }
+    }
+}
+
+fn cached_reexec() -> Result<(Handle, Handle), KernelError> {
+    let mut slot = REEXEC
+        .lock()
+        .map_err(|_| KernelError::Apply("re-exec profile cache is poisoned".into()))?;
+    if let Some(existing) = slot.as_ref() {
+        return Ok((existing.package, existing.capability));
+    }
+    let capability = CapabilitySid::internet_client()?;
+    let attrs = [windows_net::SidAndAttributes {
+        sid: capability.0,
+        attributes: windows_net::SE_GROUP_ENABLED,
+    }];
+    let profile = windows_net::AppContainerProfile::create_network_open(&attrs)
+        .map_err(prefix_apply("AppContainer profile"))?;
+    let package = profile.sid();
+    let cap_sid = capability.0;
+    REEXEC_CREATES.fetch_add(1, Ordering::Relaxed);
+    *slot = Some(ReexecSlot {
+        package,
+        capability: cap_sid,
+        _profile: profile,
+        _capability: capability,
+    });
+    Ok((package, cap_sid))
+}
+
+pub(super) fn spawn_reexec(
+    policy: &super::KernelPolicy,
+    cmd: &mut Command,
+) -> Result<(KernelApply, ExitStatus), KernelError> {
+    let (applied, status, _, timed_out) =
+        spawn_reexec_io(policy, cmd, None, StdioCapture::Inherit)?;
+    if timed_out {
+        return Err(KernelError::Timeout);
+    }
+    Ok((applied, status))
+}
+
+pub(super) fn spawn_reexec_output(
+    policy: &super::KernelPolicy,
+    cmd: &mut Command,
+) -> Result<(KernelApply, std::process::Output), KernelError> {
+    let (applied, status, output, timed_out) =
+        spawn_reexec_io(policy, cmd, None, StdioCapture::Collect)?;
+    if timed_out {
+        return Err(KernelError::Timeout);
+    }
+    Ok((
+        applied,
+        output.unwrap_or_else(|| std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }),
+    ))
+}
+
+fn spawn_reexec_io(
+    policy: &super::KernelPolicy,
+    cmd: &mut Command,
+    timeout: Option<Duration>,
+    capture: StdioCapture,
+) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>, bool), KernelError> {
+    let program = resolve_program(cmd.get_program())?;
+    let prepared = prepare_reexec(policy, &program)?;
+    spawn_prepared(prepared, cmd, timeout, capture)
+}
+
+/// AppContainer with outbound network and no WFP BLOCK.
+///
+/// Profile-secret denies use the package SID, not Everyone, so a missed
+/// restore cannot lock the user out of their own directory.
+fn prepare_reexec(policy: &super::KernelPolicy, program: &Path) -> Result<Prepared, KernelError> {
+    let mut prepared = prepare_write_restricted(policy)?;
+    let (package_sid, cap_sid) = cached_reexec()?;
+    for path in rw_grant_paths(policy) {
+        grant_package_root(&path, package_sid, &mut prepared.acl_guards)
+            .map_err(|err| annotate_path(&path, err))?;
+    }
+    for path in read_grant_paths(policy) {
+        grant_package_read(&path, package_sid, &mut prepared.acl_guards)
+            .map_err(|err| annotate_path(&path, err))?;
+    }
+    // Package SID, not Everyone.
+    for path in profile_secret_dirs() {
+        match deny_dest_ace(&path, package_sid) {
+            Ok(guard) => prepared.acl_guards.push(guard),
+            Err(err) => return Err(annotate_path(&path, err)),
+        }
+    }
+    grant_program_execute(program, package_sid, &mut prepared.acl_guards)
+        .map_err(|err| annotate_path(program, err))?;
+    let attrs = [windows_net::SidAndAttributes {
+        sid: cap_sid,
+        attributes: windows_net::SE_GROUP_ENABLED,
+    }];
+    prepared.token = wrap_appcontainer_token_caps(prepared.token, package_sid, &attrs)?;
+    prepared.helper = None;
+    prepared.wfp_skipped = false;
+    prepared._net = None;
+    Ok(prepared)
+}
+
+fn read_grant_paths(policy: &super::KernelPolicy) -> Vec<PathBuf> {
+    let rw = rw_grant_paths(policy);
+    let mut paths = Vec::new();
+    for grant in policy.grants() {
+        if grant.access == super::KernelAccess::Read
+            && !rw.iter().any(|path| path == &grant.path)
+            && !paths.iter().any(|path| path == &grant.path)
+        {
+            paths.push(grant.path.clone());
+        }
+    }
+    paths
+}
+
+fn grant_package_read(
+    path: &Path,
+    sid: Handle,
+    guards: &mut Vec<AclRestore>,
+) -> Result<(), KernelError> {
+    // Do not call SetNamedSecurityInfo on System32 or Program Files.
+    // A runner can block that write until the test is killed.
+    if is_system_root_grant(path) {
+        return Ok(());
+    }
+    let inherit = if path.is_dir() {
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT
+    } else {
+        NO_INHERITANCE
+    };
+    match set_acl_entry(
+        path,
+        sid,
+        GENERIC_READ | GENERIC_EXECUTE,
+        GRANT_ACCESS,
+        inherit,
+    ) {
+        Ok(guard) => guards.push(guard),
+        // System directories are already readable by ALL APPLICATION
+        // PACKAGES. Editing System32's DACL is not required.
+        Err(err) if acl_is_access_denied(&err) && is_system_path(path) => {}
+        Err(err) => return Err(err),
+    }
+    Ok(())
+}
+
+fn grant_program_execute(
+    program: &Path,
+    sid: Handle,
+    guards: &mut Vec<AclRestore>,
+) -> Result<(), KernelError> {
+    match set_acl_entry(
+        program,
+        sid,
+        GENERIC_READ | GENERIC_EXECUTE,
+        GRANT_ACCESS,
+        NO_INHERITANCE,
+    ) {
+        Ok(guard) => guards.push(guard),
+        Err(err) if acl_is_access_denied(&err) && is_system_path(program) => {}
+        Err(err) => return Err(err),
+    }
+    // A directory ACE does not grant existing DLLs. Skip the parent so
+    // a large deps folder is not rewritten.
+    Ok(())
+}
+
+fn annotate_path(path: &Path, err: KernelError) -> KernelError {
+    match err {
+        KernelError::Apply(msg) => KernelError::Apply(format!("{msg} ({})", path.display())),
+        other => other,
+    }
+}
+
+fn acl_is_access_denied(err: &KernelError) -> bool {
+    match err {
+        KernelError::Apply(msg) => msg.contains("(win32 5)"),
+        _ => false,
+    }
+}
+
+/// The read roots [`super::system_read_dirs`] adds. Not a subdirectory
+/// the host passed itself.
+fn is_system_root_grant(path: &Path) -> bool {
+    let path = normalize_win_path(path);
+    let mut roots = Vec::new();
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        let root = PathBuf::from(root);
+        roots.push(normalize_win_path(&root));
+        roots.push(normalize_win_path(&root.join("System32")));
+        roots.push(normalize_win_path(&root.join("SysWOW64")));
+    }
+    for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(root) = std::env::var_os(key) {
+            roots.push(normalize_win_path(Path::new(&root)));
+        }
+    }
+    roots.iter().any(|root| path == *root)
+}
+
+fn is_system_path(path: &Path) -> bool {
+    let path = normalize_win_path(path);
+    let mut roots = Vec::new();
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        roots.push(root);
+    }
+    for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(root) = std::env::var_os(key) {
+            roots.push(root);
+        }
+    }
+    roots
+        .iter()
+        .any(|root| dir_prefix(&path, &normalize_win_path(Path::new(root))))
+}
+
+/// `\\?\C:\Windows\System32` and `C:\Windows\System32` compare equal.
+fn normalize_win_path(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('/', "\\");
+    let text = text
+        .strip_prefix("\\\\?\\UNC\\")
+        .map(|rest| format!("\\\\{rest}"))
+        .unwrap_or_else(|| {
+            text.strip_prefix("\\\\?\\")
+                .unwrap_or(text.as_str())
+                .to_string()
+        });
+    text.trim_end_matches('\\').to_ascii_lowercase()
+}
+
+fn dir_prefix(path: &str, root: &str) -> bool {
+    path == root || path.starts_with(&format!("{root}\\"))
+}
+
+/// Exact profile directories from the workspace-jail deny list.
+/// Missing directories are skipped. This does not walk the profile.
+fn profile_secret_dirs() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("USERPROFILE") else {
+        return Vec::new();
+    };
+    let home = PathBuf::from(home);
+    let mut out = Vec::new();
+    for name in [".ssh", ".aws", ".gnupg", ".azure", ".docker", ".kube"] {
+        let path = home.join(name);
+        if path.is_dir() {
+            out.push(path);
+        }
+    }
+    let gh = home.join(".config").join("gh");
+    if gh.is_dir() {
+        out.push(gh);
+    }
+    out
 }
 
 /// AppContainer plus WFP on `workspace`, without creating a user process.
@@ -855,14 +1098,22 @@ fn wrap_appcontainer_token(
     restricted: CloseOnDrop,
     package_sid: Handle,
 ) -> Result<CloseOnDrop, KernelError> {
-    match windows_net::create_appcontainer_token(restricted.0, package_sid) {
+    wrap_appcontainer_token_caps(restricted, package_sid, &[])
+}
+
+fn wrap_appcontainer_token_caps(
+    restricted: CloseOnDrop,
+    package_sid: Handle,
+    capabilities: &[windows_net::SidAndAttributes],
+) -> Result<CloseOnDrop, KernelError> {
+    match windows_net::create_appcontainer_token(restricted.0, package_sid, capabilities) {
         Ok(handle) => {
             drop(restricted);
             Ok(CloseOnDrop(handle))
         }
         Err(first) => {
             let current = current_primary_token()?;
-            match windows_net::create_appcontainer_token(current.0, package_sid) {
+            match windows_net::create_appcontainer_token(current.0, package_sid, capabilities) {
                 Ok(handle) => {
                     drop((restricted, current));
                     Ok(CloseOnDrop(handle))
@@ -899,31 +1150,6 @@ fn grant_package_root(
         root,
         sid,
         GENERIC_ALL,
-        GRANT_ACCESS,
-        inherit,
-    )?);
-    Ok(())
-}
-
-/// Read and execute for a Read grant. Not `GENERIC_ALL`, so a read-only
-/// root cannot be created in by the package SID.
-fn grant_package_read(
-    root: &Path,
-    sid: Handle,
-    guards: &mut Vec<AclRestore>,
-) -> Result<(), KernelError> {
-    let meta = std::fs::symlink_metadata(root)
-        .map_err(|e| KernelError::Apply(format!("package read ACE {}: {e}", root.display())))?;
-    let is_dir = meta.is_dir() && !meta.file_type().is_symlink();
-    let inherit = if is_dir {
-        SUB_CONTAINERS_AND_OBJECTS_INHERIT
-    } else {
-        NO_INHERITANCE
-    };
-    guards.push(set_acl_entry(
-        root,
-        sid,
-        GENERIC_READ | GENERIC_EXECUTE,
         GRANT_ACCESS,
         inherit,
     )?);
@@ -1521,17 +1747,9 @@ fn deny_dest_ace(path: &Path, sid: Handle) -> Result<AclRestore, KernelError> {
 }
 
 fn rw_grant_paths(policy: &KernelPolicy) -> Vec<PathBuf> {
-    grant_paths(policy, KernelAccess::ReadWrite)
-}
-
-fn read_grant_paths(policy: &KernelPolicy) -> Vec<PathBuf> {
-    grant_paths(policy, KernelAccess::Read)
-}
-
-fn grant_paths(policy: &KernelPolicy, access: KernelAccess) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for grant in policy.grants() {
-        if grant.access == access && !paths.iter().any(|p| p == &grant.path) {
+        if grant.access == KernelAccess::ReadWrite && !paths.iter().any(|p| p == &grant.path) {
             paths.push(grant.path.clone());
         }
     }
@@ -1667,10 +1885,6 @@ fn open_current_process_token() -> Result<CloseOnDrop, KernelError> {
 fn create_restricted_token(process_token: Handle, sid: Handle) -> Result<CloseOnDrop, KernelError> {
     let restrict = SidAndAttributes { sid, attributes: 0 };
     let mut restricted = ptr::null_mut();
-    // DISABLE_MAX_PRIVILEGE disables every privilege except
-    // SeChangeNotifyPrivilege. These stay off: SeDebugPrivilege,
-    // SeBackupPrivilege, SeRestorePrivilege, SeTakeOwnershipPrivilege,
-    // SeLoadDriverPrivilege, SeTcbPrivilege. Do not drop the flag.
     // SAFETY: `process_token` is an open process token; `restrict` lives for the call.
     let ok = unsafe {
         CreateRestrictedToken(
@@ -1713,80 +1927,7 @@ fn duplicate_primary_token(token: Handle) -> Result<CloseOnDrop, KernelError> {
 fn create_write_restricted_token(sid: Handle) -> Result<CloseOnDrop, KernelError> {
     let process_token = open_current_process_token()?;
     let restricted = create_restricted_token(process_token.0, sid)?;
-    let primary = duplicate_primary_token(restricted.0)?;
-    // Objects the child creates (the MSYS section) need the restricting
-    // SID on their DACL. Ignore failure: the token is still restricted.
-    let _ = grant_default_dacl(primary.0, sid);
-    Ok(primary)
-}
-
-const TOKEN_DEFAULT_DACL: u32 = 6;
-
-#[repr(C)]
-struct TokenDefaultDacl {
-    default_dacl: Handle,
-}
-
-fn grant_default_dacl(token: Handle, sid: Handle) -> Result<(), KernelError> {
-    let mut bytes = 0u32;
-    // SAFETY: size probe; a short buffer is the expected first result.
-    unsafe {
-        GetTokenInformation(token, TOKEN_DEFAULT_DACL, ptr::null_mut(), 0, &mut bytes);
-    }
-    if bytes == 0 {
-        return Err(last_error("GetTokenInformation TokenDefaultDacl"));
-    }
-    let len = bytes;
-    let mut buf = vec![0u64; len.div_ceil(8) as usize];
-    // SAFETY: `buf` is at least `len` bytes and pointer-aligned.
-    let ok = unsafe {
-        GetTokenInformation(
-            token,
-            TOKEN_DEFAULT_DACL,
-            buf.as_mut_ptr().cast(),
-            len,
-            &mut bytes,
-        )
-    };
-    if ok == 0 {
-        return Err(last_error("GetTokenInformation TokenDefaultDacl"));
-    }
-    let current = unsafe { &*buf.as_ptr().cast::<TokenDefaultDacl>() };
-    let mut entry = ExplicitAccessW {
-        grf_access_permissions: GENERIC_ALL,
-        grf_access_mode: GRANT_ACCESS,
-        grf_inheritance: NO_INHERITANCE,
-        trustee: TrusteeW {
-            p_multiple_trustee: ptr::null_mut(),
-            multiple_trustee_operation: NO_MULTIPLE_TRUSTEE,
-            trustee_form: TRUSTEE_IS_SID,
-            trustee_type: TRUSTEE_IS_WELL_KNOWN_GROUP,
-            ptstr_name: sid,
-        },
-    };
-    let mut new_acl = ptr::null_mut();
-    // SAFETY: `entry` lives for the call; `current.default_dacl` is inside `buf`.
-    let set = unsafe { SetEntriesInAclW(1, &mut entry, current.default_dacl, &mut new_acl) };
-    if set != 0 {
-        return Err(win32_error("SetEntriesInAclW default DACL", set));
-    }
-    let new_acl = LocalMem(new_acl);
-    let mut info = TokenDefaultDacl {
-        default_dacl: new_acl.0,
-    };
-    // SAFETY: `info.default_dacl` is the ACL we just built.
-    let applied = unsafe {
-        SetTokenInformation(
-            token,
-            TOKEN_DEFAULT_DACL,
-            (&raw mut info).cast(),
-            std::mem::size_of::<TokenDefaultDacl>() as Dword,
-        )
-    };
-    if applied == 0 {
-        return Err(last_error("SetTokenInformation TokenDefaultDacl"));
-    }
-    Ok(())
+    duplicate_primary_token(restricted.0)
 }
 
 fn create_kill_job() -> Result<CloseOnDrop, KernelError> {
@@ -1836,7 +1977,6 @@ fn create_kill_job() -> Result<CloseOnDrop, KernelError> {
     let mut ui = JobobjectBasicUiRestrictions {
         ui_restrictions_class: UI_RESTRICTIONS,
     };
-    // SAFETY: `ui` matches JOBOBJECT_BASIC_UI_RESTRICTIONS.
     let ui_set = unsafe {
         SetInformationJobObject(
             job.0,
@@ -1846,14 +1986,9 @@ fn create_kill_job() -> Result<CloseOnDrop, KernelError> {
         )
     };
     if ui_set == 0 {
-        return Err(last_error("SetInformationJobObject UI restrictions"));
+        return Err(last_error("SetInformationJobObject UI"));
     }
     Ok(job)
-}
-
-#[repr(C)]
-struct JobobjectBasicUiRestrictions {
-    ui_restrictions_class: Dword,
 }
 
 fn environment_block(cmd: &mut Command) -> Vec<u16> {
@@ -1973,79 +2108,6 @@ fn append_quoted(out: &mut Vec<u16>, arg: &OsStr) {
 }
 
 #[cfg(test)]
-const TOKEN_PRIVILEGES_CLASS: u32 = 3;
-#[cfg(test)]
-const SE_PRIVILEGE_ENABLED: Dword = 0x0000_0002;
-
-/// `Some(true)` enabled, `Some(false)` present but disabled, `None` absent.
-#[cfg(test)]
-fn privilege_enabled(token: Handle, name: &str) -> Result<Option<bool>, KernelError> {
-    let wide = wide_os(OsStr::new(name));
-    let mut want = Luid {
-        low_part: 0,
-        high_part: 0,
-    };
-    // SAFETY: `wide` is a NUL-terminated privilege name.
-    let looked = unsafe { LookupPrivilegeValueW(ptr::null(), wide.as_ptr(), &mut want) };
-    if looked == 0 {
-        return Err(last_error("LookupPrivilegeValueW"));
-    }
-    let mut bytes = 0u32;
-    unsafe {
-        GetTokenInformation(
-            token,
-            TOKEN_PRIVILEGES_CLASS,
-            ptr::null_mut(),
-            0,
-            &mut bytes,
-        );
-    }
-    if bytes < 4 {
-        return Err(last_error("GetTokenInformation TokenPrivileges"));
-    }
-    let len = bytes;
-    let mut buf = vec![0u64; len.div_ceil(8) as usize];
-    // SAFETY: `buf` is at least `len` bytes and 8-byte aligned.
-    let ok = unsafe {
-        GetTokenInformation(
-            token,
-            TOKEN_PRIVILEGES_CLASS,
-            buf.as_mut_ptr().cast(),
-            len,
-            &mut bytes,
-        )
-    };
-    if ok == 0 {
-        return Err(last_error("GetTokenInformation TokenPrivileges"));
-    }
-    let raw = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, bytes as usize) };
-    let count = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-    let stride = std::mem::size_of::<LuidAndAttributes>();
-    for i in 0..count as usize {
-        let start = 4 + i * stride;
-        let end = start + stride;
-        if end > raw.len() {
-            break;
-        }
-        // SAFETY: `start` is inside `raw`. LUID_AND_ATTRIBUTES is 4-byte aligned
-        // and TOKEN_PRIVILEGES places the first entry at offset 4.
-        let entry = unsafe { &*raw[start..].as_ptr().cast::<LuidAndAttributes>() };
-        if entry.luid.low_part == want.low_part && entry.luid.high_part == want.high_part {
-            return Ok(Some(entry.attributes & SE_PRIVILEGE_ENABLED != 0));
-        }
-    }
-    Ok(None)
-}
-
-pub(super) fn appcontainer_creates() -> u32 {
-    windows_net::appcontainer_creates()
-}
-
-pub(super) fn reset_appcontainer_creates() {
-    windows_net::reset_appcontainer_creates();
-}
-
-#[cfg(test)]
 mod ace_tests {
     use super::*;
     use std::path::Path;
@@ -2151,6 +2213,28 @@ mod ace_tests {
     }
 
     #[test]
+    fn verbatim_system32_is_a_system_path() {
+        let root = std::env::var("SystemRoot").expect("SystemRoot");
+        let verbatim = format!(r"\\?\{root}\System32");
+        assert!(
+            super::is_system_path(Path::new(&verbatim)),
+            "{verbatim} should match SystemRoot"
+        );
+        assert!(
+            super::is_system_root_grant(Path::new(&verbatim)),
+            "{verbatim} is a system read root"
+        );
+        let nested = format!(r"\\?\{root}\System32\drivers");
+        assert!(
+            !super::is_system_root_grant(Path::new(&nested)),
+            "a subdirectory still needs its own ACE"
+        );
+        assert!(!super::is_system_path(Path::new(
+            r"C:\workpen-not-a-system-dir"
+        )));
+    }
+
+    #[test]
     fn deny_dest_aces_rolls_back_on_second_path_error() {
         let dir = tempfile::TempDir::new().expect("ws");
         let first = dir.path().join("a.env");
@@ -2172,34 +2256,6 @@ mod ace_tests {
             "first dest must not keep a leftover DENY ACE after rollback"
         );
         drop(sid);
-    }
-
-    #[test]
-    fn restricted_token_keeps_traverse_and_drops_admin_privileges() {
-        let sid = RestrictedSid::new().expect("sid");
-        let token = create_write_restricted_token(sid.0).expect("token");
-        let traverse = privilege_enabled(token.0, "SeChangeNotifyPrivilege").expect("lookup");
-        assert_eq!(
-            traverse,
-            Some(true),
-            "SeChangeNotifyPrivilege must stay enabled, got {traverse:?}"
-        );
-        for name in [
-            "SeDebugPrivilege",
-            "SeBackupPrivilege",
-            "SeRestorePrivilege",
-            "SeTakeOwnershipPrivilege",
-            "SeLoadDriverPrivilege",
-            "SeTcbPrivilege",
-        ] {
-            let state =
-                privilege_enabled(token.0, name).unwrap_or_else(|err| panic!("{name}: {err}"));
-            assert_ne!(
-                state,
-                Some(true),
-                "{name} must stay disabled, got {state:?}"
-            );
-        }
     }
 }
 
