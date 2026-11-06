@@ -104,7 +104,9 @@ and `d`.
 
 Commands: `why`, `run`, `policy`, `gc`, `init`, `doctor`. `workpen --help` prints usage. `workpen doctor` reports whether this machine can jail a child and does not start one.
 
-`workpen gc --max-age 7d` looks under `.workpen-worktrees`. `--dry-run` prints what it would remove and does not delete. It does not clean `target/`.
+`workpen gc --max-age 7d` looks under `.workpen-worktrees`. A registered worktree from `git worktree add` that lives outside that directory is left alone. `--dry-run` prints what it would remove and does not delete. It does not clean `target/`.
+
+Library hosts that still want those registered worktrees set `GcConfig.age_gc_registered`. The same run skips the primary checkout, a locked worktree, and a directory a process is using, and it reads status again before delete. Dry-run uses that same probe. Untracked directories outside `leftover_dir` are not candidates. `workpen gc` does not turn the flag on.
 
 ## Library
 

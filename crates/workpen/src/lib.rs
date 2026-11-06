@@ -13,7 +13,9 @@
 //! ```
 //!
 //! Leftover worktree GC is behind `feature = "gc"`. Hosts pass
-//! `leftover_dir` and `saved_ref_prefix` on `GcConfig`.
+//! `leftover_dir` and `saved_ref_prefix` on `GcConfig`. Set
+//! `age_gc_registered` to also age-gc registered worktrees that sit
+//! outside `leftover_dir`. `workpen gc` leaves that flag off.
 
 mod agent_lock;
 mod deny;

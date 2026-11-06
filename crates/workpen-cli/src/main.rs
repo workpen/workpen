@@ -640,7 +640,7 @@ fn cmd_gc(args: &[String]) -> Result<ExitCode, String> {
     if wants_help(&rest) {
         println!("{}", gc_usage());
         println!(
-            "gc looks under .workpen-worktrees, or the directory named by --leftover. It is not a target/ cleaner. When nothing is left, it prints that directory and the max-age token."
+            "gc looks under .workpen-worktrees, or the directory named by --leftover. A registered worktree outside that directory is left alone. It is not a target/ cleaner. When nothing is left, it prints that directory and the max-age token."
         );
         return Ok(ExitCode::SUCCESS);
     }
