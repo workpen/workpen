@@ -289,6 +289,7 @@ fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key).map(PathBuf::from)
 }
 
+#[cfg(windows)]
 fn stage(msg: &str) {
     println!("reexec stage: {msg}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
