@@ -47,6 +47,10 @@ The parent is trusted. The child is not.
   per name. In-child open of a planted `/tmp/proj/sub/leaked`
   is the same class as post-create.
 - Windows WFP ran. Win32 5 is `WfpSkipped`. AppContainer is still on.
+- `spawn_reexec` blocked the network. That call keeps outbound network
+  open (internet client capability, no WFP BLOCK) and reuses one
+  AppContainer in the process. `Applied` there means the container is
+  up. `run_child` is unchanged.
 - Renaming the dest-deny parent is in scope. Parent-rename is out of
   scope. Leaf `mv .env leaked` is a macOS last-match contract.
 - Windows `Stdio::piped` on `run_child` captures stdout for the host.

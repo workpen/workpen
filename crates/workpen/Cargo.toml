@@ -38,5 +38,10 @@ required-features = ["gc"]
 name = "nono_corpus"
 required-features = ["nono"]
 
+[[test]]
+name = "reexec_jail"
+harness = false
+required-features = ["nono"]
+
 [package.metadata.docs.rs]
 features = ["gc", "nono"]
