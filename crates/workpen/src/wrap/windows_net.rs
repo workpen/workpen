@@ -80,10 +80,13 @@ struct SecurityCapabilities {
     reserved: Dword,
 }
 
+pub(super) const SE_GROUP_ENABLED: Dword = 0x0000_0004;
+
 #[repr(C)]
-struct SidAndAttributes {
-    sid: Handle,
-    attributes: Dword,
+#[derive(Clone, Copy)]
+pub(super) struct SidAndAttributes {
+    pub(super) sid: Handle,
+    pub(super) attributes: Dword,
 }
 
 #[repr(C)]
@@ -194,25 +197,48 @@ pub(super) struct AppContainerProfile {
 }
 
 impl AppContainerProfile {
+    /// Unique profile with no capabilities. One spawn, then delete on drop.
     pub(super) fn create() -> Result<Self, KernelError> {
         let suffix = unique_suffix();
-        let raw = format!("wpnh.{suffix}");
-        let name = wide_os(OsStr::new(&raw));
-        let display = wide_os(OsStr::new(&raw));
+        Self::create_profile(&format!("wpnh.{suffix}"), &[])
+    }
+
+    /// Stable profile for [`super::spawn_reexec`]. Capabilities are fixed
+    /// for the life of the name. A crashed process leaves the profile;
+    /// the next create derives that sid instead of allocating another.
+    pub(super) fn create_network_open(
+        capabilities: &[SidAndAttributes],
+    ) -> Result<Self, KernelError> {
+        Self::create_profile("wpnh.reexec.net", capabilities)
+    }
+
+    fn create_profile(raw: &str, capabilities: &[SidAndAttributes]) -> Result<Self, KernelError> {
+        let name = wide_os(OsStr::new(raw));
+        let display = name.clone();
         let desc = wide_os(OsStr::new("workpen"));
         let mut sid = ptr::null_mut();
-        // SAFETY: name/display/desc are NUL-terminated; no capabilities.
+        let cap_ptr = if capabilities.is_empty() {
+            ptr::null()
+        } else {
+            capabilities.as_ptr()
+        };
+        // SAFETY: name/display/desc are NUL-terminated. Capability SIDs
+        // outlive this call. A null capability list is the no-network profile.
         let hr = unsafe {
             CreateAppContainerProfile(
                 name.as_ptr(),
                 display.as_ptr(),
                 desc.as_ptr(),
-                ptr::null(),
-                0,
+                cap_ptr,
+                capabilities.len() as Dword,
                 &mut sid,
             )
         };
         if hr != 0 || sid.is_null() {
+            if !sid.is_null() {
+                // SAFETY: userenv allocated this sid before failing the call.
+                unsafe { super::free_sid(sid) };
+            }
             sid = ptr::null_mut();
             // SAFETY: leftover profile from a crashed spawn; name is NUL-terminated.
             let derived =
@@ -332,12 +358,19 @@ impl Drop for WfpSession {
 pub(super) fn create_appcontainer_token(
     base: Handle,
     package_sid: Handle,
+    capabilities: &[SidAndAttributes],
 ) -> Result<Handle, KernelError> {
     let create = load_create_appcontainer_token()?;
+    let mut cap_buf = capabilities.to_vec();
+    let (cap_ptr, cap_count) = if cap_buf.is_empty() {
+        (ptr::null_mut(), 0)
+    } else {
+        (cap_buf.as_mut_ptr(), cap_buf.len() as Dword)
+    };
     let caps = SecurityCapabilities {
         app_container_sid: package_sid,
-        capabilities: ptr::null_mut(),
-        capability_count: 0,
+        capabilities: cap_ptr,
+        capability_count: cap_count,
         reserved: 0,
     };
     let mut out = ptr::null_mut();

@@ -56,6 +56,11 @@
 //!   class as post-create.
 //! * Windows WFP ran. Win32 5 is `WfpSkipped`. AppContainer is still
 //!   the net deny. Do not revert that skip.
+//! * [`crate::KernelPolicy::spawn_reexec`] blocked the network. That
+//!   call keeps outbound network open (internet client capability, no
+//!   WFP BLOCK) and reuses one AppContainer in the process.
+//!   [`crate::KernelApply::Applied`] there means the container is up.
+//!   [`crate::KernelPolicy::run_child`] is unchanged.
 //! * Renaming the dest-deny parent is in scope. Parent-rename of a
 //!   dest-deny ancestor (`mv workspace out`) is out of scope. Leaf
 //!   `mv .env leaked` is a Seatbelt last-match contract on macOS.

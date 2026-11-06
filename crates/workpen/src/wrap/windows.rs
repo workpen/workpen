@@ -6,7 +6,7 @@ use std::os::windows::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -63,6 +63,7 @@ const STARTF_USESTDHANDLES: Dword = 0x0000_0100;
 const DUPLICATE_SAME_ACCESS: Dword = 0x0000_0002;
 const GENERIC_READ: Dword = 0x8000_0000;
 const GENERIC_WRITE: Dword = 0x4000_0000;
+const GENERIC_EXECUTE: Dword = 0x2000_0000;
 const FILE_SHARE_READ: Dword = 0x0001;
 const FILE_SHARE_WRITE: Dword = 0x0002;
 const OPEN_EXISTING: Dword = 3;
@@ -472,9 +473,11 @@ impl Drop for AclRestore {
     }
 }
 
-// Propagate restore errors. Drop only eprintln-swallows leftovers.
+// Unwind in reverse. Two ACEs on one path each saved the DACL from
+// before that ACE. Restoring the later save first would put the earlier
+// ACE back. Drop only eprintln-swallows leftovers.
 fn restore_guards(guards: &mut [AclRestore]) -> Result<(), KernelError> {
-    for guard in guards {
+    for guard in guards.iter_mut().rev() {
         guard.restore()?;
     }
     Ok(())
@@ -662,6 +665,319 @@ fn prepare_network_blocked(policy: &KernelPolicy) -> Result<Prepared, KernelErro
     Ok(prepared)
 }
 
+/// Process-lifetime AppContainer for [`super::KernelPolicy::spawn_reexec`].
+///
+/// The package sid stays valid until process exit. Callers copy the
+/// pointer out of the mutex and must not free it.
+struct ReexecSlot {
+    package: Handle,
+    capability: Handle,
+    _profile: windows_net::AppContainerProfile,
+    _capability: CapabilitySid,
+}
+
+// SAFETY: both SIDs are owned by this slot and freed only when the slot
+// drops at process exit. The mutex publishes the slot; callers only read
+// the pointer values.
+unsafe impl Send for ReexecSlot {}
+
+static REEXEC: Mutex<Option<ReexecSlot>> = Mutex::new(None);
+static REEXEC_CREATES: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn reexec_profile_creates() -> u64 {
+    REEXEC_CREATES.load(Ordering::Relaxed)
+}
+
+struct CapabilitySid(Handle);
+
+impl CapabilitySid {
+    /// `S-1-15-3-1`, the internet client capability. Not a profile-read
+    /// capability and not private-network.
+    fn internet_client() -> Result<Self, KernelError> {
+        let authority = SidIdentifierAuthority {
+            value: [0, 0, 0, 0, 0, 15],
+        };
+        let mut sid = ptr::null_mut();
+        // SAFETY: `authority` lives for the call. Subauthorities 3, 1 are
+        // SECURITY_CAPABILITY_BASE_RID and internet client.
+        let ok =
+            unsafe { AllocateAndInitializeSid(&authority, 2, 3, 1, 0, 0, 0, 0, 0, 0, &mut sid) };
+        if ok == 0 || sid.is_null() {
+            return Err(last_error("AllocateAndInitializeSid"));
+        }
+        Ok(Self(sid))
+    }
+}
+
+impl Drop for CapabilitySid {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` came from AllocateAndInitializeSid.
+            unsafe {
+                FreeSid(self.0);
+            }
+            self.0 = ptr::null_mut();
+        }
+    }
+}
+
+fn cached_reexec() -> Result<(Handle, Handle), KernelError> {
+    let mut slot = REEXEC
+        .lock()
+        .map_err(|_| KernelError::Apply("re-exec profile cache is poisoned".into()))?;
+    if let Some(existing) = slot.as_ref() {
+        return Ok((existing.package, existing.capability));
+    }
+    let capability = CapabilitySid::internet_client()?;
+    let attrs = [windows_net::SidAndAttributes {
+        sid: capability.0,
+        attributes: windows_net::SE_GROUP_ENABLED,
+    }];
+    let profile = windows_net::AppContainerProfile::create_network_open(&attrs)
+        .map_err(prefix_apply("AppContainer profile"))?;
+    let package = profile.sid();
+    let cap_sid = capability.0;
+    REEXEC_CREATES.fetch_add(1, Ordering::Relaxed);
+    *slot = Some(ReexecSlot {
+        package,
+        capability: cap_sid,
+        _profile: profile,
+        _capability: capability,
+    });
+    Ok((package, cap_sid))
+}
+
+pub(super) fn spawn_reexec(
+    policy: &super::KernelPolicy,
+    cmd: &mut Command,
+) -> Result<(KernelApply, ExitStatus), KernelError> {
+    let (applied, status, _, timed_out) =
+        spawn_reexec_io(policy, cmd, None, StdioCapture::Inherit)?;
+    if timed_out {
+        return Err(KernelError::Timeout);
+    }
+    Ok((applied, status))
+}
+
+pub(super) fn spawn_reexec_output(
+    policy: &super::KernelPolicy,
+    cmd: &mut Command,
+) -> Result<(KernelApply, std::process::Output), KernelError> {
+    let (applied, status, output, timed_out) =
+        spawn_reexec_io(policy, cmd, None, StdioCapture::Collect)?;
+    if timed_out {
+        return Err(KernelError::Timeout);
+    }
+    Ok((
+        applied,
+        output.unwrap_or_else(|| std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }),
+    ))
+}
+
+fn spawn_reexec_io(
+    policy: &super::KernelPolicy,
+    cmd: &mut Command,
+    timeout: Option<Duration>,
+    capture: StdioCapture,
+) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>, bool), KernelError> {
+    let program = resolve_program(cmd.get_program())?;
+    let prepared = prepare_reexec(policy, &program)?;
+    spawn_prepared(prepared, cmd, timeout, capture)
+}
+
+/// AppContainer with outbound network and no WFP BLOCK.
+///
+/// Profile-secret denies use the package SID, not Everyone, so a missed
+/// restore cannot lock the user out of their own directory.
+fn prepare_reexec(policy: &super::KernelPolicy, program: &Path) -> Result<Prepared, KernelError> {
+    let mut prepared = prepare_write_restricted(policy)?;
+    let (package_sid, cap_sid) = cached_reexec()?;
+    for path in rw_grant_paths(policy) {
+        grant_package_root(&path, package_sid, &mut prepared.acl_guards)
+            .map_err(|err| annotate_path(&path, err))?;
+    }
+    for path in read_grant_paths(policy) {
+        grant_package_read(&path, package_sid, &mut prepared.acl_guards)
+            .map_err(|err| annotate_path(&path, err))?;
+    }
+    // Package SID, not Everyone.
+    for path in profile_secret_dirs() {
+        match deny_dest_ace(&path, package_sid) {
+            Ok(guard) => prepared.acl_guards.push(guard),
+            Err(err) => return Err(annotate_path(&path, err)),
+        }
+    }
+    grant_program_execute(program, package_sid, &mut prepared.acl_guards)
+        .map_err(|err| annotate_path(program, err))?;
+    let attrs = [windows_net::SidAndAttributes {
+        sid: cap_sid,
+        attributes: windows_net::SE_GROUP_ENABLED,
+    }];
+    prepared.token = wrap_appcontainer_token_caps(prepared.token, package_sid, &attrs)?;
+    prepared.helper = None;
+    prepared.wfp_skipped = false;
+    prepared._net = None;
+    Ok(prepared)
+}
+
+fn read_grant_paths(policy: &super::KernelPolicy) -> Vec<PathBuf> {
+    let rw = rw_grant_paths(policy);
+    let mut paths = Vec::new();
+    for grant in policy.grants() {
+        if grant.access == super::KernelAccess::Read
+            && !rw.iter().any(|path| path == &grant.path)
+            && !paths.iter().any(|path| path == &grant.path)
+        {
+            paths.push(grant.path.clone());
+        }
+    }
+    paths
+}
+
+fn grant_package_read(
+    path: &Path,
+    sid: Handle,
+    guards: &mut Vec<AclRestore>,
+) -> Result<(), KernelError> {
+    // Do not call SetNamedSecurityInfo on System32 or Program Files.
+    // A runner can block that write until the test is killed.
+    if is_system_root_grant(path) {
+        return Ok(());
+    }
+    let inherit = if path.is_dir() {
+        SUB_CONTAINERS_AND_OBJECTS_INHERIT
+    } else {
+        NO_INHERITANCE
+    };
+    match set_acl_entry(
+        path,
+        sid,
+        GENERIC_READ | GENERIC_EXECUTE,
+        GRANT_ACCESS,
+        inherit,
+    ) {
+        Ok(guard) => guards.push(guard),
+        // System directories are already readable by ALL APPLICATION
+        // PACKAGES. Editing System32's DACL is not required.
+        Err(err) if acl_is_access_denied(&err) && is_system_path(path) => {}
+        Err(err) => return Err(err),
+    }
+    Ok(())
+}
+
+fn grant_program_execute(
+    program: &Path,
+    sid: Handle,
+    guards: &mut Vec<AclRestore>,
+) -> Result<(), KernelError> {
+    match set_acl_entry(
+        program,
+        sid,
+        GENERIC_READ | GENERIC_EXECUTE,
+        GRANT_ACCESS,
+        NO_INHERITANCE,
+    ) {
+        Ok(guard) => guards.push(guard),
+        Err(err) if acl_is_access_denied(&err) && is_system_path(program) => {}
+        Err(err) => return Err(err),
+    }
+    // A directory ACE does not grant existing DLLs. Skip the parent so
+    // a large deps folder is not rewritten.
+    Ok(())
+}
+
+fn annotate_path(path: &Path, err: KernelError) -> KernelError {
+    match err {
+        KernelError::Apply(msg) => KernelError::Apply(format!("{msg} ({})", path.display())),
+        other => other,
+    }
+}
+
+fn acl_is_access_denied(err: &KernelError) -> bool {
+    match err {
+        KernelError::Apply(msg) => msg.contains("(win32 5)"),
+        _ => false,
+    }
+}
+
+/// The read roots [`super::system_read_dirs`] adds. Not a subdirectory
+/// the host passed itself.
+fn is_system_root_grant(path: &Path) -> bool {
+    let path = normalize_win_path(path);
+    let mut roots = Vec::new();
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        let root = PathBuf::from(root);
+        roots.push(normalize_win_path(&root));
+        roots.push(normalize_win_path(&root.join("System32")));
+        roots.push(normalize_win_path(&root.join("SysWOW64")));
+    }
+    for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(root) = std::env::var_os(key) {
+            roots.push(normalize_win_path(Path::new(&root)));
+        }
+    }
+    roots.iter().any(|root| path == *root)
+}
+
+fn is_system_path(path: &Path) -> bool {
+    let path = normalize_win_path(path);
+    let mut roots = Vec::new();
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        roots.push(root);
+    }
+    for key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(root) = std::env::var_os(key) {
+            roots.push(root);
+        }
+    }
+    roots
+        .iter()
+        .any(|root| dir_prefix(&path, &normalize_win_path(Path::new(root))))
+}
+
+/// `\\?\C:\Windows\System32` and `C:\Windows\System32` compare equal.
+fn normalize_win_path(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('/', "\\");
+    let text = text
+        .strip_prefix("\\\\?\\UNC\\")
+        .map(|rest| format!("\\\\{rest}"))
+        .unwrap_or_else(|| {
+            text.strip_prefix("\\\\?\\")
+                .unwrap_or(text.as_str())
+                .to_string()
+        });
+    text.trim_end_matches('\\').to_ascii_lowercase()
+}
+
+fn dir_prefix(path: &str, root: &str) -> bool {
+    path == root || path.starts_with(&format!("{root}\\"))
+}
+
+/// Exact profile directories from the workspace-jail deny list.
+/// Missing directories are skipped. This does not walk the profile.
+fn profile_secret_dirs() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("USERPROFILE") else {
+        return Vec::new();
+    };
+    let home = PathBuf::from(home);
+    let mut out = Vec::new();
+    for name in [".ssh", ".aws", ".gnupg", ".azure", ".docker", ".kube"] {
+        let path = home.join(name);
+        if path.is_dir() {
+            out.push(path);
+        }
+    }
+    let gh = home.join(".config").join("gh");
+    if gh.is_dir() {
+        out.push(gh);
+    }
+    out
+}
+
 /// AppContainer plus WFP on `workspace`, without creating a user process.
 /// `Ok(true)` is win32 5 (WFP skipped). The helper file is removed on drop.
 pub(super) fn probe_wfp_skipped(workspace: &Path) -> Result<bool, KernelError> {
@@ -674,14 +990,22 @@ fn wrap_appcontainer_token(
     restricted: CloseOnDrop,
     package_sid: Handle,
 ) -> Result<CloseOnDrop, KernelError> {
-    match windows_net::create_appcontainer_token(restricted.0, package_sid) {
+    wrap_appcontainer_token_caps(restricted, package_sid, &[])
+}
+
+fn wrap_appcontainer_token_caps(
+    restricted: CloseOnDrop,
+    package_sid: Handle,
+    capabilities: &[windows_net::SidAndAttributes],
+) -> Result<CloseOnDrop, KernelError> {
+    match windows_net::create_appcontainer_token(restricted.0, package_sid, capabilities) {
         Ok(handle) => {
             drop(restricted);
             Ok(CloseOnDrop(handle))
         }
         Err(first) => {
             let current = current_primary_token()?;
-            match windows_net::create_appcontainer_token(current.0, package_sid) {
+            match windows_net::create_appcontainer_token(current.0, package_sid, capabilities) {
                 Ok(handle) => {
                     drop((restricted, current));
                     Ok(CloseOnDrop(handle))
@@ -1745,6 +2069,28 @@ mod ace_tests {
             }
         }
         false
+    }
+
+    #[test]
+    fn verbatim_system32_is_a_system_path() {
+        let root = std::env::var("SystemRoot").expect("SystemRoot");
+        let verbatim = format!(r"\\?\{root}\System32");
+        assert!(
+            super::is_system_path(Path::new(&verbatim)),
+            "{verbatim} should match SystemRoot"
+        );
+        assert!(
+            super::is_system_root_grant(Path::new(&verbatim)),
+            "{verbatim} is a system read root"
+        );
+        let nested = format!(r"\\?\{root}\System32\drivers");
+        assert!(
+            !super::is_system_root_grant(Path::new(&nested)),
+            "a subdirectory still needs its own ACE"
+        );
+        assert!(!super::is_system_path(Path::new(
+            r"C:\workpen-not-a-system-dir"
+        )));
     }
 
     #[test]

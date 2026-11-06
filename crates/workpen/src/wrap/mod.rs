@@ -1,7 +1,9 @@
 //! Process-jail wrap. Feature `nono`.
 //!
-//! Unix uses pinned nono (Landlock / Seatbelt). Windows uses a
-//! write-restricted token. Never grant filesystem root (`/` or a
+//! Unix uses pinned nono (Landlock / Seatbelt). Windows `run_child`
+//! uses a write-restricted token. [`KernelPolicy::spawn_reexec`] is a
+//! separate long-lived AppContainer with outbound network. Never grant
+//! filesystem root (`/` or a
 //! Windows drive root) or the current user's home directory. Inspect
 //! [`KernelPolicy::grants`]; do not parse nono internals. Do not call
 //! [`KernelPolicy::apply`] from unit tests (`Sandbox::apply_auto` is
@@ -961,6 +963,23 @@ impl Drop for RemoveProbeDir {
     }
 }
 
+/// How many times this process created the Windows re-exec AppContainer.
+///
+/// A second [`KernelPolicy::spawn_reexec`] in the same process does not
+/// increment this. Other platforms stay at zero. `run_child` does not
+/// increment it.
+#[must_use]
+pub fn reexec_profile_creates() -> u64 {
+    #[cfg(windows)]
+    {
+        windows::reexec_profile_creates()
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
 /// Whether this OS can apply a kernel jail.
 #[must_use]
 pub fn kernel_supported() -> bool {
@@ -1374,6 +1393,87 @@ impl KernelPolicy {
             .filter(|g| g.access == KernelAccess::ReadWrite && !is_system_temp_root(&g.path))
             .map(|g| g.path.clone())
             .collect()
+    }
+
+    /// Spawn `cmd` into a long-lived Windows jail with outbound network.
+    ///
+    /// Read and read-write roots come from this policy.
+    /// [`process_jail`] adds `SystemRoot` and `ProgramFiles` as read
+    /// roots and refuses filesystem root and the user home as a
+    /// read-write root. [`Self::with_read_root`] refuses those too.
+    ///
+    /// Network stays open. The AppContainer has the internet client
+    /// capability and this function does not add a WFP BLOCK. That is
+    /// not [`Self::network_blocked`]. [`Self::run_child`] is unchanged:
+    /// `workspace` stays on the write-restricted token when network is
+    /// left open, and `network_blocked` still builds a per-command
+    /// container with no network capability.
+    ///
+    /// When `.ssh`, `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`,
+    /// or `.kube` exist under the user profile, they get a package-SID
+    /// deny. The deny is not Everyone. Missing directories are skipped.
+    /// The profile is not walked.
+    ///
+    /// The AppContainer is created once in this process and reused.
+    /// [`reexec_profile_creates`] counts that create. The profile name is
+    /// per Windows user, so a second process derives the same container.
+    /// It lives until this process exits. [`KernelApply::Applied`] means the
+    /// container is active. It does not mean WFP ran.
+    ///
+    /// Unix returns [`KernelError::Apply`] and does not start `cmd`.
+    /// Windows does the same when the container cannot be created.
+    /// The corpus test accepts a loopback connect to the parent, or
+    /// TCP to `1.1.1.1` port 443, as proof that outbound network works.
+    pub fn spawn_reexec(&self, cmd: Command) -> Result<(KernelApply, ExitStatus), KernelError> {
+        self.spawn_reexec_io(cmd, false)
+            .map(|(applied, status, _)| (applied, status))
+    }
+
+    /// [`Self::spawn_reexec`] with stdout and stderr collected.
+    pub fn spawn_reexec_output(
+        &self,
+        cmd: Command,
+    ) -> Result<(KernelApply, std::process::Output), KernelError> {
+        self.spawn_reexec_io(cmd, true)
+            .and_then(|(applied, status, output)| {
+                output.map(|output| (applied, output)).ok_or_else(|| {
+                    KernelError::Apply(format!(
+                        "re-exec child produced no output (status {status})"
+                    ))
+                })
+            })
+    }
+
+    fn spawn_reexec_io(
+        &self,
+        cmd: Command,
+        capture: bool,
+    ) -> Result<(KernelApply, ExitStatus, Option<std::process::Output>), KernelError> {
+        self.dest_deny_command(&cmd)?;
+        #[cfg(windows)]
+        {
+            if !kernel_supported() {
+                return Err(KernelError::Apply(
+                    "write-restricted token is not available".into(),
+                ));
+            }
+            let mut cmd = cmd;
+            scrub_child_command(&mut cmd);
+            if capture {
+                windows::spawn_reexec_output(self, &mut cmd)
+                    .map(|(applied, output)| (applied, output.status, Some(output)))
+            } else {
+                windows::spawn_reexec(self, &mut cmd)
+                    .map(|(applied, status)| (applied, status, None))
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (cmd, capture);
+            Err(KernelError::Apply(
+                "long-lived re-exec jail is Windows-only; child was not started".into(),
+            ))
+        }
     }
 
     pub fn run_child(&self, cmd: Command) -> Result<(KernelApply, ExitStatus), KernelError> {
