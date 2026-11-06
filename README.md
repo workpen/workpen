@@ -135,6 +135,14 @@ in one page is [docs/threat-model.md](docs/threat-model.md).
   remount applies.
 - Windows WFP without admin is skipped (`WfpSkipped`). AppContainer
   with no network capabilities is the unelevated net deny.
+  `read-only` and `strict` reuse one AppContainer per process.
+  `workspace` does not create one. The workspace jail denies
+  `.ssh`, `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`, and
+  `.kube` with the restricted SID and restores them when the jail
+  drops. `strict` and `read-only` can read the workspace
+  (`read_only` cannot write it), `SystemRoot`, `System32`, and
+  `ProgramFiles`. `prepare_reexec` keeps network open for a host
+  that re-execs into one long-lived jail.
 
 ## Contributing
 

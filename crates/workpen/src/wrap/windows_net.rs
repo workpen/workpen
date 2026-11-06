@@ -1,18 +1,23 @@
-//! Unique helper PE plus AppContainer plus package-scoped WFP.
+//! Helper PE plus AppContainer plus package-scoped WFP.
 //!
 //! Not a dest-parent-copy. Userspace WFP has no process-id condition, so
-//! a path-wide `cmd.exe` filter is out of scope. The helper is a unique
-//! PE; the AppContainer SID is unique per spawn; descendants inherit the
-//! package. WFP BLOCKs that package SID (and the helper APP_ID) only
-//! when the token can add filters. `ERROR_ACCESS_DENIED` (win32 5) is
-//! skipped: package WFP needs an elevated token. AppContainer with no
-//! network capabilities still applies.
+//! a path-wide `cmd.exe` filter is out of scope. The helper PE is unique
+//! per command. The AppContainer profile is one per process for each
+//! capability set (network blocked, or network allowed). Descendants
+//! inherit the package. WFP BLOCKs the blocked package SID (and the
+//! first helper APP_ID) only when the token can add filters.
+//! `ERROR_ACCESS_DENIED` (win32 5) is skipped: package WFP needs an
+//! elevated token. The blocked AppContainer still has no network
+//! capabilities. The allowed profile is only for the long-lived
+//! re-exec jail. `run_child` does not use it.
 
 use std::ffi::OsStr;
 use std::fs;
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::super::wfp_skip_access_denied;
@@ -193,28 +198,34 @@ pub(super) struct AppContainerProfile {
     sid: Handle,
 }
 
+// The SID is owned by this value. The cache mutex is the only share.
+unsafe impl Send for AppContainerProfile {}
+
 impl AppContainerProfile {
-    pub(super) fn create() -> Result<Self, KernelError> {
-        let suffix = unique_suffix();
-        let raw = format!("wpnh.{suffix}");
-        let name = wide_os(OsStr::new(&raw));
-        let display = wide_os(OsStr::new(&raw));
+    fn create_named(raw: &str, caps: &[SidAndAttributes]) -> Result<Self, KernelError> {
+        let name = wide_os(OsStr::new(raw));
+        let display = wide_os(OsStr::new(raw));
         let desc = wide_os(OsStr::new("workpen"));
         let mut sid = ptr::null_mut();
-        // SAFETY: name/display/desc are NUL-terminated; no capabilities.
+        CREATES.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: name/display/desc are NUL-terminated. `caps` lives for the call.
         let hr = unsafe {
             CreateAppContainerProfile(
                 name.as_ptr(),
                 display.as_ptr(),
                 desc.as_ptr(),
-                ptr::null(),
-                0,
+                if caps.is_empty() {
+                    ptr::null()
+                } else {
+                    caps.as_ptr()
+                },
+                caps.len() as Dword,
                 &mut sid,
             )
         };
         if hr != 0 || sid.is_null() {
             sid = ptr::null_mut();
-            // SAFETY: leftover profile from a crashed spawn; name is NUL-terminated.
+            // SAFETY: leftover profile from a crashed process with this pid; name is NUL-terminated.
             let derived =
                 unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
             if derived != 0 || sid.is_null() {
@@ -247,6 +258,224 @@ impl Drop for AppContainerProfile {
     }
 }
 
+const SE_GROUP_ENABLED: Dword = 0x0000_0004;
+const SECURITY_APP_PACKAGE_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 15];
+const SECURITY_CAPABILITY_BASE_RID: Dword = 3;
+const SECURITY_CAPABILITY_INTERNET_CLIENT: Dword = 1;
+const SECURITY_CAPABILITY_PRIVATE_NETWORK: Dword = 3;
+
+static CREATES: AtomicU32 = AtomicU32::new(0);
+
+struct HeldProfile {
+    profile: AppContainerProfile,
+    wfp_skipped: bool,
+    _wfp: Option<WfpSession>,
+}
+
+struct Cache {
+    blocked: Option<HeldProfile>,
+    allowed: Option<HeldProfile>,
+}
+
+static CACHE: Mutex<Cache> = Mutex::new(Cache {
+    blocked: None,
+    allowed: None,
+});
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ContainerKind {
+    /// No network capability. One profile per process.
+    Blocked,
+    /// internetClient and privateNetworkClientServer. No profile-read capability.
+    Allowed,
+}
+
+pub(super) struct PackageSid(Handle);
+
+impl PackageSid {
+    pub(super) fn as_handle(&self) -> Handle {
+        self.0
+    }
+}
+
+impl Drop for PackageSid {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: SID bytes came from LocalAlloc, not AllocateAndInitializeSid.
+            unsafe {
+                LocalFree(self.0);
+            }
+            self.0 = ptr::null_mut();
+        }
+    }
+}
+
+pub(super) fn reset_appcontainer_creates() {
+    CREATES.store(0, Ordering::Relaxed);
+}
+
+pub(super) fn appcontainer_creates() -> u32 {
+    CREATES.load(Ordering::Relaxed)
+}
+
+pub(super) fn shutdown_cache() {
+    let mut cache = CACHE.lock().unwrap_or_else(|err| err.into_inner());
+    cache.blocked = None;
+    cache.allowed = None;
+}
+
+/// Reuse the process profile for `kind`. The first call creates it.
+/// `helper` is the PE whose APP_ID the blocked WFP filter names.
+pub(super) fn acquire(
+    kind: ContainerKind,
+    helper: &Path,
+) -> Result<(PackageSid, bool), KernelError> {
+    let mut cache = CACHE.lock().unwrap_or_else(|err| err.into_inner());
+    let slot = match kind {
+        ContainerKind::Blocked => &mut cache.blocked,
+        ContainerKind::Allowed => &mut cache.allowed,
+    };
+    if slot.is_none() {
+        *slot = Some(open_profile(kind, helper)?);
+    }
+    let held = slot.as_ref().expect("profile just stored");
+    let sid = copy_sid(held.profile.sid())?;
+    Ok((PackageSid(sid), held.wfp_skipped))
+}
+
+fn open_profile(kind: ContainerKind, helper: &Path) -> Result<HeldProfile, KernelError> {
+    let pid = std::process::id();
+    match kind {
+        ContainerKind::Blocked => {
+            let profile = AppContainerProfile::create_named(&format!("wpnh.b.{pid}"), &[])?;
+            let wfp = WfpSession::apply(profile.sid(), helper)?;
+            let wfp_skipped = wfp.is_none();
+            Ok(HeldProfile {
+                profile,
+                wfp_skipped,
+                _wfp: wfp,
+            })
+        }
+        ContainerKind::Allowed => {
+            let caps = network_capabilities()?;
+            let profile = AppContainerProfile::create_named(&format!("wpnh.a.{pid}"), &caps.attrs)?;
+            Ok(HeldProfile {
+                profile,
+                wfp_skipped: false,
+                _wfp: None,
+            })
+        }
+    }
+}
+
+struct CapabilitySet {
+    _sids: Vec<OwnedSid>,
+    attrs: Vec<SidAndAttributes>,
+}
+
+struct OwnedSid(Handle);
+
+impl Drop for OwnedSid {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                super::free_sid(self.0);
+            }
+            self.0 = ptr::null_mut();
+        }
+    }
+}
+
+fn network_capabilities() -> Result<CapabilitySet, KernelError> {
+    let internet = capability_sid(SECURITY_CAPABILITY_INTERNET_CLIENT)?;
+    let private_net = capability_sid(SECURITY_CAPABILITY_PRIVATE_NETWORK)?;
+    let attrs = vec![
+        SidAndAttributes {
+            sid: internet.0,
+            attributes: SE_GROUP_ENABLED,
+        },
+        SidAndAttributes {
+            sid: private_net.0,
+            attributes: SE_GROUP_ENABLED,
+        },
+    ];
+    Ok(CapabilitySet {
+        _sids: vec![internet, private_net],
+        attrs,
+    })
+}
+
+fn capability_sid(rid: Dword) -> Result<OwnedSid, KernelError> {
+    let authority = super::SidIdentifierAuthority {
+        value: SECURITY_APP_PACKAGE_AUTHORITY,
+    };
+    let mut sid = ptr::null_mut();
+    // SAFETY: authority lives for the call. S-1-15-3-<rid>.
+    let ok = unsafe {
+        AllocateAndInitializeSid(
+            &authority,
+            2,
+            SECURITY_CAPABILITY_BASE_RID,
+            rid,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &mut sid,
+        )
+    };
+    if ok == 0 || sid.is_null() {
+        return Err(super::last_error("AllocateAndInitializeSid"));
+    }
+    Ok(OwnedSid(sid))
+}
+
+fn copy_sid(src: Handle) -> Result<Handle, KernelError> {
+    let len = unsafe { GetLengthSid(src) };
+    if len == 0 {
+        return Err(super::last_error("GetLengthSid"));
+    }
+    let buf = unsafe { LocalAlloc(0x0040, len as usize) };
+    if buf.is_null() {
+        return Err(super::last_error("LocalAlloc"));
+    }
+    let ok = unsafe { CopySid(len, buf, src) };
+    if ok == 0 {
+        unsafe {
+            LocalFree(buf);
+        }
+        return Err(super::last_error("CopySid"));
+    }
+    Ok(buf)
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn AllocateAndInitializeSid(
+        p_identifier_authority: *const super::SidIdentifierAuthority,
+        n_sub_authority_count: u8,
+        n_sub_authority0: Dword,
+        n_sub_authority1: Dword,
+        n_sub_authority2: Dword,
+        n_sub_authority3: Dword,
+        n_sub_authority4: Dword,
+        n_sub_authority5: Dword,
+        n_sub_authority6: Dword,
+        n_sub_authority7: Dword,
+        p_sid: *mut Handle,
+    ) -> Bool;
+    fn GetLengthSid(p_sid: Handle) -> Dword;
+    fn CopySid(dest_len: Dword, dest: Handle, src: Handle) -> Bool;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LocalAlloc(flags: u32, bytes: usize) -> Handle;
+    fn LocalFree(h_mem: Handle) -> Handle;
+}
+
 pub(super) struct HelperFile {
     path: PathBuf,
 }
@@ -273,6 +502,9 @@ impl Drop for HelperFile {
 pub(super) struct WfpSession {
     engine: Handle,
 }
+
+// The engine handle is owned by this value. The cache mutex is the only share.
+unsafe impl Send for WfpSession {}
 
 impl WfpSession {
     /// Open a dynamic WFP session and add package plus helper APP_ID blocks.

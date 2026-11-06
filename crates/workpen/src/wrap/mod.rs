@@ -56,6 +56,90 @@ pub struct KernelGrant {
     pub access: KernelAccess,
 }
 
+/// Long-lived Windows jail. Network stays open. Drop does not delete
+/// the process cache; [`shutdown_process_jail`] does.
+pub struct ReexecJail {
+    #[cfg(windows)]
+    policy: KernelPolicy,
+}
+
+impl ReexecJail {
+    /// Spawn `cmd` in the prepared jail and wait.
+    pub fn spawn(&self, cmd: Command) -> Result<(KernelApply, ExitStatus), KernelError> {
+        self.spawn_timeout(cmd, None)
+    }
+
+    /// Like [`Self::spawn`], returning captured stdout and stderr.
+    pub fn spawn_output(
+        &self,
+        cmd: Command,
+    ) -> Result<(KernelApply, std::process::Output), KernelError> {
+        #[cfg(windows)]
+        {
+            self.policy.dest_deny_command(&cmd)?;
+            let mut cmd = cmd;
+            let (applied, output, timed_out) =
+                windows::spawn_reexec_output(&self.policy, &mut cmd, None)?;
+            if timed_out {
+                return Err(KernelError::Timeout);
+            }
+            Ok((applied, output))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = cmd;
+            Err(KernelError::Apply(
+                "long-lived re-exec jail is only available on Windows".into(),
+            ))
+        }
+    }
+
+    fn spawn_timeout(
+        &self,
+        cmd: Command,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<(KernelApply, ExitStatus), KernelError> {
+        #[cfg(windows)]
+        {
+            self.policy.dest_deny_command(&cmd)?;
+            let mut cmd = cmd;
+            windows::spawn_reexec(&self.policy, &mut cmd, timeout)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (cmd, timeout);
+            Err(KernelError::Apply(
+                "long-lived re-exec jail is only available on Windows".into(),
+            ))
+        }
+    }
+}
+
+/// Drop the process-wide Windows AppContainer cache.
+///
+/// Dynamic WFP filters die with the session handle. The profile is
+/// deleted here. Other platforms do nothing. `run_child` for a
+/// workspace jail does not create this cache.
+pub fn shutdown_process_jail() {
+    #[cfg(windows)]
+    windows::shutdown_jail_cache();
+}
+
+/// How many times this process called `CreateAppContainerProfile`.
+/// Tests reset this. Not a stable host metric.
+#[doc(hidden)]
+#[cfg(windows)]
+pub fn windows_appcontainer_creates() -> u32 {
+    windows::appcontainer_creates()
+}
+
+/// Zero the `CreateAppContainerProfile` counter. Tests only.
+#[doc(hidden)]
+#[cfg(windows)]
+pub fn reset_windows_appcontainer_creates() {
+    windows::reset_appcontainer_creates();
+}
+
 /// Process-jail policy. Workspace RW, extra roots RW, existing system dirs Read.
 ///
 /// Dest-deny names are a second list, not a grant of `/`. Linux Landlock
@@ -1081,6 +1165,56 @@ impl KernelPolicy {
         self
     }
 
+    /// Downgrade read-write grants to read. The null device stays writable.
+    ///
+    /// On Windows this is the read-only jail: no write ACE is added, so
+    /// the restricting SID denies creates in the workspace. Network is
+    /// unchanged. Call [`Self::with_network`] when the profile should
+    /// also block sockets.
+    #[must_use]
+    pub fn read_only(mut self) -> Self {
+        for grant in &mut self.grants {
+            #[cfg(unix)]
+            if crate::deny::is_null_device(&grant.path) {
+                continue;
+            }
+            if grant.access == KernelAccess::ReadWrite {
+                grant.access = KernelAccess::Read;
+            }
+        }
+        self
+    }
+
+    /// Prepare a long-lived Windows jail the host can re-exec into.
+    ///
+    /// Network stays open. This is not the no-network AppContainer used
+    /// by [`Self::run_child`] when [`Self::network_blocked`] is set.
+    /// Filesystem root and `$HOME` are already refused by [`process_jail`].
+    /// Profile-secret directories stay unreadable. The container is
+    /// created once per process. [`shutdown_process_jail`] drops it.
+    ///
+    /// `network_blocked` must be false. A failed container returns
+    /// [`KernelError::Apply`] and does not start a process.
+    /// Other platforms return [`KernelError::Apply`].
+    pub fn prepare_reexec(self) -> Result<ReexecJail, KernelError> {
+        if self.network_blocked {
+            return Err(KernelError::Apply(
+                "re-exec jail keeps network open; call with_network(false) first".into(),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            Ok(ReexecJail { policy: self })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = self;
+            Err(KernelError::Apply(
+                "long-lived re-exec jail is only available on Windows".into(),
+            ))
+        }
+    }
+
     /// Read-only grant for one extra directory. Home and filesystem root
     /// are refused the same way as a read-write extra root. Dest-deny for
     /// that tree is recorded after the allow.
@@ -1134,13 +1268,14 @@ impl KernelPolicy {
     /// True when the policy asked the kernel backend to block sockets.
     ///
     /// Unix `run_child` passes this to nono `block_network()`. Windows
-    /// `run_child` wraps the command in a unique helper PE, launches
-    /// that helper in an AppContainer with no network capabilities, and
-    /// adds a dynamic WFP BLOCK on the package SID (and the helper
-    /// APP_ID) when the token can add filters. Fail closed if
-    /// AppContainer cannot apply. WFP `ERROR_ACCESS_DENIED` (win32 5)
-    /// is skipped: package filters need an elevated token. The child
-    /// still starts with AppContainer network deny.
+    /// `run_child` wraps the command in a helper PE and an AppContainer
+    /// with no network capabilities. One profile and one dynamic WFP
+    /// session are reused for every network-blocked command in this
+    /// process. Fail closed if the AppContainer cannot be created.
+    /// WFP `ERROR_ACCESS_DENIED` (win32 5) is skipped: package filters
+    /// need an elevated token. The child still starts with AppContainer
+    /// network deny. `workspace` (`with_network(false)`) does not create
+    /// that profile.
     pub fn network_blocked(&self) -> bool {
         self.network_blocked
     }

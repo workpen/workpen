@@ -47,6 +47,33 @@ The parent is trusted. The child is not.
   per name. In-child open of a planted `/tmp/proj/sub/leaked`
   is the same class as post-create.
 - Windows WFP ran. Win32 5 is `WfpSkipped`. AppContainer is still on.
+  Network-blocked commands in one process share one AppContainer and
+  one dynamic WFP session. `workspace` (`with_network(false)`) does
+  not create either. `shutdown_process_jail` deletes the profile.
+  Dynamic filters die with the session.
+- `DISABLE_MAX_PRIVILEGE` removed `SeChangeNotifyPrivilege`. That
+  flag keeps traverse checking and drops `SeDebugPrivilege`,
+  `SeBackupPrivilege`, `SeRestorePrivilege`, `SeTakeOwnershipPrivilege`,
+  `SeLoadDriverPrivilege`, and `SeTcbPrivilege`. Git `usr\bin` tools
+  are expected to run. A write outside the ReadWrite grant still fails.
+- The workspace jail scanned the user profile. It denies `.ssh`,
+  `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`, and `.kube`
+  with the restricted SID and restores those ACLs when the jail drops.
+  Missing names are skipped. It does not walk the profile.
+- A jailed Windows child can use the parent console or the clipboard.
+  It cannot read or write the clipboard, change system parameters, or
+  exit Windows. `JOB_OBJECT_UILIMIT_HANDLES` is not set: it blocks the
+  parent console and MSYS init exits `0xC0000142`. Captured stdout and
+  stderr still work.
+- `strict` and `read-only` on Windows can read the whole disk. They
+  can read the workspace (`read-only` cannot write it), `SystemRoot`,
+  `System32`, and `ProgramFiles`. Other paths are not readable.
+  `workspace` is unchanged except the profile-secret list above.
+- A long-lived Windows re-exec jail is per command. A host prepares
+  one with `prepare_reexec` and spawns into it. Network stays open.
+  The profile-secret directories stay unreadable. Filesystem root and
+  home are refused as read-write roots. `workspace` `run_child` is a
+  different path.
 - Renaming the dest-deny parent is in scope. Parent-rename is out of
   scope. Leaf `mv .env leaked` is a macOS last-match contract.
 - Windows `Stdio::piped` on `run_child` captures stdout for the host.
