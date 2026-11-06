@@ -699,6 +699,10 @@ fn gc_help_prints_usage() {
             stdout.contains("usage: workpen gc") && stdout.contains("--max-age"),
             "gc help {args:?} must print gc usage: {stdout}"
         );
+        assert!(
+            stdout.contains("left alone"),
+            "gc help must say an outside worktree is left alone: {stdout}"
+        );
     }
 }
 
@@ -2002,6 +2006,83 @@ fn gc_reclaim_does_not_count_a_removed_worktree() {
         "removed worktree must not be counted: {stdout}"
     );
     assert!(!leftover.exists(), "reclaim must remove the worktree");
+}
+
+#[test]
+fn gc_leaves_a_registered_worktree_outside_the_leftover_dir() {
+    let repo = init_git_repo();
+    let old = SystemTime::now() - Duration::from_secs(2 * 3600);
+    let unix = old
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("unix")
+        .as_secs()
+        .to_string();
+    let amend = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_AUTHOR_DATE", &unix)
+        .env("GIT_COMMITTER_DATE", &unix)
+        .args(["commit", "--amend", "--no-edit", "--date", &unix])
+        .current_dir(repo.path())
+        .output()
+        .expect("amend");
+    assert!(
+        amend.status.success(),
+        "{}",
+        String::from_utf8_lossy(&amend.stderr)
+    );
+    let sibling_root = TempDir::new().expect("sibling");
+    let sibling = sibling_root.path().join("feature");
+    git_in(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            sibling.to_str().expect("utf8"),
+            "-b",
+            "feature",
+        ],
+    );
+    let leftover_dir = repo.path().join(".workpen-worktrees");
+    std::fs::create_dir_all(&leftover_dir).expect("leftover dir");
+    let inside = leftover_dir.join("old-clean");
+    git_in(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            inside.to_str().expect("utf8"),
+            "-b",
+            "old-clean",
+        ],
+    );
+    stamp_mtime_tree(&sibling, old);
+    stamp_mtime_tree(&inside, old);
+    stamp_mtime_tree(&repo.path().join(".git/worktrees"), old);
+    let out = workpen()
+        .args(["gc", "--root"])
+        .arg(repo.path())
+        .args(["--max-age", "1s"])
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("reclaimed ") && stdout.contains("old-clean"),
+        "the leftover worktree must still be reclaimed: {stdout}"
+    );
+    assert!(
+        !stdout.contains("feature"),
+        "gc must not report the outside worktree: {stdout}"
+    );
+    assert!(sibling.exists(), "gc must leave the outside worktree");
+    assert!(!inside.exists(), "gc must remove the leftover worktree");
 }
 
 fn git_in(dir: &Path, args: &[&str]) {

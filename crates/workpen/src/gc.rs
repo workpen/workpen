@@ -14,12 +14,24 @@ use crate::deny::{DenyPolicy, path_is_denied_glob};
 
 /// Host knobs. Bline passes leftover_dir = ".bline-worktrees",
 /// saved_ref_prefix = "refs/bline/reclaimed".
+///
+/// `age_gc_registered` defaults to false. That is the `workpen gc`
+/// candidate set: registered worktrees under `leftover_dir` only.
+/// Set it to also age-gc the other registered worktrees of this repo
+/// (a `git worktree add` next to the checkout). The primary checkout,
+/// a locked worktree, and a live cwd stay out. Untracked directories
+/// still come only from `leftover_dir`. Construct with [`GcConfig::new`]
+/// and then set the fields. A struct literal in another crate has to
+/// name `age_gc_registered`.
 #[derive(Debug, Clone)]
 pub struct GcConfig {
     pub leftover_dir: PathBuf,
     pub saved_ref_prefix: String,
     pub max_age: Duration,
     pub dry_run: bool,
+    /// Age-gc every registered worktree of this repo, including paths
+    /// outside `leftover_dir`. False matches `workpen gc`.
+    pub age_gc_registered: bool,
     pub now: SystemTime,
 }
 
@@ -30,6 +42,7 @@ impl GcConfig {
             saved_ref_prefix: "refs/workpen/reclaimed".into(),
             max_age,
             dry_run: false,
+            age_gc_registered: false,
             now: SystemTime::now(),
         }
     }
@@ -280,8 +293,11 @@ fn classify_worktree_with_index(
 
 /// Age-gc registered worktrees under `leftover_dir`. Skip the primary
 /// checkout, locked worktrees, and a live cwd. A registered worktree
-/// outside `leftover_dir` is left alone. Untracked directories under
+/// outside `leftover_dir` is left alone unless
+/// `GcConfig::age_gc_registered` is set. Untracked directories under
 /// `leftover_dir` are Keep(UntrackedWorktree) and never removed.
+/// Untracked directories outside `leftover_dir` are not candidates.
+/// Dry-run uses the same live-cwd probe and does not delete.
 ///
 /// Uses [`DenyPolicy::default()`]. Hosts with extras should call
 /// [`run_gc_with_policy`].
@@ -310,7 +326,7 @@ pub fn run_gc_with_policy(
         if primary.as_ref().is_some_and(|p| paths_eq(p, &wt.path)) {
             continue;
         }
-        if !path_is_same_or_parent(&cfg.leftover_dir, &wt.path) {
+        if !cfg.age_gc_registered && !path_is_same_or_parent(&cfg.leftover_dir, &wt.path) {
             continue;
         }
         if wt.locked {
@@ -1269,6 +1285,44 @@ fn git_stdin(cwd: &Path, args: &[&str], stdin: &str) -> Result<String, GcError> 
 mod parse_tests {
     use super::*;
 
+    fn sample_repo(dir: &Path) -> PathBuf {
+        let repo = dir.join("origin");
+        std::fs::create_dir(&repo).expect("origin");
+        let git = |args: &[&str]| {
+            super::git(&repo, args).unwrap_or_else(|err| panic!("{args:?}: {err:?}"));
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "dev@example.com"]);
+        git(&["config", "user.name", "dev"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("README"), b"x").expect("readme");
+        git(&["add", "README"]);
+        git(&["commit", "-m", "init"]);
+        repo
+    }
+
+    fn link_worktree(repo: &Path, dest: &Path, branch: &str) {
+        super::git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                dest.to_str().expect("utf8"),
+                "-b",
+                branch,
+            ],
+        )
+        .unwrap_or_else(|err| panic!("worktree add {branch}: {err:?}"));
+    }
+
+    fn opted_in(repo: &Path, dry_run: bool) -> GcConfig {
+        let mut cfg = GcConfig::new(repo, Duration::from_secs(0));
+        cfg.age_gc_registered = true;
+        cfg.dry_run = dry_run;
+        cfg.now = SystemTime::now() + Duration::from_secs(10);
+        cfg
+    }
+
     #[test]
     fn parse_primary_and_locked() {
         let text = "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\nworktree /repo/.wt\nHEAD def\nlocked\n";
@@ -1502,6 +1556,7 @@ mod parse_tests {
             saved_ref_prefix: "refs/workpen/reclaimed".into(),
             max_age: Duration::from_secs(0),
             dry_run: true,
+            age_gc_registered: false,
             now: SystemTime::now() + Duration::from_secs(10),
         };
         let rows = run_gc_with_policy(&repo, &cfg, &DenyPolicy::default()).expect("gc");
@@ -1557,6 +1612,7 @@ mod parse_tests {
             saved_ref_prefix: "refs/workpen/reclaimed".into(),
             max_age: Duration::from_secs(0),
             dry_run: false,
+            age_gc_registered: false,
             now: SystemTime::now() + Duration::from_secs(10),
         };
         let rows = run_gc_with_policy(&repo, &cfg, &DenyPolicy::default()).expect("gc");
@@ -1572,6 +1628,105 @@ mod parse_tests {
             !inside.exists(),
             "an old worktree under leftover_dir must go"
         );
+    }
+
+    #[test]
+    fn age_gc_registered_dry_run_probes_an_outside_worktree_once() {
+        CWD_PROBE_COUNT.with(|slot| slot.set(0));
+        let dir = tempfile::tempdir().expect("tmp");
+        let repo = sample_repo(dir.path());
+        let sibling = dir.path().join("feature");
+        link_worktree(&repo, &sibling, "feature");
+        let cfg = opted_in(&repo, true);
+        let rows = run_gc_with_policy(&repo, &cfg, &DenyPolicy::default()).expect("gc");
+        assert!(
+            rows.iter().any(|(path, decision)| {
+                super::paths_eq(path, &sibling) && matches!(decision, GcDecision::Reclaim { .. })
+            }),
+            "dry-run must list the outside worktree: {rows:?}"
+        );
+        assert!(sibling.exists(), "dry-run must leave the outside worktree");
+        let probes = CWD_PROBE_COUNT.with(|slot| slot.get());
+        assert_eq!(
+            probes, 1,
+            "one cwd probe for the outside tree, got {probes}"
+        );
+    }
+
+    #[test]
+    fn outside_only_worktree_does_not_probe_when_opt_in_is_off() {
+        CWD_PROBE_COUNT.with(|slot| slot.set(0));
+        let dir = tempfile::tempdir().expect("tmp");
+        let repo = sample_repo(dir.path());
+        let sibling = dir.path().join("feature");
+        link_worktree(&repo, &sibling, "feature");
+        let mut cfg = opted_in(&repo, true);
+        cfg.age_gc_registered = false;
+        let rows = run_gc_with_policy(&repo, &cfg, &DenyPolicy::default()).expect("gc");
+        assert!(
+            !rows.iter().any(|(path, _)| super::paths_eq(path, &sibling)),
+            "default gc must not list the outside worktree: {rows:?}"
+        );
+        assert!(
+            sibling.exists(),
+            "default gc must leave the outside worktree"
+        );
+        let probes = CWD_PROBE_COUNT.with(|slot| slot.get());
+        assert_eq!(
+            probes, 0,
+            "an outside-only set must not probe when the opt-in is off, got {probes}"
+        );
+    }
+
+    #[test]
+    fn age_gc_registered_rechecks_before_it_removes_an_outside_worktree() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let repo = sample_repo(dir.path());
+        let sibling = dir.path().join("feature");
+        link_worktree(&repo, &sibling, "feature");
+        BEFORE_REMOVE.with(|slot| {
+            slot.set(Some(|path| {
+                std::fs::write(path.join("late.txt"), b"late").expect("plant");
+            }));
+        });
+        let cfg = opted_in(&repo, false);
+        let rows = run_gc(&repo, &cfg).expect("gc");
+        let decision = rows
+            .iter()
+            .find(|(path, _)| super::paths_eq(path, &sibling))
+            .map(|(_, decision)| decision);
+        match decision {
+            Some(GcDecision::Keep {
+                reason: KeepReason::UniqueUntracked,
+            }) => {}
+            other => panic!("a file planted before remove must keep the tree, got {other:?}"),
+        }
+        assert!(sibling.join("late.txt").is_file(), "late file must survive");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn age_gc_registered_keeps_a_cwd_that_starts_before_remove() {
+        let _kill = KillLiveSleeper;
+        reap_live_sleeper();
+        let dir = tempfile::tempdir().expect("tmp");
+        let repo = sample_repo(dir.path());
+        let sibling = dir.path().join("feature");
+        link_worktree(&repo, &sibling, "feature");
+        BEFORE_REMOVE.with(|slot| slot.set(Some(hold_live_cwd)));
+        let cfg = opted_in(&repo, false);
+        let rows = run_gc(&repo, &cfg).expect("gc");
+        let decision = rows
+            .iter()
+            .find(|(path, _)| super::paths_eq(path, &sibling))
+            .map(|(_, decision)| decision);
+        match decision {
+            Some(GcDecision::Keep {
+                reason: KeepReason::LiveCwd,
+            }) => {}
+            other => panic!("a cwd that starts before remove must stay, got {other:?}"),
+        }
+        assert!(sibling.exists(), "live cwd must not be removed");
     }
 
     #[test]
@@ -1595,6 +1750,7 @@ mod parse_tests {
             saved_ref_prefix: "refs/workpen/reclaimed".into(),
             max_age: Duration::from_secs(0),
             dry_run: true,
+            age_gc_registered: false,
             now: SystemTime::now() + Duration::from_secs(10),
         };
         let rows = run_gc_with_policy(&repo, &cfg, &DenyPolicy::default()).expect("gc");

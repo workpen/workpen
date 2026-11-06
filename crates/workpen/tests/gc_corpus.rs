@@ -97,6 +97,31 @@ fn cfg(repo: &Path, max_age: Duration, now: SystemTime) -> GcConfig {
     cfg
 }
 
+fn opted_in(repo: &Path, max_age: Duration, now: SystemTime) -> GcConfig {
+    let mut cfg = cfg(repo, max_age, now);
+    cfg.age_gc_registered = true;
+    cfg
+}
+
+fn listed(rows: &[(PathBuf, GcDecision)], path: &Path) -> bool {
+    rows.iter()
+        .any(|(got, _)| got.file_name() == path.file_name())
+}
+
+fn porcelain_has_worktree(porcelain: &str, path: &Path) -> bool {
+    porcelain.lines().any(|line| {
+        line.strip_prefix("worktree ")
+            .is_some_and(|got| Path::new(got).file_name() == path.file_name())
+    })
+}
+
+fn decision_for<'a>(rows: &'a [(PathBuf, GcDecision)], path: &Path) -> &'a GcDecision {
+    rows.iter()
+        .find(|(got, _)| got.file_name() == path.file_name())
+        .map(|(_, decision)| decision)
+        .unwrap_or_else(|| panic!("missing row for {}: {rows:?}", path.display()))
+}
+
 fn stamp_mtime_tree(root: &Path, when: SystemTime) {
     if let Ok(rd) = fs::read_dir(root) {
         for ent in rd.flatten() {
@@ -470,6 +495,291 @@ fn leftover_dir_is_host_configurable() {
         "host leftover_dir must be scanned: {rows:?}"
     );
     assert!(copy.exists());
+}
+
+#[test]
+fn run_gc_leaves_a_sibling_until_age_gc_registered() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let sibling = add_sibling_worktree(&repo, "feature");
+    let leftover = repo.join(".workpen-worktrees");
+    let inside = add_leftover_worktree(&repo, &leftover, "inside");
+    let now = SystemTime::now() + Duration::from_secs(10);
+    let rows = run_gc(&repo, &cfg(&repo, Duration::from_secs(0), now)).expect("gc");
+    assert!(
+        !listed(&rows, &sibling),
+        "GcConfig::new must not list a worktree outside leftover_dir: {rows:?}"
+    );
+    assert!(sibling.exists(), "the sibling must stay");
+    assert!(
+        !inside.exists(),
+        "a worktree under leftover_dir is still reclaimed"
+    );
+    assert!(repo.join("README").is_file(), "the primary checkout stays");
+}
+
+#[test]
+fn age_gc_registered_reclaims_old_clean_siblings_of_this_repo() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let sibling = add_sibling_worktree(&repo, "feature");
+    let leftover = repo.join(".bline-worktrees");
+    let inside = add_leftover_worktree(&repo, &leftover, "agent");
+    let parent = repo.parent().expect("repo parent");
+    let stray = parent.join("not-a-worktree");
+    fs::create_dir(&stray).expect("stray");
+    let copy = leftover.join("copy");
+    fs::create_dir_all(&copy).expect("copy");
+    let mut gc = opted_in(
+        &repo,
+        Duration::from_secs(0),
+        SystemTime::now() + Duration::from_secs(10),
+    );
+    gc.leftover_dir = leftover;
+    let rows = run_gc(&repo, &gc).expect("gc");
+    assert!(
+        matches!(decision_for(&rows, &sibling), GcDecision::Reclaim { .. }),
+        "an old clean registered sibling must be reclaimed: {rows:?}"
+    );
+    assert!(!sibling.exists(), "the sibling directory must go");
+    assert!(
+        matches!(decision_for(&rows, &inside), GcDecision::Reclaim { .. }),
+        "a worktree under leftover_dir is still reclaimed: {rows:?}"
+    );
+    assert!(!inside.exists(), "the agent worktree must go");
+    assert!(
+        !listed(&rows, &repo),
+        "the primary checkout is not a candidate: {rows:?}"
+    );
+    assert!(repo.join("README").is_file(), "the primary checkout stays");
+    assert!(
+        !listed(&rows, &stray),
+        "an untracked directory outside leftover_dir is not a candidate: {rows:?}"
+    );
+    assert!(stray.exists(), "the stray directory must stay");
+    assert_eq!(
+        keep_reason(decision_for(&rows, &copy)),
+        KeepReason::UntrackedWorktree
+    );
+    assert!(copy.exists(), "an untracked leftover must stay");
+}
+
+#[test]
+fn age_gc_registered_dry_run_reports_the_sibling_and_leaves_it() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let sibling = add_sibling_worktree(&repo, "feature");
+    let mut gc = opted_in(
+        &repo,
+        Duration::from_secs(0),
+        SystemTime::now() + Duration::from_secs(10),
+    );
+    gc.dry_run = true;
+    let rows = run_gc(&repo, &gc).expect("gc");
+    assert!(
+        matches!(decision_for(&rows, &sibling), GcDecision::Reclaim { .. }),
+        "dry-run must report reclaim: {rows:?}"
+    );
+    assert!(sibling.exists(), "dry-run must leave the sibling");
+    let listed_after = git_out(&repo, &["worktree", "list", "--porcelain"]);
+    assert!(
+        porcelain_has_worktree(&listed_after, &sibling),
+        "dry-run must not prune the registration: {listed_after}"
+    );
+}
+
+#[test]
+fn age_gc_registered_keeps_locked_and_dirty_siblings() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let locked = add_sibling_worktree(&repo, "locked-sib");
+    git(&repo, &["worktree", "lock", locked.to_str().expect("utf8")]);
+    let dirty = add_sibling_worktree(&repo, "dirty-sib");
+    fs::write(dirty.join("only-here.txt"), b"unique").expect("dirty");
+    let rows = run_gc(
+        &repo,
+        &opted_in(
+            &repo,
+            Duration::from_secs(0),
+            SystemTime::now() + Duration::from_secs(10),
+        ),
+    )
+    .expect("gc");
+    assert_eq!(
+        keep_reason(decision_for(&rows, &locked)),
+        KeepReason::Locked
+    );
+    assert!(locked.exists(), "a locked sibling must stay");
+    assert_eq!(
+        keep_reason(decision_for(&rows, &dirty)),
+        KeepReason::UniqueUntracked
+    );
+    assert!(dirty.exists(), "a dirty sibling must stay");
+    assert!(
+        dirty.join("only-here.txt").is_file(),
+        "the dirty file must stay"
+    );
+}
+
+#[test]
+fn age_gc_registered_keeps_a_young_sibling() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let sibling = add_sibling_worktree(&repo, "young-feature");
+    let rows = run_gc(
+        &repo,
+        &opted_in(&repo, Duration::from_secs(24 * 3600), SystemTime::now()),
+    )
+    .expect("gc");
+    assert_eq!(
+        keep_reason(decision_for(&rows, &sibling)),
+        KeepReason::TooNew
+    );
+    assert!(sibling.exists(), "a young sibling must stay");
+}
+
+#[test]
+fn age_gc_registered_keeps_a_live_sibling_cwd() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let sibling = add_sibling_worktree(&repo, "live-feature");
+    let prev = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(&sibling).expect("chdir");
+    let rows = run_gc(
+        &repo,
+        &opted_in(
+            &repo,
+            Duration::from_secs(0),
+            SystemTime::now() + Duration::from_secs(10),
+        ),
+    );
+    let _ = std::env::set_current_dir(&prev);
+    let rows = rows.expect("gc");
+    assert_eq!(
+        keep_reason(decision_for(&rows, &sibling)),
+        KeepReason::LiveCwd
+    );
+    assert!(sibling.exists(), "a live sibling cwd must stay");
+}
+
+#[test]
+fn age_gc_registered_does_not_reclaim_another_repos_worktree() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let parent = repo.parent().expect("repo parent");
+    let other = parent.join("other");
+    fs::create_dir(&other).expect("other");
+    git(&other, &["init", "-b", "main"]);
+    git(&other, &["config", "user.email", "dev@example.com"]);
+    git(&other, &["config", "user.name", "dev"]);
+    git(&other, &["config", "commit.gpgsign", "false"]);
+    fs::write(other.join("README"), b"y").expect("readme");
+    git(&other, &["add", "README"]);
+    git(&other, &["commit", "-m", "init"]);
+    let foreign = parent.join("foreign-wt");
+    git(
+        &other,
+        &[
+            "worktree",
+            "add",
+            foreign.to_str().expect("utf8"),
+            "-b",
+            "foreign-wt",
+        ],
+    );
+    let rows = run_gc(
+        &repo,
+        &opted_in(
+            &repo,
+            Duration::from_secs(0),
+            SystemTime::now() + Duration::from_secs(10),
+        ),
+    )
+    .expect("gc");
+    assert!(
+        !listed(&rows, &foreign),
+        "another repo is not a candidate: {rows:?}"
+    );
+    assert!(foreign.exists(), "the other repo's worktree must stay");
+    assert!(other.join("README").is_file(), "the other primary stays");
+}
+
+#[test]
+fn age_gc_registered_missing_directory_is_kept_and_pruned() {
+    let fx = init_repo();
+    let repo = fx.repo.clone();
+    let sibling = add_sibling_worktree(&repo, "gone");
+    fs::remove_dir_all(&sibling).expect("remove sibling dir");
+    let rows = run_gc(
+        &repo,
+        &opted_in(
+            &repo,
+            Duration::from_secs(0),
+            SystemTime::now() + Duration::from_secs(10),
+        ),
+    )
+    .expect("gc");
+    assert_eq!(
+        keep_reason(decision_for(&rows, &sibling)),
+        KeepReason::StatusUnreadable
+    );
+    let listed_after = git_out(&repo, &["worktree", "list", "--porcelain"]);
+    assert!(
+        !porcelain_has_worktree(&listed_after, &sibling),
+        "prune must drop a registration whose directory is already gone: {listed_after}"
+    );
+}
+
+#[test]
+fn age_gc_registered_on_a_bare_repo_keeps_the_git_dir() {
+    let dir = TempDir::new().expect("tmp");
+    let seed = dir.path().join("seed");
+    fs::create_dir(&seed).expect("seed");
+    git(&seed, &["init", "-b", "main"]);
+    git(&seed, &["config", "user.email", "dev@example.com"]);
+    git(&seed, &["config", "user.name", "dev"]);
+    git(&seed, &["config", "commit.gpgsign", "false"]);
+    fs::write(seed.join("README"), b"x").expect("readme");
+    git(&seed, &["add", "README"]);
+    git(&seed, &["commit", "-m", "init"]);
+    let bare = dir.path().join("origin.git");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            "--bare",
+            seed.to_str().expect("utf8"),
+            bare.to_str().expect("utf8"),
+        ],
+    );
+    let linked = dir.path().join("linked");
+    git(
+        &bare,
+        &[
+            "worktree",
+            "add",
+            linked.to_str().expect("utf8"),
+            "-b",
+            "linked",
+        ],
+    );
+    let mut gc = opted_in(
+        &bare,
+        Duration::from_secs(0),
+        SystemTime::now() + Duration::from_secs(10),
+    );
+    gc.leftover_dir = bare.join(".workpen-worktrees");
+    let rows = run_gc(&bare, &gc).expect("gc");
+    assert!(bare.exists(), "the bare git dir must stay");
+    assert!(
+        !listed(&rows, &bare),
+        "the bare repo is the primary: {rows:?}"
+    );
+    assert!(
+        matches!(decision_for(&rows, &linked), GcDecision::Reclaim { .. }),
+        "the linked worktree of a bare repo must be reclaimed: {rows:?}"
+    );
+    assert!(!linked.exists(), "the linked directory must go");
 }
 
 #[test]
