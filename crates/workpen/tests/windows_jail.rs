@@ -573,8 +573,8 @@ fn windows_jail_child_cannot_use_clipboard_or_parent_console() {
                 );
             } else {
                 assert!(
-                    report.contains("con-fail"),
-                    "blocked={blocked} child opened CONOUT$ with no parent console, report={report}"
+                    !parent_has_console(),
+                    "blocked={blocked} child attached a console to the parent, report={report}"
                 );
             }
         }
@@ -694,12 +694,18 @@ unsafe extern "system" {
 }
 "#;
 
-fn ensure_parent_console() -> bool {
+fn parent_has_console() -> bool {
     unsafe extern "system" {
         fn GetConsoleWindow() -> *mut u8;
+    }
+    !unsafe { GetConsoleWindow() }.is_null()
+}
+
+fn ensure_parent_console() -> bool {
+    unsafe extern "system" {
         fn AllocConsole() -> i32;
     }
-    if !unsafe { GetConsoleWindow() }.is_null() {
+    if parent_has_console() {
         return true;
     }
     unsafe { AllocConsole() != 0 }

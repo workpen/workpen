@@ -337,6 +337,25 @@ unsafe extern "system" {
         p_dacl: Handle,
         p_sacl: Handle,
     ) -> Dword;
+    fn GetSecurityInfo(
+        handle: Handle,
+        object_type: u32,
+        security_info: Dword,
+        ppsid_owner: *mut Handle,
+        ppsid_group: *mut Handle,
+        pp_dacl: *mut Handle,
+        pp_sacl: *mut Handle,
+        pp_security_descriptor: *mut Handle,
+    ) -> Dword;
+    fn SetSecurityInfo(
+        handle: Handle,
+        object_type: u32,
+        security_info: Dword,
+        psid_owner: Handle,
+        psid_group: Handle,
+        p_dacl: Handle,
+        p_sacl: Handle,
+    ) -> Dword;
     fn SetEntriesInAclW(
         c_count_of_explicit_entries: u32,
         p_list_of_explicit_entries: *mut ExplicitAccessW,
@@ -473,17 +492,40 @@ impl AclRestore {
         if self.restored {
             return Ok(());
         }
-        // SAFETY: `path` is a NUL-terminated file path; `dacl` is from the saved SD.
-        let err = unsafe {
-            SetNamedSecurityInfoW(
-                self.path.as_mut_ptr(),
-                self.object_type,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                self.dacl,
-                ptr::null_mut(),
-            )
+        let err = if self.object_type == SE_KERNEL_OBJECT {
+            let name =
+                String::from_utf16_lossy(self.path.split(|c| *c == 0).next().unwrap_or(&self.path));
+            let Ok(dir) = open_object_directory(&name) else {
+                return Err(KernelError::Apply(
+                    "restore could not reopen the object directory".into(),
+                ));
+            };
+            let err = unsafe {
+                SetSecurityInfo(
+                    dir,
+                    SE_KERNEL_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    self.dacl,
+                    ptr::null_mut(),
+                )
+            };
+            unsafe { CloseHandle(dir) };
+            err
+        } else {
+            // SAFETY: `path` is a NUL-terminated file path; `dacl` is from the saved SD.
+            unsafe {
+                SetNamedSecurityInfoW(
+                    self.path.as_mut_ptr(),
+                    self.object_type,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    self.dacl,
+                    ptr::null_mut(),
+                )
+            }
         };
         if err != 0 {
             return Err(win32_error("restore DACL", err));
@@ -747,15 +789,8 @@ fn allow_session_object_create(sid: Handle) -> Result<Vec<AclRestore>, KernelErr
         | DIRECTORY_CREATE_OBJECT
         | DIRECTORY_CREATE_SUBDIRECTORY;
     let mut guards = Vec::new();
-    for path in object_namespace_dirs() {
-        match set_named_ace(
-            &path,
-            SE_KERNEL_OBJECT,
-            sid,
-            rights,
-            GRANT_ACCESS,
-            NO_INHERITANCE,
-        ) {
+    for name in object_namespace_names() {
+        match grant_directory_object(&name, sid, rights) {
             Ok(guard) => guards.push(guard),
             Err(err) => eprintln!("workpen: namespace ACE skipped: {err}"),
         }
@@ -763,21 +798,138 @@ fn allow_session_object_create(sid: Handle) -> Result<Vec<AclRestore>, KernelErr
     Ok(guards)
 }
 
-fn object_namespace_dirs() -> Vec<Vec<u16>> {
-    let mut names = vec![
-        r"\BaseNamedObjects".to_string(),
-        "BaseNamedObjects".to_string(),
-    ];
+fn object_namespace_names() -> Vec<String> {
+    let mut names = vec![r"\BaseNamedObjects".to_string()];
     let mut session = 0u32;
     let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
     if ok != 0 {
         names.push(format!("\\Sessions\\{session}\\BaseNamedObjects"));
-        names.push(format!("Sessions\\{session}\\BaseNamedObjects"));
     }
     names
-        .into_iter()
-        .map(|name| wide_os(OsStr::new(&name)))
-        .collect()
+}
+
+fn grant_directory_object(
+    name: &str,
+    sid: Handle,
+    rights: Dword,
+) -> Result<AclRestore, KernelError> {
+    let dir = open_object_directory(name)?;
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut sacl = ptr::null_mut();
+    let mut sd = ptr::null_mut();
+    let got = unsafe {
+        GetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    if got != 0 {
+        unsafe { CloseHandle(dir) };
+        return Err(win32_error("GetSecurityInfo", got));
+    }
+    let sd = LocalMem(sd);
+    let mut entry = ExplicitAccessW {
+        grf_access_permissions: rights,
+        grf_access_mode: GRANT_ACCESS,
+        grf_inheritance: NO_INHERITANCE,
+        trustee: TrusteeW {
+            p_multiple_trustee: ptr::null_mut(),
+            multiple_trustee_operation: NO_MULTIPLE_TRUSTEE,
+            trustee_form: TRUSTEE_IS_SID,
+            trustee_type: TRUSTEE_IS_WELL_KNOWN_GROUP,
+            ptstr_name: sid,
+        },
+    };
+    let mut new_acl = ptr::null_mut();
+    let set = unsafe { SetEntriesInAclW(1, &mut entry, dacl, &mut new_acl) };
+    if set != 0 {
+        unsafe { CloseHandle(dir) };
+        return Err(win32_error("SetEntriesInAclW", set));
+    }
+    let new_acl = LocalMem(new_acl);
+    let applied = unsafe {
+        SetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            new_acl.0,
+            ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(dir) };
+    if applied != 0 {
+        return Err(win32_error("SetSecurityInfo", applied));
+    }
+    Ok(AclRestore {
+        path: wide_os(OsStr::new(name)),
+        object_type: SE_KERNEL_OBJECT,
+        _sd: sd,
+        dacl,
+        restored: false,
+    })
+}
+
+#[repr(C)]
+struct UnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+#[repr(C)]
+struct ObjectAttributes {
+    length: u32,
+    root_directory: Handle,
+    object_name: *mut UnicodeString,
+    attributes: u32,
+    security_descriptor: *mut core::ffi::c_void,
+    security_quality_of_service: *mut core::ffi::c_void,
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtOpenDirectoryObject(
+        directory_handle: *mut Handle,
+        desired_access: u32,
+        object_attributes: *mut ObjectAttributes,
+    ) -> i32;
+}
+
+fn open_object_directory(name: &str) -> Result<Handle, KernelError> {
+    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
+    let mut us = UnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attrs = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: ptr::null_mut(),
+        object_name: &mut us,
+        attributes: 0x40,
+        security_descriptor: ptr::null_mut(),
+        security_quality_of_service: ptr::null_mut(),
+    };
+    let mut handle = ptr::null_mut();
+    // READ_CONTROL | WRITE_DAC. The DACL edit does not need directory create.
+    let status = unsafe { NtOpenDirectoryObject(&mut handle, 0x0006_0000, &mut attrs) };
+    if status != 0 || handle.is_null() {
+        return Err(KernelError::Apply(format!(
+            "NtOpenDirectoryObject {name} failed (ntstatus {status:#x})"
+        )));
+    }
+    Ok(handle)
 }
 
 /// Process-lifetime AppContainer for [`super::KernelPolicy::spawn_reexec`].
