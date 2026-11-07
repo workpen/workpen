@@ -1386,8 +1386,12 @@ fn start_map_holder(token: Handle) -> Result<MapHolder, KernelError> {
             ptr::null_mut(),
         )
     };
-    if read != 0 && got > 0 && buf[..got as usize].windows(2).any(|w| w == b"ok") {
-        saw_ok = true;
+    if read != 0 && got > 0 {
+        let said = String::from_utf8_lossy(&buf[..got as usize]);
+        eprintln!("workpen: msys holder said {said}");
+        if said.contains("ok") {
+            saw_ok = true;
+        }
     }
     if !saw_ok {
         let err = unsafe { GetLastError() };

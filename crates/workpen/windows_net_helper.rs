@@ -62,6 +62,24 @@ fn hold_map(name: Option<&OsString>) -> ExitCode {
         lp_security_descriptor: sd_ptr.cast(),
         b_inherit_handle: 0,
     };
+    let null_sd = unsafe {
+        CreateFileMappingW(
+            -1isize as *mut core::ffi::c_void,
+            std::ptr::null_mut(),
+            0x04,
+            0,
+            16 * 1024 * 1024,
+            wide.as_mut_ptr(),
+        )
+    };
+    let null_err = unsafe { GetLastError() };
+    eprintln!(
+        "workpen-net-helper: null-sd null={} err={null_err}",
+        null_sd.is_null()
+    );
+    if !null_sd.is_null() {
+        unsafe { CloseHandle(null_sd) };
+    }
     let handle = unsafe {
         CreateFileMappingW(
             -1isize as *mut core::ffi::c_void,
