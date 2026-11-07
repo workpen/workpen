@@ -74,6 +74,10 @@ const DIRECTORY_ALL_ACCESS: Dword = 0x000F_000F;
 const MSYS_DIR_WRITE_DAC: Dword = MSYS_DIR_ACCESS | 0x0004_0000;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const OBJ_OPENIF: u32 = 0x80;
+const OBJECT_INHERIT_ACE: Dword = 0x1;
+const CONTAINER_INHERIT_ACE: Dword = 0x2;
+const PAGE_READWRITE_PROT: Dword = 0x04;
+const SEC_COMMIT: Dword = 0x0800_0000;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
 const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003A_u32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
@@ -869,7 +873,7 @@ fn cached_blocked_profile(helper: &Path) -> Result<(Handle, bool), KernelError> 
 /// leaf already exists. [`allow_msys_shared_dirs`] grants the leaf.
 /// A missed ACE does not fail the spawn.
 fn allow_session_object_create(sid: Handle) -> Result<Vec<AclRestore>, KernelError> {
-    let rights = DIRECTORY_ALL_ACCESS | GENERIC_ALL;
+    let rights = DIRECTORY_ALL_ACCESS | SECTION_ALL_ACCESS | GENERIC_ALL;
     let mut guards = Vec::new();
     for name in object_namespace_names() {
         match grant_directory_object(&name, sid, rights) {
@@ -921,7 +925,9 @@ fn grant_directory_object(
     let mut entry = ExplicitAccessW {
         grf_access_permissions: rights,
         grf_access_mode: GRANT_ACCESS,
-        grf_inheritance: NO_INHERITANCE,
+        // `sec_none` creates the per-user section with no explicit DACL,
+        // so the section inherits this ACE. `shared.5` uses a null DACL.
+        grf_inheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
         trustee: TrusteeW {
             p_multiple_trustee: ptr::null_mut(),
             multiple_trustee_operation: NO_MULTIPLE_TRUSTEE,
@@ -995,6 +1001,15 @@ unsafe extern "system" {
         desired_access: u32,
         object_attributes: *mut ObjectAttributes,
     ) -> i32;
+    fn NtCreateSection(
+        section_handle: *mut Handle,
+        desired_access: u32,
+        object_attributes: *mut ObjectAttributes,
+        maximum_size: *mut i64,
+        section_page_protection: u32,
+        allocation_attributes: u32,
+        file_handle: Handle,
+    ) -> i32;
 }
 
 fn open_object_directory(name: &str) -> Result<Handle, KernelError> {
@@ -1011,7 +1026,12 @@ fn open_object_directory(name: &str) -> Result<Handle, KernelError> {
 /// Checkout's git has usually created that leaf already, with an
 /// Everyone ACE that does not name the restricted SID, so a grant on
 /// the parent directory still returns `0xC0000022`.
-fn allow_msys_shared_dirs(program: &Path, restricted: Handle, world: Handle) {
+fn allow_msys_shared_dirs(
+    program: &Path,
+    restricted: Handle,
+    world: Handle,
+    guards: &mut Vec<AclRestore>,
+) {
     let Some(dll) = msys_dll_beside(program) else {
         return;
     };
@@ -1039,7 +1059,26 @@ fn allow_msys_shared_dirs(program: &Path, restricted: Handle, world: Handle) {
     // DACL). Checkout already created `S-1-5-21-....1` without the
     // restricting SID. `shared.5` uses a null DACL and already opens.
     ensure_msys_shared_dir(r"\BaseNamedObjects\Restricted", restricted, world);
+    // Hold the inheritable ACE until the child exits. Dropping the
+    // guard here would restore the directory before CreateFileMapping.
+    for name in restricted_namespace_names() {
+        if let Ok(guard) =
+            grant_directory_object(&name, restricted, DIRECTORY_ALL_ACCESS | SECTION_ALL_ACCESS)
+        {
+            guards.push(guard);
+        }
+    }
     grant_user_shared_section(restricted);
+}
+
+fn restricted_namespace_names() -> Vec<String> {
+    let mut names = vec![r"\BaseNamedObjects\Restricted".to_string()];
+    let mut session = 0u32;
+    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+    if ok != 0 && session != 0 {
+        names.push(format!(r"\Sessions\{session}\BaseNamedObjects\Restricted"));
+    }
+    names
 }
 
 /// `user_info::create` maps `SID.USER_VERSION`. This MSYS build uses `.1`.
@@ -1089,33 +1128,107 @@ fn sid_to_string(sid: &[u8]) -> Result<String, KernelError> {
     Ok(text)
 }
 
-fn grant_existing_section(name: &str, restricted: Handle) {
-    match open_section_status(name, 0x0006_0000) {
-        Ok(section) => {
-            if let Err(err) = grant_sid_on_directory(section, restricted, SECTION_ALL_ACCESS) {
-                eprintln!("workpen: msys section ACE skipped: {name}: {err}");
-            }
-        }
+fn grant_existing_section(name: &str, _restricted: Handle) {
+    let section = match open_section_status(name, 0x0006_0000) {
+        Ok(section) => section,
         Err(status) if status == STATUS_ACCESS_DENIED => {
             if let Err(err) = take_section_ownership(name) {
                 eprintln!("workpen: msys section owner skipped: {name}: {err}");
                 return;
             }
             match open_section_status(name, 0x0006_0000) {
-                Ok(section) => {
-                    if let Err(err) =
-                        grant_sid_on_directory(section, restricted, SECTION_ALL_ACCESS)
-                    {
-                        eprintln!("workpen: msys section ACE skipped: {name}: {err}");
-                    }
-                }
+                Ok(section) => section,
                 Err(status) => {
                     eprintln!("workpen: msys section open skipped: {name} (ntstatus {status:#x})");
+                    return;
                 }
             }
         }
-        Err(_) => {}
+        Err(status)
+            if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND =>
+        {
+            match create_user_section(name) {
+                Ok(()) => return,
+                Err(err) => {
+                    eprintln!("workpen: msys section create skipped: {name}: {err}");
+                    return;
+                }
+            }
+        }
+        Err(status) => {
+            eprintln!("workpen: msys section open skipped: {name} (ntstatus {status:#x})");
+            return;
+        }
+    };
+    // A null DACL grants the restricting SID. The inherited directory
+    // ACE does not rewrite a section checkout already created.
+    let set = unsafe {
+        SetSecurityInfo(
+            section,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(section) };
+    if set != 0 {
+        eprintln!(
+            "workpen: msys section DACL skipped: {name}: {}",
+            win32_error("SetSecurityInfo", set)
+        );
     }
+}
+
+fn create_user_section(name: &str) -> Result<(), KernelError> {
+    let mut sd = [0u8; 64];
+    let ready = unsafe {
+        InitializeSecurityDescriptor(sd.as_mut_ptr(), 1) != 0
+            && SetSecurityDescriptorDacl(sd.as_mut_ptr(), 1, ptr::null_mut(), 0) != 0
+    };
+    if !ready {
+        return Err(last_error("null DACL for msys section"));
+    }
+    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
+    let mut us = UnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attrs = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: ptr::null_mut(),
+        object_name: &mut us,
+        attributes: OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
+        security_descriptor: sd.as_mut_ptr().cast(),
+        security_quality_of_service: ptr::null_mut(),
+    };
+    // Larger than MSYS `user_info`. A smaller existing mapping is opened
+    // below and given a null DACL instead of being replaced.
+    let mut size: i64 = 4 * 1024 * 1024;
+    let mut handle = ptr::null_mut();
+    // SAFETY: `sd`, `us`, `wide`, and `size` live for the call.
+    let status = unsafe {
+        NtCreateSection(
+            &mut handle,
+            SECTION_ALL_ACCESS,
+            &mut attrs,
+            &mut size,
+            PAGE_READWRITE_PROT,
+            SEC_COMMIT,
+            ptr::null_mut(),
+        )
+    };
+    if status != 0 || handle.is_null() {
+        return Err(KernelError::Apply(format!(
+            "NtCreateSection {name} failed (ntstatus {status:#x})"
+        )));
+    }
+    unsafe { CloseHandle(handle) };
+    Ok(())
 }
 
 fn open_section_status(name: &str, access: u32) -> Result<Handle, i32> {
@@ -2117,7 +2230,12 @@ fn spawn_prepared_child(
         None => command_line(cmd)?,
     };
     if let Ok(program) = resolve_program(cmd.get_program()) {
-        allow_msys_shared_dirs(&program, prepared._sid.0, prepared._world.0);
+        allow_msys_shared_dirs(
+            &program,
+            prepared._sid.0,
+            prepared._world.0,
+            &mut prepared.acl_guards,
+        );
     }
     let mut env_block = environment_block(cmd);
     let std_in = inheritable_std_handle(STD_INPUT_HANDLE, false)?;
