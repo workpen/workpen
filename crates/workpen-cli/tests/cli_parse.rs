@@ -1681,6 +1681,80 @@ fn policy_prints_jail_without_secret_bytes() {
     assert!(!text.contains("SECRET"));
 }
 
+#[cfg(unix)]
+#[test]
+fn run_refuses_a_symlink_that_why_refuses() {
+    let dir = TempDir::new().expect("workspace");
+    std::os::unix::fs::symlink("/etc/passwd", dir.path().join("passwd")).expect("symlink");
+    let why = workpen()
+        .args(["why", "--root"])
+        .arg(dir.path())
+        .arg("passwd")
+        .output()
+        .expect("why");
+    let why_out = String::from_utf8_lossy(&why.stdout);
+    assert_eq!(why.status.code(), Some(1), "{why_out}");
+    assert!(
+        why_out.contains("symlink that leaves the workspace"),
+        "{why_out}"
+    );
+    let run = workpen()
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--", "/bin/cat", "passwd"])
+        .output()
+        .expect("run");
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(
+        run.status.code(),
+        Some(3),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        stdout.is_empty(),
+        "cat must not print the symlink target: {stdout}"
+    );
+    assert!(
+        stderr.contains("symlink that leaves the workspace"),
+        "{stderr}"
+    );
+    let shell = workpen()
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--", "/bin/bash", "-c", "cat passwd"])
+        .output()
+        .expect("shell");
+    let shell_out = String::from_utf8_lossy(&shell.stdout);
+    let shell_err = String::from_utf8_lossy(&shell.stderr);
+    assert_eq!(
+        shell.status.code(),
+        Some(3),
+        "stdout={shell_out} stderr={shell_err}"
+    );
+    assert!(shell_out.is_empty(), "{shell_out}");
+    assert!(
+        shell_err.contains("symlink that leaves the workspace"),
+        "{shell_err}"
+    );
+    let direct = workpen()
+        .args(["run", "--root"])
+        .arg(dir.path())
+        .args(["--", "/bin/cat", "/etc/passwd"])
+        .output()
+        .expect("direct");
+    assert_eq!(
+        direct.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&direct.stderr)
+    );
+    assert!(
+        !direct.stdout.is_empty(),
+        "absolute system path stays readable"
+    );
+}
+
 #[test]
 fn policy_json_formats_a_dest_deny() {
     let dir = TempDir::new().expect("workspace");
