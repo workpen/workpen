@@ -452,7 +452,6 @@ unsafe extern "system" {
     ) -> Bool;
     fn GetLengthSid(sid: Handle) -> Dword;
     fn CopySid(len: Dword, dest: *mut u8, src: Handle) -> Bool;
-    fn ConvertSidToStringSidW(sid: Handle, string_sid: *mut *mut u16) -> Bool;
 }
 
 #[link(name = "kernel32")]
@@ -691,20 +690,7 @@ struct Prepared {
     _world: WorldSid,
     helper: Option<PathBuf>,
     _net: Option<NetGuards>,
-    sid_holder: Option<SidHolder>,
     wfp_skipped: bool,
-}
-
-struct SidHolder {
-    _helper: windows_net::HelperFile,
-    process: CloseOnDrop,
-    _stdin: CloseOnDrop,
-}
-
-impl Drop for SidHolder {
-    fn drop(&mut self) {
-        unsafe { TerminateProcess(self.process.0, 0) };
-    }
 }
 
 struct NetGuards {
@@ -796,7 +782,6 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
         _world: world,
         helper: None,
         _net: None,
-        sid_holder: None,
         wfp_skipped: false,
     })
 }
@@ -2173,170 +2158,6 @@ fn spawn_prepared(
     }
 }
 
-static MAP_PROBE_DONE: AtomicBool = AtomicBool::new(false);
-
-fn user_sid_mapping_name(token: Handle) -> Option<String> {
-    let sid = token_user_sid(token).ok()?;
-    let mut wide = ptr::null_mut();
-    let ok = unsafe { ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut wide) };
-    if ok == 0 || wide.is_null() {
-        return None;
-    }
-    let mut len = 0usize;
-    while unsafe { *wide.add(len) } != 0 && len < 256 {
-        len += 1;
-    }
-    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
-    unsafe { LocalFree(wide.cast()) };
-    Some(format!("{text}.1"))
-}
-
-fn probe_mapping_shapes(prepared: &mut Prepared, program: &Path) {
-    if msys_dll_beside(program).is_none() || MAP_PROBE_DONE.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    let Ok(helper) = windows_net::HelperFile::install(&std::env::temp_dir()) else {
-        eprintln!("workpen: map probe helper skipped");
-        return;
-    };
-    let mut cmd = Command::new(helper.path());
-    cmd.arg("--sec-probe");
-    if let Some(name) = user_sid_mapping_name(prepared.token.0) {
-        cmd.arg(name);
-    }
-    match spawn_prepared_child(
-        prepared,
-        &mut cmd,
-        Some(Duration::from_secs(20)),
-        StdioCapture::Collect,
-    ) {
-        Ok((_, _, Some(output), _)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("workpen: map probe {stderr}");
-        }
-        Ok((_, status, _, _)) => eprintln!("workpen: map probe status={status}"),
-        Err(err) => eprintln!("workpen: map probe failed: {err}"),
-    }
-}
-
-fn start_sid_holder(prepared: &mut Prepared, program: &Path) {
-    if prepared.sid_holder.is_some() || msys_dll_beside(program).is_none() {
-        return;
-    }
-    let Some(name) = user_sid_mapping_name(prepared.token.0) else {
-        return;
-    };
-    let Ok(helper) = windows_net::HelperFile::install(&std::env::temp_dir()) else {
-        eprintln!("workpen: sid holder helper skipped");
-        return;
-    };
-    let mut cmd = Command::new(helper.path());
-    cmd.arg("--hold-sid");
-    cmd.arg(&name);
-    let Ok((app, mut cmdline, cwd)) = command_line(&cmd) else {
-        return;
-    };
-    let mut env_block = environment_block(&mut cmd);
-    let Ok((child_in, parent_in)) = inheritable_pipe(false) else {
-        return;
-    };
-    let Some(parent_in) = parent_in else {
-        return;
-    };
-    let Ok((child_out, parent_out)) = inheritable_pipe(true) else {
-        return;
-    };
-    let Some(parent_out) = parent_out else {
-        return;
-    };
-    let mut startup = StartupInfoW {
-        cb: std::mem::size_of::<StartupInfoW>() as Dword,
-        lp_reserved: ptr::null_mut(),
-        lp_desktop: ptr::null_mut(),
-        lp_title: ptr::null_mut(),
-        dw_x: 0,
-        dw_y: 0,
-        dw_x_size: 0,
-        dw_y_size: 0,
-        dw_x_count_chars: 0,
-        dw_y_count_chars: 0,
-        dw_fill_attribute: 0,
-        dw_flags: STARTF_USESTDHANDLES,
-        w_show_window: 0,
-        cb_reserved2: 0,
-        lp_reserved2: ptr::null_mut(),
-        h_std_input: child_in.0,
-        h_std_output: child_out.0,
-        h_std_error: child_out.0,
-    };
-    let mut info = ProcessInformation {
-        h_process: ptr::null_mut(),
-        h_thread: ptr::null_mut(),
-        dw_process_id: 0,
-        dw_thread_id: 0,
-    };
-    let cwd_ptr = cwd.as_ref().map_or(ptr::null(), |c| c.as_ptr());
-    let created = unsafe {
-        CreateProcessAsUserW(
-            prepared.token.0,
-            app.as_ptr(),
-            cmdline.as_mut_ptr(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            1,
-            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
-            env_block.as_mut_ptr().cast(),
-            cwd_ptr,
-            &mut startup,
-            &mut info,
-        )
-    };
-    drop((child_in, child_out));
-    if created == 0 {
-        eprintln!("workpen: sid holder create failed");
-        return;
-    }
-    let process = CloseOnDrop(info.h_process);
-    let thread = CloseOnDrop(info.h_thread);
-    if unsafe { AssignProcessToJobObject(prepared.job.0, process.0) } == 0 {
-        eprintln!("workpen: sid holder job assign failed");
-    }
-    if let Err(err) = lock_suspended_token(process.0, prepared._sid.0) {
-        eprintln!("workpen: sid holder lock failed: {err}");
-        unsafe { TerminateProcess(process.0, 1) };
-        return;
-    }
-    if unsafe { ResumeThread(thread.0) } == u32::MAX {
-        eprintln!("workpen: sid holder resume failed");
-        unsafe { TerminateProcess(process.0, 1) };
-        return;
-    }
-    let mut got = Vec::new();
-    let mut buf = [0u8; 256];
-    while !got.windows(5).any(|chunk| chunk == b"READY") && got.len() < 16384 {
-        let mut n = 0u32;
-        let ok = unsafe {
-            ReadFile(
-                parent_out.0,
-                buf.as_mut_ptr().cast(),
-                buf.len() as Dword,
-                &mut n,
-                ptr::null_mut(),
-            )
-        };
-        if ok == 0 || n == 0 {
-            break;
-        }
-        got.extend_from_slice(&buf[..n as usize]);
-    }
-    eprintln!("workpen: sid holder {}", String::from_utf8_lossy(&got));
-    prepared.sid_holder = Some(SidHolder {
-        _helper: helper,
-        process,
-        _stdin: parent_in,
-    });
-}
-
 fn spawn_prepared_child(
     prepared: &mut Prepared,
     cmd: &mut Command,
@@ -2355,8 +2176,6 @@ fn spawn_prepared_child(
             prepared.token.0,
             &mut prepared.acl_guards,
         );
-        probe_mapping_shapes(prepared, &program);
-        start_sid_holder(prepared, &program);
     }
     let mut env_block = environment_block(cmd);
     let std_in = inheritable_std_handle(STD_INPUT_HANDLE, false)?;
@@ -2479,6 +2298,16 @@ fn spawn_prepared_child(
     // CreateProcessAsUser duplicates the token. Lock that copy, not the
     // handle we passed in, or MSYS still replaces the default DACL.
     if let Err(err) = lock_suspended_token(process.0, prepared._sid.0) {
+        unsafe {
+            TerminateProcess(process.0, 1);
+        }
+        let _ = join_drain(stdout_drain);
+        let _ = join_drain(stderr_drain);
+        join_copy(stdout_fwd);
+        join_copy(stderr_fwd);
+        return Err(err);
+    }
+    if let Err(err) = deny_process_write_dac(process.0) {
         unsafe {
             TerminateProcess(process.0, 1);
         }
@@ -3138,6 +2967,42 @@ fn deny_token_adjust_default(token: Handle) -> Result<(), KernelError> {
     };
     if set != 0 {
         return Err(win32_error("SetSecurityInfo token", set));
+    }
+    Ok(())
+}
+
+fn deny_process_write_dac(process: Handle) -> Result<(), KernelError> {
+    // MSYS replaces the process DACL with `sec_user`, which has no
+    // S-1-5-12. `shared.5` still opens because that call passes an
+    // explicit null DACL. `sec_none` does not. Deny WRITE_DAC so the
+    // replacement fails and MSYS continues.
+    let user = current_user_sid()?;
+    let world = WorldSid::new().map_err(|_| KernelError::Apply("world SID".into()))?;
+    let mut acl_words = vec![0u32; 64];
+    let acl = acl_words.as_mut_ptr().cast::<u8>();
+    let deny = 0x0004_0000u32;
+    let allow = 0x001F_FFFF & !deny;
+    let ready = unsafe {
+        InitializeAcl(acl, (acl_words.len() * 4) as Dword, 2) != 0
+            && AddAccessDeniedAce(acl, 2, deny, world.0) != 0
+            && AddAccessAllowedAce(acl, 2, allow, user.as_ptr().cast_mut().cast()) != 0
+    };
+    if !ready {
+        return Err(last_error("process DACL"));
+    }
+    let set = unsafe {
+        SetSecurityInfo(
+            process,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            acl.cast(),
+            ptr::null_mut(),
+        )
+    };
+    if set != 0 {
+        return Err(win32_error("SetSecurityInfo process", set));
     }
     Ok(())
 }

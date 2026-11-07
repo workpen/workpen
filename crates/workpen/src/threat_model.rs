@@ -74,8 +74,9 @@
 //!   DACL for the per-user section `SID.1`. The jail grants
 //!   `GENERIC_ALL` to the user, Everyone, and `S-1-5-12` on that
 //!   DACL and, while the child is suspended, denies
-//!   `TOKEN_ADJUST_DEFAULT` so MSYS cannot replace it. The
-//!   `Restricted` namespace directory is given a null DACL for
+//!   `TOKEN_ADJUST_DEFAULT` so MSYS cannot replace it, and denies
+//!   `WRITE_DAC` on the process so MSYS cannot replace the process
+//!   DACL. The `Restricted` namespace directory is given a null DACL for
 //!   the child so inheritance cannot omit `S-1-5-12`. A write
 //!   outside the ReadWrite grant still fails.
 //! * The workspace jail scanned the user profile. It denies `.ssh`,
