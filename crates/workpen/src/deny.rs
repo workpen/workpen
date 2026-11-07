@@ -824,24 +824,31 @@ fn is_shell_c_cluster(rest: &str) -> bool {
 /// A non-flag `NAME=value` dest-denies the value. Does not dest-deny a
 /// flattened join of all argv. Does not dest-deny a following separate
 /// token unless that token is already a raw dest.
+/// A relative token that is a symlink out of the workspace is refused,
+/// the same way `why` refuses it. Absolute tokens stay on dest-deny
+/// only, so `/bin/cat` and `/etc/passwd` are unchanged.
 pub fn check_command_argv(
     cmd: &[impl AsRef<str>],
     root: &Path,
     policy: &DenyPolicy,
 ) -> Result<(), CheckDestError> {
+    let guard = workspace_guard(root);
     for (i, token) in cmd.iter().enumerate() {
         let token = token.as_ref();
         if !token.is_empty() && !token.starts_with('-') {
             let dest = dest_under_root(root, token);
             check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
+            refuse_relative_symlink(guard.as_ref(), token)?;
             if let Some(value) = assignment_dest_value(token) {
                 let dest = dest_under_root(root, value);
                 check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
+                refuse_relative_symlink(guard.as_ref(), value)?;
             }
         }
         if let Some(value) = attached_flag_dest(token) {
             let dest = dest_under_root(root, value);
             check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
+            refuse_relative_symlink(guard.as_ref(), value)?;
         }
         if let Some(body) = shell_c_body(token, cmd.get(i + 1).map(|s| s.as_ref())) {
             check_command_dests(body, root, policy)?;
@@ -1040,8 +1047,8 @@ fn check_cmd_powershell_remaining_dests(
             {
                 refuse_powershell_stdin_dash(path)?;
                 let dest = dest_under_root(root, path);
-                return check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))
-                    .map(|_| ());
+                check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
+                return refuse_relative_symlink(workspace_guard(root).as_ref(), path);
             }
             if let Some(body) =
                 powershell_command_body(token.as_ref(), rest.get(j + 1).map(|s| s.as_ref()))
@@ -1462,7 +1469,37 @@ fn check_env_named_operand(
 
 fn check_env_file_dest(path: &str, root: &Path, policy: &DenyPolicy) -> Result<(), CheckDestError> {
     let dest = dest_under_root(root, path);
-    check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root)).map(|_| ())
+    check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
+    refuse_relative_symlink(workspace_guard(root).as_ref(), path)
+}
+
+fn workspace_guard(root: &Path) -> Option<PathGuard> {
+    PathGuard::with_extra_roots(root, std::iter::empty::<&Path>()).ok()
+}
+
+/// Relative argv dests use the same symlink rule as `why`.
+/// Absolute program paths are not workspace dests.
+fn refuse_relative_symlink(guard: Option<&PathGuard>, token: &str) -> Result<(), CheckDestError> {
+    let Some(guard) = guard else {
+        return Ok(());
+    };
+    // `/bin/cat` is absolute on Unix. On Windows `Path::is_absolute`
+    // is false for `/bin/cat` and for `cmd /c`, so a leading slash
+    // or backslash is also not a workspace-relative dest.
+    let lead = token.as_bytes().first().copied();
+    if token.is_empty() || Path::new(token).is_absolute() || matches!(lead, Some(b'/' | b'\\')) {
+        return Ok(());
+    }
+    // `NUL` and `CON` are devices. `check_dest` already classified them.
+    #[cfg(windows)]
+    if windows_device_kind(token).is_some() {
+        return Ok(());
+    }
+    match guard.check(Path::new(token)) {
+        Ok(_) => Ok(()),
+        Err(err @ PathGuardError::Denied(_)) => Err(err.into()),
+        Err(_) => Ok(()),
+    }
 }
 
 /// Join extracted command dests under `root` and dest-deny each.
@@ -1478,6 +1515,7 @@ pub fn check_command_dests(
     root: &Path,
     policy: &DenyPolicy,
 ) -> Result<(), CheckDestError> {
+    let guard = workspace_guard(root);
     for (_display, candidate) in command_path_tokens(command) {
         for peeled in peel_shell_parts(&candidate) {
             if peeled.is_empty() {
@@ -1486,6 +1524,7 @@ pub fn check_command_dests(
             if let Some(value) = attached_flag_dest(peeled) {
                 let dest = dest_under_root(root, value);
                 check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
+                refuse_relative_symlink(guard.as_ref(), value)?;
                 continue;
             }
             if peeled.starts_with('-') {
@@ -1493,9 +1532,11 @@ pub fn check_command_dests(
             }
             let dest = dest_under_root(root, peeled);
             check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
+            refuse_relative_symlink(guard.as_ref(), peeled)?;
             if let Some(value) = assignment_dest_value(peeled) {
                 let dest = dest_under_root(root, value);
                 check_dest_rooted(&dest.to_string_lossy(), policy, None, Some(root))?;
+                refuse_relative_symlink(guard.as_ref(), value)?;
             }
         }
     }
