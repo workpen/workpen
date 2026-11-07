@@ -451,6 +451,7 @@ unsafe extern "system" {
     ) -> Bool;
     fn GetLengthSid(sid: Handle) -> Dword;
     fn CopySid(len: Dword, dest: *mut u8, src: Handle) -> Bool;
+    fn ConvertSidToStringSidW(sid: Handle, string_sid: *mut *mut u16) -> Bool;
 }
 
 #[link(name = "kernel32")]
@@ -685,6 +686,7 @@ struct Prepared {
     token: CloseOnDrop,
     job: CloseOnDrop,
     acl_guards: Vec<AclRestore>,
+    map_holder: Option<MapHolder>,
     _sid: RestrictedSid,
     _world: WorldSid,
     helper: Option<PathBuf>,
@@ -777,6 +779,7 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
         token,
         job,
         acl_guards,
+        map_holder: None,
         _sid: sid,
         _world: world,
         helper: None,
@@ -1093,6 +1096,7 @@ fn allow_msys_shared_dirs(
     world: Handle,
     token: Handle,
     guards: &mut Vec<AclRestore>,
+    holder: &mut Option<MapHolder>,
 ) {
     let Some(dll) = msys_dll_beside(program) else {
         return;
@@ -1136,7 +1140,11 @@ fn allow_msys_shared_dirs(
     // Do not pre-create SID.1. A section left behind with a DACL the
     // child cannot open makes CreateFileMapping fail instead of
     // creating one from the null default DACL.
-    let _ = (restricted, world, token);
+    let _ = (restricted, world);
+    match start_map_holder(token) {
+        Ok(started) => *holder = Some(started),
+        Err(err) => eprintln!("workpen: msys map holder skipped: {err}"),
+    }
 }
 
 fn probe_directory_create(token: Handle, name: &str) {
@@ -1168,6 +1176,121 @@ fn restricted_namespace_names() -> Vec<String> {
         names.push(format!(r"\Sessions\{session}\BaseNamedObjects\Restricted"));
     }
     names
+}
+
+struct MapHolder {
+    process: CloseOnDrop,
+    _thread: CloseOnDrop,
+    _stdin_write: CloseOnDrop,
+    _exe: windows_net::HelperFile,
+}
+
+impl Drop for MapHolder {
+    fn drop(&mut self) {
+        unsafe { TerminateProcess(self.process.0, 1) };
+    }
+}
+
+fn start_map_holder(token: Handle) -> Result<MapHolder, KernelError> {
+    let sid = current_user_sid()?;
+    let name = format!("{}.1", sid_to_string(&sid)?);
+    let exe = windows_net::HelperFile::install(&std::env::temp_dir())?;
+    let mut cmdline = wide_os(OsStr::new(&format!(
+        "\"{}\" --hold-map {name}",
+        exe.path().display()
+    )));
+    let app = wide_path(exe.path());
+    let (stdin_read, stdin_write) = inheritable_pipe(false)?;
+    let stdin_write = stdin_write.ok_or_else(|| KernelError::Apply("stdin pipe".into()))?;
+    let (stdout_write, stdout_read) = inheritable_pipe(true)?;
+    let stdout_read = stdout_read.ok_or_else(|| KernelError::Apply("stdout pipe".into()))?;
+    let mut startup = StartupInfoW {
+        cb: std::mem::size_of::<StartupInfoW>() as Dword,
+        lp_reserved: ptr::null_mut(),
+        lp_desktop: ptr::null_mut(),
+        lp_title: ptr::null_mut(),
+        dw_x: 0,
+        dw_y: 0,
+        dw_x_size: 0,
+        dw_y_size: 0,
+        dw_x_count_chars: 0,
+        dw_y_count_chars: 0,
+        dw_fill_attribute: 0,
+        dw_flags: STARTF_USESTDHANDLES,
+        w_show_window: 0,
+        cb_reserved2: 0,
+        lp_reserved2: ptr::null_mut(),
+        h_std_input: stdin_read.0,
+        h_std_output: stdout_write.0,
+        h_std_error: stdout_write.0,
+    };
+    let mut info = ProcessInformation {
+        h_process: ptr::null_mut(),
+        h_thread: ptr::null_mut(),
+        dw_process_id: 0,
+        dw_thread_id: 0,
+    };
+    let created = unsafe {
+        CreateProcessAsUserW(
+            token,
+            app.as_ptr(),
+            cmdline.as_mut_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            1,
+            0,
+            ptr::null_mut(),
+            ptr::null(),
+            &mut startup,
+            &mut info,
+        )
+    };
+    drop((stdin_read, stdout_write));
+    if created == 0 {
+        return Err(last_error("CreateProcessAsUserW map holder"));
+    }
+    let process = CloseOnDrop(info.h_process);
+    let thread = CloseOnDrop(info.h_thread);
+    let mut saw_ok = false;
+    let mut buf = [0u8; 64];
+    let mut got = 0u32;
+    let read = unsafe {
+        ReadFile(
+            stdout_read.0,
+            buf.as_mut_ptr(),
+            buf.len() as Dword,
+            &mut got,
+            ptr::null_mut(),
+        )
+    };
+    if read != 0 && got > 0 && buf[..got as usize].windows(2).any(|w| w == b"ok") {
+        saw_ok = true;
+    }
+    if !saw_ok {
+        let err = unsafe { GetLastError() };
+        eprintln!("workpen: msys map holder did not report ok (win32 {err})");
+    }
+    Ok(MapHolder {
+        process,
+        _thread: thread,
+        _stdin_write: stdin_write,
+        _exe: exe,
+    })
+}
+
+fn sid_to_string(sid: &[u8]) -> Result<String, KernelError> {
+    let mut wide = ptr::null_mut();
+    let ok = unsafe { ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut wide) };
+    if ok == 0 || wide.is_null() {
+        return Err(last_error("ConvertSidToStringSidW"));
+    }
+    let mut len = 0usize;
+    while unsafe { *wide.add(len) } != 0 && len < 256 {
+        len += 1;
+    }
+    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
+    unsafe { LocalFree(wide.cast()) };
+    Ok(text)
 }
 
 fn msys_dll_beside(program: &Path) -> Option<PathBuf> {
@@ -2110,6 +2233,7 @@ fn spawn_prepared_child(
             prepared._world.0,
             prepared.token.0,
             &mut prepared.acl_guards,
+            &mut prepared.map_holder,
         );
     }
     let mut env_block = environment_block(cmd);
