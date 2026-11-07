@@ -48,10 +48,6 @@ const SE_FILE_OBJECT: u32 = 1;
 const DACL_SECURITY_INFORMATION: Dword = 0x4;
 const CREATE_SUSPENDED: Dword = 0x0000_0004;
 const CREATE_UNICODE_ENVIRONMENT: Dword = 0x0000_0400;
-const DEBUG_PROCESS: Dword = 0x0000_0001;
-const DEBUG_ONLY_THIS_PROCESS: Dword = 0x0000_0100;
-const DBG_CONTINUE: Dword = 0x0001_0002;
-const DBG_EXCEPTION_NOT_HANDLED: Dword = 0x8001_0001;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: Dword = 0x2000;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
 const JOB_OBJECT_BASIC_UI_RESTRICTIONS: u32 = 4;
@@ -301,16 +297,6 @@ unsafe extern "system" {
         lp_pipe_attributes: *mut SecurityAttributes,
         n_size: Dword,
     ) -> Bool;
-    fn WaitForDebugEvent(lp_debug_event: *mut u8, dw_milliseconds: Dword) -> Bool;
-    fn ContinueDebugEvent(
-        dw_process_id: Dword,
-        dw_thread_id: Dword,
-        dw_continue_status: Dword,
-    ) -> Bool;
-    fn DebugActiveProcessStop(dw_process_id: Dword) -> Bool;
-    fn OpenThread(dw_desired_access: Dword, b_inherit_handle: Bool, dw_thread_id: Dword) -> Handle;
-    fn GetThreadContext(h_thread: Handle, lp_context: *mut u8) -> Bool;
-    fn SetThreadContext(h_thread: Handle, lp_context: *const u8) -> Bool;
     fn ReadProcessMemory(
         h_process: Handle,
         lp_base_address: *const core::ffi::c_void,
@@ -1449,129 +1435,91 @@ fn grant_npfs_inherit_inner(file: Handle, sid: Handle) -> Result<Option<AclResto
     }))
 }
 
-struct DebugSession(u32);
-impl Drop for DebugSession {
-    fn drop(&mut self) {
-        unsafe {
-            DebugActiveProcessStop(self.0);
-        }
-    }
-}
-
-#[repr(C, align(16))]
-struct ThreadContext([u8; 1232]);
-
-/// True when the wait timed out.
-fn pump_msys_pipe_debug(process: Handle, _pid: Dword, restricted: Handle, wait_ms: Dword) -> bool {
-    let sa = match remote_pipe_sa(process, restricted) {
-        Ok(sa) => sa,
-        Err(err) => {
-            eprintln!("workpen: pipe hook sd skipped: {err}");
-            ptr::null_mut()
-        }
+/// `sec_user` does not name `S-1-5-12`, and the write end of the signal
+/// pipe is opened with `GENERIC_WRITE`. Replace the descriptor on every
+/// `NtCreateNamedPipeFile` in this process. ntdll is mapped before
+/// `DllMain`, so the patch is visible to `sigproc_init`.
+fn install_ntdll_pipe_hook(process: Handle, restricted: Handle) -> Result<(), KernelError> {
+    let stub = ntdll_export(b"NtCreateNamedPipeFile\0")?;
+    let mut head = [0u8; 8];
+    let read = unsafe {
+        ReadProcessMemory(
+            process,
+            stub.cast(),
+            head.as_mut_ptr(),
+            head.len(),
+            ptr::null_mut(),
+        )
     };
-    let export = create_named_pipe_export();
-    let mut original = 0u8;
-    let mut armed = false;
-    let mut stepping = false;
-    let mut hits = 0u32;
-    let mut logged_other = false;
-    let started = std::time::Instant::now();
-    let finite = wait_ms != INFINITE;
-    loop {
-        if finite && started.elapsed().as_millis() >= u128::from(wait_ms) {
-            eprintln!("workpen: pipe hook hits={hits}");
-            return true;
-        }
-        let mut event = [0u8; 1024];
-        let slice = if finite {
-            let left = u128::from(wait_ms).saturating_sub(started.elapsed().as_millis());
-            u32::try_from(left.min(1000)).unwrap_or(1000).max(1)
-        } else {
-            1000
-        };
-        if unsafe { WaitForDebugEvent(event.as_mut_ptr(), slice) } == 0 {
-            continue;
-        }
-        let code = event_u32(&event, 0);
-        let event_pid = event_u32(&event, 4);
-        let tid = event_u32(&event, 8);
-        let mut status = DBG_CONTINUE;
-        if code == 6 || code == 3 {
-            close_debug_handle(event_u64(&event, 16));
-            if code == 3 {
-                close_debug_handle(event_u64(&event, 24));
-                close_debug_handle(event_u64(&event, 32));
-            }
-        }
-        if !armed && !stepping && !export.is_null() && !sa.is_null() {
-            let mut byte = 0u8;
-            let readable =
-                unsafe { ReadProcessMemory(process, export.cast(), &mut byte, 1, ptr::null_mut()) };
-            if readable != 0 {
-                original = byte;
-                if write_byte(process, export, 0xCC) {
-                    armed = true;
-                    eprintln!("workpen: pipe hook armed");
-                }
-            }
-        }
-        if code == 1 {
-            let address = event_u64(&event, 32);
-            let break_at = export as u64;
-            if stepping && event_u32(&event, 16) == 0x8000_0004 {
-                if write_byte(process, export, 0xCC) {
-                    armed = true;
-                }
-                stepping = false;
-            } else if armed && (address == break_at || address == break_at.wrapping_add(1)) {
-                hits += 1;
-                if patch_pipe_argument(process, tid, export, original, sa) {
-                    stepping = true;
-                    armed = false;
-                } else {
-                    let _ = write_byte(process, export, original);
-                    armed = false;
-                    eprintln!("workpen: pipe hook patch failed");
-                }
-            } else if event_u32(&event, 16) == 0x8000_0003 {
-                if !logged_other {
-                    eprintln!("workpen: pipe hook other {address:#x} ours={break_at:#x}");
-                    logged_other = true;
-                }
-            } else {
-                status = DBG_EXCEPTION_NOT_HANDLED;
-            }
-        }
-        if unsafe { ContinueDebugEvent(event_pid, tid, status) } == 0 {
-            eprintln!("workpen: pipe hook hits={hits}");
-            return false;
-        }
-        if code == 5 {
-            eprintln!("workpen: pipe hook hits={hits}");
-            return false;
-        }
+    if read == 0 {
+        return Err(last_error("ReadProcessMemory ntdll"));
     }
+    if head[0..4] != [0x4C, 0x8B, 0xD1, 0xB8] {
+        return Err(KernelError::Apply(format!(
+            "NtCreateNamedPipeFile stub {:02x?}",
+            &head[..]
+        )));
+    }
+    let syscall = u32::from_le_bytes(head[4..8].try_into().unwrap());
+    let sd = remote_user_and_restricted_sd(process, restricted)?;
+    let cave = alloc_hook_cave(process, stub as usize);
+    if cave.is_null() {
+        return Err(last_error("VirtualAllocEx near ntdll"));
+    }
+    let code = pipe_hook_shellcode(sd as u64, syscall);
+    if !write_remote(process, cave, &code) {
+        return Err(last_error("WriteProcessMemory shellcode"));
+    }
+    let rel = (cave as isize).wrapping_sub(stub as isize + 5);
+    let rel = i32::try_from(rel)
+        .map_err(|_| KernelError::Apply("pipe hook cave is out of rel32 range".to_string()))?;
+    let mut patch = vec![0xE9];
+    patch.extend_from_slice(&rel.to_le_bytes());
+    if !write_remote(process, stub.cast(), &patch) {
+        return Err(last_error("WriteProcessMemory ntdll stub"));
+    }
+    eprintln!("workpen: pipe hook ntdll syscall={syscall}");
+    Ok(())
 }
 
-fn create_named_pipe_export() -> *mut u8 {
-    let module_name = wide_os(OsStr::new("kernel32.dll"));
+fn ntdll_export(name: &[u8]) -> Result<*mut u8, KernelError> {
+    let module_name = wide_os(OsStr::new("ntdll.dll"));
     let module = unsafe { GetModuleHandleW(module_name.as_ptr()) };
     if module.is_null() {
-        return ptr::null_mut();
+        return Err(last_error("GetModuleHandleW ntdll"));
     }
-    let name = b"CreateNamedPipeW\0";
-    unsafe { GetProcAddress(module, name.as_ptr()).cast() }
+    let addr = unsafe { GetProcAddress(module, name.as_ptr()) };
+    if addr.is_null() {
+        return Err(last_error("GetProcAddress NtCreateNamedPipeFile"));
+    }
+    Ok(addr.cast())
 }
 
-fn remote_pipe_sa(
+fn pipe_hook_shellcode(sd: u64, syscall: u32) -> Vec<u8> {
+    let mut code = vec![
+        0x4D, 0x85, 0xC0, // test r8, r8
+        0x74, 0x0E, // jz to the syscall setup
+        0x48, 0xB8, // mov rax, imm64
+    ];
+    code.extend_from_slice(&sd.to_le_bytes());
+    code.extend_from_slice(&[
+        0x49, 0x89, 0x40, 0x20, // mov [r8+20h], rax
+        0x4C, 0x8B, 0xD1, // mov r10, rcx
+        0xB8, // mov eax, imm32
+    ]);
+    code.extend_from_slice(&syscall.to_le_bytes());
+    code.extend_from_slice(&[0x0F, 0x05, 0xC3]); // syscall; ret
+    code
+}
+
+fn remote_user_and_restricted_sd(
     process: Handle,
     restricted: Handle,
 ) -> Result<*mut core::ffi::c_void, KernelError> {
     let user = current_user_sid()?;
     let remote = unsafe { VirtualAllocEx(process, ptr::null_mut(), 512, 0x3000, 0x04) };
     if remote.is_null() {
-        return Err(last_error("VirtualAllocEx"));
+        return Err(last_error("VirtualAllocEx security descriptor"));
     }
     let mut buf = vec![0u8; 512];
     let sd = buf.as_mut_ptr();
@@ -1591,99 +1539,45 @@ fn remote_pipe_sa(
     if !ready {
         return Err(last_error("pipe security descriptor"));
     }
-    let remote_acl = unsafe { remote.add(64) };
     unsafe {
         sd.add(32)
             .cast::<*mut core::ffi::c_void>()
-            .write(remote_acl);
+            .write(remote.add(64));
     }
-    let sa_off = 448;
-    let length = std::mem::size_of::<SecurityAttributes>() as u32;
-    buf[sa_off..sa_off + 4].copy_from_slice(&length.to_le_bytes());
-    buf[sa_off + 8..sa_off + 16].copy_from_slice(&(remote as u64).to_le_bytes());
-    let wrote =
-        unsafe { WriteProcessMemory(process, remote, buf.as_ptr(), buf.len(), ptr::null_mut()) };
-    if wrote == 0 {
-        return Err(last_error("WriteProcessMemory"));
+    if !write_remote(process, remote, &buf) {
+        return Err(last_error("WriteProcessMemory security descriptor"));
     }
-    Ok(unsafe { remote.add(sa_off) })
+    Ok(remote)
 }
 
-fn patch_pipe_argument(
-    process: Handle,
-    tid: Dword,
-    export: *mut u8,
-    original: u8,
-    sa: *mut core::ffi::c_void,
-) -> bool {
-    let thread = unsafe { OpenThread(0x0018 | 0x0040, 0, tid) };
-    if thread.is_null() {
-        return false;
+fn alloc_hook_cave(process: Handle, stub: usize) -> *mut core::ffi::c_void {
+    let page = stub & !0xFFFF;
+    for step in 1..512usize {
+        let hint = page.wrapping_sub(step * 0x10000) as *mut core::ffi::c_void;
+        let got = unsafe { VirtualAllocEx(process, hint, 0x1000, 0x3000, 0x40) };
+        if !got.is_null() {
+            return got;
+        }
     }
-    let mut context = ThreadContext([0u8; 1232]);
-    context.0[0x30..0x34].copy_from_slice(&0x0010_0003u32.to_le_bytes());
-    let got = unsafe { GetThreadContext(thread, context.0.as_mut_ptr()) };
-    if got == 0 {
-        unsafe { CloseHandle(thread) };
-        return false;
-    }
-    let rsp = u64::from_le_bytes(context.0[0x98..0xA0].try_into().unwrap());
-    let slot = rsp.wrapping_add(0x40);
-    let sa_bytes = (sa as u64).to_le_bytes();
-    let wrote = unsafe {
-        WriteProcessMemory(
-            process,
-            slot as *mut core::ffi::c_void,
-            sa_bytes.as_ptr(),
-            sa_bytes.len(),
-            ptr::null_mut(),
-        )
-    };
-    if !write_byte(process, export, original) {
-        unsafe { CloseHandle(thread) };
-        return false;
-    }
-    context.0[0xF8..0x100].copy_from_slice(&(export as u64).to_le_bytes());
-    let mut flags = u32::from_le_bytes(context.0[0x44..0x48].try_into().unwrap());
-    if wrote != 0 {
-        flags |= 0x100;
-    } else {
-        flags &= !0x100;
-    }
-    context.0[0x44..0x48].copy_from_slice(&flags.to_le_bytes());
-    let set = unsafe { SetThreadContext(thread, context.0.as_ptr()) };
-    unsafe { CloseHandle(thread) };
-    wrote != 0 && set != 0
+    ptr::null_mut()
 }
 
-fn write_byte(process: Handle, addr: *mut u8, byte: u8) -> bool {
-    let ok = unsafe { WriteProcessMemory(process, addr.cast(), &byte, 1, ptr::null_mut()) };
+fn write_remote(process: Handle, addr: *mut core::ffi::c_void, bytes: &[u8]) -> bool {
+    let ok =
+        unsafe { WriteProcessMemory(process, addr, bytes.as_ptr(), bytes.len(), ptr::null_mut()) };
     if ok != 0 {
         return true;
     }
     let mut old = 0u32;
-    if unsafe { VirtualProtectEx(process, addr.cast(), 1, 0x40, &mut old) } == 0 {
+    if unsafe { VirtualProtectEx(process, addr, bytes.len(), 0x40, &mut old) } == 0 {
         return false;
     }
-    let ok = unsafe { WriteProcessMemory(process, addr.cast(), &byte, 1, ptr::null_mut()) };
+    let ok =
+        unsafe { WriteProcessMemory(process, addr, bytes.as_ptr(), bytes.len(), ptr::null_mut()) };
     unsafe {
-        VirtualProtectEx(process, addr.cast(), 1, old, &mut old);
+        VirtualProtectEx(process, addr, bytes.len(), old, &mut old);
     }
     ok != 0
-}
-
-fn close_debug_handle(value: u64) {
-    if value != 0 {
-        unsafe { CloseHandle(value as Handle) };
-    }
-}
-
-fn event_u32(event: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(event[offset..offset + 4].try_into().unwrap())
-}
-
-fn event_u64(event: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(event[offset..offset + 8].try_into().unwrap())
 }
 
 fn probe_directory_create(token: Handle, name: &str) {
@@ -2926,17 +2820,6 @@ fn spawn_prepared_child(
     let cwd_ptr = cwd.as_ref().map_or(ptr::null(), |c| c.as_ptr());
     // SAFETY: token is a primary write-restricted token; buffers are NUL-terminated
     // and live for the call. cmdline is writable as CreateProcessAsUserW requires.
-    // MSYS builds the signal pipe inside `msys-2.0.dll` `DllMain`, with a
-    // user DACL that does not name `S-1-5-12`. The write end then fails.
-    // Debug the process and point `CreateNamedPipeW` at a descriptor that
-    // includes that SID. Other programs are not debugged.
-    let creation_flags = CREATE_SUSPENDED
-        | CREATE_UNICODE_ENVIRONMENT
-        | if debug_pipe {
-            DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS
-        } else {
-            0
-        };
     let created = unsafe {
         CreateProcessAsUserW(
             prepared.token.0,
@@ -2945,7 +2828,7 @@ fn spawn_prepared_child(
             ptr::null_mut(),
             ptr::null_mut(),
             1,
-            creation_flags,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
             env_block.as_mut_ptr().cast(),
             cwd_ptr,
             &mut startup,
@@ -2958,7 +2841,6 @@ fn spawn_prepared_child(
     drop((std_in, std_out, std_err));
     let process = CloseOnDrop(info.h_process);
     let thread = CloseOnDrop(info.h_thread);
-    let _debug_stop = debug_pipe.then_some(DebugSession(info.dw_process_id));
     // Drain capture pipes before the child runs so a large write cannot
     // fill the pipe and block WaitForSingleObject.
     let forward_stop = Arc::new(AtomicBool::new(false));
@@ -3028,6 +2910,13 @@ fn spawn_prepared_child(
         join_copy(stderr_fwd);
         return Err(err);
     }
+    // `sigproc_init` runs from the MSYS `DllMain`, before the entry point.
+    // Patch `NtCreateNamedPipeFile` while the process is still suspended.
+    if debug_pipe {
+        if let Err(err) = install_ntdll_pipe_hook(process.0, prepared._sid.0) {
+            eprintln!("workpen: pipe hook skipped: {err}");
+        }
+    }
     // SAFETY: thread is the primary thread of the suspended process.
     let resumed = unsafe { ResumeThread(thread.0) };
     if resumed == Dword::MAX {
@@ -3047,15 +2936,7 @@ fn spawn_prepared_child(
     };
     // SAFETY: process handle stays valid until we return.
     let started = std::time::Instant::now();
-    let wait = if debug_pipe {
-        if pump_msys_pipe_debug(process.0, info.dw_process_id, prepared._sid.0, wait_ms) {
-            WAIT_TIMEOUT
-        } else {
-            WAIT_OBJECT_0
-        }
-    } else {
-        unsafe { WaitForSingleObject(process.0, wait_ms) }
-    };
+    let wait = unsafe { WaitForSingleObject(process.0, wait_ms) };
     let mut timed_out = wait == WAIT_TIMEOUT;
     if timed_out {
         drop(std::mem::replace(

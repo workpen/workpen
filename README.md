@@ -147,8 +147,8 @@ in one page is [docs/threat-model.md](docs/threat-model.md).
   directory. MSYS creates the per-user section in that directory
   without a security descriptor, so the directory gets an inheritable
   allow for the user and `S-1-5-12`. For an MSYS program the
-  jail points the signal-pipe create at a descriptor that
-  includes that SID. The job
+  jail patches named-pipe creation so the signal pipe includes
+  that SID. The job
   blocks clipboard use.
   A session with no window station does not
   enforce that limit. The child still inherits the parent console
