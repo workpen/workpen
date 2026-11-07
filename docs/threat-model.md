@@ -47,6 +47,44 @@ The parent is trusted. The child is not.
   per name. In-child open of a planted `/tmp/proj/sub/leaked`
   is the same class as post-create.
 - Windows WFP ran. Win32 5 is `WfpSkipped`. AppContainer is still on.
+  Network-blocked commands in one process share one AppContainer and
+  one dynamic WFP session. `workspace` (`with_network(false)`) does
+  not create either. `shutdown_process_jail` deletes that blocked
+  profile. Dynamic filters die with the session.
+- `DISABLE_MAX_PRIVILEGE` removed `SeChangeNotifyPrivilege`. That
+  flag keeps traverse checking and drops `SeDebugPrivilege`,
+  `SeBackupPrivilege`, `SeRestorePrivilege`, `SeTakeOwnershipPrivilege`,
+  `SeLoadDriverPrivilege`, and `SeTcbPrivilege`. Git `usr\bin` tools
+  run. MSYS opens `\BaseNamedObjects\msys-2.0S<n>-<install key>` with
+  `OBJ_OPENIF`. The jail grants the restricted SID on that directory.
+  The key is the MSYS hash of `msys-2.0.dll`, not a fixed id. The same
+  grant is applied under `\Sessions\BNOLINKS\<session>` when the
+  process is not in session 0. MSYS creates the per-user section `SID.1`
+  in that directory and passes a null security descriptor
+  (`sec_none`). The section inherits the directory, so the jail
+  adds an inheritable allow for the user and `S-1-5-12`. An
+  existing `SID.1` gets the same allow. MSYS then creates its
+  signal pipe during `msys-2.0.dll` startup with a user security
+  descriptor that does not name `S-1-5-12`, then opens the write end.
+  For that program the jail patches `NtCreateNamedPipeFile` so the
+  pipe descriptor includes `S-1-5-12`. A write outside the ReadWrite grant still fails.
+- The workspace jail scanned the user profile. It denies `.ssh`,
+  `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`, and `.kube`
+  with the restricted SID and restores those ACLs when the jail drops.
+  Missing names are skipped. It does not walk the profile.
+- A jailed Windows child must not take over the parent console.
+  The job blocks clipboard read and write, system parameters, and
+  ExitWindows. A session with no window station does not enforce
+  the clipboard limit. The child still inherits the parent console
+  when the parent has one. `JOB_OBJECT_UILIMIT_HANDLES` is not set:
+  it blocks USER handles owned outside the job, and MSYS init exits
+  `0xC0000142`. `CREATE_NO_WINDOW` is not set: it hangs console
+  programs such as `cmd`. Captured stdout and stderr are pipes and
+  still work.
+- `strict` and `read-only` on Windows can read the whole disk. They
+  can read the workspace (`read-only` cannot write it), `SystemRoot`,
+  `System32`, and `ProgramFiles`. Other paths are not readable.
+  `workspace` is unchanged except the profile-secret list above.
 - `spawn_reexec` blocked the network. That call keeps outbound network
   open (internet client capability, no WFP BLOCK) and reuses one
   AppContainer in the process. `Applied` there means the container is

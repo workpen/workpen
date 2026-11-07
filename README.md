@@ -135,6 +135,24 @@ in one page is [docs/threat-model.md](docs/threat-model.md).
   remount applies.
 - Windows WFP without admin is skipped (`WfpSkipped`). AppContainer
   with no network capabilities is the unelevated net deny.
+  `read-only` and `strict` reuse one AppContainer per process.
+  `workspace` does not create one. The workspace jail denies
+  `.ssh`, `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`, and
+  `.kube` with the restricted SID and restores them when the jail
+  drops. `strict` and `read-only` can read the workspace
+  (`read_only` cannot write it), `SystemRoot`, `System32`, and
+  `ProgramFiles`. `spawn_reexec` keeps network open for a host
+  that re-execs into one long-lived jail. Git `usr\bin` tools run.
+  The jail grants the restricted SID on that install's MSYS shared
+  directory. MSYS creates the per-user section in that directory
+  without a security descriptor, so the directory gets an inheritable
+  allow for the user and `S-1-5-12`. For an MSYS program the
+  jail patches named-pipe creation so the signal pipe includes
+  that SID. The job
+  blocks clipboard use.
+  A session with no window station does not
+  enforce that limit. The child still inherits the parent console
+  when the parent has one.
 
 ## Contributing
 

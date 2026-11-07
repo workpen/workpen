@@ -197,12 +197,6 @@ pub(super) struct AppContainerProfile {
 }
 
 impl AppContainerProfile {
-    /// Unique profile with no capabilities. One spawn, then delete on drop.
-    pub(super) fn create() -> Result<Self, KernelError> {
-        let suffix = unique_suffix();
-        Self::create_profile(&format!("wpnh.{suffix}"), &[])
-    }
-
     /// Stable profile for [`super::spawn_reexec`]. Capabilities are fixed
     /// for the life of the name. A crashed process leaves the profile;
     /// the next create derives that sid instead of allocating another.
@@ -210,6 +204,12 @@ impl AppContainerProfile {
         capabilities: &[SidAndAttributes],
     ) -> Result<Self, KernelError> {
         Self::create_profile("wpnh.reexec.net", capabilities)
+    }
+
+    /// Stable no-network profile. A second create in this process derives
+    /// the sid when the name is still registered.
+    pub(super) fn create_stable(raw: &str) -> Result<Self, KernelError> {
+        Self::create_profile(raw, &[])
     }
 
     fn create_profile(raw: &str, capabilities: &[SidAndAttributes]) -> Result<Self, KernelError> {

@@ -55,9 +55,11 @@ pub use wrap::{
     child_env_deny_names, collect_doctor_facts, collect_workspace_dest_denies,
     collect_workspace_dest_denies_limited, doctor_fails, is_denied_child_env, kernel_supported,
     process_jail, process_jail_with_policy, reexec_profile_creates, require_applied,
-    require_dest_hide, scrub_child_command, spawn_after_setup, with_bash_noprofile,
-    write_timeout_notice,
+    require_dest_hide, scrub_child_command, shutdown_process_jail, spawn_after_setup,
+    with_bash_noprofile, write_timeout_notice,
 };
+#[cfg(all(feature = "nono", windows))]
+pub use wrap::{reset_windows_appcontainer_creates, windows_appcontainer_creates};
 
 /// Crate version from Cargo.toml.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

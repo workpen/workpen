@@ -50,6 +50,55 @@ const CREATE_SUSPENDED: Dword = 0x0000_0004;
 const CREATE_UNICODE_ENVIRONMENT: Dword = 0x0000_0400;
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: Dword = 0x2000;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+const JOB_OBJECT_BASIC_UI_RESTRICTIONS: u32 = 4;
+const JOB_OBJECT_UILIMIT_HANDLES: Dword = 0x0000_0001;
+const JOB_OBJECT_UILIMIT_READCLIPBOARD: Dword = 0x0000_0002;
+const JOB_OBJECT_UILIMIT_WRITECLIPBOARD: Dword = 0x0000_0004;
+const JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS: Dword = 0x0000_0008;
+const JOB_OBJECT_UILIMIT_EXITWINDOWS: Dword = 0x0000_0080;
+/// Clipboard, system parameters, and ExitWindows. Not HANDLES:
+/// that flag blocks USER handles owned outside the job, and MSYS
+/// `DllMain` then exits `0xC0000142`.
+const UI_RESTRICTIONS: Dword = JOB_OBJECT_UILIMIT_READCLIPBOARD
+    | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
+    | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
+    | JOB_OBJECT_UILIMIT_EXITWINDOWS;
+const _: () = assert!(UI_RESTRICTIONS & JOB_OBJECT_UILIMIT_HANDLES == 0);
+const SE_KERNEL_OBJECT: u32 = 6;
+/// `DIRECTORY_QUERY | DIRECTORY_TRAVERSE | DIRECTORY_CREATE_OBJECT | DIRECTORY_CREATE_SUBDIRECTORY | READ_CONTROL`.
+/// MSYS requests this mask for its shared directory (`CYG_SHARED_DIR_ACCESS`).
+const MSYS_DIR_ACCESS: Dword = 0x0002_000F;
+const DIRECTORY_ALL_ACCESS: Dword = 0x000F_000F;
+/// `SECTION_ALL_ACCESS`.
+const SECTION_ALL_ACCESS: Dword = 0x000F_001F;
+/// MSYS mask plus WRITE_DAC, so the parent can edit the leaf it creates
+/// without also granting DELETE to Everyone.
+const MSYS_DIR_WRITE_DAC: Dword = MSYS_DIR_ACCESS | 0x0004_0000;
+/// `SECTION_ALL_ACCESS`. MSYS `NtCreateSection` requests
+/// `STANDARD_RIGHTS_REQUIRED | SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE`
+/// (`0x000F0007`), which is a subset. The per-user section inherits this
+/// mask from the MSYS directory because `sec_none` passes a null descriptor.
+const MSYS_SECTION_ACCESS: Dword = 0x000F_001F;
+const MSYS_INHERIT_ACCESS: Dword = MSYS_DIR_ACCESS | MSYS_SECTION_ACCESS;
+/// `FILE_ALL_ACCESS`. Named-pipe create needs `FILE_CREATE_PIPE_INSTANCE`.
+const FILE_ALL_ACCESS: Dword = 0x001F_01FF;
+const FILE_SHARE_DELETE: Dword = 0x4;
+const FILE_DIRECTORY_FILE: u32 = 0x1;
+/// Not a Windows `SE_OBJECT_TYPE`. Restore reopens `\Device\NamedPipe`.
+const NPFS_RESTORE: u32 = 0x4E50_4653;
+const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+const OBJ_OPENIF: u32 = 0x80;
+const OBJECT_INHERIT_ACE: Dword = 0x1;
+const CONTAINER_INHERIT_ACE: Dword = 0x2;
+const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
+const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003A_u32 as i32;
+const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
+const WRITE_OWNER: u32 = 0x0008_0000;
+const OWNER_SECURITY_INFORMATION: Dword = 0x1;
+const TOKEN_ADJUST_PRIVILEGES: Dword = 0x0020;
+const TOKEN_USER: u32 = 1;
+const SE_PRIVILEGE_ENABLED: Dword = 0x0000_0002;
+const TOKEN_DEFAULT_DACL: u32 = 6;
 const TOKEN_PRIMARY: u32 = 1;
 const SECURITY_IMPERSONATION: u32 = 2;
 const INFINITE: Dword = 0xFFFF_FFFF;
@@ -79,6 +128,25 @@ struct SidAndAttributes {
     attributes: Dword,
 }
 
+#[repr(C)]
+struct Luid {
+    low_part: Dword,
+    high_part: i32,
+}
+
+#[repr(C)]
+struct LuidAndAttributes {
+    luid: Luid,
+    attributes: Dword,
+}
+
+#[repr(C)]
+struct TokenPrivileges {
+    count: Dword,
+    attr: LuidAndAttributes,
+}
+
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct TrusteeW {
     p_multiple_trustee: *mut TrusteeW,
@@ -166,9 +234,16 @@ struct JobobjectExtendedLimitInformation {
     peak_job_memory_used: usize,
 }
 
+#[repr(C)]
+struct JobobjectBasicUiRestrictions {
+    ui_restrictions_class: Dword,
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentProcess() -> Handle;
+    fn GetCurrentProcessId() -> u32;
+    fn ProcessIdToSessionId(process_id: u32, session_id: *mut u32) -> i32;
     fn GetCurrentThread() -> Handle;
     fn CancelSynchronousIo(h_thread: Handle) -> Bool;
     fn CloseHandle(h_object: Handle) -> Bool;
@@ -213,12 +288,42 @@ unsafe extern "system" {
         h_template_file: Handle,
     ) -> Handle;
     fn GetModuleHandleW(lp_module_name: *const u16) -> Handle;
+    fn ImpersonateLoggedOnUser(token: Handle) -> Bool;
+    fn RevertToSelf() -> Bool;
     fn GetProcAddress(h_module: Handle, lp_proc_name: *const u8) -> *mut core::ffi::c_void;
     fn CreatePipe(
         h_read_pipe: *mut Handle,
         h_write_pipe: *mut Handle,
         lp_pipe_attributes: *mut SecurityAttributes,
         n_size: Dword,
+    ) -> Bool;
+    fn ReadProcessMemory(
+        h_process: Handle,
+        lp_base_address: *const core::ffi::c_void,
+        lp_buffer: *mut u8,
+        n_size: usize,
+        lp_number_of_bytes_read: *mut usize,
+    ) -> Bool;
+    fn WriteProcessMemory(
+        h_process: Handle,
+        lp_base_address: *mut core::ffi::c_void,
+        lp_buffer: *const u8,
+        n_size: usize,
+        lp_number_of_bytes_written: *mut usize,
+    ) -> Bool;
+    fn VirtualAllocEx(
+        h_process: Handle,
+        lp_address: *mut core::ffi::c_void,
+        dw_size: usize,
+        fl_allocation_type: Dword,
+        fl_protect: Dword,
+    ) -> *mut core::ffi::c_void;
+    fn VirtualProtectEx(
+        h_process: Handle,
+        lp_address: *mut core::ffi::c_void,
+        dw_size: usize,
+        fl_new_protect: Dword,
+        lpfl_old_protect: *mut Dword,
     ) -> Bool;
     fn ReadFile(
         h_file: Handle,
@@ -235,6 +340,20 @@ unsafe extern "system" {
         lp_overlapped: *mut core::ffi::c_void,
     ) -> Bool;
     fn SetHandleInformation(h_object: Handle, dw_mask: Dword, dw_flags: Dword) -> Bool;
+    fn GetFinalPathNameByHandleW(
+        h_file: Handle,
+        lpsz_file_path: *mut u16,
+        cch_file_path: Dword,
+        dw_flags: Dword,
+    ) -> Dword;
+    fn LCMapStringW(
+        locale: u32,
+        flags: Dword,
+        src: *const u16,
+        src_len: i32,
+        dest: *mut u16,
+        dest_len: i32,
+    ) -> i32;
 }
 
 const HANDLE_FLAG_INHERIT: Dword = 0x0000_0001;
@@ -311,12 +430,86 @@ unsafe extern "system" {
         p_dacl: Handle,
         p_sacl: Handle,
     ) -> Dword;
+    fn GetSecurityInfo(
+        handle: Handle,
+        object_type: u32,
+        security_info: Dword,
+        ppsid_owner: *mut Handle,
+        ppsid_group: *mut Handle,
+        pp_dacl: *mut Handle,
+        pp_sacl: *mut Handle,
+        pp_security_descriptor: *mut Handle,
+    ) -> Dword;
+    fn SetSecurityInfo(
+        handle: Handle,
+        object_type: u32,
+        security_info: Dword,
+        psid_owner: Handle,
+        psid_group: Handle,
+        p_dacl: Handle,
+        p_sacl: Handle,
+    ) -> Dword;
     fn SetEntriesInAclW(
         c_count_of_explicit_entries: u32,
         p_list_of_explicit_entries: *mut ExplicitAccessW,
         old_acl: Handle,
         new_acl: *mut Handle,
     ) -> Dword;
+    fn GetTokenInformation(
+        token_handle: Handle,
+        token_information_class: u32,
+        token_information: *mut core::ffi::c_void,
+        token_information_length: Dword,
+        return_length: *mut Dword,
+    ) -> Bool;
+    fn SetTokenInformation(
+        token_handle: Handle,
+        token_information_class: u32,
+        token_information: *mut core::ffi::c_void,
+        token_information_length: Dword,
+    ) -> Bool;
+    fn InitializeSecurityDescriptor(sd: *mut u8, revision: u32) -> Bool;
+    fn InitializeAcl(acl: *mut u8, length: Dword, revision: u32) -> Bool;
+    fn AddAccessAllowedAce(acl: *mut u8, revision: u32, mask: Dword, sid: Handle) -> Bool;
+    fn AddAccessAllowedAceEx(
+        acl: *mut u8,
+        revision: u32,
+        flags: u32,
+        mask: Dword,
+        sid: Handle,
+    ) -> Bool;
+    fn AddAccessDeniedAce(acl: *mut u8, revision: u32, mask: Dword, sid: Handle) -> Bool;
+    fn GetAce(acl: Handle, index: Dword, ace: *mut Handle) -> Bool;
+    fn AddAce(
+        acl: *mut u8,
+        revision: u32,
+        index: Dword,
+        ace_list: *const u8,
+        ace_list_bytes: Dword,
+    ) -> Bool;
+    fn EqualSid(a: Handle, b: Handle) -> Bool;
+    fn ConvertSidToStringSidW(sid: Handle, string_sid: *mut *mut u16) -> Bool;
+    fn SetSecurityDescriptorDacl(
+        sd: *mut u8,
+        present: Bool,
+        dacl: *mut u8,
+        defaulted: Bool,
+    ) -> Bool;
+    fn LookupPrivilegeValueW(
+        lp_system_name: *const u16,
+        lp_name: *const u16,
+        lp_luid: *mut Luid,
+    ) -> Bool;
+    fn AdjustTokenPrivileges(
+        token: Handle,
+        disable_all: Bool,
+        new_state: *mut TokenPrivileges,
+        buffer_length: Dword,
+        previous: *mut core::ffi::c_void,
+        return_length: *mut Dword,
+    ) -> Bool;
+    fn GetLengthSid(sid: Handle) -> Dword;
+    fn CopySid(len: Dword, dest: *mut u8, src: Handle) -> Bool;
 }
 
 #[link(name = "kernel32")]
@@ -436,6 +629,7 @@ impl Drop for LocalMem {
 
 struct AclRestore {
     path: Vec<u16>,
+    object_type: u32,
     /// Owns the security descriptor so `dacl` stays valid until restore.
     _sd: LocalMem,
     dacl: Handle,
@@ -446,17 +640,60 @@ impl AclRestore {
         if self.restored {
             return Ok(());
         }
-        // SAFETY: `path` is a NUL-terminated file path; `dacl` is from the saved SD.
-        let err = unsafe {
-            SetNamedSecurityInfoW(
-                self.path.as_mut_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                self.dacl,
-                ptr::null_mut(),
-            )
+        let err = if self.object_type == NPFS_RESTORE {
+            let Ok(file) = open_nt_file(r"\Device\NamedPipe", 0x0006_0000, FILE_DIRECTORY_FILE)
+            else {
+                return Err(KernelError::Apply(
+                    "restore could not reopen the named pipe device".into(),
+                ));
+            };
+            let err = unsafe {
+                SetSecurityInfo(
+                    file,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    self.dacl,
+                    ptr::null_mut(),
+                )
+            };
+            unsafe { CloseHandle(file) };
+            err
+        } else if self.object_type == SE_KERNEL_OBJECT {
+            let name =
+                String::from_utf16_lossy(self.path.split(|c| *c == 0).next().unwrap_or(&self.path));
+            let Ok(dir) = open_object_directory(&name) else {
+                return Err(KernelError::Apply(
+                    "restore could not reopen the object directory".into(),
+                ));
+            };
+            let err = unsafe {
+                SetSecurityInfo(
+                    dir,
+                    SE_KERNEL_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    self.dacl,
+                    ptr::null_mut(),
+                )
+            };
+            unsafe { CloseHandle(dir) };
+            err
+        } else {
+            // SAFETY: `path` is a NUL-terminated file path; `dacl` is from the saved SD.
+            unsafe {
+                SetNamedSecurityInfoW(
+                    self.path.as_mut_ptr(),
+                    self.object_type,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    self.dacl,
+                    ptr::null_mut(),
+                )
+            }
         };
         if err != 0 {
             return Err(win32_error("restore DACL", err));
@@ -535,9 +772,7 @@ struct Prepared {
 }
 
 struct NetGuards {
-    _profile: windows_net::AppContainerProfile,
     _helper: windows_net::HelperFile,
-    _wfp: Option<windows_net::WfpSession>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -604,15 +839,17 @@ fn spawn_write_restricted_io(
 
 fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelError> {
     let rw_paths = rw_grant_paths(policy);
-    if rw_paths.is_empty() {
+    if rw_paths.is_empty() && read_grant_paths(policy).is_empty() {
         return Err(KernelError::Apply(
-            "write-restricted spawn needs a ReadWrite grant".into(),
+            "write-restricted spawn needs a read or read-write grant".into(),
         ));
     }
     let sid = RestrictedSid::new()?;
     let world = WorldSid::new()?;
     let mut acl_guards = grant_write_aces(&rw_paths, sid.0)?;
     acl_guards.extend(deny_dest_aces(&dest_deny_paths(policy), world.0)?);
+    acl_guards.extend(deny_dest_aces(&profile_secret_dirs(), sid.0)?);
+    acl_guards.extend(allow_session_object_create(sid.0)?);
     let token = create_write_restricted_token(sid.0).map_err(prefix_apply("token setup"))?;
     let job = create_kill_job().map_err(prefix_apply("job setup"))?;
     Ok(Prepared {
@@ -628,41 +865,1423 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
 }
 
 fn prepare_network_blocked(policy: &KernelPolicy) -> Result<Prepared, KernelError> {
-    let workspace = policy
-        .grants()
-        .iter()
-        .find(|g| g.access == KernelAccess::ReadWrite)
-        .map(|g| g.path.clone())
-        .ok_or_else(|| KernelError::Apply("network deny needs a ReadWrite grant".into()))?;
-    let profile =
-        windows_net::AppContainerProfile::create().map_err(prefix_apply("AppContainer profile"))?;
+    let workspace = container_anchor(policy)?;
     let helper =
         windows_net::HelperFile::install(&workspace).map_err(prefix_apply("net helper"))?;
+    let (package_sid, wfp_skipped) = cached_blocked_profile(helper.path())?;
     let mut prepared = prepare_write_restricted(policy)?;
     for path in rw_grant_paths(policy) {
-        grant_package_root(&path, profile.sid(), &mut prepared.acl_guards)?;
+        grant_package_root(&path, package_sid, &mut prepared.acl_guards)?;
+    }
+    for path in read_grant_paths(policy) {
+        grant_package_read(&path, package_sid, &mut prepared.acl_guards)?;
     }
     prepared
         .acl_guards
-        .extend(deny_dest_aces(&dest_deny_paths(policy), profile.sid())?);
+        .extend(deny_dest_aces(&dest_deny_paths(policy), package_sid)?);
+    prepared
+        .acl_guards
+        .extend(deny_dest_aces(&profile_secret_dirs(), package_sid)?);
     prepared.acl_guards.push(set_acl_entry(
         helper.path(),
-        profile.sid(),
+        package_sid,
         GENERIC_ALL,
         GRANT_ACCESS,
         NO_INHERITANCE,
     )?);
-    let wfp = windows_net::WfpSession::apply(profile.sid(), helper.path())
-        .map_err(prefix_apply("WFP package filter"))?;
-    prepared.wfp_skipped = wfp.is_none();
-    prepared.token = wrap_appcontainer_token(prepared.token, profile.sid())?;
+    prepared.wfp_skipped = wfp_skipped;
+    prepared.token = wrap_appcontainer_token(prepared.token, package_sid)?;
     prepared.helper = Some(helper.path().to_path_buf());
-    prepared._net = Some(NetGuards {
-        _profile: profile,
-        _helper: helper,
-        _wfp: wfp,
-    });
+    prepared._net = Some(NetGuards { _helper: helper });
     Ok(prepared)
+}
+
+fn container_anchor(policy: &KernelPolicy) -> Result<PathBuf, KernelError> {
+    if let Some(path) = rw_grant_paths(policy).into_iter().next() {
+        return Ok(path);
+    }
+    read_grant_paths(policy)
+        .into_iter()
+        .next()
+        .ok_or_else(|| KernelError::Apply("network deny needs a read or read-write grant".into()))
+}
+
+struct BlockedSlot {
+    profile: windows_net::AppContainerProfile,
+    wfp: Option<windows_net::WfpSession>,
+}
+
+// SAFETY: the profile and WFP engine are owned by this slot. The mutex
+// is the only share. Drop closes them.
+unsafe impl Send for BlockedSlot {}
+
+static BLOCKED: Mutex<Option<BlockedSlot>> = Mutex::new(None);
+static BLOCKED_CREATES: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn appcontainer_creates() -> u32 {
+    u32::try_from(BLOCKED_CREATES.load(Ordering::Relaxed)).unwrap_or(u32::MAX)
+}
+
+pub(super) fn reset_appcontainer_creates() {
+    BLOCKED_CREATES.store(0, Ordering::Relaxed);
+}
+
+pub(super) fn shutdown_jail_cache() {
+    let mut slot = BLOCKED.lock().unwrap_or_else(|err| err.into_inner());
+    *slot = None;
+}
+
+fn cached_blocked_profile(helper: &Path) -> Result<(Handle, bool), KernelError> {
+    let mut slot = BLOCKED.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(existing) = slot.as_ref() {
+        return Ok((existing.profile.sid(), existing.wfp.is_none()));
+    }
+    let pid = unsafe { GetCurrentProcessId() };
+    BLOCKED_CREATES.fetch_add(1, Ordering::Relaxed);
+    let profile = windows_net::AppContainerProfile::create_stable(&format!("wpnh.b.{pid}"))
+        .map_err(prefix_apply("AppContainer profile"))?;
+    let wfp = windows_net::WfpSession::apply(profile.sid(), helper)
+        .map_err(prefix_apply("WFP package filter"))?;
+    let sid = profile.sid();
+    let skipped = wfp.is_none();
+    *slot = Some(BlockedSlot { profile, wfp });
+    Ok((sid, skipped))
+}
+
+/// Best-effort grant on the session object directory. MSYS does not
+/// create `\BaseNamedObjects\msys-...` through this ACE when that
+/// leaf already exists. [`allow_msys_shared_dirs`] grants the leaf.
+/// A missed ACE does not fail the spawn.
+fn allow_session_object_create(sid: Handle) -> Result<Vec<AclRestore>, KernelError> {
+    let rights = DIRECTORY_ALL_ACCESS | SECTION_ALL_ACCESS | GENERIC_ALL;
+    let mut guards = Vec::new();
+    for name in object_namespace_names() {
+        match grant_directory_object(&name, sid, rights) {
+            Ok(guard) => guards.push(guard),
+            Err(err) => eprintln!("workpen: namespace ACE skipped: {err}"),
+        }
+    }
+    Ok(guards)
+}
+
+fn object_namespace_names() -> Vec<String> {
+    let mut names = vec![r"\BaseNamedObjects".to_string()];
+    let mut session = 0u32;
+    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+    if ok != 0 {
+        names.push(format!("\\Sessions\\{session}\\BaseNamedObjects"));
+    }
+    names
+}
+
+fn grant_directory_object(
+    name: &str,
+    sid: Handle,
+    rights: Dword,
+) -> Result<AclRestore, KernelError> {
+    let dir = open_object_directory(name)?;
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut sacl = ptr::null_mut();
+    let mut sd = ptr::null_mut();
+    let got = unsafe {
+        GetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    if got != 0 {
+        unsafe { CloseHandle(dir) };
+        return Err(win32_error("GetSecurityInfo", got));
+    }
+    let sd = LocalMem(sd);
+    let mut entry = ExplicitAccessW {
+        grf_access_permissions: rights,
+        grf_access_mode: GRANT_ACCESS,
+        // Children created in this directory inherit the ACE. An MSYS
+        // leaf that already exists does not. That leaf is granted below.
+        grf_inheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        trustee: TrusteeW {
+            p_multiple_trustee: ptr::null_mut(),
+            multiple_trustee_operation: NO_MULTIPLE_TRUSTEE,
+            trustee_form: TRUSTEE_IS_SID,
+            trustee_type: TRUSTEE_IS_WELL_KNOWN_GROUP,
+            ptstr_name: sid,
+        },
+    };
+    let mut new_acl = ptr::null_mut();
+    let set = unsafe { SetEntriesInAclW(1, &mut entry, dacl, &mut new_acl) };
+    if set != 0 {
+        unsafe { CloseHandle(dir) };
+        return Err(win32_error("SetEntriesInAclW", set));
+    }
+    let new_acl = LocalMem(new_acl);
+    let applied = unsafe {
+        SetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            new_acl.0,
+            ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(dir) };
+    if applied != 0 {
+        return Err(win32_error("SetSecurityInfo", applied));
+    }
+    Ok(AclRestore {
+        path: wide_os(OsStr::new(name)),
+        object_type: SE_KERNEL_OBJECT,
+        _sd: sd,
+        dacl,
+        restored: false,
+    })
+}
+
+fn open_directory_for_dacl(name: &str) -> Result<Handle, KernelError> {
+    match open_directory_status(name, 0x0006_0000) {
+        Ok(dir) => Ok(dir),
+        Err(status) if status == STATUS_ACCESS_DENIED => {
+            take_directory_ownership(name)?;
+            open_directory_status(name, 0x0006_0000).map_err(|status| {
+                KernelError::Apply(format!(
+                    "NtOpenDirectoryObject {name} after ownership failed (ntstatus {status:#x})"
+                ))
+            })
+        }
+        Err(status) => Err(KernelError::Apply(format!(
+            "NtOpenDirectoryObject {name} failed (ntstatus {status:#x})"
+        ))),
+    }
+}
+
+fn relax_child_bno(process: Handle, restricted: Handle, world: Handle) {
+    let mut token = ptr::null_mut();
+    let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
+    if opened == 0 {
+        eprintln!(
+            "workpen: msys bno token failed: {}",
+            last_error("OpenProcessToken")
+        );
+        return;
+    }
+    let token = CloseOnDrop(token);
+    let mut bytes = 0u32;
+    unsafe {
+        GetTokenInformation(token.0, 44, ptr::null_mut(), 0, &mut bytes);
+    }
+    if bytes < 16 {
+        eprintln!("workpen: msys bno query size={bytes} win32 {}", unsafe {
+            GetLastError()
+        });
+        return;
+    }
+    let mut buf = vec![0u8; bytes as usize];
+    let ok =
+        unsafe { GetTokenInformation(token.0, 44, buf.as_mut_ptr().cast(), bytes, &mut bytes) };
+    if ok == 0 {
+        eprintln!(
+            "workpen: msys bno query failed: {}",
+            last_error("GetTokenInformation TokenBnoIsolation")
+        );
+        return;
+    }
+    let prefix = unsafe { buf.as_ptr().cast::<*mut u16>().read() };
+    let enabled = unsafe { *buf.as_ptr().add(8) };
+    if prefix.is_null() {
+        eprintln!("workpen: msys bno enabled={enabled} prefix=<null>");
+        return;
+    }
+    let mut len = 0usize;
+    while unsafe { *prefix.add(len) } != 0 && len < 512 {
+        len += 1;
+    }
+    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(prefix, len) });
+    eprintln!("workpen: msys bno enabled={enabled} prefix={text}");
+    if enabled != 0 && !text.is_empty() {
+        let mut session = 0u32;
+        let session_ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+        let mut paths = vec![text.clone()];
+        if session_ok != 0 {
+            paths.push(format!(r"\Sessions\{session}\BaseNamedObjects\{text}"));
+        }
+        paths.push(format!(r"\BaseNamedObjects\{text}"));
+        for path in paths {
+            match null_directory_dacl(&path, restricted, world) {
+                Ok(_) => {}
+                Err(err) => eprintln!("workpen: msys bno dacl skipped: {path}: {err}"),
+            }
+        }
+    }
+}
+
+/// Replace this object directory's DACL with null.
+/// Do not call this on `\BaseNamedObjects` itself.
+fn null_directory_dacl(
+    name: &str,
+    _restricted: Handle,
+    _world: Handle,
+) -> Result<Option<AclRestore>, KernelError> {
+    let dir = open_directory_for_dacl(name)?;
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut sacl = ptr::null_mut();
+    let mut sd = ptr::null_mut();
+    let got = unsafe {
+        GetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    if got != 0 {
+        unsafe { CloseHandle(dir) };
+        return Err(win32_error("GetSecurityInfo", got));
+    }
+    let sd = LocalMem(sd);
+    // DACL_SECURITY_INFORMATION plus a null DACL pointer installs a
+    // null DACL. The saved DACL above is restored after the child exits.
+    let applied = unsafe {
+        SetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(dir) };
+    if applied != 0 {
+        return Err(win32_error("SetSecurityInfo null DACL", applied));
+    }
+    Ok(Some(AclRestore {
+        path: wide_os(OsStr::new(name)),
+        object_type: SE_KERNEL_OBJECT,
+        _sd: sd,
+        dacl,
+        restored: false,
+    }))
+}
+
+#[repr(C)]
+struct UnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+#[repr(C)]
+struct ObjectAttributes {
+    length: u32,
+    root_directory: Handle,
+    object_name: *mut UnicodeString,
+    attributes: u32,
+    security_descriptor: *mut core::ffi::c_void,
+    security_quality_of_service: *mut core::ffi::c_void,
+}
+
+#[repr(C)]
+struct IoStatusBlock {
+    status: usize,
+    information: usize,
+}
+
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtOpenDirectoryObject(
+        directory_handle: *mut Handle,
+        desired_access: u32,
+        object_attributes: *mut ObjectAttributes,
+    ) -> i32;
+    fn NtCreateDirectoryObject(
+        directory_handle: *mut Handle,
+        desired_access: u32,
+        object_attributes: *mut ObjectAttributes,
+    ) -> i32;
+    fn NtOpenSection(
+        section_handle: *mut Handle,
+        desired_access: u32,
+        object_attributes: *mut ObjectAttributes,
+    ) -> i32;
+    fn NtOpenFile(
+        file_handle: *mut Handle,
+        desired_access: u32,
+        object_attributes: *mut ObjectAttributes,
+        io_status_block: *mut IoStatusBlock,
+        share_access: u32,
+        open_options: u32,
+    ) -> i32;
+}
+
+fn open_object_directory(name: &str) -> Result<Handle, KernelError> {
+    // READ_CONTROL | WRITE_DAC. The DACL edit does not need directory create.
+    open_directory_status(name, 0x0006_0000).map_err(|status| {
+        KernelError::Apply(format!(
+            "NtOpenDirectoryObject {name} failed (ntstatus {status:#x})"
+        ))
+    })
+}
+
+/// MSYS `get_shared_parent_dir` calls `NtCreateDirectoryObject` on
+/// `\BaseNamedObjects\msys-2.0S<n>-<install key>` with `OBJ_OPENIF`.
+/// Checkout's git has usually created that leaf already, with an
+/// Everyone ACE that does not name the restricted SID, so a grant on
+/// the parent directory still returns `0xC0000022`.
+fn allow_msys_shared_dirs(
+    program: &Path,
+    restricted: Handle,
+    world: Handle,
+    token: Handle,
+    guards: &mut Vec<AclRestore>,
+) {
+    let Some(dll) = msys_dll_beside(program) else {
+        return;
+    };
+    let nt_path = match msys_install_nt_path(&dll) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("workpen: msys dll path skipped: {err}");
+            return;
+        }
+    };
+    let hash = hash_path_name(0, &nt_path);
+    let shared_id = msys_shared_id(&dll).unwrap_or_else(|| "msys-2.0S5".to_string());
+    let leaf = format!("{shared_id}-{hash:016x}");
+    ensure_msys_shared_dir(&format!(r"\BaseNamedObjects\{leaf}"), restricted, world);
+    let mut session = 0u32;
+    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+    if ok != 0 && session != 0 {
+        ensure_msys_shared_dir(
+            &format!(r"\Sessions\BNOLINKS\{session}\{leaf}"),
+            restricted,
+            world,
+        );
+    }
+    // `SID.1` is created in the leaf above. `Restricted` is unrelated.
+    // Nulling `\BaseNamedObjects` itself breaks AppContainer tests.
+    ensure_msys_shared_dir(r"\BaseNamedObjects\Restricted", restricted, world);
+    // `Restricted` only. Restored after the child exits.
+    // Do not null `\BaseNamedObjects`.
+    // `sigproc_init` creates the signal pipe with `sec_user`, which
+    // does not name `S-1-5-12`. The pipe device allow is restored
+    // with the other guards.
+    allow_signal_pipe(restricted, guards);
+    for name in restricted_namespace_names() {
+        match null_directory_dacl(&name, restricted, world) {
+            Ok(Some(guard)) => guards.push(guard),
+            Ok(None) => {}
+            Err(err) => eprintln!("workpen: msys restricted dir skipped: {name}: {err}"),
+        }
+        probe_directory_create(token, &name);
+    }
+}
+
+fn allow_signal_pipe(restricted: Handle, guards: &mut Vec<AclRestore>) {
+    let file = match open_nt_file(r"\Device\NamedPipe", 0x0006_0000, FILE_DIRECTORY_FILE) {
+        Ok(file) => file,
+        Err(status) => {
+            eprintln!("workpen: npfs open skipped ntstatus {status:#x}");
+            return;
+        }
+    };
+    match grant_npfs_inherit(file, restricted) {
+        Ok(Some(guard)) => {
+            eprintln!("workpen: npfs inherit ok");
+            guards.push(guard);
+        }
+        Ok(None) => eprintln!("workpen: npfs dacl null"),
+        Err(err) => eprintln!("workpen: npfs inherit skipped: {err}"),
+    }
+}
+
+fn open_nt_file(name: &str, access: u32, options: u32) -> Result<Handle, i32> {
+    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
+    let mut us = UnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attrs = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: ptr::null_mut(),
+        object_name: &mut us,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: ptr::null_mut(),
+        security_quality_of_service: ptr::null_mut(),
+    };
+    let mut iosb = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut handle = ptr::null_mut();
+    let status = unsafe {
+        NtOpenFile(
+            &mut handle,
+            access,
+            &mut attrs,
+            &mut iosb,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            options,
+        )
+    };
+    if status != 0 || handle.is_null() {
+        return Err(status);
+    }
+    Ok(handle)
+}
+
+fn grant_npfs_inherit(file: Handle, sid: Handle) -> Result<Option<AclRestore>, KernelError> {
+    let result = grant_npfs_inherit_inner(file, sid);
+    unsafe { CloseHandle(file) };
+    result
+}
+
+fn grant_npfs_inherit_inner(file: Handle, sid: Handle) -> Result<Option<AclRestore>, KernelError> {
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut sacl = ptr::null_mut();
+    let mut sd = ptr::null_mut();
+    let got = unsafe {
+        GetSecurityInfo(
+            file,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    if got != 0 {
+        return Err(win32_error("GetSecurityInfo", got));
+    }
+    let sd = LocalMem(sd);
+    // A null device DACL already lets the restricted token create a
+    // pipe. Replacing it would remove everyone else's access.
+    if dacl.is_null() {
+        return Ok(None);
+    }
+    let mask = GENERIC_ALL | FILE_ALL_ACCESS;
+    let trustee = TrusteeW {
+        p_multiple_trustee: ptr::null_mut(),
+        multiple_trustee_operation: NO_MULTIPLE_TRUSTEE,
+        trustee_form: TRUSTEE_IS_SID,
+        trustee_type: TRUSTEE_IS_WELL_KNOWN_GROUP,
+        ptstr_name: sid,
+    };
+    // A direct ACE covers create-in-directory. NPFS assigns the new
+    // pipe's security with a null parent, so inheritance does not
+    // rewrite `sec_user`. The direct ACE is the create check.
+    let mut entries = [
+        ExplicitAccessW {
+            grf_access_permissions: mask,
+            grf_access_mode: GRANT_ACCESS,
+            grf_inheritance: NO_INHERITANCE,
+            trustee,
+        },
+        ExplicitAccessW {
+            grf_access_permissions: mask,
+            grf_access_mode: GRANT_ACCESS,
+            grf_inheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            trustee,
+        },
+    ];
+    let mut new_acl = ptr::null_mut();
+    let set = unsafe { SetEntriesInAclW(2, entries.as_mut_ptr(), dacl, &mut new_acl) };
+    if set != 0 {
+        return Err(win32_error("SetEntriesInAclW", set));
+    }
+    let new_acl = LocalMem(new_acl);
+    let applied = unsafe {
+        SetSecurityInfo(
+            file,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            new_acl.0,
+            ptr::null_mut(),
+        )
+    };
+    if applied != 0 {
+        return Err(win32_error("SetSecurityInfo", applied));
+    }
+    Ok(Some(AclRestore {
+        path: wide_os(OsStr::new(r"\Device\NamedPipe")),
+        object_type: NPFS_RESTORE,
+        _sd: sd,
+        dacl,
+        restored: false,
+    }))
+}
+
+/// `sec_user` does not name `S-1-5-12`, and the write end of the signal
+/// pipe is opened with `GENERIC_WRITE`. Replace the descriptor on every
+/// `NtCreateNamedPipeFile` in this process. ntdll is mapped before
+/// `DllMain`, so the patch is visible to `sigproc_init`.
+fn install_ntdll_pipe_hook(process: Handle, restricted: Handle) -> Result<(), KernelError> {
+    let stub = ntdll_export(b"NtCreateNamedPipeFile\0")?;
+    let mut head = [0u8; 8];
+    let read = unsafe {
+        ReadProcessMemory(
+            process,
+            stub.cast(),
+            head.as_mut_ptr(),
+            head.len(),
+            ptr::null_mut(),
+        )
+    };
+    if read == 0 {
+        return Err(last_error("ReadProcessMemory ntdll"));
+    }
+    if head[0..4] != [0x4C, 0x8B, 0xD1, 0xB8] {
+        return Err(KernelError::Apply(format!(
+            "NtCreateNamedPipeFile stub {:02x?}",
+            &head[..]
+        )));
+    }
+    let syscall = u32::from_le_bytes(head[4..8].try_into().unwrap());
+    let sd = remote_user_and_restricted_sd(process, restricted)?;
+    let cave = alloc_hook_cave(process, stub as usize);
+    if cave.is_null() {
+        return Err(last_error("VirtualAllocEx near ntdll"));
+    }
+    let code = pipe_hook_shellcode(sd as u64, syscall);
+    if !write_remote(process, cave, &code) {
+        return Err(last_error("WriteProcessMemory shellcode"));
+    }
+    let rel = (cave as isize).wrapping_sub(stub as isize + 5);
+    let rel = i32::try_from(rel)
+        .map_err(|_| KernelError::Apply("pipe hook cave is out of rel32 range".to_string()))?;
+    let mut patch = vec![0xE9];
+    patch.extend_from_slice(&rel.to_le_bytes());
+    if !write_remote(process, stub.cast(), &patch) {
+        return Err(last_error("WriteProcessMemory ntdll stub"));
+    }
+    eprintln!("workpen: pipe hook ntdll syscall={syscall}");
+    Ok(())
+}
+
+fn ntdll_export(name: &[u8]) -> Result<*mut u8, KernelError> {
+    let module_name = wide_os(OsStr::new("ntdll.dll"));
+    let module = unsafe { GetModuleHandleW(module_name.as_ptr()) };
+    if module.is_null() {
+        return Err(last_error("GetModuleHandleW ntdll"));
+    }
+    let addr = unsafe { GetProcAddress(module, name.as_ptr()) };
+    if addr.is_null() {
+        return Err(last_error("GetProcAddress NtCreateNamedPipeFile"));
+    }
+    Ok(addr.cast())
+}
+
+fn pipe_hook_shellcode(sd: u64, syscall: u32) -> Vec<u8> {
+    let mut code = vec![
+        0x4D, 0x85, 0xC0, // test r8, r8
+        0x74, 0x0E, // jz to the syscall setup
+        0x48, 0xB8, // mov rax, imm64
+    ];
+    code.extend_from_slice(&sd.to_le_bytes());
+    code.extend_from_slice(&[
+        0x49, 0x89, 0x40, 0x20, // mov [r8+20h], rax
+        0x4C, 0x8B, 0xD1, // mov r10, rcx
+        0xB8, // mov eax, imm32
+    ]);
+    code.extend_from_slice(&syscall.to_le_bytes());
+    code.extend_from_slice(&[0x0F, 0x05, 0xC3]); // syscall; ret
+    code
+}
+
+fn remote_user_and_restricted_sd(
+    process: Handle,
+    restricted: Handle,
+) -> Result<*mut core::ffi::c_void, KernelError> {
+    let user = current_user_sid()?;
+    let remote = unsafe { VirtualAllocEx(process, ptr::null_mut(), 512, 0x3000, 0x04) };
+    if remote.is_null() {
+        return Err(last_error("VirtualAllocEx security descriptor"));
+    }
+    let mut buf = vec![0u8; 512];
+    let sd = buf.as_mut_ptr();
+    let acl = unsafe { sd.add(64) };
+    let ready = unsafe {
+        InitializeSecurityDescriptor(sd, 1) != 0
+            && InitializeAcl(acl, 360, 2) != 0
+            && AddAccessAllowedAce(
+                acl,
+                2,
+                GENERIC_ALL | FILE_ALL_ACCESS,
+                user.as_ptr().cast_mut().cast(),
+            ) != 0
+            && AddAccessAllowedAce(acl, 2, GENERIC_ALL | FILE_ALL_ACCESS, restricted) != 0
+            && SetSecurityDescriptorDacl(sd, 1, acl, 0) != 0
+    };
+    if !ready {
+        return Err(last_error("pipe security descriptor"));
+    }
+    unsafe {
+        sd.add(32)
+            .cast::<*mut core::ffi::c_void>()
+            .write(remote.add(64));
+    }
+    if !write_remote(process, remote, &buf) {
+        return Err(last_error("WriteProcessMemory security descriptor"));
+    }
+    Ok(remote)
+}
+
+fn alloc_hook_cave(process: Handle, stub: usize) -> *mut core::ffi::c_void {
+    let page = stub & !0xFFFF;
+    for step in 1..512usize {
+        let hint = page.wrapping_sub(step * 0x10000) as *mut core::ffi::c_void;
+        let got = unsafe { VirtualAllocEx(process, hint, 0x1000, 0x3000, 0x40) };
+        if !got.is_null() {
+            return got;
+        }
+    }
+    ptr::null_mut()
+}
+
+fn write_remote(process: Handle, addr: *mut core::ffi::c_void, bytes: &[u8]) -> bool {
+    let ok =
+        unsafe { WriteProcessMemory(process, addr, bytes.as_ptr(), bytes.len(), ptr::null_mut()) };
+    if ok != 0 {
+        return true;
+    }
+    let mut old = 0u32;
+    if unsafe { VirtualProtectEx(process, addr, bytes.len(), 0x40, &mut old) } == 0 {
+        return false;
+    }
+    let ok =
+        unsafe { WriteProcessMemory(process, addr, bytes.as_ptr(), bytes.len(), ptr::null_mut()) };
+    unsafe {
+        VirtualProtectEx(process, addr, bytes.len(), old, &mut old);
+    }
+    ok != 0
+}
+
+fn probe_directory_create(token: Handle, name: &str) {
+    if unsafe { ImpersonateLoggedOnUser(token) } == 0 {
+        eprintln!(
+            "workpen: msys dir probe impersonate failed: {}",
+            last_error("ImpersonateLoggedOnUser")
+        );
+        return;
+    }
+    let opened = open_directory_status(name, MSYS_DIR_ACCESS);
+    unsafe { RevertToSelf() };
+    match opened {
+        Ok(dir) => {
+            unsafe { CloseHandle(dir) };
+            eprintln!("workpen: msys dir probe ok {name}");
+        }
+        Err(status) => {
+            eprintln!("workpen: msys dir probe failed {name} ntstatus {status:#x}");
+        }
+    }
+}
+
+fn restricted_namespace_names() -> Vec<String> {
+    // Only `Restricted`. Nulling `\BaseNamedObjects` itself breaks
+    // AppContainer creation in tests that run at the same time.
+    let mut names = vec![r"\BaseNamedObjects\Restricted".to_string()];
+    let mut session = 0u32;
+    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+    if ok != 0 && session != 0 {
+        names.push(format!(r"\Sessions\{session}\BaseNamedObjects\Restricted"));
+    }
+    names
+}
+
+fn msys_dll_beside(program: &Path) -> Option<PathBuf> {
+    let dll = program.parent()?.join("msys-2.0.dll");
+    dll.is_file().then_some(dll)
+}
+
+fn msys_shared_id(dll: &Path) -> Option<String> {
+    let bytes = std::fs::read(dll).ok()?;
+    // The version banner is `shared id: msys-2.0S<n>`. A bare scan can
+    // match an earlier `msys-2.0S` byte run that is not the shared id.
+    shared_id_after(&bytes, b"shared id: msys-2.0S")
+        .or_else(|| shared_id_after(&bytes, b"msys-2.0S"))
+}
+
+fn shared_id_after(bytes: &[u8], needle: &[u8]) -> Option<String> {
+    let rel = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)?;
+    let start = rel + needle.len();
+    let digits = bytes[start..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return None;
+    }
+    Some(format!(
+        "msys-2.0S{}",
+        String::from_utf8_lossy(&bytes[start..start + digits])
+    ))
+}
+
+fn msys_install_nt_path(dll: &Path) -> Result<Vec<u16>, KernelError> {
+    let wide = wide_path(dll);
+    // SAFETY: `wide` is a NUL-terminated path. The share mode matches
+    // MSYS `FILE_SHARE_VALID_FLAGS` so a running git does not block the open.
+    let file = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | 0x4,
+            ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    if file.is_null() || file == INVALID_HANDLE_VALUE {
+        return Err(last_error("CreateFileW msys dll"));
+    }
+    let mut buf = vec![0u16; 32768];
+    // SAFETY: `file` is the open DLL; `buf` receives the Win32 path.
+    let n = unsafe { GetFinalPathNameByHandleW(file, buf.as_mut_ptr(), buf.len() as Dword, 0) };
+    unsafe { CloseHandle(file) };
+    if n == 0 || n as usize >= buf.len() {
+        return Err(last_error("GetFinalPathNameByHandleW"));
+    }
+    buf.truncate(n as usize);
+    normalize_msys_install_path(&mut buf);
+    Ok(buf)
+}
+
+/// MSYS turns the DLL path into an NT path and hashes that, including
+/// the file name. `\??\` is `\\?\` with the second character replaced.
+fn normalize_msys_install_path(path: &mut Vec<u16>) {
+    let slash = u16::from(b'\\');
+    let question = u16::from(b'?');
+    let prefixed = path.len() >= 2 && path[0] == slash && path[1] == slash;
+    if !prefixed {
+        let mut next = vec![slash, slash, question, slash];
+        next.append(path);
+        *path = next;
+    }
+    if path.len() >= 2 {
+        path[1] = question;
+    }
+}
+
+/// Cygwin `hash_path_name`: each unit is upcased, then
+/// `hash = ch + (hash << 6) + (hash << 16) - hash` in 64 bits.
+fn hash_path_name(mut hash: u64, name: &[u16]) -> u64 {
+    let upper = upcase_path(name);
+    for unit in upper {
+        let ch = u64::from(unit);
+        hash = ch
+            .wrapping_add(hash.wrapping_shl(6))
+            .wrapping_add(hash.wrapping_shl(16))
+            .wrapping_sub(hash);
+    }
+    hash
+}
+
+fn upcase_path(name: &[u16]) -> Vec<u16> {
+    let mut out = name.to_vec();
+    if out.is_empty() {
+        return out;
+    }
+    // LOCALE_INVARIANT + LCMAP_UPPERCASE. ASCII matches
+    // `RtlUpcaseUnicodeChar`. A failed map still uppercases A-Z.
+    let mapped = unsafe {
+        LCMapStringW(
+            0x007F,
+            0x0000_0200,
+            name.as_ptr(),
+            name.len() as i32,
+            out.as_mut_ptr(),
+            out.len() as i32,
+        )
+    };
+    if mapped == 0 {
+        for unit in &mut out {
+            if (u16::from(b'a')..=u16::from(b'z')).contains(unit) {
+                *unit -= 32;
+            }
+        }
+    }
+    out
+}
+
+fn ensure_msys_shared_dir(name: &str, restricted: Handle, world: Handle) {
+    let dir = match open_directory_status(name, 0x0006_0000) {
+        Ok(dir) => dir,
+        Err(status)
+            if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND =>
+        {
+            match create_msys_directory(name, restricted, world) {
+                Ok(dir) => dir,
+                Err(status) => {
+                    eprintln!("workpen: msys shared create skipped: {name} (ntstatus {status:#x})");
+                    return;
+                }
+            }
+        }
+        Err(status) if status == STATUS_ACCESS_DENIED => {
+            // The leaf exists, but its DACL does not grant WRITE_DAC.
+            if let Err(err) = take_directory_ownership(name) {
+                eprintln!("workpen: msys shared owner skipped: {name}: {err}");
+                return;
+            }
+            match open_directory_status(name, 0x0006_0000) {
+                Ok(dir) => dir,
+                Err(status) => {
+                    eprintln!("workpen: msys shared open skipped: {name} (ntstatus {status:#x})");
+                    return;
+                }
+            }
+        }
+        Err(status) => {
+            eprintln!("workpen: msys shared open skipped: {name} (ntstatus {status:#x})");
+            return;
+        }
+    };
+    secure_msys_directory(dir, name, restricted);
+}
+
+fn take_directory_ownership(name: &str) -> Result<(), KernelError> {
+    enable_privilege("SeTakeOwnershipPrivilege")?;
+    let dir = open_directory_status(name, WRITE_OWNER | 0x0002_0000).map_err(|status| {
+        KernelError::Apply(format!(
+            "NtOpenDirectoryObject {name} WRITE_OWNER failed (ntstatus {status:#x})"
+        ))
+    })?;
+    let user = current_user_sid()?;
+    // SAFETY: `dir` is open for WRITE_OWNER. `user` is a SID copy.
+    let set = unsafe {
+        SetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            user.as_ptr().cast_mut().cast(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(dir) };
+    if set != 0 {
+        return Err(win32_error("SetSecurityInfo owner", set));
+    }
+    Ok(())
+}
+
+fn enable_privilege(name: &str) -> Result<(), KernelError> {
+    let mut token = ptr::null_mut();
+    // SAFETY: current process. Adjust plus query is enough to enable one privilege.
+    let opened = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+    };
+    if opened == 0 {
+        return Err(last_error("OpenProcessToken privileges"));
+    }
+    let token = CloseOnDrop(token);
+    let wide = wide_os(OsStr::new(name));
+    let mut luid = Luid {
+        low_part: 0,
+        high_part: 0,
+    };
+    // SAFETY: `wide` is a NUL-terminated privilege name.
+    let looked = unsafe { LookupPrivilegeValueW(ptr::null(), wide.as_ptr(), &mut luid) };
+    if looked == 0 {
+        return Err(last_error("LookupPrivilegeValueW"));
+    }
+    let mut state = TokenPrivileges {
+        count: 1,
+        attr: LuidAndAttributes {
+            luid,
+            attributes: SE_PRIVILEGE_ENABLED,
+        },
+    };
+    // SAFETY: `state` is one privilege. Previous state is unused.
+    let adjusted = unsafe {
+        AdjustTokenPrivileges(token.0, 0, &mut state, 0, ptr::null_mut(), ptr::null_mut())
+    };
+    let err = unsafe { GetLastError() };
+    if adjusted == 0 || err == 1300 {
+        return Err(KernelError::Apply(format!(
+            "AdjustTokenPrivileges {name} failed (win32 {err})"
+        )));
+    }
+    Ok(())
+}
+
+fn current_user_sid() -> Result<Vec<u8>, KernelError> {
+    let token = open_current_process_token()?;
+    token_user_sid(token.0)
+}
+
+fn token_user_sid(token: Handle) -> Result<Vec<u8>, KernelError> {
+    let mut bytes = 0u32;
+    unsafe {
+        GetTokenInformation(token, TOKEN_USER, ptr::null_mut(), 0, &mut bytes);
+    }
+    if bytes < 8 {
+        return Err(last_error("GetTokenInformation TokenUser"));
+    }
+    let mut buf = vec![0u8; bytes as usize];
+    // SAFETY: `buf` is `bytes` long. The class is TokenUser.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_USER,
+            buf.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+        )
+    };
+    if ok == 0 {
+        return Err(last_error("GetTokenInformation TokenUser"));
+    }
+    let sid = unsafe { buf.as_ptr().cast::<Handle>().read() };
+    if sid.is_null() {
+        return Err(KernelError::Apply("TokenUser SID is null".into()));
+    }
+    let len = unsafe { GetLengthSid(sid) };
+    if len == 0 || len > 256 {
+        return Err(last_error("GetLengthSid"));
+    }
+    let mut copy = vec![0u8; len as usize];
+    // SAFETY: `sid` is the TokenUser SID inside `buf`, which stays alive.
+    let copied = unsafe { CopySid(len, copy.as_mut_ptr(), sid) };
+    if copied == 0 {
+        return Err(last_error("CopySid"));
+    }
+    Ok(copy)
+}
+
+fn open_directory_status(name: &str, access: u32) -> Result<Handle, i32> {
+    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
+    let mut us = UnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attrs = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: ptr::null_mut(),
+        object_name: &mut us,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: ptr::null_mut(),
+        security_quality_of_service: ptr::null_mut(),
+    };
+    let mut handle = ptr::null_mut();
+    // SAFETY: `us` and `wide` live for the call.
+    let status = unsafe { NtOpenDirectoryObject(&mut handle, access, &mut attrs) };
+    if status != 0 || handle.is_null() {
+        return Err(status);
+    }
+    Ok(handle)
+}
+
+fn create_msys_directory(name: &str, restricted: Handle, world: Handle) -> Result<Handle, i32> {
+    let mut sd = [0u64; 8];
+    let sd_ptr = sd.as_mut_ptr().cast::<u8>();
+    // ACLs must be DWORD-aligned. A `Vec<u8>` is not.
+    let mut acl_words = vec![0u32; 64];
+    let acl = acl_words.as_mut_ptr().cast::<u8>();
+    let ready = unsafe {
+        InitializeSecurityDescriptor(sd_ptr, 1) != 0
+            && InitializeAcl(acl, acl_words.len() as Dword * 4, 2) != 0
+            && AddAccessAllowedAce(acl, 2, MSYS_DIR_WRITE_DAC, world) != 0
+            && AddAccessAllowedAce(acl, 2, MSYS_DIR_ACCESS, restricted) != 0
+            && SetSecurityDescriptorDacl(sd_ptr, 1, acl, 0) != 0
+    };
+    if !ready {
+        return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+    }
+    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
+    let mut us = UnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attrs = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: ptr::null_mut(),
+        object_name: &mut us,
+        attributes: OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
+        security_descriptor: sd.as_mut_ptr().cast(),
+        security_quality_of_service: ptr::null_mut(),
+    };
+    let mut handle = ptr::null_mut();
+    // SAFETY: `sd`, `acl`, `us`, and `wide` live for the call.
+    let status = unsafe { NtCreateDirectoryObject(&mut handle, MSYS_DIR_WRITE_DAC, &mut attrs) };
+    if status != 0 || handle.is_null() {
+        return Err(status);
+    }
+    Ok(handle)
+}
+
+fn grant_sid_on_directory(dir: Handle, sid: Handle, rights: Dword) -> Result<(), KernelError> {
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut sacl = ptr::null_mut();
+    let mut sd = ptr::null_mut();
+    // SAFETY: `dir` is an open object directory.
+    let got = unsafe {
+        GetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    if got != 0 {
+        return Err(win32_error("GetSecurityInfo", got));
+    }
+    let _sd = LocalMem(sd);
+    // A null DACL already grants every SID. The caller adds an
+    // inheritable section allow when this returns.
+    if dacl.is_null() {
+        return Ok(());
+    }
+    let new_acl = match acl_with_grant(dacl, sid, rights) {
+        Ok(acl) => acl,
+        Err(err) => return Err(err),
+    };
+    // SAFETY: `new_acl` is a LocalAlloc ACL from SetEntriesInAclW.
+    let applied = unsafe {
+        SetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            new_acl.0,
+            ptr::null_mut(),
+        )
+    };
+    if applied != 0 {
+        return Err(win32_error("SetSecurityInfo", applied));
+    }
+    Ok(())
+}
+
+/// `sec_none` passes a null descriptor, so `SID.1` inherits this
+/// directory. The directory-open ACE is not inheritable. Children need
+/// an allow for the user and for `S-1-5-12`.
+fn secure_msys_directory(dir: Handle, name: &str, restricted: Handle) {
+    let granted = grant_sid_on_directory(dir, restricted, MSYS_DIR_ACCESS);
+    let inherited = append_inheritable_section_allows(dir, restricted);
+    // `Restricted` is not the parent of `SID.1`.
+    let existing = if name.contains("msys-") {
+        grant_existing_user_section(name, restricted)
+    } else {
+        Ok(())
+    };
+    unsafe { CloseHandle(dir) };
+    if let Err(err) = granted {
+        eprintln!("workpen: msys shared ACE skipped: {name}: {err}");
+    }
+    match inherited {
+        Ok(()) => eprintln!("workpen: msys inherit ok {name}"),
+        Err(err) => eprintln!("workpen: msys inherit skipped: {name}: {err}"),
+    }
+    if let Err(err) = existing {
+        eprintln!("workpen: msys user section skipped: {name}: {err}");
+    }
+}
+
+fn append_inheritable_section_allows(
+    object: Handle,
+    restricted: Handle,
+) -> Result<(), KernelError> {
+    let user = current_user_sid()?;
+    let user_sid = user.as_ptr().cast_mut().cast();
+    let (dacl, _sd) = object_dacl(object)?;
+    let have_user = acl_has_inherit_allow(dacl, user_sid, MSYS_INHERIT_ACCESS);
+    let have_restricted = acl_has_inherit_allow(dacl, restricted, MSYS_INHERIT_ACCESS);
+    if have_user && have_restricted {
+        return Ok(());
+    }
+    let mut words = vec![0u32; 1024];
+    let acl = words.as_mut_ptr().cast::<u8>();
+    let bytes = (words.len() * 4) as Dword;
+    if unsafe { InitializeAcl(acl, bytes, 2) } == 0 {
+        return Err(last_error("InitializeAcl"));
+    }
+    if !dacl.is_null() {
+        copy_aces(dacl, acl)?;
+    }
+    let flags = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+    if !have_user
+        && unsafe { AddAccessAllowedAceEx(acl, 2, flags, MSYS_INHERIT_ACCESS, user_sid) } == 0
+    {
+        return Err(last_error("AddAccessAllowedAceEx user"));
+    }
+    if !have_restricted
+        && unsafe { AddAccessAllowedAceEx(acl, 2, flags, MSYS_INHERIT_ACCESS, restricted) } == 0
+    {
+        return Err(last_error("AddAccessAllowedAceEx restricted"));
+    }
+    let applied = unsafe {
+        SetSecurityInfo(
+            object,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            acl.cast(),
+            ptr::null_mut(),
+        )
+    };
+    if applied != 0 {
+        return Err(win32_error("SetSecurityInfo", applied));
+    }
+    Ok(())
+}
+
+fn object_dacl(object: Handle) -> Result<(Handle, LocalMem), KernelError> {
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut sacl = ptr::null_mut();
+    let mut sd = ptr::null_mut();
+    let got = unsafe {
+        GetSecurityInfo(
+            object,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    if got != 0 {
+        return Err(win32_error("GetSecurityInfo", got));
+    }
+    Ok((dacl, LocalMem(sd)))
+}
+
+fn copy_aces(from: Handle, to: *mut u8) -> Result<(), KernelError> {
+    let count = u32::from(ace_count(from));
+    for index in 0..count {
+        let mut ace = ptr::null_mut();
+        if unsafe { GetAce(from, index, &mut ace) } == 0 || ace.is_null() {
+            return Err(last_error("GetAce"));
+        }
+        let bytes = ace.cast::<u8>();
+        let size = unsafe { u16::from_le_bytes([*bytes.add(2), *bytes.add(3)]) };
+        if unsafe { AddAce(to, 2, Dword::MAX, bytes, u32::from(size)) } == 0 {
+            return Err(last_error("AddAce"));
+        }
+    }
+    Ok(())
+}
+
+fn ace_count(acl: Handle) -> u16 {
+    if acl.is_null() {
+        return 0;
+    }
+    let bytes = acl.cast::<u8>();
+    unsafe { u16::from_le_bytes([*bytes.add(4), *bytes.add(5)]) }
+}
+
+fn acl_has_inherit_allow(acl: Handle, sid: Handle, mask: Dword) -> bool {
+    if acl.is_null() || sid.is_null() {
+        return false;
+    }
+    let count = u32::from(ace_count(acl));
+    for index in 0..count {
+        let mut ace = ptr::null_mut();
+        if unsafe { GetAce(acl, index, &mut ace) } == 0 || ace.is_null() {
+            return false;
+        }
+        let bytes = ace.cast::<u8>();
+        let size = unsafe { u16::from_le_bytes([*bytes.add(2), *bytes.add(3)]) };
+        if size < 20 {
+            continue;
+        }
+        let kind = unsafe { *bytes };
+        let flags = unsafe { *bytes.add(1) };
+        let ace_mask = unsafe {
+            u32::from_le_bytes([*bytes.add(4), *bytes.add(5), *bytes.add(6), *bytes.add(7)])
+        };
+        if kind != 0 || flags & (OBJECT_INHERIT_ACE as u8) == 0 {
+            continue;
+        }
+        if ace_mask & mask != mask {
+            continue;
+        }
+        if unsafe { EqualSid(bytes.add(8).cast(), sid) } != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// MSYS `user_info::create` opens `SID.1` with `OBJ_OPENIF`. An existing
+/// section does not inherit a directory ACE added later.
+fn grant_existing_user_section(dir_name: &str, restricted: Handle) -> Result<(), KernelError> {
+    let user = current_user_sid()?;
+    let text = sid_to_string(&user)?;
+    let path = format!(r"{dir_name}\{text}.1");
+    match open_section_status(&path, 0x0006_0000) {
+        Ok(section) => {
+            let result = append_inheritable_section_allows(section, restricted);
+            unsafe { CloseHandle(section) };
+            if result.is_ok() {
+                eprintln!("workpen: msys user section allow {path}");
+            }
+            result
+        }
+        Err(status)
+            if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND =>
+        {
+            eprintln!("workpen: msys user section absent {path}");
+            Ok(())
+        }
+        Err(status) => {
+            eprintln!("workpen: msys user section open {path} ntstatus {status:#x}");
+            Ok(())
+        }
+    }
+}
+
+fn sid_to_string(sid: &[u8]) -> Result<String, KernelError> {
+    let mut wide = ptr::null_mut();
+    let ok = unsafe { ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut wide) };
+    if ok == 0 || wide.is_null() {
+        return Err(last_error("ConvertSidToStringSidW"));
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *wide.add(len) != 0 && len < 200 {
+            len += 1;
+        }
+    }
+    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
+    unsafe { LocalFree(wide.cast()) };
+    if text.is_empty() {
+        return Err(KernelError::Apply("empty SID string".into()));
+    }
+    Ok(text)
+}
+
+fn open_section_status(name: &str, access: u32) -> Result<Handle, i32> {
+    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
+    let mut us = UnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attrs = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: ptr::null_mut(),
+        object_name: &mut us,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: ptr::null_mut(),
+        security_quality_of_service: ptr::null_mut(),
+    };
+    let mut handle = ptr::null_mut();
+    let status = unsafe { NtOpenSection(&mut handle, access, &mut attrs) };
+    if status != 0 || handle.is_null() {
+        return Err(status);
+    }
+    Ok(handle)
+}
+
+fn acl_with_grant(old: Handle, sid: Handle, rights: Dword) -> Result<LocalMem, KernelError> {
+    let mut entry = ExplicitAccessW {
+        grf_access_permissions: rights,
+        grf_access_mode: GRANT_ACCESS,
+        grf_inheritance: NO_INHERITANCE,
+        trustee: TrusteeW {
+            p_multiple_trustee: ptr::null_mut(),
+            multiple_trustee_operation: NO_MULTIPLE_TRUSTEE,
+            trustee_form: TRUSTEE_IS_SID,
+            trustee_type: TRUSTEE_IS_WELL_KNOWN_GROUP,
+            ptstr_name: sid,
+        },
+    };
+    let mut new_acl = ptr::null_mut();
+    // SAFETY: `entry` lives for the call. `old` may be null.
+    let set = unsafe { SetEntriesInAclW(1, &mut entry, old, &mut new_acl) };
+    if set != 0 || new_acl.is_null() {
+        return Err(win32_error("SetEntriesInAclW", set));
+    }
+    Ok(LocalMem(new_acl))
+}
+
+#[repr(C)]
+struct TokenDefaultDacl {
+    default_dacl: *mut u8,
+}
+
+fn grant_token_default_dacl(token: Handle, sid: Handle) -> Result<(), KernelError> {
+    // A null token default does not become a null object DACL.
+    // `sec_none` needs an allow that names `S-1-5-12` and the user.
+    let user = token_user_sid(token)?;
+    let world = WorldSid::new().map_err(|_| KernelError::Apply("world SID".into()))?;
+    let mut acl_words = vec![0u32; 64];
+    let acl = acl_words.as_mut_ptr().cast::<u8>();
+    let mask = GENERIC_ALL | 0x001F_FFFF;
+    let ready = unsafe {
+        InitializeAcl(acl, (acl_words.len() * 4) as Dword, 2) != 0
+            && AddAccessAllowedAce(acl, 2, mask, world.0) != 0
+            && AddAccessAllowedAce(acl, 2, mask, user.as_ptr().cast_mut().cast()) != 0
+            && AddAccessAllowedAce(acl, 2, mask, sid) != 0
+    };
+    if !ready {
+        return Err(last_error("default DACL"));
+    }
+    let info = TokenDefaultDacl { default_dacl: acl };
+    // SAFETY: `acl_words` stays alive for the call. The kernel copies it.
+    let set = unsafe {
+        SetTokenInformation(
+            token,
+            TOKEN_DEFAULT_DACL,
+            (&raw const info).cast_mut().cast(),
+            std::mem::size_of::<TokenDefaultDacl>() as Dword,
+        )
+    };
+    if set == 0 {
+        return Err(last_error("SetTokenInformation TokenDefaultDacl"));
+    }
+    Ok(())
 }
 
 /// Process-lifetime AppContainer for [`super::KernelPolicy::spawn_reexec`].
@@ -1140,6 +2759,17 @@ fn spawn_prepared_child(
         Some(helper) => wrap_command_line(helper, cmd)?,
         None => command_line(cmd)?,
     };
+    let mut debug_pipe = false;
+    if let Ok(program) = resolve_program(cmd.get_program()) {
+        debug_pipe = msys_dll_beside(&program).is_some();
+        allow_msys_shared_dirs(
+            &program,
+            prepared._sid.0,
+            prepared._world.0,
+            prepared.token.0,
+            &mut prepared.acl_guards,
+        );
+    }
     let mut env_block = environment_block(cmd);
     let std_in = inheritable_std_handle(STD_INPUT_HANDLE, false)?;
     let piped = matches!(capture, StdioCapture::Collect | StdioCapture::Forward);
@@ -1256,6 +2886,36 @@ fn spawn_prepared_child(
         join_copy(stdout_fwd);
         join_copy(stderr_fwd);
         return Err(last_error("AssignProcessToJobObject"));
+    }
+    relax_child_bno(process.0, prepared._sid.0, prepared._world.0);
+    // CreateProcessAsUser duplicates the token. Lock that copy, not the
+    // handle we passed in, or MSYS still replaces the default DACL.
+    if let Err(err) = lock_suspended_token(process.0, prepared._sid.0) {
+        unsafe {
+            TerminateProcess(process.0, 1);
+        }
+        let _ = join_drain(stdout_drain);
+        let _ = join_drain(stderr_drain);
+        join_copy(stdout_fwd);
+        join_copy(stderr_fwd);
+        return Err(err);
+    }
+    if let Err(err) = deny_process_write_dac(process.0) {
+        unsafe {
+            TerminateProcess(process.0, 1);
+        }
+        let _ = join_drain(stdout_drain);
+        let _ = join_drain(stderr_drain);
+        join_copy(stdout_fwd);
+        join_copy(stderr_fwd);
+        return Err(err);
+    }
+    // `sigproc_init` runs from the MSYS `DllMain`, before the entry point.
+    // Patch `NtCreateNamedPipeFile` while the process is still suspended.
+    if debug_pipe {
+        if let Err(err) = install_ntdll_pipe_hook(process.0, prepared._sid.0) {
+            eprintln!("workpen: pipe hook skipped: {err}");
+        }
     }
     // SAFETY: thread is the primary thread of the suspended process.
     let resumed = unsafe { ResumeThread(thread.0) };
@@ -1679,7 +3339,25 @@ fn set_acl_entry(
     mode: u32,
     inheritance: Dword,
 ) -> Result<AclRestore, KernelError> {
-    let mut wide = wide_path(path);
+    set_named_ace(
+        &wide_path(path),
+        SE_FILE_OBJECT,
+        sid,
+        permissions,
+        mode,
+        inheritance,
+    )
+}
+
+fn set_named_ace(
+    wide: &[u16],
+    object_type: u32,
+    sid: Handle,
+    permissions: Dword,
+    mode: u32,
+    inheritance: Dword,
+) -> Result<AclRestore, KernelError> {
+    let mut wide = wide.to_vec();
     let mut owner = ptr::null_mut();
     let mut group = ptr::null_mut();
     let mut dacl = ptr::null_mut();
@@ -1689,7 +3367,7 @@ fn set_acl_entry(
     let got = unsafe {
         GetNamedSecurityInfoW(
             wide.as_ptr(),
-            SE_FILE_OBJECT,
+            object_type,
             DACL_SECURITY_INFORMATION,
             &mut owner,
             &mut group,
@@ -1725,7 +3403,7 @@ fn set_acl_entry(
     let applied = unsafe {
         SetNamedSecurityInfoW(
             wide.as_mut_ptr(),
-            SE_FILE_OBJECT,
+            object_type,
             DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
             ptr::null_mut(),
@@ -1738,6 +3416,7 @@ fn set_acl_entry(
     }
     Ok(AclRestore {
         path: wide,
+        object_type,
         _sd: sd,
         dacl,
         restored: false,
@@ -1800,7 +3479,132 @@ fn duplicate_primary_token(token: Handle) -> Result<CloseOnDrop, KernelError> {
 fn create_write_restricted_token(sid: Handle) -> Result<CloseOnDrop, KernelError> {
     let process_token = open_current_process_token()?;
     let restricted = create_restricted_token(process_token.0, sid)?;
-    duplicate_primary_token(restricted.0)
+    let primary = duplicate_primary_token(restricted.0)?;
+    if let Err(err) = grant_token_default_dacl(primary.0, sid) {
+        eprintln!("workpen: token default DACL skipped: {err}");
+    }
+    Ok(primary)
+}
+
+fn lock_suspended_token(process: Handle, restricted: Handle) -> Result<(), KernelError> {
+    let mut raw = ptr::null_mut();
+    // READ_CONTROL | WRITE_DAC, plus the rights SetTokenInformation needs.
+    // The child has not run, so this open still sees the kernel's default
+    // token DACL. MSYS later opens the same token with MAXIMUM_ALLOWED.
+    let opened = unsafe {
+        OpenProcessToken(
+            process,
+            TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | 0x0006_0000,
+            &mut raw,
+        )
+    };
+    if opened == 0 {
+        return Err(last_error("OpenProcessToken child"));
+    }
+    let token = CloseOnDrop(raw);
+    grant_token_default_dacl(token.0, restricted)?;
+    let (null_dacl, aces) = token_default_dacl_aces(token.0);
+    eprintln!("workpen: token default dacl null={null_dacl} aces={aces}");
+    deny_token_adjust_default(token.0)
+}
+
+fn token_default_dacl_aces(token: Handle) -> (bool, i32) {
+    let mut bytes = 0u32;
+    unsafe {
+        GetTokenInformation(token, TOKEN_DEFAULT_DACL, ptr::null_mut(), 0, &mut bytes);
+    }
+    if bytes < std::mem::size_of::<TokenDefaultDacl>() as u32 {
+        return (true, -1);
+    }
+    let mut buf = vec![0u8; bytes as usize];
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_DEFAULT_DACL,
+            buf.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+        )
+    };
+    if ok == 0 {
+        return (false, -2);
+    }
+    let acl = unsafe { buf.as_ptr().cast::<TokenDefaultDacl>().read().default_dacl };
+    if acl.is_null() {
+        return (true, 0);
+    }
+    let count = unsafe { u16::from_le_bytes([*acl.add(4), *acl.add(5)]) };
+    (false, i32::from(count))
+}
+
+fn deny_token_adjust_default(token: Handle) -> Result<(), KernelError> {
+    let user = token_user_sid(token)?;
+    let world = WorldSid::new().map_err(|_| KernelError::Apply("world SID".into()))?;
+    let mut acl_words = vec![0u32; 64];
+    let acl = acl_words.as_mut_ptr().cast::<u8>();
+    // Deny the rights MSYS uses to replace the default DACL, and the
+    // rights that would put TOKEN_ADJUST_DEFAULT back on this token.
+    let deny_mask = TOKEN_ADJUST_DEFAULT | 0x0004_0000 | 0x0008_0000;
+    let allow_mask = 0x000F_01FF & !deny_mask;
+    let ready = unsafe {
+        InitializeAcl(acl, (acl_words.len() * 4) as Dword, 2) != 0
+            && AddAccessDeniedAce(acl, 2, deny_mask, world.0) != 0
+            && AddAccessAllowedAce(acl, 2, allow_mask, user.as_ptr().cast_mut().cast()) != 0
+    };
+    if !ready {
+        return Err(last_error("token DACL"));
+    }
+    let set = unsafe {
+        SetSecurityInfo(
+            token,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            acl.cast(),
+            ptr::null_mut(),
+        )
+    };
+    if set != 0 {
+        return Err(win32_error("SetSecurityInfo token", set));
+    }
+    Ok(())
+}
+
+fn deny_process_write_dac(process: Handle) -> Result<(), KernelError> {
+    // MSYS replaces the process DACL with `sec_user`, which has no
+    // S-1-5-12. `shared.5` still opens because that call passes an
+    // explicit null DACL. `sec_none` does not. Deny WRITE_DAC so the
+    // replacement fails and MSYS continues.
+    let user = current_user_sid()?;
+    let world = WorldSid::new().map_err(|_| KernelError::Apply("world SID".into()))?;
+    let mut acl_words = vec![0u32; 64];
+    let acl = acl_words.as_mut_ptr().cast::<u8>();
+    let deny = 0x0004_0000u32;
+    let allow = 0x001F_FFFF & !deny;
+    let ready = unsafe {
+        InitializeAcl(acl, (acl_words.len() * 4) as Dword, 2) != 0
+            && AddAccessDeniedAce(acl, 2, deny, world.0) != 0
+            && AddAccessAllowedAce(acl, 2, allow, user.as_ptr().cast_mut().cast()) != 0
+    };
+    if !ready {
+        return Err(last_error("process DACL"));
+    }
+    let set = unsafe {
+        SetSecurityInfo(
+            process,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            acl.cast(),
+            ptr::null_mut(),
+        )
+    };
+    if set != 0 {
+        return Err(win32_error("SetSecurityInfo process", set));
+    }
+    Ok(())
 }
 
 fn create_kill_job() -> Result<CloseOnDrop, KernelError> {
@@ -1846,6 +3650,20 @@ fn create_kill_job() -> Result<CloseOnDrop, KernelError> {
     };
     if set == 0 {
         return Err(last_error("SetInformationJobObject"));
+    }
+    let mut ui = JobobjectBasicUiRestrictions {
+        ui_restrictions_class: UI_RESTRICTIONS,
+    };
+    let ui_set = unsafe {
+        SetInformationJobObject(
+            job.0,
+            JOB_OBJECT_BASIC_UI_RESTRICTIONS,
+            (&raw mut ui).cast(),
+            std::mem::size_of::<JobobjectBasicUiRestrictions>() as Dword,
+        )
+    };
+    if ui_set == 0 {
+        return Err(last_error("SetInformationJobObject UI"));
     }
     Ok(job)
 }
@@ -1969,6 +3787,7 @@ fn append_quoted(out: &mut Vec<u16>, arg: &OsStr) {
 #[cfg(test)]
 mod ace_tests {
     use super::*;
+    use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
 
     const ACCESS_DENIED_ACE_TYPE: u8 = 0x01;
@@ -2115,6 +3934,111 @@ mod ace_tests {
             "first dest must not keep a leftover DENY ACE after rollback"
         );
         drop(sid);
+    }
+
+    #[test]
+    fn msys_install_key_for_program_files_git() {
+        let mut path: Vec<u16> =
+            std::ffi::OsStr::new(r"\\?\C:\Program Files\Git\usr\bin\msys-2.0.dll")
+                .encode_wide()
+                .collect();
+        normalize_msys_install_path(&mut path);
+        let hash = hash_path_name(0, &path);
+        assert_eq!(format!("{hash:016x}"), "1888ae32e00d56aa");
+    }
+
+    #[test]
+    fn restricted_token_keeps_traverse_and_drops_admin_privileges() {
+        let sid = RestrictedSid::new().expect("sid");
+        let token = create_write_restricted_token(sid.0).expect("token");
+        let traverse = privilege_enabled(token.0, "SeChangeNotifyPrivilege").expect("lookup");
+        assert_eq!(
+            traverse,
+            Some(true),
+            "SeChangeNotifyPrivilege must stay enabled, got {traverse:?}"
+        );
+        for name in [
+            "SeDebugPrivilege",
+            "SeBackupPrivilege",
+            "SeRestorePrivilege",
+            "SeTakeOwnershipPrivilege",
+            "SeLoadDriverPrivilege",
+            "SeTcbPrivilege",
+        ] {
+            let state =
+                privilege_enabled(token.0, name).unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert_ne!(
+                state,
+                Some(true),
+                "{name} must stay disabled, got {state:?}"
+            );
+        }
+    }
+
+    #[repr(C)]
+    struct Luid {
+        low_part: Dword,
+        high_part: i32,
+    }
+
+    #[repr(C)]
+    struct LuidAndAttributes {
+        luid: Luid,
+        attributes: Dword,
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn LookupPrivilegeValueW(
+            lp_system_name: *const u16,
+            lp_name: *const u16,
+            lp_luid: *mut Luid,
+        ) -> Bool;
+    }
+
+    /// `Some(true)` enabled, `Some(false)` present but disabled, `None` absent.
+    fn privilege_enabled(token: Handle, name: &str) -> Result<Option<bool>, KernelError> {
+        const SE_PRIVILEGE_ENABLED: Dword = 0x0000_0002;
+        let wide = wide_os(std::ffi::OsStr::new(name));
+        let mut want = Luid {
+            low_part: 0,
+            high_part: 0,
+        };
+        // SAFETY: `wide` is a NUL-terminated privilege name.
+        let looked = unsafe { LookupPrivilegeValueW(ptr::null(), wide.as_ptr(), &mut want) };
+        if looked == 0 {
+            return Err(last_error("LookupPrivilegeValueW"));
+        }
+        let mut bytes = 0u32;
+        unsafe {
+            GetTokenInformation(token, 3, ptr::null_mut(), 0, &mut bytes);
+        }
+        if bytes < 4 {
+            return Err(last_error("GetTokenInformation TokenPrivileges"));
+        }
+        let len = bytes;
+        let mut buf = vec![0u64; len.div_ceil(8) as usize];
+        // SAFETY: `buf` is at least `len` bytes and 8-byte aligned.
+        let ok = unsafe { GetTokenInformation(token, 3, buf.as_mut_ptr().cast(), len, &mut bytes) };
+        if ok == 0 {
+            return Err(last_error("GetTokenInformation TokenPrivileges"));
+        }
+        let raw = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, bytes as usize) };
+        let count = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        let stride = std::mem::size_of::<LuidAndAttributes>();
+        for i in 0..count as usize {
+            let start = 4 + i * stride;
+            let end = start + stride;
+            if end > raw.len() {
+                break;
+            }
+            // SAFETY: `start` is inside `raw`. The first privilege entry is at offset 4.
+            let entry = unsafe { &*raw[start..].as_ptr().cast::<LuidAndAttributes>() };
+            if entry.luid.low_part == want.low_part && entry.luid.high_part == want.high_part {
+                return Ok(Some(entry.attributes & SE_PRIVILEGE_ENABLED != 0));
+            }
+        }
+        Ok(None)
     }
 }
 
