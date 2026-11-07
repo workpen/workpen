@@ -1218,6 +1218,7 @@ fn allow_msys_shared_dirs(
     restricted: Handle,
     world: Handle,
     token: Handle,
+    job: Handle,
     guards: &mut Vec<AclRestore>,
     holder: &mut Option<MapHolder>,
 ) {
@@ -1264,7 +1265,7 @@ fn allow_msys_shared_dirs(
     // child cannot open makes CreateFileMapping fail instead of
     // creating one from the null default DACL.
     let _ = (restricted, world);
-    match start_map_holder(token) {
+    match start_map_holder(token, job) {
         Ok(started) => *holder = Some(started),
         Err(err) => eprintln!("workpen: msys map holder skipped: {err}"),
     }
@@ -1314,7 +1315,7 @@ impl Drop for MapHolder {
     }
 }
 
-fn start_map_holder(token: Handle) -> Result<MapHolder, KernelError> {
+fn start_map_holder(token: Handle, job: Handle) -> Result<MapHolder, KernelError> {
     let sid = current_user_sid()?;
     let name = format!("{}.1", sid_to_string(&sid)?);
     let exe = windows_net::HelperFile::install(&std::env::temp_dir())?;
@@ -1361,7 +1362,7 @@ fn start_map_holder(token: Handle) -> Result<MapHolder, KernelError> {
             ptr::null_mut(),
             ptr::null_mut(),
             1,
-            0,
+            CREATE_SUSPENDED,
             ptr::null_mut(),
             ptr::null(),
             &mut startup,
@@ -1374,6 +1375,13 @@ fn start_map_holder(token: Handle) -> Result<MapHolder, KernelError> {
     }
     let process = CloseOnDrop(info.h_process);
     let thread = CloseOnDrop(info.h_thread);
+    let assigned = unsafe { AssignProcessToJobObject(job, process.0) };
+    if assigned == 0 {
+        return Err(last_error("AssignProcessToJobObject map holder"));
+    }
+    if unsafe { ResumeThread(thread.0) } == Dword::MAX {
+        return Err(last_error("ResumeThread map holder"));
+    }
     let mut said = Vec::new();
     for _ in 0..8 {
         let mut buf = [0u8; 256];
@@ -2362,6 +2370,7 @@ fn spawn_prepared_child(
             prepared._sid.0,
             prepared._world.0,
             prepared.token.0,
+            prepared.job.0,
             &mut prepared.acl_guards,
             &mut prepared.map_holder,
         );
