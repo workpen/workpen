@@ -452,21 +452,11 @@ unsafe extern "system" {
     ) -> Bool;
     fn GetLengthSid(sid: Handle) -> Dword;
     fn CopySid(len: Dword, dest: *mut u8, src: Handle) -> Bool;
-    fn ConvertSidToStringSidW(sid: Handle, string_sid: *mut *mut u16) -> Bool;
 }
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LocalFree(h_mem: Handle) -> Handle;
-    fn OpenFileMappingW(access: Dword, inherit: Bool, name: *const u16) -> Handle;
-    fn CreateFileMappingW(
-        file: Handle,
-        attributes: *mut SecurityAttributes,
-        protect: Dword,
-        size_high: Dword,
-        size_low: Dword,
-        name: *const u16,
-    ) -> Handle;
 }
 
 struct CloseOnDrop(Handle);
@@ -700,7 +690,6 @@ struct Prepared {
     _world: WorldSid,
     helper: Option<PathBuf>,
     _net: Option<NetGuards>,
-    sections: Vec<CloseOnDrop>,
     wfp_skipped: bool,
 }
 
@@ -793,7 +782,6 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
         _world: world,
         helper: None,
         _net: None,
-        sections: Vec::new(),
         wfp_skipped: false,
     })
 }
@@ -1145,20 +1133,6 @@ unsafe extern "system" {
         desired_access: u32,
         object_attributes: *mut ObjectAttributes,
     ) -> i32;
-    fn NtOpenSection(
-        section_handle: *mut Handle,
-        desired_access: u32,
-        object_attributes: *mut ObjectAttributes,
-    ) -> i32;
-    fn NtCreateSection(
-        section_handle: *mut Handle,
-        desired_access: u32,
-        object_attributes: *mut ObjectAttributes,
-        maximum_size: *mut i64,
-        section_page_protection: u32,
-        allocation_attributes: u32,
-        file_handle: Handle,
-    ) -> i32;
 }
 
 fn open_object_directory(name: &str) -> Result<Handle, KernelError> {
@@ -1181,7 +1155,6 @@ fn allow_msys_shared_dirs(
     world: Handle,
     token: Handle,
     guards: &mut Vec<AclRestore>,
-    holds: &mut Vec<CloseOnDrop>,
 ) {
     let Some(dll) = msys_dll_beside(program) else {
         return;
@@ -1206,13 +1179,14 @@ fn allow_msys_shared_dirs(
             world,
         );
     }
-    // Per-user `CreateFileMapping` uses `sec_none`. `shared.5` passes
-    // an explicit null DACL and already opens. A restricted token
-    // creates the per-user section under `Restricted`.
+    // `shared.5` passes an explicit null DACL and already opens.
+    // `sec_none` inherits the namespace directory, so a pre-created
+    // section is the object cat opens. Leave creation to cat.
     ensure_msys_shared_dir(r"\BaseNamedObjects\Restricted", restricted, world);
-    // Null that directory DACL for the child so `sec_none` cannot
-    // inherit an allow that omits the restricting SID. Restored after
-    // the child exits.
+    // Null the namespace DACL for the child so `sec_none` cannot
+    // inherit an allow that omits the restricting SID. The token
+    // default DACL is null, and MSYS cannot replace it. Restored
+    // after the child exits.
     for name in restricted_namespace_names() {
         match null_directory_dacl(&name, restricted, world) {
             Ok(Some(guard)) => guards.push(guard),
@@ -1220,236 +1194,6 @@ fn allow_msys_shared_dirs(
             Err(err) => eprintln!("workpen: msys restricted dir skipped: {name}: {err}"),
         }
         probe_directory_create(token, &name);
-    }
-    // `cat` opens an existing `SID.1`. Changing the token default DACL
-    // does not change that object's ACL.
-    grant_existing_user_section(token, restricted, holds);
-}
-
-fn sid_string(token: Handle) -> Result<String, KernelError> {
-    let sid = token_user_sid(token)?;
-    let mut wide = ptr::null_mut();
-    // SAFETY: `sid` is a copied SID. The API allocates `wide`.
-    let ok = unsafe { ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut wide) };
-    if ok == 0 || wide.is_null() {
-        return Err(last_error("ConvertSidToStringSidW"));
-    }
-    let mut len = 0usize;
-    while unsafe { *wide.add(len) } != 0 {
-        len += 1;
-        if len > 256 {
-            unsafe { LocalFree(wide.cast()) };
-            return Err(KernelError::Apply("SID string is too long".into()));
-        }
-    }
-    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
-    unsafe { LocalFree(wide.cast()) };
-    Ok(text)
-}
-
-fn open_section(name: &str) -> Result<Handle, i32> {
-    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
-    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
-    let mut us = UnicodeString {
-        length: bytes,
-        maximum_length: bytes,
-        buffer: wide.as_mut_ptr(),
-    };
-    let mut attrs = ObjectAttributes {
-        length: std::mem::size_of::<ObjectAttributes>() as u32,
-        root_directory: ptr::null_mut(),
-        object_name: &mut us,
-        attributes: 0x40,
-        security_descriptor: ptr::null_mut(),
-        security_quality_of_service: ptr::null_mut(),
-    };
-    let mut handle = ptr::null_mut();
-    // READ_CONTROL | WRITE_DAC | SECTION_QUERY.
-    let status = unsafe { NtOpenSection(&mut handle, 0x0006_0001, &mut attrs) };
-    if status < 0 || handle.is_null() {
-        return Err(status);
-    }
-    Ok(handle)
-}
-
-fn grant_sid_on_section(section: Handle, sid: Handle) -> Result<(), KernelError> {
-    let mut dacl = ptr::null_mut();
-    let mut sd = ptr::null_mut();
-    let got = unsafe {
-        GetSecurityInfo(
-            section,
-            SE_KERNEL_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut dacl,
-            ptr::null_mut(),
-            &mut sd,
-        )
-    };
-    if got != 0 {
-        return Err(win32_error("GetSecurityInfo section", got));
-    }
-    let _sd = LocalMem(sd);
-    // A null DACL already allows the restricting SID. Replacing it with
-    // only that SID fails the normal access check, so CreateFileMapping
-    // returns Win32 5 for both the parent and cat.
-    if dacl.is_null() {
-        return Ok(());
-    }
-    let new_acl = acl_with_grant(dacl, sid, GENERIC_ALL | SECTION_ALL_ACCESS)?;
-    let applied = unsafe {
-        SetSecurityInfo(
-            section,
-            SE_KERNEL_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            new_acl.0,
-            ptr::null_mut(),
-        )
-    };
-    if applied != 0 {
-        return Err(win32_error("SetSecurityInfo section", applied));
-    }
-    Ok(())
-}
-
-fn null_security_descriptor(words: &mut [u64; 8]) -> bool {
-    let sd = words.as_mut_ptr().cast::<u8>();
-    unsafe {
-        InitializeSecurityDescriptor(sd, 1) != 0
-            && SetSecurityDescriptorDacl(sd, 1, ptr::null_mut(), 0) != 0
-    }
-}
-
-fn create_null_section(name: &str) -> Result<Handle, i32> {
-    let mut words = [0u64; 8];
-    if !null_security_descriptor(&mut words) {
-        return Err(-1);
-    }
-    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
-    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
-    let mut us = UnicodeString {
-        length: bytes,
-        maximum_length: bytes,
-        buffer: wide.as_mut_ptr(),
-    };
-    let mut attrs = ObjectAttributes {
-        length: std::mem::size_of::<ObjectAttributes>() as u32,
-        root_directory: ptr::null_mut(),
-        object_name: &mut us,
-        attributes: 0x40,
-        security_descriptor: words.as_mut_ptr().cast(),
-        security_quality_of_service: ptr::null_mut(),
-    };
-    // Larger than MSYS `user_info`. A smaller existing section makes
-    // CreateFileMapping fail with Win32 5.
-    let mut size: i64 = 64 * 1024 * 1024;
-    let mut handle = ptr::null_mut();
-    let status = unsafe {
-        NtCreateSection(
-            &mut handle,
-            SECTION_ALL_ACCESS,
-            &mut attrs,
-            &mut size,
-            0x04,
-            0x0800_0000,
-            ptr::null_mut(),
-        )
-    };
-    if status < 0 || handle.is_null() {
-        return Err(status);
-    }
-    Ok(handle)
-}
-
-fn create_win32_null_section(name: &[u16]) -> Result<Handle, Dword> {
-    let mut words = [0u64; 8];
-    if !null_security_descriptor(&mut words) {
-        return Err(1);
-    }
-    let mut attrs = SecurityAttributes {
-        n_length: std::mem::size_of::<SecurityAttributes>() as Dword,
-        lp_security_descriptor: words.as_mut_ptr().cast(),
-        b_inherit_handle: 0,
-    };
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            &mut attrs,
-            0x04,
-            0,
-            64 * 1024 * 1024,
-            name.as_ptr(),
-        )
-    };
-    if handle.is_null() {
-        return Err(unsafe { GetLastError() });
-    }
-    Ok(handle)
-}
-
-fn grant_existing_user_section(token: Handle, restricted: Handle, holds: &mut Vec<CloseOnDrop>) {
-    let Ok(sid_text) = sid_string(token) else {
-        eprintln!("workpen: section sid skipped");
-        return;
-    };
-    let name = format!("{sid_text}.1");
-    let mut session = 0u32;
-    unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
-    let mut paths = vec![
-        format!(r"\BaseNamedObjects\{name}"),
-        format!(r"\BaseNamedObjects\Restricted\{name}"),
-    ];
-    if session != 0 {
-        paths.push(format!(r"\Sessions\{session}\BaseNamedObjects\{name}"));
-        paths.push(format!(
-            r"\Sessions\{session}\BaseNamedObjects\Restricted\{name}"
-        ));
-    }
-    for path in paths {
-        match open_section(&path) {
-            Ok(handle) => {
-                match grant_sid_on_section(handle, restricted) {
-                    Ok(()) => eprintln!("workpen: section grant ok {path}"),
-                    Err(err) => eprintln!("workpen: section grant failed {path}: {err}"),
-                }
-                holds.push(CloseOnDrop(handle));
-            }
-            Err(status) => match create_null_section(&path) {
-                Ok(handle) => {
-                    eprintln!("workpen: section created {path}");
-                    holds.push(CloseOnDrop(handle));
-                }
-                Err(create_status) => eprintln!(
-                    "workpen: section missing {path} ntstatus={status:#x} create={create_status:#x}"
-                ),
-            },
-        }
-    }
-    for prefix in ["Local\\", "Global\\", ""] {
-        let win_name = format!("{prefix}{name}");
-        let wide = wide_os(OsStr::new(&win_name));
-        let handle = unsafe { OpenFileMappingW(0x0006_0001, 0, wide.as_ptr()) };
-        if handle.is_null() {
-            let err = unsafe { GetLastError() };
-            match create_win32_null_section(&wide) {
-                Ok(created) => {
-                    eprintln!("workpen: section win32 created {win_name}");
-                    holds.push(CloseOnDrop(created));
-                }
-                Err(create_err) => eprintln!(
-                    "workpen: section win32 missing {win_name} win32={err} create={create_err}"
-                ),
-            }
-            continue;
-        }
-        match grant_sid_on_section(handle, restricted) {
-            Ok(()) => eprintln!("workpen: section grant ok {win_name}"),
-            Err(err) => eprintln!("workpen: section grant failed {win_name}: {err}"),
-        }
-        holds.push(CloseOnDrop(handle));
     }
 }
 
@@ -1475,10 +1219,14 @@ fn probe_directory_create(token: Handle, name: &str) {
 }
 
 fn restricted_namespace_names() -> Vec<String> {
-    let mut names = vec![r"\BaseNamedObjects\Restricted".to_string()];
+    let mut names = vec![
+        r"\BaseNamedObjects".to_string(),
+        r"\BaseNamedObjects\Restricted".to_string(),
+    ];
     let mut session = 0u32;
     let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
     if ok != 0 && session != 0 {
+        names.push(format!(r"\Sessions\{session}\BaseNamedObjects"));
         names.push(format!(r"\Sessions\{session}\BaseNamedObjects\Restricted"));
     }
     names
@@ -2420,7 +2168,6 @@ fn spawn_prepared_child(
             prepared._world.0,
             prepared.token.0,
             &mut prepared.acl_guards,
-            &mut prepared.sections,
         );
     }
     let mut env_block = environment_block(cmd);

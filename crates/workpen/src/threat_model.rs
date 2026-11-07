@@ -75,9 +75,9 @@
 //!   opens because that call passes an explicit null DACL. The
 //!   jail uses a null token default DACL and, while the child is
 //!   suspended, denies `TOKEN_ADJUST_DEFAULT` so MSYS cannot
-//!   replace it. It also creates `SID.1` with a null DACL when
-//!   that section is not already present. A write outside the
-//!   ReadWrite grant still fails.
+//!   replace it. The session namespace directory is given a null
+//!   DACL for the child so inheritance cannot omit `S-1-5-12`.
+//!   A write outside the ReadWrite grant still fails.
 //! * The workspace jail scanned the user profile. It denies `.ssh`,
 //!   `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`, and `.kube`
 //!   with the restricted SID and restores those ACLs when the jail
