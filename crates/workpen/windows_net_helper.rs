@@ -66,17 +66,17 @@ fn hold_sid(name: Option<&OsString>) -> ExitCode {
         return ExitCode::from(2);
     };
     let text = name.to_string_lossy();
-    let handle = map_open(&text, 1, 128 * 1024 * 1024);
+    let handle = map_open(&text, 1, 64 * 1024 * 1024);
     let err = unsafe { GetLastError() };
     eprintln!(
-        "workpen-net-helper: hold null={} err={err}",
+        "workpen-net-helper: sid-hold null={} err={err}",
         handle.is_null()
     );
     if handle.is_null() {
         return ExitCode::from(1);
     }
     let mut out = std::io::stdout();
-    let _ = writeln!(out, "hold");
+    let _ = writeln!(out, "READY");
     let _ = out.flush();
     let mut sink = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut sink);
