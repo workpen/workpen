@@ -96,8 +96,11 @@ The parent is trusted. The child is not.
 - Linux stdout forwarding writes one byte when a larger write returns
   `EAGAIN`. A pipe with a few free bytes does not spin. A reader that
   stops still fills the pipe, and `--timeout` ends that forward.
-- Linux `PR_SET_DUMPABLE=0` in `pre_exec` lasts after `execve`. A
-  readable program starts dumpable again. `RLIMIT_CORE=0` survives.
+- Linux `PR_SET_DUMPABLE=0` in `pre_exec` does not survive `execve`
+  of a readable program. The kernel sets dumpable back to 1. The
+  setting covers only the window before exec. `RLIMIT_CORE=0`
+  survives. The child contract is that rlimit plus Landlock,
+  remount, and seccomp.
 
 ## Promises
 
