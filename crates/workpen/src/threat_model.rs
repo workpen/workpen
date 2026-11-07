@@ -71,13 +71,13 @@
 //!   the MSYS hash of `msys-2.0.dll`, not a fixed id. The same grant
 //!   is applied under `\Sessions\BNOLINKS\<session>` when the process
 //!   is not in session 0. MSYS `sec_none` uses the token default
-//!   DACL for the per-user section `SID.1`. `shared.5` already
-//!   opens because that call passes an explicit null DACL. The
-//!   jail uses a null token default DACL and, while the child is
-//!   suspended, denies `TOKEN_ADJUST_DEFAULT` so MSYS cannot
-//!   replace it. The session namespace directory is given a null
-//!   DACL for the child so inheritance cannot omit `S-1-5-12`.
-//!   A write outside the ReadWrite grant still fails.
+//!   DACL for the per-user section `SID.1`. The jail grants
+//!   `GENERIC_ALL` to the user, Everyone, and `S-1-5-12` on that
+//!   DACL and, while the child is suspended, denies
+//!   `TOKEN_ADJUST_DEFAULT` so MSYS cannot replace it. The
+//!   `Restricted` namespace directory is given a null DACL for
+//!   the child so inheritance cannot omit `S-1-5-12`. A write
+//!   outside the ReadWrite grant still fails.
 //! * The workspace jail scanned the user profile. It denies `.ssh`,
 //!   `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`, and `.kube`
 //!   with the restricted SID and restores those ACLs when the jail

@@ -1219,14 +1219,12 @@ fn probe_directory_create(token: Handle, name: &str) {
 }
 
 fn restricted_namespace_names() -> Vec<String> {
-    let mut names = vec![
-        r"\BaseNamedObjects".to_string(),
-        r"\BaseNamedObjects\Restricted".to_string(),
-    ];
+    // Only `Restricted`. Nulling `\BaseNamedObjects` itself breaks
+    // AppContainer creation in tests that run at the same time.
+    let mut names = vec![r"\BaseNamedObjects\Restricted".to_string()];
     let mut session = 0u32;
     let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
     if ok != 0 && session != 0 {
-        names.push(format!(r"\Sessions\{session}\BaseNamedObjects"));
         names.push(format!(r"\Sessions\{session}\BaseNamedObjects\Restricted"));
     }
     names
@@ -1662,16 +1660,25 @@ struct TokenDefaultDacl {
     default_dacl: *mut u8,
 }
 
-fn grant_token_default_dacl(token: Handle, _sid: Handle) -> Result<(), KernelError> {
-    // `sec_none` stores this DACL on a new section. `shared.5` already
-    // opens because MSYS passes an explicit null DACL (`sec_all_nih`).
-    // MSYS cannot replace this: `TOKEN_ADJUST_DEFAULT` is denied on the
-    // suspended child. A null default DACL is that same null DACL.
-    let info = TokenDefaultDacl {
-        default_dacl: ptr::null_mut(),
+fn grant_token_default_dacl(token: Handle, sid: Handle) -> Result<(), KernelError> {
+    // A null token default does not become a null object DACL.
+    // `sec_none` needs an allow that names `S-1-5-12` and the user.
+    let user = token_user_sid(token)?;
+    let world = WorldSid::new().map_err(|_| KernelError::Apply("world SID".into()))?;
+    let mut acl_words = vec![0u32; 64];
+    let acl = acl_words.as_mut_ptr().cast::<u8>();
+    let mask = GENERIC_ALL | 0x001F_FFFF;
+    let ready = unsafe {
+        InitializeAcl(acl, (acl_words.len() * 4) as Dword, 2) != 0
+            && AddAccessAllowedAce(acl, 2, mask, world.0) != 0
+            && AddAccessAllowedAce(acl, 2, mask, user.as_ptr().cast_mut().cast()) != 0
+            && AddAccessAllowedAce(acl, 2, mask, sid) != 0
     };
-    // SAFETY: `info` is a null default DACL. The kernel copies that fact
-    // into the token before this returns.
+    if !ready {
+        return Err(last_error("default DACL"));
+    }
+    let info = TokenDefaultDacl { default_dacl: acl };
+    // SAFETY: `acl_words` stays alive for the call. The kernel copies it.
     let set = unsafe {
         SetTokenInformation(
             token,
@@ -2886,7 +2893,38 @@ fn lock_suspended_token(process: Handle, restricted: Handle) -> Result<(), Kerne
     }
     let token = CloseOnDrop(raw);
     grant_token_default_dacl(token.0, restricted)?;
+    let (null_dacl, aces) = token_default_dacl_aces(token.0);
+    eprintln!("workpen: token default dacl null={null_dacl} aces={aces}");
     deny_token_adjust_default(token.0)
+}
+
+fn token_default_dacl_aces(token: Handle) -> (bool, i32) {
+    let mut bytes = 0u32;
+    unsafe {
+        GetTokenInformation(token, TOKEN_DEFAULT_DACL, ptr::null_mut(), 0, &mut bytes);
+    }
+    if bytes < std::mem::size_of::<TokenDefaultDacl>() as u32 {
+        return (true, -1);
+    }
+    let mut buf = vec![0u8; bytes as usize];
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_DEFAULT_DACL,
+            buf.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+        )
+    };
+    if ok == 0 {
+        return (false, -2);
+    }
+    let acl = unsafe { buf.as_ptr().cast::<TokenDefaultDacl>().read().default_dacl };
+    if acl.is_null() {
+        return (true, 0);
+    }
+    let count = unsafe { u16::from_le_bytes([*acl.add(4), *acl.add(5)]) };
+    (false, i32::from(count))
 }
 
 fn deny_token_adjust_default(token: Handle) -> Result<(), KernelError> {
