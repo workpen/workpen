@@ -1597,35 +1597,21 @@ struct TokenDefaultDacl {
 }
 
 fn grant_token_default_dacl(token: Handle, sid: Handle) -> Result<(), KernelError> {
-    let mut bytes = 0u32;
-    unsafe {
-        GetTokenInformation(token, TOKEN_DEFAULT_DACL, ptr::null_mut(), 0, &mut bytes);
-    }
-    if bytes < std::mem::size_of::<TokenDefaultDacl>() as u32 {
-        return Err(last_error("GetTokenInformation TokenDefaultDacl"));
-    }
-    let mut buf = vec![0u8; bytes as usize];
-    // SAFETY: `buf` is `bytes` long. The class is TokenDefaultDacl.
-    let ok = unsafe {
-        GetTokenInformation(
-            token,
-            TOKEN_DEFAULT_DACL,
-            buf.as_mut_ptr().cast(),
-            bytes,
-            &mut bytes,
-        )
+    // `sec_none` copies this DACL onto the new section. A null token
+    // default does not produce a null object DACL, so the restricting
+    // SID was still missing and CreateFileMapping returned error 5.
+    let world = WorldSid::new().map_err(|_| KernelError::Apply("world SID".into()))?;
+    let mut acl_words = vec![0u32; 64];
+    let acl = acl_words.as_mut_ptr().cast::<u8>();
+    let ready = unsafe {
+        InitializeAcl(acl, (acl_words.len() * 4) as Dword, 2) != 0
+            && AddAccessAllowedAce(acl, 2, 0x001F_FFFF, world.0) != 0
+            && AddAccessAllowedAce(acl, 2, 0x001F_FFFF, sid) != 0
     };
-    if ok == 0 {
-        return Err(last_error("GetTokenInformation TokenDefaultDacl"));
+    if !ready {
+        return Err(last_error("default DACL"));
     }
-    let _old = unsafe { buf.as_ptr().cast::<TokenDefaultDacl>().read().default_dacl };
-    // `sec_none` means "use the token default DACL". A null default
-    // DACL is what makes `shared.5` openable: the new section allows
-    // the restricting SID. An added ACE on the old DACL did not.
-    let _ = sid;
-    let info = TokenDefaultDacl {
-        default_dacl: ptr::null_mut(),
-    };
+    let info = TokenDefaultDacl { default_dacl: acl };
     // SAFETY: `info` points at an ACL that stays alive for the call.
     // The kernel copies the ACL into the token.
     let set = unsafe {
