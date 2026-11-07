@@ -69,7 +69,7 @@ const SE_KERNEL_OBJECT: u32 = 6;
 /// MSYS requests this mask for its shared directory (`CYG_SHARED_DIR_ACCESS`).
 const MSYS_DIR_ACCESS: Dword = 0x0002_000F;
 const DIRECTORY_ALL_ACCESS: Dword = 0x000F_000F;
-/// `SECTION_ALL_ACCESS`. Inherited by a section created with `sec_none`.
+/// `SECTION_ALL_ACCESS`.
 const SECTION_ALL_ACCESS: Dword = 0x000F_001F;
 /// MSYS mask plus WRITE_DAC, so the parent can edit the leaf it creates
 /// without also granting DELETE to Everyone.
@@ -431,13 +431,6 @@ unsafe extern "system" {
     fn InitializeAcl(acl: *mut u8, length: Dword, revision: u32) -> Bool;
     fn AddAccessAllowedAce(acl: *mut u8, revision: u32, mask: Dword, sid: Handle) -> Bool;
     fn AddAccessDeniedAce(acl: *mut u8, revision: u32, mask: Dword, sid: Handle) -> Bool;
-    fn AddAccessAllowedAceEx(
-        acl: *mut u8,
-        revision: u32,
-        ace_flags: u32,
-        mask: Dword,
-        sid: Handle,
-    ) -> Bool;
     fn SetSecurityDescriptorDacl(
         sd: *mut u8,
         present: Bool,
@@ -1053,54 +1046,14 @@ fn relax_child_bno(process: Handle, restricted: Handle, world: Handle) {
     }
 }
 
-fn directory_ace_count(name: &str) -> i32 {
-    let Ok(dir) = open_directory_status(name, 0x0002_0000) else {
-        return -1;
-    };
-    let mut owner = ptr::null_mut();
-    let mut group = ptr::null_mut();
-    let mut dacl = ptr::null_mut();
-    let mut sacl = ptr::null_mut();
-    let mut sd = ptr::null_mut();
-    let got = unsafe {
-        GetSecurityInfo(
-            dir,
-            SE_KERNEL_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            &mut owner,
-            &mut group,
-            &mut dacl,
-            &mut sacl,
-            &mut sd,
-        )
-    };
-    unsafe { CloseHandle(dir) };
-    if got != 0 {
-        if !sd.is_null() {
-            unsafe { LocalFree(sd) };
-        }
-        return -2;
-    }
-    if dacl.is_null() {
-        if !sd.is_null() {
-            unsafe { LocalFree(sd) };
-        }
-        return 0;
-    }
-    // ACL.AceCount is a u16 at byte offset 4.
-    let bytes = dacl.cast::<u8>();
-    let count = unsafe { u16::from_le_bytes([*bytes.add(4), *bytes.add(5)]) };
-    unsafe { LocalFree(sd) };
-    i32::from(count)
-}
-
-/// Replace the directory DACL with an inheritable allow for Everyone
-/// and the restricting SID. `sec_none` inherits that onto the new
-/// section. A null DACL does not.
+/// `sec_none` inherits this directory. An inheritable allow that omits
+/// a right `CreateFileMapping` requests fails the restricted write
+/// check with Win32 5. A null DACL does not inherit that allow.
+/// `shared.5` already opens because MSYS passes an explicit null DACL.
 fn null_directory_dacl(
     name: &str,
-    restricted: Handle,
-    world: Handle,
+    _restricted: Handle,
+    _world: Handle,
 ) -> Result<Option<AclRestore>, KernelError> {
     let dir = open_directory_for_dacl(name)?;
     let mut owner = ptr::null_mut();
@@ -1125,19 +1078,8 @@ fn null_directory_dacl(
         return Err(win32_error("GetSecurityInfo", got));
     }
     let sd = LocalMem(sd);
-    let mut acl_words = vec![0u32; 128];
-    let acl = acl_words.as_mut_ptr().cast::<u8>();
-    let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
-    let mask = DIRECTORY_ALL_ACCESS | SECTION_ALL_ACCESS;
-    let ready = unsafe {
-        InitializeAcl(acl, (acl_words.len() * 4) as Dword, 2) != 0
-            && AddAccessAllowedAceEx(acl, 2, inherit, mask, world) != 0
-            && AddAccessAllowedAceEx(acl, 2, inherit, mask, restricted) != 0
-    };
-    if !ready {
-        unsafe { CloseHandle(dir) };
-        return Err(last_error("inheritable namespace DACL"));
-    }
+    // DACL_SECURITY_INFORMATION plus a null DACL pointer installs a
+    // null DACL. The saved DACL above is restored after the child exits.
     let applied = unsafe {
         SetSecurityInfo(
             dir,
@@ -1145,18 +1087,14 @@ fn null_directory_dacl(
             DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
             ptr::null_mut(),
-            acl.cast(),
+            ptr::null_mut(),
             ptr::null_mut(),
         )
     };
     unsafe { CloseHandle(dir) };
     if applied != 0 {
-        return Err(win32_error("SetSecurityInfo inheritable DACL", applied));
+        return Err(win32_error("SetSecurityInfo null DACL", applied));
     }
-    eprintln!(
-        "workpen: msys dir {name} ace_count_after={}",
-        directory_ace_count(name)
-    );
     Ok(Some(AclRestore {
         path: wide_os(OsStr::new(name)),
         object_type: SE_KERNEL_OBJECT,
@@ -1241,14 +1179,13 @@ fn allow_msys_shared_dirs(
             world,
         );
     }
-    // Per-user `CreateFileMapping` uses `sec_none` (the token default
-    // DACL). Checkout already created `S-1-5-21-....1` without the
-    // restricting SID. `shared.5` uses a null DACL and already opens.
+    // Per-user `CreateFileMapping` uses `sec_none`. `shared.5` passes
+    // an explicit null DACL and already opens. A restricted token
+    // creates the per-user section under `Restricted`.
     ensure_msys_shared_dir(r"\BaseNamedObjects\Restricted", restricted, world);
-    // A restricted token creates Win32 sections in this directory.
-    // Its DACL denies the parent, so the earlier NtCreateSection
-    // returned 0xC0000022. A null DACL lets the child create and
-    // open. The saved DACL is restored after the child exits.
+    // Null that directory DACL for the child so `sec_none` cannot
+    // inherit an allow that omits the restricting SID. Restored after
+    // the child exits.
     for name in restricted_namespace_names() {
         match null_directory_dacl(&name, restricted, world) {
             Ok(Some(guard)) => guards.push(guard),
@@ -1725,16 +1662,18 @@ struct TokenDefaultDacl {
 }
 
 fn grant_token_default_dacl(token: Handle, sid: Handle) -> Result<(), KernelError> {
-    // `sec_none` copies this DACL onto the new section. A null token
-    // default does not produce a null object DACL, so the restricting
-    // SID was still missing and CreateFileMapping returned error 5.
+    // `sec_none` stores this DACL on the new section. Specific rights
+    // were not enough for `CreateFileMapping` under `WRITE_RESTRICTED`.
+    // `GENERIC_ALL` is what MSYS itself puts on a user DACL.
+    let user = token_user_sid(token)?;
     let world = WorldSid::new().map_err(|_| KernelError::Apply("world SID".into()))?;
     let mut acl_words = vec![0u32; 64];
     let acl = acl_words.as_mut_ptr().cast::<u8>();
     let ready = unsafe {
         InitializeAcl(acl, (acl_words.len() * 4) as Dword, 2) != 0
-            && AddAccessAllowedAce(acl, 2, 0x001F_FFFF, world.0) != 0
-            && AddAccessAllowedAce(acl, 2, 0x001F_FFFF, sid) != 0
+            && AddAccessAllowedAce(acl, 2, GENERIC_ALL, world.0) != 0
+            && AddAccessAllowedAce(acl, 2, GENERIC_ALL, user.as_ptr().cast_mut().cast()) != 0
+            && AddAccessAllowedAce(acl, 2, GENERIC_ALL, sid) != 0
     };
     if !ready {
         return Err(last_error("default DACL"));
