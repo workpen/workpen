@@ -31,8 +31,7 @@ const TOKEN_PRIMARY_MASK: Dword = TOKEN_ASSIGN_PRIMARY
     | TOKEN_DUPLICATE
     | TOKEN_QUERY
     | TOKEN_ADJUST_DEFAULT
-    | TOKEN_ADJUST_SESSIONID
-    | 0x0006_0000; // READ_CONTROL | WRITE_DAC, so the token DACL can be locked.
+    | TOKEN_ADJUST_SESSIONID;
 const SECURITY_NT_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 5];
 const SECURITY_WORLD_SID_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 1];
 const SECURITY_RESTRICTED_CODE_RID: Dword = 12;
@@ -431,6 +430,7 @@ unsafe extern "system" {
     fn InitializeSecurityDescriptor(sd: *mut u8, revision: u32) -> Bool;
     fn InitializeAcl(acl: *mut u8, length: Dword, revision: u32) -> Bool;
     fn AddAccessAllowedAce(acl: *mut u8, revision: u32, mask: Dword, sid: Handle) -> Bool;
+    fn AddAccessDeniedAce(acl: *mut u8, revision: u32, mask: Dword, sid: Handle) -> Bool;
     fn AddAccessAllowedAceEx(
         acl: *mut u8,
         revision: u32,
@@ -1534,9 +1534,13 @@ fn enable_privilege(name: &str) -> Result<(), KernelError> {
 
 fn current_user_sid() -> Result<Vec<u8>, KernelError> {
     let token = open_current_process_token()?;
+    token_user_sid(token.0)
+}
+
+fn token_user_sid(token: Handle) -> Result<Vec<u8>, KernelError> {
     let mut bytes = 0u32;
     unsafe {
-        GetTokenInformation(token.0, TOKEN_USER, ptr::null_mut(), 0, &mut bytes);
+        GetTokenInformation(token, TOKEN_USER, ptr::null_mut(), 0, &mut bytes);
     }
     if bytes < 8 {
         return Err(last_error("GetTokenInformation TokenUser"));
@@ -1545,7 +1549,7 @@ fn current_user_sid() -> Result<Vec<u8>, KernelError> {
     // SAFETY: `buf` is `bytes` long. The class is TokenUser.
     let ok = unsafe {
         GetTokenInformation(
-            token.0,
+            token,
             TOKEN_USER,
             buf.as_mut_ptr().cast(),
             bytes,
@@ -2354,6 +2358,18 @@ fn spawn_prepared_child(
         return Err(last_error("AssignProcessToJobObject"));
     }
     relax_child_bno(process.0, prepared._sid.0, prepared._world.0);
+    // CreateProcessAsUser duplicates the token. Lock that copy, not the
+    // handle we passed in, or MSYS still replaces the default DACL.
+    if let Err(err) = lock_suspended_token(process.0, prepared._sid.0) {
+        unsafe {
+            TerminateProcess(process.0, 1);
+        }
+        let _ = join_drain(stdout_drain);
+        let _ = join_drain(stderr_drain);
+        join_copy(stdout_fwd);
+        join_copy(stderr_fwd);
+        return Err(err);
+    }
     // SAFETY: thread is the primary thread of the suspended process.
     let resumed = unsafe { ResumeThread(thread.0) };
     if resumed == Dword::MAX {
@@ -2920,24 +2936,42 @@ fn create_write_restricted_token(sid: Handle) -> Result<CloseOnDrop, KernelError
     if let Err(err) = grant_token_default_dacl(primary.0, sid) {
         eprintln!("workpen: token default DACL skipped: {err}");
     }
-    // MSYS replaces this DACL with the user-only `sec_user` DACL when
-    // `NtSetInformationToken(TokenDefaultDacl)` succeeds. That drops
-    // S-1-5-12 and CreateFileMapping then returns Win32 error 5.
-    if let Err(err) = deny_token_adjust_default(primary.0) {
-        eprintln!("workpen: token adjust lock skipped: {err}");
-    }
     Ok(primary)
 }
 
+fn lock_suspended_token(process: Handle, restricted: Handle) -> Result<(), KernelError> {
+    let mut raw = ptr::null_mut();
+    // READ_CONTROL | WRITE_DAC, plus the rights SetTokenInformation needs.
+    // The child has not run, so this open still sees the kernel's default
+    // token DACL. MSYS later opens the same token with MAXIMUM_ALLOWED.
+    let opened = unsafe {
+        OpenProcessToken(
+            process,
+            TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | 0x0006_0000,
+            &mut raw,
+        )
+    };
+    if opened == 0 {
+        return Err(last_error("OpenProcessToken child"));
+    }
+    let token = CloseOnDrop(raw);
+    grant_token_default_dacl(token.0, restricted)?;
+    deny_token_adjust_default(token.0)
+}
+
 fn deny_token_adjust_default(token: Handle) -> Result<(), KernelError> {
-    let user = current_user_sid()?;
-    let mut acl_words = vec![0u32; 32];
+    let user = token_user_sid(token)?;
+    let world = WorldSid::new().map_err(|_| KernelError::Apply("world SID".into()))?;
+    let mut acl_words = vec![0u32; 64];
     let acl = acl_words.as_mut_ptr().cast::<u8>();
-    // TOKEN_ALL_ACCESS without TOKEN_ADJUST_DEFAULT (0x80).
-    let mask = 0x000F_01FF & !0x80;
+    // Deny the rights MSYS uses to replace the default DACL, and the
+    // rights that would put TOKEN_ADJUST_DEFAULT back on this token.
+    let deny_mask = TOKEN_ADJUST_DEFAULT | 0x0004_0000 | 0x0008_0000;
+    let allow_mask = 0x000F_01FF & !deny_mask;
     let ready = unsafe {
         InitializeAcl(acl, (acl_words.len() * 4) as Dword, 2) != 0
-            && AddAccessAllowedAce(acl, 2, mask, user.as_ptr().cast_mut().cast()) != 0
+            && AddAccessDeniedAce(acl, 2, deny_mask, world.0) != 0
+            && AddAccessAllowedAce(acl, 2, allow_mask, user.as_ptr().cast_mut().cast()) != 0
     };
     if !ready {
         return Err(last_error("token DACL"));

@@ -70,9 +70,13 @@
 //!   The jail grants the restricted SID on that directory. The key is
 //!   the MSYS hash of `msys-2.0.dll`, not a fixed id. The same grant
 //!   is applied under `\Sessions\BNOLINKS\<session>` when the process
-//!   is not in session 0. The per-user section `SID.1` gets the same
-//!   grant when checkout already created it. A write outside the
-//!   ReadWrite grant still fails.
+//!   is not in session 0. MSYS then calls
+//!   `NtSetInformationToken(TokenDefaultDacl)` and would drop
+//!   `S-1-5-12` from the default DACL. While the child is still
+//!   suspended, the jail denies `TOKEN_ADJUST_DEFAULT` on that
+//!   child's token, so the default DACL that grants `S-1-5-12` stays.
+//!   The per-user section `SID.1` is created from that DACL. A write
+//!   outside the ReadWrite grant still fails.
 //! * The workspace jail scanned the user profile. It denies `.ssh`,
 //!   `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`, and `.kube`
 //!   with the restricted SID and restores those ACLs when the jail

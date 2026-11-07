@@ -144,7 +144,8 @@ in one page is [docs/threat-model.md](docs/threat-model.md).
   `ProgramFiles`. `spawn_reexec` keeps network open for a host
   that re-execs into one long-lived jail. Git `usr\bin` tools run:
   the jail grants the restricted SID on that install's MSYS shared
-  directory. The job blocks clipboard use. A session with no window
+  directory, and keeps `S-1-5-12` on the token default DACL so the
+  per-user section can be created. The job blocks clipboard use. A session with no window
   station does not enforce that limit. The child still inherits the
   parent console when the parent has one.
 
