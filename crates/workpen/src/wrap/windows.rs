@@ -275,6 +275,8 @@ unsafe extern "system" {
         h_template_file: Handle,
     ) -> Handle;
     fn GetModuleHandleW(lp_module_name: *const u16) -> Handle;
+    fn ImpersonateLoggedOnUser(token: Handle) -> Bool;
+    fn RevertToSelf() -> Bool;
     fn GetProcAddress(h_module: Handle, lp_proc_name: *const u8) -> *mut core::ffi::c_void;
     fn CreatePipe(
         h_read_pipe: *mut Handle,
@@ -1129,11 +1131,33 @@ fn allow_msys_shared_dirs(
             Ok(None) => {}
             Err(err) => eprintln!("workpen: msys restricted dir skipped: {name}: {err}"),
         }
+        probe_directory_create(token, &name);
     }
     // Do not pre-create SID.1. A section left behind with a DACL the
     // child cannot open makes CreateFileMapping fail instead of
     // creating one from the null default DACL.
     let _ = (restricted, world, token);
+}
+
+fn probe_directory_create(token: Handle, name: &str) {
+    if unsafe { ImpersonateLoggedOnUser(token) } == 0 {
+        eprintln!(
+            "workpen: msys dir probe impersonate failed: {}",
+            last_error("ImpersonateLoggedOnUser")
+        );
+        return;
+    }
+    let opened = open_directory_status(name, MSYS_DIR_ACCESS);
+    unsafe { RevertToSelf() };
+    match opened {
+        Ok(dir) => {
+            unsafe { CloseHandle(dir) };
+            eprintln!("workpen: msys dir probe ok {name}");
+        }
+        Err(status) => {
+            eprintln!("workpen: msys dir probe failed {name} ntstatus {status:#x}");
+        }
+    }
 }
 
 fn restricted_namespace_names() -> Vec<String> {
