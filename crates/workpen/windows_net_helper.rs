@@ -14,7 +14,7 @@ fn main() -> ExitCode {
     }
     #[cfg(windows)]
     if rest.first().is_some_and(|arg| arg == "--sec-probe") {
-        return sec_probe();
+        return sec_probe(rest.get(1));
     }
     let Some(dash) = rest.iter().position(|a| a == "--") else {
         eprintln!("workpen-net-helper: missing --");
@@ -41,12 +41,18 @@ fn main() -> ExitCode {
 /// `CreateFileMappingW` under this process token. `cat` passes
 /// `sec_none`: a `SECURITY_ATTRIBUTES` whose descriptor pointer is null.
 #[cfg(windows)]
-fn sec_probe() -> ExitCode {
+fn sec_probe(sid_name: Option<&OsString>) -> ExitCode {
     let pid = std::process::id();
     map_shape("null-psa", &format!("wp-null-psa-{pid}"), 0, 4096);
     map_shape("sec-none", &format!("wp-sec-none-{pid}"), 1, 4096);
     map_shape("sec-all", &format!("wp-sec-all-{pid}"), 2, 4096);
     map_shape("null-psa-64m", &format!("wp-null-64m-{pid}"), 0, 64 * 1024 * 1024);
+    if let Some(name) = sid_name {
+        let text = name.to_string_lossy();
+        map_shape("sid-sec-none", &text, 1, 4096);
+        map_shape("sid-sec-none-64m", &text, 1, 64 * 1024 * 1024);
+        map_shape("sid-local", &format!("Local\\{text}"), 1, 4096);
+    }
     ExitCode::from(0)
 }
 

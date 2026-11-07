@@ -452,6 +452,7 @@ unsafe extern "system" {
     ) -> Bool;
     fn GetLengthSid(sid: Handle) -> Dword;
     fn CopySid(len: Dword, dest: *mut u8, src: Handle) -> Bool;
+    fn ConvertSidToStringSidW(sid: Handle, string_sid: *mut *mut u16) -> Bool;
 }
 
 #[link(name = "kernel32")]
@@ -2160,6 +2161,22 @@ fn spawn_prepared(
 
 static MAP_PROBE_DONE: AtomicBool = AtomicBool::new(false);
 
+fn user_sid_mapping_name(token: Handle) -> Option<String> {
+    let sid = token_user_sid(token).ok()?;
+    let mut wide = ptr::null_mut();
+    let ok = unsafe { ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut wide) };
+    if ok == 0 || wide.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    while unsafe { *wide.add(len) } != 0 && len < 256 {
+        len += 1;
+    }
+    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
+    unsafe { LocalFree(wide.cast()) };
+    Some(format!("{text}.1"))
+}
+
 fn probe_mapping_shapes(prepared: &mut Prepared, program: &Path) {
     if msys_dll_beside(program).is_none() || MAP_PROBE_DONE.swap(true, Ordering::Relaxed) {
         return;
@@ -2170,6 +2187,9 @@ fn probe_mapping_shapes(prepared: &mut Prepared, program: &Path) {
     };
     let mut cmd = Command::new(helper.path());
     cmd.arg("--sec-probe");
+    if let Some(name) = user_sid_mapping_name(prepared.token.0) {
+        cmd.arg(name);
+    }
     match spawn_prepared_child(
         prepared,
         &mut cmd,
