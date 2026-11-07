@@ -967,6 +967,80 @@ fn grant_directory_object(
     })
 }
 
+fn open_directory_for_dacl(name: &str) -> Result<Handle, KernelError> {
+    match open_directory_status(name, 0x0006_0000) {
+        Ok(dir) => Ok(dir),
+        Err(status) if status == STATUS_ACCESS_DENIED => {
+            take_directory_ownership(name)?;
+            open_directory_status(name, 0x0006_0000).map_err(|status| {
+                KernelError::Apply(format!(
+                    "NtOpenDirectoryObject {name} after ownership failed (ntstatus {status:#x})"
+                ))
+            })
+        }
+        Err(status) => Err(KernelError::Apply(format!(
+            "NtOpenDirectoryObject {name} failed (ntstatus {status:#x})"
+        ))),
+    }
+}
+
+/// Replace the directory DACL with a null DACL and return the saved one.
+/// `Ok(None)` means the directory already had a null DACL.
+fn null_directory_dacl(name: &str) -> Result<Option<AclRestore>, KernelError> {
+    let dir = open_directory_for_dacl(name)?;
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut sacl = ptr::null_mut();
+    let mut sd = ptr::null_mut();
+    let got = unsafe {
+        GetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    if got != 0 {
+        unsafe { CloseHandle(dir) };
+        return Err(win32_error("GetSecurityInfo", got));
+    }
+    if dacl.is_null() {
+        unsafe {
+            LocalFree(sd);
+            CloseHandle(dir);
+        }
+        return Ok(None);
+    }
+    let sd = LocalMem(sd);
+    let applied = unsafe {
+        SetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(dir) };
+    if applied != 0 {
+        return Err(win32_error("SetSecurityInfo null DACL", applied));
+    }
+    Ok(Some(AclRestore {
+        path: wide_os(OsStr::new(name)),
+        object_type: SE_KERNEL_OBJECT,
+        _sd: sd,
+        dacl,
+        restored: false,
+    }))
+}
+
 #[repr(C)]
 struct UnicodeString {
     length: u16,
@@ -1059,13 +1133,15 @@ fn allow_msys_shared_dirs(
     // DACL). Checkout already created `S-1-5-21-....1` without the
     // restricting SID. `shared.5` uses a null DACL and already opens.
     ensure_msys_shared_dir(r"\BaseNamedObjects\Restricted", restricted, world);
-    // Hold the inheritable ACE until the child exits. Dropping the
-    // guard here would restore the directory before CreateFileMapping.
+    // A restricted token creates Win32 sections in this directory.
+    // Its DACL denies the parent, so the earlier NtCreateSection
+    // returned 0xC0000022. A null DACL lets the child create and
+    // open. The saved DACL is restored after the child exits.
     for name in restricted_namespace_names() {
-        if let Ok(guard) =
-            grant_directory_object(&name, restricted, DIRECTORY_ALL_ACCESS | SECTION_ALL_ACCESS)
-        {
-            guards.push(guard);
+        match null_directory_dacl(&name) {
+            Ok(Some(guard)) => guards.push(guard),
+            Ok(None) => {}
+            Err(err) => eprintln!("workpen: msys restricted dir skipped: {name}: {err}"),
         }
     }
     grant_user_shared_section(restricted, world);
