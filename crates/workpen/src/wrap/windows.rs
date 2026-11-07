@@ -69,6 +69,8 @@ const SE_KERNEL_OBJECT: u32 = 6;
 /// MSYS requests this mask for its shared directory (`CYG_SHARED_DIR_ACCESS`).
 const MSYS_DIR_ACCESS: Dword = 0x0002_000F;
 const DIRECTORY_ALL_ACCESS: Dword = 0x000F_000F;
+/// `SECTION_ALL_ACCESS`. Inherited by a section created with `sec_none`.
+const SECTION_ALL_ACCESS: Dword = 0x000F_001F;
 /// MSYS mask plus WRITE_DAC, so the parent can edit the leaf it creates
 /// without also granting DELETE to Everyone.
 const MSYS_DIR_WRITE_DAC: Dword = MSYS_DIR_ACCESS | 0x0004_0000;
@@ -76,8 +78,6 @@ const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const OBJ_OPENIF: u32 = 0x80;
 const OBJECT_INHERIT_ACE: Dword = 0x1;
 const CONTAINER_INHERIT_ACE: Dword = 0x2;
-const PAGE_READWRITE_PROT: Dword = 0x04;
-const SEC_COMMIT: Dword = 0x0800_0000;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
 const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003A_u32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
@@ -274,16 +274,6 @@ unsafe extern "system" {
         dw_flags_and_attributes: Dword,
         h_template_file: Handle,
     ) -> Handle;
-    fn CreateFileMappingW(
-        h_file: Handle,
-        lp_file_mapping_attributes: *mut SecurityAttributes,
-        fl_protect: Dword,
-        dw_maximum_size_high: Dword,
-        dw_maximum_size_low: Dword,
-        lp_name: *const u16,
-    ) -> Handle;
-    fn ImpersonateLoggedOnUser(token: Handle) -> Bool;
-    fn RevertToSelf() -> Bool;
     fn GetModuleHandleW(lp_module_name: *const u16) -> Handle;
     fn GetProcAddress(h_module: Handle, lp_proc_name: *const u8) -> *mut core::ffi::c_void;
     fn CreatePipe(
@@ -459,7 +449,6 @@ unsafe extern "system" {
     ) -> Bool;
     fn GetLengthSid(sid: Handle) -> Dword;
     fn CopySid(len: Dword, dest: *mut u8, src: Handle) -> Bool;
-    fn ConvertSidToStringSidW(sid: Handle, string_sid: *mut *mut u16) -> Bool;
 }
 
 #[link(name = "kernel32")]
@@ -694,9 +683,6 @@ struct Prepared {
     token: CloseOnDrop,
     job: CloseOnDrop,
     acl_guards: Vec<AclRestore>,
-    /// Keeps pre-created MSYS sections alive until the child exits.
-    /// Without a held handle, a non-permanent section is deleted on close.
-    sections: Vec<CloseOnDrop>,
     _sid: RestrictedSid,
     _world: WorldSid,
     helper: Option<PathBuf>,
@@ -789,7 +775,6 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
         token,
         job,
         acl_guards,
-        sections: Vec::new(),
         _sid: sid,
         _world: world,
         helper: None,
@@ -1084,20 +1069,6 @@ unsafe extern "system" {
         desired_access: u32,
         object_attributes: *mut ObjectAttributes,
     ) -> i32;
-    fn NtOpenSection(
-        section_handle: *mut Handle,
-        desired_access: u32,
-        object_attributes: *mut ObjectAttributes,
-    ) -> i32;
-    fn NtCreateSection(
-        section_handle: *mut Handle,
-        desired_access: u32,
-        object_attributes: *mut ObjectAttributes,
-        maximum_size: *mut i64,
-        section_page_protection: u32,
-        allocation_attributes: u32,
-        file_handle: Handle,
-    ) -> i32;
 }
 
 fn open_object_directory(name: &str) -> Result<Handle, KernelError> {
@@ -1120,7 +1091,6 @@ fn allow_msys_shared_dirs(
     world: Handle,
     token: Handle,
     guards: &mut Vec<AclRestore>,
-    sections: &mut Vec<CloseOnDrop>,
 ) {
     let Some(dll) = msys_dll_beside(program) else {
         return;
@@ -1160,7 +1130,10 @@ fn allow_msys_shared_dirs(
             Err(err) => eprintln!("workpen: msys restricted dir skipped: {name}: {err}"),
         }
     }
-    sections.extend(grant_user_shared_section(restricted, world, token));
+    // Do not pre-create SID.1. A section left behind with a DACL the
+    // child cannot open makes CreateFileMapping fail instead of
+    // creating one from the null default DACL.
+    let _ = (restricted, world, token);
 }
 
 fn restricted_namespace_names() -> Vec<String> {
@@ -1171,306 +1144,6 @@ fn restricted_namespace_names() -> Vec<String> {
         names.push(format!(r"\Sessions\{session}\BaseNamedObjects\Restricted"));
     }
     names
-}
-
-/// `user_info::create` maps `SID.USER_VERSION`. This MSYS build uses `.1`.
-const MSYS_USER_SHARED_SUFFIX: &str = ".1";
-/// `SECTION_ALL_ACCESS`. `CreateFileMapping` asks for map read and write.
-const SECTION_ALL_ACCESS: Dword = 0x000F_001F;
-
-fn grant_user_shared_section(restricted: Handle, world: Handle, token: Handle) -> Vec<CloseOnDrop> {
-    let Ok(sid) = current_user_sid() else {
-        return Vec::new();
-    };
-    let Ok(text) = sid_to_string(&sid) else {
-        return Vec::new();
-    };
-    let leaf = format!("{text}{MSYS_USER_SHARED_SUFFIX}");
-    let mut names = vec![
-        format!(r"\BaseNamedObjects\{leaf}"),
-        format!(r"\BaseNamedObjects\Restricted\{leaf}"),
-    ];
-    let mut session = 0u32;
-    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
-    if ok != 0 && session != 0 {
-        // A restricted token's Win32 namespace is this subdirectory,
-        // not the session root. CreateFileMapping looks here.
-        let restricted_dir = format!(r"\Sessions\{session}\BaseNamedObjects\Restricted");
-        ensure_msys_shared_dir(&restricted_dir, restricted, world);
-        names.push(format!(r"{restricted_dir}\{leaf}"));
-        names.push(format!(r"\Sessions\{session}\BaseNamedObjects\{leaf}"));
-        names.push(format!(r"\Sessions\BNOLINKS\{session}\{leaf}"));
-    }
-    let mut held = Vec::new();
-    if let Some(handle) = create_mapping_as_token(token, &leaf) {
-        held.push(handle);
-    }
-    for name in names {
-        if let Some(handle) = grant_existing_section(&name, restricted) {
-            held.push(CloseOnDrop(handle));
-        }
-    }
-    held
-}
-
-struct RevertImpersonation;
-impl Drop for RevertImpersonation {
-    fn drop(&mut self) {
-        unsafe { RevertToSelf() };
-    }
-}
-
-/// Create the mapping with the same Win32 call the child makes, while
-/// impersonating the restricted token, so it lands in that token's
-/// namespace. `sec_none` is not a null DACL; this one is.
-fn create_mapping_as_token(token: Handle, name: &str) -> Option<CloseOnDrop> {
-    if unsafe { ImpersonateLoggedOnUser(token) } == 0 {
-        eprintln!(
-            "workpen: msys impersonate skipped: {}",
-            last_error("ImpersonateLoggedOnUser")
-        );
-        return None;
-    }
-    let _revert = RevertImpersonation;
-    let mut sd = [0u64; 8];
-    let sd_ptr = sd.as_mut_ptr().cast::<u8>();
-    let ready = unsafe {
-        InitializeSecurityDescriptor(sd_ptr, 1) != 0
-            && SetSecurityDescriptorDacl(sd_ptr, 1, ptr::null_mut(), 0) != 0
-    };
-    if !ready {
-        eprintln!(
-            "workpen: msys mapping SD skipped: {}",
-            last_error("null DACL")
-        );
-        return None;
-    }
-    let mut sa = SecurityAttributes {
-        n_length: std::mem::size_of::<SecurityAttributes>() as Dword,
-        lp_security_descriptor: sd_ptr.cast(),
-        b_inherit_handle: 0,
-    };
-    let wide = wide_os(OsStr::new(name));
-    // SAFETY: impersonation is reverted by `_revert`. `wide` is the
-    // Win32 mapping name. `sa` and `sd` live for the call.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            &mut sa,
-            PAGE_READWRITE_PROT,
-            0,
-            16 * 1024 * 1024,
-            wide.as_ptr(),
-        )
-    };
-    if handle.is_null() {
-        eprintln!(
-            "workpen: msys CreateFileMapping {name} skipped (win32 {})",
-            unsafe { GetLastError() }
-        );
-        return None;
-    }
-    let created_err = unsafe { GetLastError() };
-    let reopened = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            &mut sa,
-            PAGE_READWRITE_PROT,
-            0,
-            1024 * 1024,
-            wide.as_ptr(),
-        )
-    };
-    if reopened.is_null() {
-        eprintln!(
-            "workpen: msys mapping reopen failed name={name} created_err={created_err} win32 {}",
-            unsafe { GetLastError() }
-        );
-    } else {
-        eprintln!("workpen: msys mapping reopen ok name={name} created_err={created_err}");
-        unsafe { CloseHandle(reopened) };
-    }
-    Some(CloseOnDrop(handle))
-}
-
-fn sid_to_string(sid: &[u8]) -> Result<String, KernelError> {
-    let mut wide = ptr::null_mut();
-    // SAFETY: `sid` is a copied SID. The API allocates `wide`.
-    let ok = unsafe { ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut wide) };
-    if ok == 0 || wide.is_null() {
-        return Err(last_error("ConvertSidToStringSidW"));
-    }
-    let mut len = 0usize;
-    while unsafe { *wide.add(len) } != 0 {
-        len += 1;
-        if len > 256 {
-            break;
-        }
-    }
-    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
-    unsafe { LocalFree(wide.cast()) };
-    Ok(text)
-}
-
-fn grant_existing_section(name: &str, _restricted: Handle) -> Option<Handle> {
-    let section = match open_section_status(name, 0x0006_0000) {
-        Ok(section) => section,
-        Err(status) if status == STATUS_ACCESS_DENIED => {
-            if let Err(err) = take_section_ownership(name) {
-                eprintln!("workpen: msys section owner skipped: {name}: {err}");
-                return None;
-            }
-            match open_section_status(name, 0x0006_0000) {
-                Ok(section) => section,
-                Err(status) => {
-                    eprintln!("workpen: msys section open skipped: {name} (ntstatus {status:#x})");
-                    return None;
-                }
-            }
-        }
-        Err(status)
-            if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND =>
-        {
-            match create_user_section(name) {
-                Ok(section) => return Some(section),
-                Err(err) => {
-                    eprintln!("workpen: msys section create skipped: {name}: {err}");
-                    return None;
-                }
-            }
-        }
-        Err(status) => {
-            eprintln!("workpen: msys section open skipped: {name} (ntstatus {status:#x})");
-            return None;
-        }
-    };
-    // A null DACL grants the restricting SID. The inherited directory
-    // ACE does not rewrite a section checkout already created.
-    // Keep the handle. A non-permanent section is deleted on close,
-    // and CreateFileMapping then creates a new one the token cannot open.
-    let set = unsafe {
-        SetSecurityInfo(
-            section,
-            SE_KERNEL_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    };
-    if set != 0 {
-        eprintln!(
-            "workpen: msys section DACL skipped: {name}: {}",
-            win32_error("SetSecurityInfo", set)
-        );
-        unsafe { CloseHandle(section) };
-        return None;
-    }
-    Some(section)
-}
-
-fn create_user_section(name: &str) -> Result<Handle, KernelError> {
-    // `u8` storage is only 1-aligned. NtCreateSection returns
-    // STATUS_DATATYPE_MISALIGNMENT (0x80000002) for that descriptor.
-    let mut sd = [0u64; 8];
-    let sd_ptr = sd.as_mut_ptr().cast::<u8>();
-    let ready = unsafe {
-        InitializeSecurityDescriptor(sd_ptr, 1) != 0
-            && SetSecurityDescriptorDacl(sd_ptr, 1, ptr::null_mut(), 0) != 0
-    };
-    if !ready {
-        return Err(last_error("null DACL for msys section"));
-    }
-    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
-    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
-    let mut us = UnicodeString {
-        length: bytes,
-        maximum_length: bytes,
-        buffer: wide.as_mut_ptr(),
-    };
-    let mut attrs = ObjectAttributes {
-        length: std::mem::size_of::<ObjectAttributes>() as u32,
-        root_directory: ptr::null_mut(),
-        object_name: &mut us,
-        attributes: OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
-        security_descriptor: sd.as_mut_ptr().cast(),
-        security_quality_of_service: ptr::null_mut(),
-    };
-    // Larger than MSYS `user_info`. A smaller existing mapping is opened
-    // below and given a null DACL instead of being replaced.
-    let mut size: i64 = 4 * 1024 * 1024;
-    let mut handle = ptr::null_mut();
-    // SAFETY: `sd`, `us`, `wide`, and `size` live for the call.
-    let status = unsafe {
-        NtCreateSection(
-            &mut handle,
-            SECTION_ALL_ACCESS,
-            &mut attrs,
-            &mut size,
-            PAGE_READWRITE_PROT,
-            SEC_COMMIT,
-            ptr::null_mut(),
-        )
-    };
-    if status != 0 || handle.is_null() {
-        return Err(KernelError::Apply(format!(
-            "NtCreateSection {name} failed (ntstatus {status:#x})"
-        )));
-    }
-    Ok(handle)
-}
-
-fn open_section_status(name: &str, access: u32) -> Result<Handle, i32> {
-    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
-    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
-    let mut us = UnicodeString {
-        length: bytes,
-        maximum_length: bytes,
-        buffer: wide.as_mut_ptr(),
-    };
-    let mut attrs = ObjectAttributes {
-        length: std::mem::size_of::<ObjectAttributes>() as u32,
-        root_directory: ptr::null_mut(),
-        object_name: &mut us,
-        attributes: OBJ_CASE_INSENSITIVE,
-        security_descriptor: ptr::null_mut(),
-        security_quality_of_service: ptr::null_mut(),
-    };
-    let mut handle = ptr::null_mut();
-    // SAFETY: `us` and `wide` live for the call.
-    let status = unsafe { NtOpenSection(&mut handle, access, &mut attrs) };
-    if status != 0 || handle.is_null() {
-        return Err(status);
-    }
-    Ok(handle)
-}
-
-fn take_section_ownership(name: &str) -> Result<(), KernelError> {
-    enable_privilege("SeTakeOwnershipPrivilege")?;
-    let section = open_section_status(name, WRITE_OWNER | 0x0002_0000).map_err(|status| {
-        KernelError::Apply(format!(
-            "NtOpenSection {name} WRITE_OWNER failed (ntstatus {status:#x})"
-        ))
-    })?;
-    let user = current_user_sid()?;
-    // SAFETY: `section` is open for WRITE_OWNER. `user` is a SID copy.
-    let set = unsafe {
-        SetSecurityInfo(
-            section,
-            SE_KERNEL_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            user.as_ptr().cast_mut().cast(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    };
-    unsafe { CloseHandle(section) };
-    if set != 0 {
-        return Err(win32_error("SetSecurityInfo section owner", set));
-    }
-    Ok(())
 }
 
 fn msys_dll_beside(program: &Path) -> Option<PathBuf> {
@@ -1921,15 +1594,13 @@ fn grant_token_default_dacl(token: Handle, sid: Handle) -> Result<(), KernelErro
     if ok == 0 {
         return Err(last_error("GetTokenInformation TokenDefaultDacl"));
     }
-    let old = unsafe { buf.as_ptr().cast::<TokenDefaultDacl>().read().default_dacl };
-    // A null default DACL already grants every SID, including the
-    // restricting SID. Replacing it with one ACE would drop the user.
-    if old.is_null() {
-        return Ok(());
-    }
-    let new_acl = acl_with_grant(old.cast(), sid, 0x001F_FFFF)?;
+    let _old = unsafe { buf.as_ptr().cast::<TokenDefaultDacl>().read().default_dacl };
+    // `sec_none` means "use the token default DACL". A null default
+    // DACL is what makes `shared.5` openable: the new section allows
+    // the restricting SID. An added ACE on the old DACL did not.
+    let _ = sid;
     let info = TokenDefaultDacl {
-        default_dacl: new_acl.0.cast(),
+        default_dacl: ptr::null_mut(),
     };
     // SAFETY: `info` points at an ACL that stays alive for the call.
     // The kernel copies the ACL into the token.
@@ -2429,7 +2100,6 @@ fn spawn_prepared_child(
             prepared._world.0,
             prepared.token.0,
             &mut prepared.acl_guards,
-            &mut prepared.sections,
         );
     }
     let mut env_block = environment_block(cmd);
