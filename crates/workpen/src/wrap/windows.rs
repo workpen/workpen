@@ -1068,7 +1068,7 @@ fn allow_msys_shared_dirs(
             guards.push(guard);
         }
     }
-    grant_user_shared_section(restricted);
+    grant_user_shared_section(restricted, world);
 }
 
 fn restricted_namespace_names() -> Vec<String> {
@@ -1086,7 +1086,7 @@ const MSYS_USER_SHARED_SUFFIX: &str = ".1";
 /// `SECTION_ALL_ACCESS`. `CreateFileMapping` asks for map read and write.
 const SECTION_ALL_ACCESS: Dword = 0x000F_001F;
 
-fn grant_user_shared_section(restricted: Handle) {
+fn grant_user_shared_section(restricted: Handle, world: Handle) {
     let Ok(sid) = current_user_sid() else {
         return;
     };
@@ -1101,6 +1101,11 @@ fn grant_user_shared_section(restricted: Handle) {
     let mut session = 0u32;
     let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
     if ok != 0 && session != 0 {
+        // A restricted token's Win32 namespace is this subdirectory,
+        // not the session root. CreateFileMapping looks here.
+        let restricted_dir = format!(r"\Sessions\{session}\BaseNamedObjects\Restricted");
+        ensure_msys_shared_dir(&restricted_dir, restricted, world);
+        names.push(format!(r"{restricted_dir}\{leaf}"));
         names.push(format!(r"\Sessions\{session}\BaseNamedObjects\{leaf}"));
         names.push(format!(r"\Sessions\BNOLINKS\{session}\{leaf}"));
     }
