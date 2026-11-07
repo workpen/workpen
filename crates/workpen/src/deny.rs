@@ -1483,7 +1483,16 @@ fn refuse_relative_symlink(guard: Option<&PathGuard>, token: &str) -> Result<(),
     let Some(guard) = guard else {
         return Ok(());
     };
-    if token.is_empty() || Path::new(token).is_absolute() {
+    // `/bin/cat` is absolute on Unix. On Windows `Path::is_absolute`
+    // is false for `/bin/cat` and for `cmd /c`, so a leading slash
+    // or backslash is also not a workspace-relative dest.
+    let lead = token.as_bytes().first().copied();
+    if token.is_empty() || Path::new(token).is_absolute() || matches!(lead, Some(b'/' | b'\\')) {
+        return Ok(());
+    }
+    // `NUL` and `CON` are devices. `check_dest` already classified them.
+    #[cfg(windows)]
+    if windows_device_kind(token).is_some() {
         return Ok(());
     }
     match guard.check(Path::new(token)) {
