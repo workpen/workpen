@@ -12,6 +12,10 @@ fn main() -> ExitCode {
     if rest.first().is_some_and(|arg| arg == "--hold-map") {
         return hold_map(rest.get(1));
     }
+    #[cfg(windows)]
+    if rest.first().is_some_and(|arg| arg == "--sec-probe") {
+        return sec_probe();
+    }
     let Some(dash) = rest.iter().position(|a| a == "--") else {
         eprintln!("workpen-net-helper: missing --");
         return ExitCode::from(2);
@@ -31,6 +35,68 @@ fn main() -> ExitCode {
             eprintln!("workpen-net-helper: spawn {}: {e}", cmd[0].to_string_lossy());
             ExitCode::from(1)
         }
+    }
+}
+
+/// `CreateFileMappingW` under this process token. `cat` passes
+/// `sec_none`: a `SECURITY_ATTRIBUTES` whose descriptor pointer is null.
+#[cfg(windows)]
+fn sec_probe() -> ExitCode {
+    let pid = std::process::id();
+    map_shape("null-psa", &format!("wp-null-psa-{pid}"), 0, 4096);
+    map_shape("sec-none", &format!("wp-sec-none-{pid}"), 1, 4096);
+    map_shape("sec-all", &format!("wp-sec-all-{pid}"), 2, 4096);
+    map_shape("null-psa-64m", &format!("wp-null-64m-{pid}"), 0, 64 * 1024 * 1024);
+    ExitCode::from(0)
+}
+
+#[cfg(windows)]
+fn map_shape(label: &str, name: &str, mode: u8, size: u32) {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut wide: Vec<u16> = std::ffi::OsStr::new(name)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut words = [0u64; 8];
+    let sd = words.as_mut_ptr().cast::<u8>();
+    if mode == 2 {
+        let ready = unsafe {
+            InitializeSecurityDescriptor(sd, 1) != 0
+                && SetSecurityDescriptorDacl(sd, 1, std::ptr::null_mut(), 0) != 0
+        };
+        if !ready {
+            eprintln!("workpen-net-helper: shape={label} sd-failed");
+            return;
+        }
+    }
+    let mut sa = SecurityAttributesHold {
+        n_length: std::mem::size_of::<SecurityAttributesHold>() as u32,
+        lp_security_descriptor: if mode == 2 { sd.cast() } else { std::ptr::null_mut() },
+        b_inherit_handle: 1,
+    };
+    let attrs = if mode == 0 {
+        std::ptr::null_mut()
+    } else {
+        &mut sa
+    };
+    let handle = unsafe {
+        CreateFileMappingW(
+            -1isize as *mut core::ffi::c_void,
+            attrs,
+            0x04,
+            0,
+            size,
+            wide.as_mut_ptr(),
+        )
+    };
+    let err = unsafe { GetLastError() };
+    eprintln!(
+        "workpen-net-helper: shape={label} size={size} null={} err={err}",
+        handle.is_null()
+    );
+    if !handle.is_null() {
+        unsafe { CloseHandle(handle) };
     }
 }
 

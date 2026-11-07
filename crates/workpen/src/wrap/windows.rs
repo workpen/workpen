@@ -2158,6 +2158,33 @@ fn spawn_prepared(
     }
 }
 
+static MAP_PROBE_DONE: AtomicBool = AtomicBool::new(false);
+
+fn probe_mapping_shapes(prepared: &mut Prepared, program: &Path) {
+    if msys_dll_beside(program).is_none() || MAP_PROBE_DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Ok(helper) = windows_net::HelperFile::install(&std::env::temp_dir()) else {
+        eprintln!("workpen: map probe helper skipped");
+        return;
+    };
+    let mut cmd = Command::new(helper.path());
+    cmd.arg("--sec-probe");
+    match spawn_prepared_child(
+        prepared,
+        &mut cmd,
+        Some(Duration::from_secs(20)),
+        StdioCapture::Collect,
+    ) {
+        Ok((_, _, Some(output), _)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("workpen: map probe {stderr}");
+        }
+        Ok((_, status, _, _)) => eprintln!("workpen: map probe status={status}"),
+        Err(err) => eprintln!("workpen: map probe failed: {err}"),
+    }
+}
+
 fn spawn_prepared_child(
     prepared: &mut Prepared,
     cmd: &mut Command,
@@ -2176,6 +2203,7 @@ fn spawn_prepared_child(
             prepared.token.0,
             &mut prepared.acl_guards,
         );
+        probe_mapping_shapes(prepared, &program);
     }
     let mut env_block = environment_block(cmd);
     let std_in = inheritable_std_handle(STD_INPUT_HANDLE, false)?;
