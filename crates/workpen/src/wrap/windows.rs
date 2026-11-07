@@ -430,6 +430,13 @@ unsafe extern "system" {
     fn InitializeSecurityDescriptor(sd: *mut u8, revision: u32) -> Bool;
     fn InitializeAcl(acl: *mut u8, length: Dword, revision: u32) -> Bool;
     fn AddAccessAllowedAce(acl: *mut u8, revision: u32, mask: Dword, sid: Handle) -> Bool;
+    fn AddAccessAllowedAceEx(
+        acl: *mut u8,
+        revision: u32,
+        ace_flags: u32,
+        mask: Dword,
+        sid: Handle,
+    ) -> Bool;
     fn SetSecurityDescriptorDacl(
         sd: *mut u8,
         present: Bool,
@@ -988,9 +995,55 @@ fn open_directory_for_dacl(name: &str) -> Result<Handle, KernelError> {
     }
 }
 
-/// Replace the directory DACL with a null DACL and return the saved one.
-/// `Ok(None)` means the directory already had a null DACL.
-fn null_directory_dacl(name: &str) -> Result<Option<AclRestore>, KernelError> {
+fn directory_ace_count(name: &str) -> i32 {
+    let Ok(dir) = open_directory_status(name, 0x0002_0000) else {
+        return -1;
+    };
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut sacl = ptr::null_mut();
+    let mut sd = ptr::null_mut();
+    let got = unsafe {
+        GetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    unsafe { CloseHandle(dir) };
+    if got != 0 {
+        if !sd.is_null() {
+            unsafe { LocalFree(sd) };
+        }
+        return -2;
+    }
+    if dacl.is_null() {
+        if !sd.is_null() {
+            unsafe { LocalFree(sd) };
+        }
+        return 0;
+    }
+    // ACL.AceCount is a u16 at byte offset 4.
+    let bytes = dacl.cast::<u8>();
+    let count = unsafe { u16::from_le_bytes([*bytes.add(4), *bytes.add(5)]) };
+    unsafe { LocalFree(sd) };
+    i32::from(count)
+}
+
+/// Replace the directory DACL with an inheritable allow for Everyone
+/// and the restricting SID. `sec_none` inherits that onto the new
+/// section. A null DACL does not.
+fn null_directory_dacl(
+    name: &str,
+    restricted: Handle,
+    world: Handle,
+) -> Result<Option<AclRestore>, KernelError> {
     let dir = open_directory_for_dacl(name)?;
     let mut owner = ptr::null_mut();
     let mut group = ptr::null_mut();
@@ -1013,14 +1066,20 @@ fn null_directory_dacl(name: &str) -> Result<Option<AclRestore>, KernelError> {
         unsafe { CloseHandle(dir) };
         return Err(win32_error("GetSecurityInfo", got));
     }
-    if dacl.is_null() {
-        unsafe {
-            LocalFree(sd);
-            CloseHandle(dir);
-        }
-        return Ok(None);
-    }
     let sd = LocalMem(sd);
+    let mut acl_words = vec![0u32; 128];
+    let acl = acl_words.as_mut_ptr().cast::<u8>();
+    let inherit = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+    let mask = DIRECTORY_ALL_ACCESS | SECTION_ALL_ACCESS;
+    let ready = unsafe {
+        InitializeAcl(acl, (acl_words.len() * 4) as Dword, 2) != 0
+            && AddAccessAllowedAceEx(acl, 2, inherit, mask, world) != 0
+            && AddAccessAllowedAceEx(acl, 2, inherit, mask, restricted) != 0
+    };
+    if !ready {
+        unsafe { CloseHandle(dir) };
+        return Err(last_error("inheritable namespace DACL"));
+    }
     let applied = unsafe {
         SetSecurityInfo(
             dir,
@@ -1028,14 +1087,18 @@ fn null_directory_dacl(name: &str) -> Result<Option<AclRestore>, KernelError> {
             DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
             ptr::null_mut(),
-            ptr::null_mut(),
+            acl.cast(),
             ptr::null_mut(),
         )
     };
     unsafe { CloseHandle(dir) };
     if applied != 0 {
-        return Err(win32_error("SetSecurityInfo null DACL", applied));
+        return Err(win32_error("SetSecurityInfo inheritable DACL", applied));
     }
+    eprintln!(
+        "workpen: msys dir {name} ace_count_after={}",
+        directory_ace_count(name)
+    );
     Ok(Some(AclRestore {
         path: wide_os(OsStr::new(name)),
         object_type: SE_KERNEL_OBJECT,
@@ -1130,7 +1193,7 @@ fn allow_msys_shared_dirs(
     // returned 0xC0000022. A null DACL lets the child create and
     // open. The saved DACL is restored after the child exits.
     for name in restricted_namespace_names() {
-        match null_directory_dacl(&name) {
+        match null_directory_dacl(&name, restricted, world) {
             Ok(Some(guard)) => guards.push(guard),
             Ok(None) => {}
             Err(err) => eprintln!("workpen: msys restricted dir skipped: {name}: {err}"),
