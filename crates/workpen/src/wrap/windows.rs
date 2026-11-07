@@ -452,11 +452,13 @@ unsafe extern "system" {
     ) -> Bool;
     fn GetLengthSid(sid: Handle) -> Dword;
     fn CopySid(len: Dword, dest: *mut u8, src: Handle) -> Bool;
+    fn ConvertSidToStringSidW(sid: Handle, string_sid: *mut *mut u16) -> Bool;
 }
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LocalFree(h_mem: Handle) -> Handle;
+    fn OpenFileMappingW(access: Dword, inherit: Bool, name: *const u16) -> Handle;
 }
 
 struct CloseOnDrop(Handle);
@@ -690,6 +692,7 @@ struct Prepared {
     _world: WorldSid,
     helper: Option<PathBuf>,
     _net: Option<NetGuards>,
+    sections: Vec<CloseOnDrop>,
     wfp_skipped: bool,
 }
 
@@ -782,6 +785,7 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
         _world: world,
         helper: None,
         _net: None,
+        sections: Vec::new(),
         wfp_skipped: false,
     })
 }
@@ -1133,6 +1137,11 @@ unsafe extern "system" {
         desired_access: u32,
         object_attributes: *mut ObjectAttributes,
     ) -> i32;
+    fn NtOpenSection(
+        section_handle: *mut Handle,
+        desired_access: u32,
+        object_attributes: *mut ObjectAttributes,
+    ) -> i32;
 }
 
 fn open_object_directory(name: &str) -> Result<Handle, KernelError> {
@@ -1155,6 +1164,7 @@ fn allow_msys_shared_dirs(
     world: Handle,
     token: Handle,
     guards: &mut Vec<AclRestore>,
+    holds: &mut Vec<CloseOnDrop>,
 ) {
     let Some(dll) = msys_dll_beside(program) else {
         return;
@@ -1194,10 +1204,139 @@ fn allow_msys_shared_dirs(
         }
         probe_directory_create(token, &name);
     }
-    // Do not pre-create SID.1. A section left behind with a DACL the
-    // child cannot open makes CreateFileMapping fail instead of
-    // creating one from the null default DACL.
-    let _ = (restricted, world, token);
+    // `cat` opens an existing `SID.1`. Changing the token default DACL
+    // does not change that object's ACL.
+    grant_existing_user_section(token, restricted, holds);
+}
+
+fn sid_string(token: Handle) -> Result<String, KernelError> {
+    let sid = token_user_sid(token)?;
+    let mut wide = ptr::null_mut();
+    // SAFETY: `sid` is a copied SID. The API allocates `wide`.
+    let ok = unsafe { ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut wide) };
+    if ok == 0 || wide.is_null() {
+        return Err(last_error("ConvertSidToStringSidW"));
+    }
+    let mut len = 0usize;
+    while unsafe { *wide.add(len) } != 0 {
+        len += 1;
+        if len > 256 {
+            unsafe { LocalFree(wide.cast()) };
+            return Err(KernelError::Apply("SID string is too long".into()));
+        }
+    }
+    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
+    unsafe { LocalFree(wide.cast()) };
+    Ok(text)
+}
+
+fn open_section(name: &str) -> Result<Handle, i32> {
+    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
+    let mut us = UnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attrs = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: ptr::null_mut(),
+        object_name: &mut us,
+        attributes: 0x40,
+        security_descriptor: ptr::null_mut(),
+        security_quality_of_service: ptr::null_mut(),
+    };
+    let mut handle = ptr::null_mut();
+    // READ_CONTROL | WRITE_DAC | SECTION_QUERY.
+    let status = unsafe { NtOpenSection(&mut handle, 0x0006_0001, &mut attrs) };
+    if status < 0 || handle.is_null() {
+        return Err(status);
+    }
+    Ok(handle)
+}
+
+fn grant_sid_on_section(section: Handle, sid: Handle) -> Result<(), KernelError> {
+    let mut dacl = ptr::null_mut();
+    let mut sd = ptr::null_mut();
+    let got = unsafe {
+        GetSecurityInfo(
+            section,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if got != 0 {
+        return Err(win32_error("GetSecurityInfo section", got));
+    }
+    let _sd = LocalMem(sd);
+    let new_acl = acl_with_grant(dacl, sid, GENERIC_ALL | SECTION_ALL_ACCESS)?;
+    let applied = unsafe {
+        SetSecurityInfo(
+            section,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            new_acl.0,
+            ptr::null_mut(),
+        )
+    };
+    if applied != 0 {
+        return Err(win32_error("SetSecurityInfo section", applied));
+    }
+    Ok(())
+}
+
+fn grant_existing_user_section(token: Handle, restricted: Handle, holds: &mut Vec<CloseOnDrop>) {
+    let Ok(sid_text) = sid_string(token) else {
+        eprintln!("workpen: section sid skipped");
+        return;
+    };
+    let name = format!("{sid_text}.1");
+    let mut session = 0u32;
+    unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+    let mut paths = vec![
+        format!(r"\BaseNamedObjects\{name}"),
+        format!(r"\BaseNamedObjects\Restricted\{name}"),
+    ];
+    if session != 0 {
+        paths.push(format!(r"\Sessions\{session}\BaseNamedObjects\{name}"));
+        paths.push(format!(
+            r"\Sessions\{session}\BaseNamedObjects\Restricted\{name}"
+        ));
+    }
+    for path in paths {
+        match open_section(&path) {
+            Ok(handle) => {
+                match grant_sid_on_section(handle, restricted) {
+                    Ok(()) => eprintln!("workpen: section grant ok {path}"),
+                    Err(err) => eprintln!("workpen: section grant failed {path}: {err}"),
+                }
+                holds.push(CloseOnDrop(handle));
+            }
+            Err(status) => eprintln!("workpen: section missing {path} ntstatus={status:#x}"),
+        }
+    }
+    for prefix in ["Local\\", "Global\\", ""] {
+        let win_name = format!("{prefix}{name}");
+        let wide = wide_os(OsStr::new(&win_name));
+        let handle = unsafe { OpenFileMappingW(0x0006_0001, 0, wide.as_ptr()) };
+        if handle.is_null() {
+            let err = unsafe { GetLastError() };
+            eprintln!("workpen: section win32 missing {win_name} win32={err}");
+            continue;
+        }
+        match grant_sid_on_section(handle, restricted) {
+            Ok(()) => eprintln!("workpen: section grant ok {win_name}"),
+            Err(err) => eprintln!("workpen: section grant failed {win_name}: {err}"),
+        }
+        holds.push(CloseOnDrop(handle));
+    }
 }
 
 fn probe_directory_create(token: Handle, name: &str) {
@@ -2177,6 +2316,7 @@ fn spawn_prepared_child(
             prepared._world.0,
             prepared.token.0,
             &mut prepared.acl_guards,
+            &mut prepared.sections,
         );
     }
     let mut env_block = environment_block(cmd);
