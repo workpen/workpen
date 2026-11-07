@@ -81,6 +81,8 @@ fn hold_sid(name: Option<&OsString>) -> ExitCode {
             handle.is_null()
         );
         if !handle.is_null() {
+            let dacl = grant_held_mapping(handle);
+            eprintln!("workpen-net-helper: sid-dacl name={candidate} {dacl}");
             held.push(handle);
         }
     }
@@ -157,6 +159,58 @@ fn map_open(name: &str, mode: u8, size: u32) -> *mut core::ffi::c_void {
 }
 
 #[cfg(windows)]
+fn grant_held_mapping(handle: *mut core::ffi::c_void) -> String {
+    let mut nt = SidAuthority { value: [0, 0, 0, 0, 0, 5] };
+    let mut world_auth = SidAuthority { value: [0, 0, 0, 0, 0, 1] };
+    let mut restricted = std::ptr::null_mut();
+    let mut world = std::ptr::null_mut();
+    let restricted_ok = unsafe {
+        AllocateAndInitializeSid(
+            &mut nt, 1, 12, 0, 0, 0, 0, 0, 0, 0, &mut restricted,
+        )
+    };
+    let world_ok = unsafe {
+        AllocateAndInitializeSid(
+            &mut world_auth, 1, 0, 0, 0, 0, 0, 0, 0, 0, &mut world,
+        )
+    };
+    if restricted_ok == 0 || world_ok == 0 {
+        return format!("sid={}", unsafe { GetLastError() });
+    }
+    let mut acl_words = vec![0u32; 64];
+    let acl = acl_words.as_mut_ptr().cast::<u8>();
+    let ready = unsafe {
+        InitializeAcl(acl, (acl_words.len() * 4) as u32, 2) != 0
+            && AddAccessAllowedAce(acl, 2, 0x1000_0000, world) != 0
+            && AddAccessAllowedAce(acl, 2, 0x1000_0000, restricted) != 0
+    };
+    let result = if !ready {
+        format!("acl={}", unsafe { GetLastError() })
+    } else {
+        let set = unsafe {
+            SetSecurityInfo(
+                handle,
+                6,
+                4,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                acl,
+                std::ptr::null_mut(),
+            )
+        };
+        if set == 0 {
+            "ok".to_string()
+        } else {
+            format!("set={set}")
+        }
+    };
+    unsafe {
+        FreeSid(restricted);
+        FreeSid(world);
+    }
+    result
+}
+
 fn object_name(handle: *mut core::ffi::c_void) -> String {
     if handle.is_null() {
         return String::new();
@@ -290,6 +344,38 @@ unsafe extern "system" {
         dacl: *mut u8,
         defaulted: i32,
     ) -> i32;
+    fn AllocateAndInitializeSid(
+        authority: *mut SidAuthority,
+        sub_count: u8,
+        sub0: u32,
+        sub1: u32,
+        sub2: u32,
+        sub3: u32,
+        sub4: u32,
+        sub5: u32,
+        sub6: u32,
+        sub7: u32,
+        sid: *mut *mut core::ffi::c_void,
+    ) -> i32;
+    fn FreeSid(sid: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    fn InitializeAcl(acl: *mut u8, length: u32, revision: u32) -> i32;
+    fn AddAccessAllowedAce(acl: *mut u8, revision: u32, mask: u32, sid: *mut core::ffi::c_void)
+        -> i32;
+    fn SetSecurityInfo(
+        handle: *mut core::ffi::c_void,
+        object_type: u32,
+        security_info: u32,
+        owner: *mut core::ffi::c_void,
+        group: *mut core::ffi::c_void,
+        dacl: *mut u8,
+        sacl: *mut core::ffi::c_void,
+    ) -> u32;
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct SidAuthority {
+    value: [u8; 6],
 }
 
 #[cfg(windows)]
