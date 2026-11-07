@@ -691,7 +691,20 @@ struct Prepared {
     _world: WorldSid,
     helper: Option<PathBuf>,
     _net: Option<NetGuards>,
+    sid_holder: Option<SidHolder>,
     wfp_skipped: bool,
+}
+
+struct SidHolder {
+    _helper: windows_net::HelperFile,
+    process: CloseOnDrop,
+    _stdin: CloseOnDrop,
+}
+
+impl Drop for SidHolder {
+    fn drop(&mut self) {
+        unsafe { TerminateProcess(self.process.0, 0) };
+    }
 }
 
 struct NetGuards {
@@ -783,6 +796,7 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
         _world: world,
         helper: None,
         _net: None,
+        sid_holder: None,
         wfp_skipped: false,
     })
 }
@@ -2205,6 +2219,124 @@ fn probe_mapping_shapes(prepared: &mut Prepared, program: &Path) {
     }
 }
 
+fn start_sid_holder(prepared: &mut Prepared, program: &Path) {
+    if prepared.sid_holder.is_some() || msys_dll_beside(program).is_none() {
+        return;
+    }
+    let Some(name) = user_sid_mapping_name(prepared.token.0) else {
+        return;
+    };
+    let Ok(helper) = windows_net::HelperFile::install(&std::env::temp_dir()) else {
+        eprintln!("workpen: sid holder helper skipped");
+        return;
+    };
+    let mut cmd = Command::new(helper.path());
+    cmd.arg("--hold-sid");
+    cmd.arg(&name);
+    let Ok((app, mut cmdline, cwd)) = command_line(&cmd) else {
+        return;
+    };
+    let mut env_block = environment_block(&mut cmd);
+    let Ok((child_in, parent_in)) = inheritable_pipe(false) else {
+        return;
+    };
+    let Some(parent_in) = parent_in else {
+        return;
+    };
+    let Ok((child_out, parent_out)) = inheritable_pipe(true) else {
+        return;
+    };
+    let Some(parent_out) = parent_out else {
+        return;
+    };
+    let mut startup = StartupInfoW {
+        cb: std::mem::size_of::<StartupInfoW>() as Dword,
+        lp_reserved: ptr::null_mut(),
+        lp_desktop: ptr::null_mut(),
+        lp_title: ptr::null_mut(),
+        dw_x: 0,
+        dw_y: 0,
+        dw_x_size: 0,
+        dw_y_size: 0,
+        dw_x_count_chars: 0,
+        dw_y_count_chars: 0,
+        dw_fill_attribute: 0,
+        dw_flags: STARTF_USESTDHANDLES,
+        w_show_window: 0,
+        cb_reserved2: 0,
+        lp_reserved2: ptr::null_mut(),
+        h_std_input: child_in.0,
+        h_std_output: child_out.0,
+        h_std_error: child_out.0,
+    };
+    let mut info = ProcessInformation {
+        h_process: ptr::null_mut(),
+        h_thread: ptr::null_mut(),
+        dw_process_id: 0,
+        dw_thread_id: 0,
+    };
+    let cwd_ptr = cwd.as_ref().map_or(ptr::null(), |c| c.as_ptr());
+    let created = unsafe {
+        CreateProcessAsUserW(
+            prepared.token.0,
+            app.as_ptr(),
+            cmdline.as_mut_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            1,
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+            env_block.as_mut_ptr().cast(),
+            cwd_ptr,
+            &mut startup,
+            &mut info,
+        )
+    };
+    drop((child_in, child_out));
+    if created == 0 {
+        eprintln!("workpen: sid holder create failed");
+        return;
+    }
+    let process = CloseOnDrop(info.h_process);
+    let thread = CloseOnDrop(info.h_thread);
+    if unsafe { AssignProcessToJobObject(prepared.job.0, process.0) } == 0 {
+        eprintln!("workpen: sid holder job assign failed");
+    }
+    if let Err(err) = lock_suspended_token(process.0, prepared._sid.0) {
+        eprintln!("workpen: sid holder lock failed: {err}");
+        unsafe { TerminateProcess(process.0, 1) };
+        return;
+    }
+    if unsafe { ResumeThread(thread.0) } == u32::MAX {
+        eprintln!("workpen: sid holder resume failed");
+        unsafe { TerminateProcess(process.0, 1) };
+        return;
+    }
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    while !got.windows(4).any(|chunk| chunk == b"hold") && got.len() < 8192 {
+        let mut n = 0u32;
+        let ok = unsafe {
+            ReadFile(
+                parent_out.0,
+                buf.as_mut_ptr().cast(),
+                buf.len() as Dword,
+                &mut n,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 || n == 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n as usize]);
+    }
+    eprintln!("workpen: sid holder {}", String::from_utf8_lossy(&got));
+    prepared.sid_holder = Some(SidHolder {
+        _helper: helper,
+        process,
+        _stdin: parent_in,
+    });
+}
+
 fn spawn_prepared_child(
     prepared: &mut Prepared,
     cmd: &mut Command,
@@ -2224,6 +2356,7 @@ fn spawn_prepared_child(
             &mut prepared.acl_guards,
         );
         probe_mapping_shapes(prepared, &program);
+        start_sid_holder(prepared, &program);
     }
     let mut env_block = environment_block(cmd);
     let std_in = inheritable_std_handle(STD_INPUT_HANDLE, false)?;

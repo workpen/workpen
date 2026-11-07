@@ -16,6 +16,10 @@ fn main() -> ExitCode {
     if rest.first().is_some_and(|arg| arg == "--sec-probe") {
         return sec_probe(rest.get(1));
     }
+    #[cfg(windows)]
+    if rest.first().is_some_and(|arg| arg == "--hold-sid") {
+        return hold_sid(rest.get(1));
+    }
     let Some(dash) = rest.iter().position(|a| a == "--") else {
         eprintln!("workpen-net-helper: missing --");
         return ExitCode::from(2);
@@ -47,17 +51,54 @@ fn sec_probe(sid_name: Option<&OsString>) -> ExitCode {
     map_shape("sec-none", &format!("wp-sec-none-{pid}"), 1, 4096);
     map_shape("sec-all", &format!("wp-sec-all-{pid}"), 2, 4096);
     map_shape("null-psa-64m", &format!("wp-null-64m-{pid}"), 0, 64 * 1024 * 1024);
-    if let Some(name) = sid_name {
-        let text = name.to_string_lossy();
-        map_shape("sid-sec-none", &text, 1, 4096);
-        map_shape("sid-sec-none-64m", &text, 1, 64 * 1024 * 1024);
-        map_shape("sid-local", &format!("Local\\{text}"), 1, 4096);
+    let _ = sid_name;
+    ExitCode::from(0)
+}
+
+/// Keep `NAME` mapped with `sec_none` until stdin closes. `cat` then
+/// opens this section instead of creating a new one.
+#[cfg(windows)]
+fn hold_sid(name: Option<&OsString>) -> ExitCode {
+    use std::io::{Read, Write};
+
+    let Some(name) = name else {
+        eprintln!("workpen-net-helper: missing sid name");
+        return ExitCode::from(2);
+    };
+    let text = name.to_string_lossy();
+    let handle = map_open(&text, 1, 128 * 1024 * 1024);
+    let err = unsafe { GetLastError() };
+    eprintln!(
+        "workpen-net-helper: hold null={} err={err}",
+        handle.is_null()
+    );
+    if handle.is_null() {
+        return ExitCode::from(1);
     }
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "hold");
+    let _ = out.flush();
+    let mut sink = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut sink);
+    unsafe { CloseHandle(handle) };
     ExitCode::from(0)
 }
 
 #[cfg(windows)]
 fn map_shape(label: &str, name: &str, mode: u8, size: u32) {
+    let handle = map_open(name, mode, size);
+    let err = unsafe { GetLastError() };
+    eprintln!(
+        "workpen-net-helper: shape={label} size={size} null={} err={err}",
+        handle.is_null()
+    );
+    if !handle.is_null() {
+        unsafe { CloseHandle(handle) };
+    }
+}
+
+#[cfg(windows)]
+fn map_open(name: &str, mode: u8, size: u32) -> *mut core::ffi::c_void {
     use std::os::windows::ffi::OsStrExt;
 
     let mut wide: Vec<u16> = std::ffi::OsStr::new(name)
@@ -72,13 +113,16 @@ fn map_shape(label: &str, name: &str, mode: u8, size: u32) {
                 && SetSecurityDescriptorDacl(sd, 1, std::ptr::null_mut(), 0) != 0
         };
         if !ready {
-            eprintln!("workpen-net-helper: shape={label} sd-failed");
-            return;
+            return std::ptr::null_mut();
         }
     }
     let mut sa = SecurityAttributesHold {
         n_length: std::mem::size_of::<SecurityAttributesHold>() as u32,
-        lp_security_descriptor: if mode == 2 { sd.cast() } else { std::ptr::null_mut() },
+        lp_security_descriptor: if mode == 2 {
+            sd.cast()
+        } else {
+            std::ptr::null_mut()
+        },
         b_inherit_handle: 1,
     };
     let attrs = if mode == 0 {
@@ -86,7 +130,7 @@ fn map_shape(label: &str, name: &str, mode: u8, size: u32) {
     } else {
         &mut sa
     };
-    let handle = unsafe {
+    unsafe {
         CreateFileMappingW(
             -1isize as *mut core::ffi::c_void,
             attrs,
@@ -95,14 +139,6 @@ fn map_shape(label: &str, name: &str, mode: u8, size: u32) {
             size,
             wide.as_mut_ptr(),
         )
-    };
-    let err = unsafe { GetLastError() };
-    eprintln!(
-        "workpen-net-helper: shape={label} size={size} null={} err={err}",
-        handle.is_null()
-    );
-    if !handle.is_null() {
-        unsafe { CloseHandle(handle) };
     }
 }
 
