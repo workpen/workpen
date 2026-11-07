@@ -459,6 +459,14 @@ unsafe extern "system" {
 unsafe extern "system" {
     fn LocalFree(h_mem: Handle) -> Handle;
     fn OpenFileMappingW(access: Dword, inherit: Bool, name: *const u16) -> Handle;
+    fn CreateFileMappingW(
+        file: Handle,
+        attributes: *mut SecurityAttributes,
+        protect: Dword,
+        size_high: Dword,
+        size_low: Dword,
+        name: *const u16,
+    ) -> Handle;
 }
 
 struct CloseOnDrop(Handle);
@@ -1142,6 +1150,15 @@ unsafe extern "system" {
         desired_access: u32,
         object_attributes: *mut ObjectAttributes,
     ) -> i32;
+    fn NtCreateSection(
+        section_handle: *mut Handle,
+        desired_access: u32,
+        object_attributes: *mut ObjectAttributes,
+        maximum_size: *mut i64,
+        section_page_protection: u32,
+        allocation_attributes: u32,
+        file_handle: Handle,
+    ) -> i32;
 }
 
 fn open_object_directory(name: &str) -> Result<Handle, KernelError> {
@@ -1292,6 +1309,81 @@ fn grant_sid_on_section(section: Handle, sid: Handle) -> Result<(), KernelError>
     Ok(())
 }
 
+fn null_security_descriptor(words: &mut [u64; 8]) -> bool {
+    let sd = words.as_mut_ptr().cast::<u8>();
+    unsafe {
+        InitializeSecurityDescriptor(sd, 1) != 0
+            && SetSecurityDescriptorDacl(sd, 1, ptr::null_mut(), 0) != 0
+    }
+}
+
+fn create_null_section(name: &str) -> Result<Handle, i32> {
+    let mut words = [0u64; 8];
+    if !null_security_descriptor(&mut words) {
+        return Err(-1);
+    }
+    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
+    let mut us = UnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attrs = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: ptr::null_mut(),
+        object_name: &mut us,
+        attributes: 0x40,
+        security_descriptor: words.as_mut_ptr().cast(),
+        security_quality_of_service: ptr::null_mut(),
+    };
+    // Larger than MSYS `user_info`. A smaller existing section makes
+    // CreateFileMapping fail with Win32 5.
+    let mut size: i64 = 64 * 1024 * 1024;
+    let mut handle = ptr::null_mut();
+    let status = unsafe {
+        NtCreateSection(
+            &mut handle,
+            SECTION_ALL_ACCESS,
+            &mut attrs,
+            &mut size,
+            0x04,
+            0x0800_0000,
+            ptr::null_mut(),
+        )
+    };
+    if status < 0 || handle.is_null() {
+        return Err(status);
+    }
+    Ok(handle)
+}
+
+fn create_win32_null_section(name: &[u16]) -> Result<Handle, Dword> {
+    let mut words = [0u64; 8];
+    if !null_security_descriptor(&mut words) {
+        return Err(1);
+    }
+    let mut attrs = SecurityAttributes {
+        n_length: std::mem::size_of::<SecurityAttributes>() as Dword,
+        lp_security_descriptor: words.as_mut_ptr().cast(),
+        b_inherit_handle: 0,
+    };
+    let handle = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            &mut attrs,
+            0x04,
+            0,
+            64 * 1024 * 1024,
+            name.as_ptr(),
+        )
+    };
+    if handle.is_null() {
+        return Err(unsafe { GetLastError() });
+    }
+    Ok(handle)
+}
+
 fn grant_existing_user_section(token: Handle, restricted: Handle, holds: &mut Vec<CloseOnDrop>) {
     let Ok(sid_text) = sid_string(token) else {
         eprintln!("workpen: section sid skipped");
@@ -1319,7 +1411,15 @@ fn grant_existing_user_section(token: Handle, restricted: Handle, holds: &mut Ve
                 }
                 holds.push(CloseOnDrop(handle));
             }
-            Err(status) => eprintln!("workpen: section missing {path} ntstatus={status:#x}"),
+            Err(status) => match create_null_section(&path) {
+                Ok(handle) => {
+                    eprintln!("workpen: section created {path}");
+                    holds.push(CloseOnDrop(handle));
+                }
+                Err(create_status) => eprintln!(
+                    "workpen: section missing {path} ntstatus={status:#x} create={create_status:#x}"
+                ),
+            },
         }
     }
     for prefix in ["Local\\", "Global\\", ""] {
@@ -1328,7 +1428,15 @@ fn grant_existing_user_section(token: Handle, restricted: Handle, holds: &mut Ve
         let handle = unsafe { OpenFileMappingW(0x0006_0001, 0, wide.as_ptr()) };
         if handle.is_null() {
             let err = unsafe { GetLastError() };
-            eprintln!("workpen: section win32 missing {win_name} win32={err}");
+            match create_win32_null_section(&wide) {
+                Ok(created) => {
+                    eprintln!("workpen: section win32 created {win_name}");
+                    holds.push(CloseOnDrop(created));
+                }
+                Err(create_err) => eprintln!(
+                    "workpen: section win32 missing {win_name} win32={err} create={create_err}"
+                ),
+            }
             continue;
         }
         match grant_sid_on_section(handle, restricted) {
@@ -1800,26 +1908,16 @@ struct TokenDefaultDacl {
     default_dacl: *mut u8,
 }
 
-fn grant_token_default_dacl(token: Handle, sid: Handle) -> Result<(), KernelError> {
-    // `sec_none` stores this DACL on the new section. Specific rights
-    // were not enough for `CreateFileMapping` under `WRITE_RESTRICTED`.
-    // `GENERIC_ALL` is what MSYS itself puts on a user DACL.
-    let user = token_user_sid(token)?;
-    let world = WorldSid::new().map_err(|_| KernelError::Apply("world SID".into()))?;
-    let mut acl_words = vec![0u32; 64];
-    let acl = acl_words.as_mut_ptr().cast::<u8>();
-    let ready = unsafe {
-        InitializeAcl(acl, (acl_words.len() * 4) as Dword, 2) != 0
-            && AddAccessAllowedAce(acl, 2, GENERIC_ALL, world.0) != 0
-            && AddAccessAllowedAce(acl, 2, GENERIC_ALL, user.as_ptr().cast_mut().cast()) != 0
-            && AddAccessAllowedAce(acl, 2, GENERIC_ALL, sid) != 0
+fn grant_token_default_dacl(token: Handle, _sid: Handle) -> Result<(), KernelError> {
+    // `sec_none` stores this DACL on a new section. `shared.5` already
+    // opens because MSYS passes an explicit null DACL (`sec_all_nih`).
+    // MSYS cannot replace this: `TOKEN_ADJUST_DEFAULT` is denied on the
+    // suspended child. A null default DACL is that same null DACL.
+    let info = TokenDefaultDacl {
+        default_dacl: ptr::null_mut(),
     };
-    if !ready {
-        return Err(last_error("default DACL"));
-    }
-    let info = TokenDefaultDacl { default_dacl: acl };
-    // SAFETY: `info` points at an ACL that stays alive for the call.
-    // The kernel copies the ACL into the token.
+    // SAFETY: `info` is a null default DACL. The kernel copies that fact
+    // into the token before this returns.
     let set = unsafe {
         SetTokenInformation(
             token,
