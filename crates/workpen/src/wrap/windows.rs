@@ -1291,6 +1291,12 @@ fn grant_sid_on_section(section: Handle, sid: Handle) -> Result<(), KernelError>
         return Err(win32_error("GetSecurityInfo section", got));
     }
     let _sd = LocalMem(sd);
+    // A null DACL already allows the restricting SID. Replacing it with
+    // only that SID fails the normal access check, so CreateFileMapping
+    // returns Win32 5 for both the parent and cat.
+    if dacl.is_null() {
+        return Ok(());
+    }
     let new_acl = acl_with_grant(dacl, sid, GENERIC_ALL | SECTION_ALL_ACCESS)?;
     let applied = unsafe {
         SetSecurityInfo(
