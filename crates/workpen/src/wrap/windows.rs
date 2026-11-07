@@ -1374,29 +1374,32 @@ fn start_map_holder(token: Handle) -> Result<MapHolder, KernelError> {
     }
     let process = CloseOnDrop(info.h_process);
     let thread = CloseOnDrop(info.h_thread);
-    let mut saw_ok = false;
-    let mut buf = [0u8; 64];
-    let mut got = 0u32;
-    let read = unsafe {
-        ReadFile(
-            stdout_read.0,
-            buf.as_mut_ptr(),
-            buf.len() as Dword,
-            &mut got,
-            ptr::null_mut(),
-        )
-    };
-    if read != 0 && got > 0 {
-        let said = String::from_utf8_lossy(&buf[..got as usize]);
-        eprintln!("workpen: msys holder said {said}");
-        if said.contains("ok") {
-            saw_ok = true;
+    let mut said = Vec::new();
+    for _ in 0..8 {
+        let mut buf = [0u8; 256];
+        let mut got = 0u32;
+        let read = unsafe {
+            ReadFile(
+                stdout_read.0,
+                buf.as_mut_ptr(),
+                buf.len() as Dword,
+                &mut got,
+                ptr::null_mut(),
+            )
+        };
+        if read == 0 || got == 0 {
+            break;
+        }
+        said.extend_from_slice(&buf[..got as usize]);
+        let text = String::from_utf8_lossy(&said);
+        if text.contains("ok") || text.contains("CreateFileMapping") {
+            break;
         }
     }
-    if !saw_ok {
-        let err = unsafe { GetLastError() };
-        eprintln!("workpen: msys map holder did not report ok (win32 {err})");
-    }
+    eprintln!(
+        "workpen: msys holder said {}",
+        String::from_utf8_lossy(&said)
+    );
     Ok(MapHolder {
         process,
         _thread: thread,
