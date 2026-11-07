@@ -65,6 +65,24 @@ const UI_RESTRICTIONS: Dword = JOB_OBJECT_UILIMIT_READCLIPBOARD
     | JOB_OBJECT_UILIMIT_EXITWINDOWS;
 const _: () = assert!(UI_RESTRICTIONS & JOB_OBJECT_UILIMIT_HANDLES == 0);
 const SE_KERNEL_OBJECT: u32 = 6;
+/// `DIRECTORY_QUERY | DIRECTORY_TRAVERSE | DIRECTORY_CREATE_OBJECT | DIRECTORY_CREATE_SUBDIRECTORY | READ_CONTROL`.
+/// MSYS requests this mask for its shared directory (`CYG_SHARED_DIR_ACCESS`).
+const MSYS_DIR_ACCESS: Dword = 0x0002_000F;
+const DIRECTORY_ALL_ACCESS: Dword = 0x000F_000F;
+/// MSYS mask plus WRITE_DAC, so the parent can edit the leaf it creates
+/// without also granting DELETE to Everyone.
+const MSYS_DIR_WRITE_DAC: Dword = MSYS_DIR_ACCESS | 0x0004_0000;
+const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+const OBJ_OPENIF: u32 = 0x80;
+const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
+const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003A_u32 as i32;
+const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
+const WRITE_OWNER: u32 = 0x0008_0000;
+const OWNER_SECURITY_INFORMATION: Dword = 0x1;
+const TOKEN_ADJUST_PRIVILEGES: Dword = 0x0020;
+const TOKEN_USER: u32 = 1;
+const SE_PRIVILEGE_ENABLED: Dword = 0x0000_0002;
+const TOKEN_DEFAULT_DACL: u32 = 6;
 const TOKEN_PRIMARY: u32 = 1;
 const SECURITY_IMPERSONATION: u32 = 2;
 const INFINITE: Dword = 0xFFFF_FFFF;
@@ -92,6 +110,24 @@ struct SidIdentifierAuthority {
 struct SidAndAttributes {
     sid: Handle,
     attributes: Dword,
+}
+
+#[repr(C)]
+struct Luid {
+    low_part: Dword,
+    high_part: i32,
+}
+
+#[repr(C)]
+struct LuidAndAttributes {
+    luid: Luid,
+    attributes: Dword,
+}
+
+#[repr(C)]
+struct TokenPrivileges {
+    count: Dword,
+    attr: LuidAndAttributes,
 }
 
 #[repr(C)]
@@ -257,6 +293,20 @@ unsafe extern "system" {
         lp_overlapped: *mut core::ffi::c_void,
     ) -> Bool;
     fn SetHandleInformation(h_object: Handle, dw_mask: Dword, dw_flags: Dword) -> Bool;
+    fn GetFinalPathNameByHandleW(
+        h_file: Handle,
+        lpsz_file_path: *mut u16,
+        cch_file_path: Dword,
+        dw_flags: Dword,
+    ) -> Dword;
+    fn LCMapStringW(
+        locale: u32,
+        flags: Dword,
+        src: *const u16,
+        src_len: i32,
+        dest: *mut u16,
+        dest_len: i32,
+    ) -> i32;
 }
 
 const HANDLE_FLAG_INHERIT: Dword = 0x0000_0001;
@@ -358,6 +408,43 @@ unsafe extern "system" {
         old_acl: Handle,
         new_acl: *mut Handle,
     ) -> Dword;
+    fn GetTokenInformation(
+        token_handle: Handle,
+        token_information_class: u32,
+        token_information: *mut core::ffi::c_void,
+        token_information_length: Dword,
+        return_length: *mut Dword,
+    ) -> Bool;
+    fn SetTokenInformation(
+        token_handle: Handle,
+        token_information_class: u32,
+        token_information: *mut core::ffi::c_void,
+        token_information_length: Dword,
+    ) -> Bool;
+    fn InitializeSecurityDescriptor(sd: *mut u8, revision: u32) -> Bool;
+    fn InitializeAcl(acl: *mut u8, length: Dword, revision: u32) -> Bool;
+    fn AddAccessAllowedAce(acl: *mut u8, revision: u32, mask: Dword, sid: Handle) -> Bool;
+    fn SetSecurityDescriptorDacl(
+        sd: *mut u8,
+        present: Bool,
+        dacl: *mut u8,
+        defaulted: Bool,
+    ) -> Bool;
+    fn LookupPrivilegeValueW(
+        lp_system_name: *const u16,
+        lp_name: *const u16,
+        lp_luid: *mut Luid,
+    ) -> Bool;
+    fn AdjustTokenPrivileges(
+        token: Handle,
+        disable_all: Bool,
+        new_state: *mut TokenPrivileges,
+        buffer_length: Dword,
+        previous: *mut core::ffi::c_void,
+        return_length: *mut Dword,
+    ) -> Bool;
+    fn GetLengthSid(sid: Handle) -> Dword;
+    fn CopySid(len: Dword, dest: *mut u8, src: Handle) -> Bool;
 }
 
 #[link(name = "kernel32")]
@@ -776,14 +863,12 @@ fn cached_blocked_profile(helper: &Path) -> Result<(Handle, bool), KernelError> 
     Ok((sid, skipped))
 }
 
-/// `NtCreateDirectoryObject` on `\BaseNamedObjects` needs
-/// `DIRECTORY_CREATE_SUBDIRECTORY`. `0xC0000022` is that deny. A missed
-/// ACE does not fail the spawn.
+/// Best-effort grant on the session object directory. MSYS does not
+/// create `\BaseNamedObjects\msys-...` through this ACE when that
+/// leaf already exists. [`allow_msys_shared_dirs`] grants the leaf.
+/// A missed ACE does not fail the spawn.
 fn allow_session_object_create(sid: Handle) -> Result<Vec<AclRestore>, KernelError> {
-    // NtCreateDirectoryObject asks for DIRECTORY_ALL_ACCESS
-    // (STANDARD_RIGHTS_REQUIRED plus the four directory bits). A
-    // create-only mask still returns 0xC0000022.
-    let rights = 0x000F_000F | 0x1000_0000;
+    let rights = DIRECTORY_ALL_ACCESS | GENERIC_ALL;
     let mut guards = Vec::new();
     for name in object_namespace_names() {
         match grant_directory_object(&name, sid, rights) {
@@ -899,9 +984,332 @@ unsafe extern "system" {
         desired_access: u32,
         object_attributes: *mut ObjectAttributes,
     ) -> i32;
+    fn NtCreateDirectoryObject(
+        directory_handle: *mut Handle,
+        desired_access: u32,
+        object_attributes: *mut ObjectAttributes,
+    ) -> i32;
 }
 
 fn open_object_directory(name: &str) -> Result<Handle, KernelError> {
+    // READ_CONTROL | WRITE_DAC. The DACL edit does not need directory create.
+    open_directory_status(name, 0x0006_0000).map_err(|status| {
+        KernelError::Apply(format!(
+            "NtOpenDirectoryObject {name} failed (ntstatus {status:#x})"
+        ))
+    })
+}
+
+/// MSYS `get_shared_parent_dir` calls `NtCreateDirectoryObject` on
+/// `\BaseNamedObjects\msys-2.0S<n>-<install key>` with `OBJ_OPENIF`.
+/// Checkout's git has usually created that leaf already, with an
+/// Everyone ACE that does not name the restricted SID, so a grant on
+/// the parent directory still returns `0xC0000022`.
+fn allow_msys_shared_dirs(program: &Path, restricted: Handle, world: Handle) {
+    let Some(dll) = msys_dll_beside(program) else {
+        return;
+    };
+    let nt_path = match msys_install_nt_path(&dll) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("workpen: msys dll path skipped: {err}");
+            return;
+        }
+    };
+    let hash = hash_path_name(0, &nt_path);
+    let shared_id = msys_shared_id(&dll).unwrap_or_else(|| "msys-2.0S5".to_string());
+    let leaf = format!("{shared_id}-{hash:016x}");
+    ensure_msys_shared_dir(&format!(r"\BaseNamedObjects\{leaf}"), restricted, world);
+    let mut session = 0u32;
+    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+    if ok != 0 && session != 0 {
+        ensure_msys_shared_dir(
+            &format!(r"\Sessions\BNOLINKS\{session}\{leaf}"),
+            restricted,
+            world,
+        );
+    }
+}
+
+fn msys_dll_beside(program: &Path) -> Option<PathBuf> {
+    let dll = program.parent()?.join("msys-2.0.dll");
+    dll.is_file().then_some(dll)
+}
+
+fn msys_shared_id(dll: &Path) -> Option<String> {
+    let bytes = std::fs::read(dll).ok()?;
+    // The version banner is `shared id: msys-2.0S<n>`. A bare scan can
+    // match an earlier `msys-2.0S` byte run that is not the shared id.
+    shared_id_after(&bytes, b"shared id: msys-2.0S")
+        .or_else(|| shared_id_after(&bytes, b"msys-2.0S"))
+}
+
+fn shared_id_after(bytes: &[u8], needle: &[u8]) -> Option<String> {
+    let rel = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)?;
+    let start = rel + needle.len();
+    let digits = bytes[start..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return None;
+    }
+    Some(format!(
+        "msys-2.0S{}",
+        String::from_utf8_lossy(&bytes[start..start + digits])
+    ))
+}
+
+fn msys_install_nt_path(dll: &Path) -> Result<Vec<u16>, KernelError> {
+    let wide = wide_path(dll);
+    // SAFETY: `wide` is a NUL-terminated path. The share mode matches
+    // MSYS `FILE_SHARE_VALID_FLAGS` so a running git does not block the open.
+    let file = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | 0x4,
+            ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    if file.is_null() || file == INVALID_HANDLE_VALUE {
+        return Err(last_error("CreateFileW msys dll"));
+    }
+    let mut buf = vec![0u16; 32768];
+    // SAFETY: `file` is the open DLL; `buf` receives the Win32 path.
+    let n = unsafe { GetFinalPathNameByHandleW(file, buf.as_mut_ptr(), buf.len() as Dword, 0) };
+    unsafe { CloseHandle(file) };
+    if n == 0 || n as usize >= buf.len() {
+        return Err(last_error("GetFinalPathNameByHandleW"));
+    }
+    buf.truncate(n as usize);
+    normalize_msys_install_path(&mut buf);
+    Ok(buf)
+}
+
+/// MSYS turns the DLL path into an NT path and hashes that, including
+/// the file name. `\??\` is `\\?\` with the second character replaced.
+fn normalize_msys_install_path(path: &mut Vec<u16>) {
+    let slash = u16::from(b'\\');
+    let question = u16::from(b'?');
+    let prefixed = path.len() >= 2 && path[0] == slash && path[1] == slash;
+    if !prefixed {
+        let mut next = vec![slash, slash, question, slash];
+        next.append(path);
+        *path = next;
+    }
+    if path.len() >= 2 {
+        path[1] = question;
+    }
+}
+
+/// Cygwin `hash_path_name`: each unit is upcased, then
+/// `hash = ch + (hash << 6) + (hash << 16) - hash` in 64 bits.
+fn hash_path_name(mut hash: u64, name: &[u16]) -> u64 {
+    let upper = upcase_path(name);
+    for unit in upper {
+        let ch = u64::from(unit);
+        hash = ch
+            .wrapping_add(hash.wrapping_shl(6))
+            .wrapping_add(hash.wrapping_shl(16))
+            .wrapping_sub(hash);
+    }
+    hash
+}
+
+fn upcase_path(name: &[u16]) -> Vec<u16> {
+    let mut out = name.to_vec();
+    if out.is_empty() {
+        return out;
+    }
+    // LOCALE_INVARIANT + LCMAP_UPPERCASE. ASCII matches
+    // `RtlUpcaseUnicodeChar`. A failed map still uppercases A-Z.
+    let mapped = unsafe {
+        LCMapStringW(
+            0x007F,
+            0x0000_0200,
+            name.as_ptr(),
+            name.len() as i32,
+            out.as_mut_ptr(),
+            out.len() as i32,
+        )
+    };
+    if mapped == 0 {
+        for unit in &mut out {
+            if (u16::from(b'a')..=u16::from(b'z')).contains(unit) {
+                *unit -= 32;
+            }
+        }
+    }
+    out
+}
+
+fn ensure_msys_shared_dir(name: &str, restricted: Handle, world: Handle) {
+    match open_directory_status(name, 0x0006_0000) {
+        Ok(dir) => {
+            if let Err(err) = grant_sid_on_directory(dir, restricted, MSYS_DIR_ACCESS) {
+                eprintln!("workpen: msys shared ACE skipped: {name}: {err}");
+            }
+            return;
+        }
+        Err(status)
+            if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND =>
+        {
+            // The leaf is missing. Create it below.
+        }
+        Err(status) if status == STATUS_ACCESS_DENIED => {
+            // The leaf exists, but its DACL does not grant WRITE_DAC.
+            // Take ownership, then add the restricting SID.
+            if let Err(err) = take_directory_ownership(name) {
+                eprintln!("workpen: msys shared owner skipped: {name}: {err}");
+                return;
+            }
+            match open_directory_status(name, 0x0006_0000) {
+                Ok(dir) => {
+                    if let Err(err) = grant_sid_on_directory(dir, restricted, MSYS_DIR_ACCESS) {
+                        eprintln!("workpen: msys shared ACE skipped: {name}: {err}");
+                    }
+                }
+                Err(status) => {
+                    eprintln!("workpen: msys shared open skipped: {name} (ntstatus {status:#x})");
+                }
+            }
+            return;
+        }
+        Err(status) => {
+            eprintln!("workpen: msys shared open skipped: {name} (ntstatus {status:#x})");
+            return;
+        }
+    }
+    match create_msys_directory(name, restricted, world) {
+        Ok(dir) => {
+            if let Err(err) = grant_sid_on_directory(dir, restricted, MSYS_DIR_ACCESS) {
+                eprintln!("workpen: msys shared ACE skipped: {name}: {err}");
+            }
+        }
+        Err(status) => {
+            eprintln!("workpen: msys shared create skipped: {name} (ntstatus {status:#x})");
+        }
+    }
+}
+
+fn take_directory_ownership(name: &str) -> Result<(), KernelError> {
+    enable_privilege("SeTakeOwnershipPrivilege")?;
+    let dir = open_directory_status(name, WRITE_OWNER | 0x0002_0000).map_err(|status| {
+        KernelError::Apply(format!(
+            "NtOpenDirectoryObject {name} WRITE_OWNER failed (ntstatus {status:#x})"
+        ))
+    })?;
+    let user = current_user_sid()?;
+    // SAFETY: `dir` is open for WRITE_OWNER. `user` is a SID copy.
+    let set = unsafe {
+        SetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            user.as_ptr().cast_mut().cast(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(dir) };
+    if set != 0 {
+        return Err(win32_error("SetSecurityInfo owner", set));
+    }
+    Ok(())
+}
+
+fn enable_privilege(name: &str) -> Result<(), KernelError> {
+    let mut token = ptr::null_mut();
+    // SAFETY: current process. Adjust plus query is enough to enable one privilege.
+    let opened = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        )
+    };
+    if opened == 0 {
+        return Err(last_error("OpenProcessToken privileges"));
+    }
+    let token = CloseOnDrop(token);
+    let wide = wide_os(OsStr::new(name));
+    let mut luid = Luid {
+        low_part: 0,
+        high_part: 0,
+    };
+    // SAFETY: `wide` is a NUL-terminated privilege name.
+    let looked = unsafe { LookupPrivilegeValueW(ptr::null(), wide.as_ptr(), &mut luid) };
+    if looked == 0 {
+        return Err(last_error("LookupPrivilegeValueW"));
+    }
+    let mut state = TokenPrivileges {
+        count: 1,
+        attr: LuidAndAttributes {
+            luid,
+            attributes: SE_PRIVILEGE_ENABLED,
+        },
+    };
+    // SAFETY: `state` is one privilege. Previous state is unused.
+    let adjusted = unsafe {
+        AdjustTokenPrivileges(token.0, 0, &mut state, 0, ptr::null_mut(), ptr::null_mut())
+    };
+    let err = unsafe { GetLastError() };
+    if adjusted == 0 || err == 1300 {
+        return Err(KernelError::Apply(format!(
+            "AdjustTokenPrivileges {name} failed (win32 {err})"
+        )));
+    }
+    Ok(())
+}
+
+fn current_user_sid() -> Result<Vec<u8>, KernelError> {
+    let token = open_current_process_token()?;
+    let mut bytes = 0u32;
+    unsafe {
+        GetTokenInformation(token.0, TOKEN_USER, ptr::null_mut(), 0, &mut bytes);
+    }
+    if bytes < 8 {
+        return Err(last_error("GetTokenInformation TokenUser"));
+    }
+    let mut buf = vec![0u8; bytes as usize];
+    // SAFETY: `buf` is `bytes` long. The class is TokenUser.
+    let ok = unsafe {
+        GetTokenInformation(
+            token.0,
+            TOKEN_USER,
+            buf.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+        )
+    };
+    if ok == 0 {
+        return Err(last_error("GetTokenInformation TokenUser"));
+    }
+    let sid = unsafe { buf.as_ptr().cast::<Handle>().read() };
+    if sid.is_null() {
+        return Err(KernelError::Apply("TokenUser SID is null".into()));
+    }
+    let len = unsafe { GetLengthSid(sid) };
+    if len == 0 || len > 256 {
+        return Err(last_error("GetLengthSid"));
+    }
+    let mut copy = vec![0u8; len as usize];
+    // SAFETY: `sid` is the TokenUser SID inside `buf`, which stays alive.
+    let copied = unsafe { CopySid(len, copy.as_mut_ptr(), sid) };
+    if copied == 0 {
+        return Err(last_error("CopySid"));
+    }
+    Ok(copy)
+}
+
+fn open_directory_status(name: &str, access: u32) -> Result<Handle, i32> {
     let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
     let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
     let mut us = UnicodeString {
@@ -913,19 +1321,185 @@ fn open_object_directory(name: &str) -> Result<Handle, KernelError> {
         length: std::mem::size_of::<ObjectAttributes>() as u32,
         root_directory: ptr::null_mut(),
         object_name: &mut us,
-        attributes: 0x40,
+        attributes: OBJ_CASE_INSENSITIVE,
         security_descriptor: ptr::null_mut(),
         security_quality_of_service: ptr::null_mut(),
     };
     let mut handle = ptr::null_mut();
-    // READ_CONTROL | WRITE_DAC. The DACL edit does not need directory create.
-    let status = unsafe { NtOpenDirectoryObject(&mut handle, 0x0006_0000, &mut attrs) };
+    // SAFETY: `us` and `wide` live for the call.
+    let status = unsafe { NtOpenDirectoryObject(&mut handle, access, &mut attrs) };
     if status != 0 || handle.is_null() {
-        return Err(KernelError::Apply(format!(
-            "NtOpenDirectoryObject {name} failed (ntstatus {status:#x})"
-        )));
+        return Err(status);
     }
     Ok(handle)
+}
+
+fn create_msys_directory(name: &str, restricted: Handle, world: Handle) -> Result<Handle, i32> {
+    let mut sd = [0u8; 64];
+    let mut acl = vec![0u8; 256];
+    let ready = unsafe {
+        InitializeSecurityDescriptor(sd.as_mut_ptr(), 1) != 0
+            && InitializeAcl(acl.as_mut_ptr(), acl.len() as Dword, 2) != 0
+            && AddAccessAllowedAce(acl.as_mut_ptr(), 2, MSYS_DIR_WRITE_DAC, world) != 0
+            && AddAccessAllowedAce(acl.as_mut_ptr(), 2, MSYS_DIR_ACCESS, restricted) != 0
+            && SetSecurityDescriptorDacl(sd.as_mut_ptr(), 1, acl.as_mut_ptr(), 0) != 0
+    };
+    if !ready {
+        return Err(STATUS_OBJECT_PATH_NOT_FOUND);
+    }
+    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
+    let mut us = UnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attrs = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: ptr::null_mut(),
+        object_name: &mut us,
+        attributes: OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
+        security_descriptor: sd.as_mut_ptr().cast(),
+        security_quality_of_service: ptr::null_mut(),
+    };
+    let mut handle = ptr::null_mut();
+    // SAFETY: `sd`, `acl`, `us`, and `wide` live for the call.
+    let status = unsafe { NtCreateDirectoryObject(&mut handle, MSYS_DIR_WRITE_DAC, &mut attrs) };
+    if status != 0 || handle.is_null() {
+        return Err(status);
+    }
+    Ok(handle)
+}
+
+fn grant_sid_on_directory(dir: Handle, sid: Handle, rights: Dword) -> Result<(), KernelError> {
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut sacl = ptr::null_mut();
+    let mut sd = ptr::null_mut();
+    // SAFETY: `dir` is an open object directory.
+    let got = unsafe {
+        GetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    if got != 0 {
+        unsafe { CloseHandle(dir) };
+        return Err(win32_error("GetSecurityInfo", got));
+    }
+    let _sd = LocalMem(sd);
+    // A null DACL already grants the restricting SID. Replacing it
+    // would leave only the new ACE.
+    if dacl.is_null() {
+        unsafe { CloseHandle(dir) };
+        return Ok(());
+    }
+    let new_acl = match acl_with_grant(dacl, sid, rights) {
+        Ok(acl) => acl,
+        Err(err) => {
+            unsafe { CloseHandle(dir) };
+            return Err(err);
+        }
+    };
+    // SAFETY: `new_acl` is a LocalAlloc ACL from SetEntriesInAclW.
+    let applied = unsafe {
+        SetSecurityInfo(
+            dir,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            new_acl.0,
+            ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(dir) };
+    if applied != 0 {
+        return Err(win32_error("SetSecurityInfo", applied));
+    }
+    Ok(())
+}
+
+fn acl_with_grant(old: Handle, sid: Handle, rights: Dword) -> Result<LocalMem, KernelError> {
+    let mut entry = ExplicitAccessW {
+        grf_access_permissions: rights,
+        grf_access_mode: GRANT_ACCESS,
+        grf_inheritance: NO_INHERITANCE,
+        trustee: TrusteeW {
+            p_multiple_trustee: ptr::null_mut(),
+            multiple_trustee_operation: NO_MULTIPLE_TRUSTEE,
+            trustee_form: TRUSTEE_IS_SID,
+            trustee_type: TRUSTEE_IS_WELL_KNOWN_GROUP,
+            ptstr_name: sid,
+        },
+    };
+    let mut new_acl = ptr::null_mut();
+    // SAFETY: `entry` lives for the call. `old` may be null.
+    let set = unsafe { SetEntriesInAclW(1, &mut entry, old, &mut new_acl) };
+    if set != 0 || new_acl.is_null() {
+        return Err(win32_error("SetEntriesInAclW", set));
+    }
+    Ok(LocalMem(new_acl))
+}
+
+#[repr(C)]
+struct TokenDefaultDacl {
+    default_dacl: *mut u8,
+}
+
+fn grant_token_default_dacl(token: Handle, sid: Handle) -> Result<(), KernelError> {
+    let mut bytes = 0u32;
+    unsafe {
+        GetTokenInformation(token, TOKEN_DEFAULT_DACL, ptr::null_mut(), 0, &mut bytes);
+    }
+    if bytes < std::mem::size_of::<TokenDefaultDacl>() as u32 {
+        return Err(last_error("GetTokenInformation TokenDefaultDacl"));
+    }
+    let mut buf = vec![0u8; bytes as usize];
+    // SAFETY: `buf` is `bytes` long. The class is TokenDefaultDacl.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TOKEN_DEFAULT_DACL,
+            buf.as_mut_ptr().cast(),
+            bytes,
+            &mut bytes,
+        )
+    };
+    if ok == 0 {
+        return Err(last_error("GetTokenInformation TokenDefaultDacl"));
+    }
+    let old = unsafe { buf.as_ptr().cast::<TokenDefaultDacl>().read().default_dacl };
+    // A null default DACL already grants every SID, including the
+    // restricting SID. Replacing it with one ACE would drop the user.
+    if old.is_null() {
+        return Ok(());
+    }
+    let new_acl = acl_with_grant(old.cast(), sid, 0x001F_FFFF)?;
+    let info = TokenDefaultDacl {
+        default_dacl: new_acl.0.cast(),
+    };
+    // SAFETY: `info` points at an ACL that stays alive for the call.
+    // The kernel copies the ACL into the token.
+    let set = unsafe {
+        SetTokenInformation(
+            token,
+            TOKEN_DEFAULT_DACL,
+            (&raw const info).cast_mut().cast(),
+            std::mem::size_of::<TokenDefaultDacl>() as Dword,
+        )
+    };
+    if set == 0 {
+        return Err(last_error("SetTokenInformation TokenDefaultDacl"));
+    }
+    Ok(())
 }
 
 /// Process-lifetime AppContainer for [`super::KernelPolicy::spawn_reexec`].
@@ -1403,6 +1977,9 @@ fn spawn_prepared_child(
         Some(helper) => wrap_command_line(helper, cmd)?,
         None => command_line(cmd)?,
     };
+    if let Ok(program) = resolve_program(cmd.get_program()) {
+        allow_msys_shared_dirs(&program, prepared._sid.0, prepared._world.0);
+    }
     let mut env_block = environment_block(cmd);
     let std_in = inheritable_std_handle(STD_INPUT_HANDLE, false)?;
     let piped = matches!(capture, StdioCapture::Collect | StdioCapture::Forward);
@@ -2082,7 +2659,11 @@ fn duplicate_primary_token(token: Handle) -> Result<CloseOnDrop, KernelError> {
 fn create_write_restricted_token(sid: Handle) -> Result<CloseOnDrop, KernelError> {
     let process_token = open_current_process_token()?;
     let restricted = create_restricted_token(process_token.0, sid)?;
-    duplicate_primary_token(restricted.0)
+    let primary = duplicate_primary_token(restricted.0)?;
+    if let Err(err) = grant_token_default_dacl(primary.0, sid) {
+        eprintln!("workpen: token default DACL skipped: {err}");
+    }
+    Ok(primary)
 }
 
 fn create_kill_job() -> Result<CloseOnDrop, KernelError> {
@@ -2265,6 +2846,7 @@ fn append_quoted(out: &mut Vec<u16>, arg: &OsStr) {
 #[cfg(test)]
 mod ace_tests {
     use super::*;
+    use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
 
     const ACCESS_DENIED_ACE_TYPE: u8 = 0x01;
@@ -2411,6 +2993,111 @@ mod ace_tests {
             "first dest must not keep a leftover DENY ACE after rollback"
         );
         drop(sid);
+    }
+
+    #[test]
+    fn msys_install_key_for_program_files_git() {
+        let mut path: Vec<u16> =
+            std::ffi::OsStr::new(r"\\?\C:\Program Files\Git\usr\bin\msys-2.0.dll")
+                .encode_wide()
+                .collect();
+        normalize_msys_install_path(&mut path);
+        let hash = hash_path_name(0, &path);
+        assert_eq!(format!("{hash:016x}"), "1888ae32e00d56aa");
+    }
+
+    #[test]
+    fn restricted_token_keeps_traverse_and_drops_admin_privileges() {
+        let sid = RestrictedSid::new().expect("sid");
+        let token = create_write_restricted_token(sid.0).expect("token");
+        let traverse = privilege_enabled(token.0, "SeChangeNotifyPrivilege").expect("lookup");
+        assert_eq!(
+            traverse,
+            Some(true),
+            "SeChangeNotifyPrivilege must stay enabled, got {traverse:?}"
+        );
+        for name in [
+            "SeDebugPrivilege",
+            "SeBackupPrivilege",
+            "SeRestorePrivilege",
+            "SeTakeOwnershipPrivilege",
+            "SeLoadDriverPrivilege",
+            "SeTcbPrivilege",
+        ] {
+            let state =
+                privilege_enabled(token.0, name).unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert_ne!(
+                state,
+                Some(true),
+                "{name} must stay disabled, got {state:?}"
+            );
+        }
+    }
+
+    #[repr(C)]
+    struct Luid {
+        low_part: Dword,
+        high_part: i32,
+    }
+
+    #[repr(C)]
+    struct LuidAndAttributes {
+        luid: Luid,
+        attributes: Dword,
+    }
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn LookupPrivilegeValueW(
+            lp_system_name: *const u16,
+            lp_name: *const u16,
+            lp_luid: *mut Luid,
+        ) -> Bool;
+    }
+
+    /// `Some(true)` enabled, `Some(false)` present but disabled, `None` absent.
+    fn privilege_enabled(token: Handle, name: &str) -> Result<Option<bool>, KernelError> {
+        const SE_PRIVILEGE_ENABLED: Dword = 0x0000_0002;
+        let wide = wide_os(std::ffi::OsStr::new(name));
+        let mut want = Luid {
+            low_part: 0,
+            high_part: 0,
+        };
+        // SAFETY: `wide` is a NUL-terminated privilege name.
+        let looked = unsafe { LookupPrivilegeValueW(ptr::null(), wide.as_ptr(), &mut want) };
+        if looked == 0 {
+            return Err(last_error("LookupPrivilegeValueW"));
+        }
+        let mut bytes = 0u32;
+        unsafe {
+            GetTokenInformation(token, 3, ptr::null_mut(), 0, &mut bytes);
+        }
+        if bytes < 4 {
+            return Err(last_error("GetTokenInformation TokenPrivileges"));
+        }
+        let len = bytes;
+        let mut buf = vec![0u64; len.div_ceil(8) as usize];
+        // SAFETY: `buf` is at least `len` bytes and 8-byte aligned.
+        let ok = unsafe { GetTokenInformation(token, 3, buf.as_mut_ptr().cast(), len, &mut bytes) };
+        if ok == 0 {
+            return Err(last_error("GetTokenInformation TokenPrivileges"));
+        }
+        let raw = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, bytes as usize) };
+        let count = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        let stride = std::mem::size_of::<LuidAndAttributes>();
+        for i in 0..count as usize {
+            let start = 4 + i * stride;
+            let end = start + stride;
+            if end > raw.len() {
+                break;
+            }
+            // SAFETY: `start` is inside `raw`. The first privilege entry is at offset 4.
+            let entry = unsafe { &*raw[start..].as_ptr().cast::<LuidAndAttributes>() };
+            if entry.luid.low_part == want.low_part && entry.luid.high_part == want.high_part {
+                return Ok(Some(entry.attributes & SE_PRIVILEGE_ENABLED != 0));
+            }
+        }
+        Ok(None)
     }
 }
 

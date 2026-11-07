@@ -55,14 +55,20 @@ The parent is trusted. The child is not.
   flag keeps traverse checking and drops `SeDebugPrivilege`,
   `SeBackupPrivilege`, `SeRestorePrivilege`, `SeTakeOwnershipPrivilege`,
   `SeLoadDriverPrivilege`, and `SeTcbPrivilege`. Git `usr\bin` tools
-  are expected to run. A write outside the ReadWrite grant still fails.
+  run. MSYS opens `\BaseNamedObjects\msys-2.0S<n>-<install key>` with
+  `OBJ_OPENIF`. The jail grants the restricted SID on that directory.
+  The key is the MSYS hash of `msys-2.0.dll`, not a fixed id. The same
+  grant is applied under `\Sessions\BNOLINKS\<session>` when the
+  process is not in session 0. A write outside the ReadWrite grant
+  still fails.
 - The workspace jail scanned the user profile. It denies `.ssh`,
   `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`, and `.kube`
   with the restricted SID and restores those ACLs when the jail drops.
   Missing names are skipped. It does not walk the profile.
-- A jailed Windows child cannot use the parent console or the
-  clipboard. Clipboard read and write, system parameters, and
-  ExitWindows are blocked. The child still inherits the parent console
+- A jailed Windows child must not take over the parent console.
+  The job blocks clipboard read and write, system parameters, and
+  ExitWindows. A session with no window station does not enforce
+  the clipboard limit. The child still inherits the parent console
   when the parent has one. `JOB_OBJECT_UILIMIT_HANDLES` is not set:
   it blocks USER handles owned outside the job, and MSYS init exits
   `0xC0000142`. `CREATE_NO_WINDOW` is not set: it hangs console
