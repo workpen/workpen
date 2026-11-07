@@ -64,9 +64,10 @@ The parent is trusted. The child is not.
   (`sec_none`). The section inherits the directory, so the jail
   adds an inheritable allow for the user and `S-1-5-12`. An
   existing `SID.1` gets the same allow. MSYS then creates its
-  signal pipe with a user security descriptor that does not name
-  `S-1-5-12`. The jail grants that SID on `\Device\NamedPipe` and
-  restores the previous DACL when the child exits. A write outside the ReadWrite grant still fails.
+  signal pipe during `msys-2.0.dll` startup with a user security
+  descriptor that does not name `S-1-5-12`, then opens the write end.
+  For that program the jail is the debugger and points
+  `CreateNamedPipeW` at a descriptor that includes `S-1-5-12`. A write outside the ReadWrite grant still fails.
 - The workspace jail scanned the user profile. It denies `.ssh`,
   `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`, and `.kube`
   with the restricted SID and restores those ACLs when the jail drops.
