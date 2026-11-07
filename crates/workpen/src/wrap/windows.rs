@@ -1270,6 +1270,26 @@ fn create_mapping_as_token(token: Handle, name: &str) -> Option<CloseOnDrop> {
         );
         return None;
     }
+    let created_err = unsafe { GetLastError() };
+    let reopened = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            &mut sa,
+            PAGE_READWRITE_PROT,
+            0,
+            1024 * 1024,
+            wide.as_ptr(),
+        )
+    };
+    if reopened.is_null() {
+        eprintln!(
+            "workpen: msys mapping reopen failed name={name} created_err={created_err} win32 {}",
+            unsafe { GetLastError() }
+        );
+    } else {
+        eprintln!("workpen: msys mapping reopen ok name={name} created_err={created_err}");
+        unsafe { CloseHandle(reopened) };
+    }
     Some(CloseOnDrop(handle))
 }
 
