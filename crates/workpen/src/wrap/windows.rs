@@ -1300,15 +1300,26 @@ fn probe_signal_pipe(token: Handle, restricted: Handle) {
     }
     let _revert = Revert;
     let user_sid: Handle = user.as_ptr().cast_mut().cast();
-    let null_err = probe_pipe_result(&[], "null");
-    let user_err = probe_pipe_result(&[user_sid], "user");
-    let both_err = probe_pipe_result(&[user_sid, restricted], "both");
-    eprintln!("workpen: pipe probe null={null_err} user={user_err} both={both_err}");
+    let null_err = probe_pipe_result(&[], "null", 1);
+    let user_err = probe_pipe_result(&[user_sid], "user", 1);
+    let user_first = probe_pipe_result(&[user_sid], "user-first", 1 | 0x0008_0000);
+    let both_first = probe_pipe_result(&[user_sid, restricted], "both-first", 1 | 0x0008_0000);
+    eprintln!(
+        "workpen: pipe probe null={}/{} user={}/{} user-first={}/{} both-first={}/{}",
+        null_err.0,
+        null_err.1,
+        user_err.0,
+        user_err.1,
+        user_first.0,
+        user_first.1,
+        both_first.0,
+        both_first.1
+    );
 }
 
-fn probe_pipe_result(sids: &[Handle], label: &str) -> u32 {
+fn probe_pipe_result(sids: &[Handle], label: &str, open_mode: Dword) -> (u32, u32) {
     if sids.is_empty() {
-        return create_probe_pipe(label, ptr::null_mut());
+        return create_probe_pipe(label, ptr::null_mut(), open_mode);
     }
     let mut buf = vec![0u64; 48];
     let sd = buf.as_mut_ptr().cast::<u8>();
@@ -1329,28 +1340,46 @@ fn probe_pipe_result(sids: &[Handle], label: &str) -> u32 {
         ready = false;
     }
     if !ready {
-        return unsafe { GetLastError() };
+        return (unsafe { GetLastError() }, 0);
     }
     let mut sa = SecurityAttributes {
         n_length: std::mem::size_of::<SecurityAttributes>() as Dword,
         lp_security_descriptor: sd.cast(),
         b_inherit_handle: 0,
     };
-    create_probe_pipe(label, &mut sa)
+    create_probe_pipe(label, &mut sa, open_mode)
 }
 
-fn create_probe_pipe(label: &str, sa: *mut SecurityAttributes) -> u32 {
+fn create_probe_pipe(label: &str, sa: *mut SecurityAttributes, open_mode: Dword) -> (u32, u32) {
     let name = wide_os(OsStr::new(&format!(
         r"\\.\pipe\wp-probe-{label}-{}",
         std::process::id()
     )));
-    let handle = unsafe { CreateNamedPipeW(name.as_ptr(), 1, 4, 1, 4096, 4096, 0, sa) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+    let server = unsafe { CreateNamedPipeW(name.as_ptr(), open_mode, 4, 1, 4096, 4096, 0, sa) };
+    if server.is_null() || server == INVALID_HANDLE_VALUE {
+        return (unsafe { GetLastError() }, 0);
+    }
+    // MSYS keeps the server end and opens the write end with this access.
+    // `OPEN_EXISTING` ignores `sa`; the pipe DACL from the create is checked.
+    let write = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_WRITE | 0x80,
+            0,
+            sa.cast(),
+            3,
+            0,
+            ptr::null_mut(),
+        )
+    };
+    let write_err = if write.is_null() || write == INVALID_HANDLE_VALUE {
         unsafe { GetLastError() }
     } else {
-        unsafe { CloseHandle(handle) };
+        unsafe { CloseHandle(write) };
         0
-    }
+    };
+    unsafe { CloseHandle(server) };
+    (0, write_err)
 }
 
 fn allow_signal_pipe(restricted: Handle, token: Handle, guards: &mut Vec<AclRestore>) {
