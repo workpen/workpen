@@ -274,6 +274,16 @@ unsafe extern "system" {
         dw_flags_and_attributes: Dword,
         h_template_file: Handle,
     ) -> Handle;
+    fn CreateFileMappingW(
+        h_file: Handle,
+        lp_file_mapping_attributes: *mut SecurityAttributes,
+        fl_protect: Dword,
+        dw_maximum_size_high: Dword,
+        dw_maximum_size_low: Dword,
+        lp_name: *const u16,
+    ) -> Handle;
+    fn ImpersonateLoggedOnUser(token: Handle) -> Bool;
+    fn RevertToSelf() -> Bool;
     fn GetModuleHandleW(lp_module_name: *const u16) -> Handle;
     fn GetProcAddress(h_module: Handle, lp_proc_name: *const u8) -> *mut core::ffi::c_void;
     fn CreatePipe(
@@ -1108,6 +1118,7 @@ fn allow_msys_shared_dirs(
     program: &Path,
     restricted: Handle,
     world: Handle,
+    token: Handle,
     guards: &mut Vec<AclRestore>,
     sections: &mut Vec<CloseOnDrop>,
 ) {
@@ -1149,7 +1160,7 @@ fn allow_msys_shared_dirs(
             Err(err) => eprintln!("workpen: msys restricted dir skipped: {name}: {err}"),
         }
     }
-    sections.extend(grant_user_shared_section(restricted, world));
+    sections.extend(grant_user_shared_section(restricted, world, token));
 }
 
 fn restricted_namespace_names() -> Vec<String> {
@@ -1167,7 +1178,7 @@ const MSYS_USER_SHARED_SUFFIX: &str = ".1";
 /// `SECTION_ALL_ACCESS`. `CreateFileMapping` asks for map read and write.
 const SECTION_ALL_ACCESS: Dword = 0x000F_001F;
 
-fn grant_user_shared_section(restricted: Handle, world: Handle) -> Vec<CloseOnDrop> {
+fn grant_user_shared_section(restricted: Handle, world: Handle, token: Handle) -> Vec<CloseOnDrop> {
     let Ok(sid) = current_user_sid() else {
         return Vec::new();
     };
@@ -1191,12 +1202,75 @@ fn grant_user_shared_section(restricted: Handle, world: Handle) -> Vec<CloseOnDr
         names.push(format!(r"\Sessions\BNOLINKS\{session}\{leaf}"));
     }
     let mut held = Vec::new();
+    if let Some(handle) = create_mapping_as_token(token, &leaf) {
+        held.push(handle);
+    }
     for name in names {
         if let Some(handle) = grant_existing_section(&name, restricted) {
             held.push(CloseOnDrop(handle));
         }
     }
     held
+}
+
+struct RevertImpersonation;
+impl Drop for RevertImpersonation {
+    fn drop(&mut self) {
+        unsafe { RevertToSelf() };
+    }
+}
+
+/// Create the mapping with the same Win32 call the child makes, while
+/// impersonating the restricted token, so it lands in that token's
+/// namespace. `sec_none` is not a null DACL; this one is.
+fn create_mapping_as_token(token: Handle, name: &str) -> Option<CloseOnDrop> {
+    if unsafe { ImpersonateLoggedOnUser(token) } == 0 {
+        eprintln!(
+            "workpen: msys impersonate skipped: {}",
+            last_error("ImpersonateLoggedOnUser")
+        );
+        return None;
+    }
+    let _revert = RevertImpersonation;
+    let mut sd = [0u64; 8];
+    let sd_ptr = sd.as_mut_ptr().cast::<u8>();
+    let ready = unsafe {
+        InitializeSecurityDescriptor(sd_ptr, 1) != 0
+            && SetSecurityDescriptorDacl(sd_ptr, 1, ptr::null_mut(), 0) != 0
+    };
+    if !ready {
+        eprintln!(
+            "workpen: msys mapping SD skipped: {}",
+            last_error("null DACL")
+        );
+        return None;
+    }
+    let mut sa = SecurityAttributes {
+        n_length: std::mem::size_of::<SecurityAttributes>() as Dword,
+        lp_security_descriptor: sd_ptr.cast(),
+        b_inherit_handle: 0,
+    };
+    let wide = wide_os(OsStr::new(name));
+    // SAFETY: impersonation is reverted by `_revert`. `wide` is the
+    // Win32 mapping name. `sa` and `sd` live for the call.
+    let handle = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            &mut sa,
+            PAGE_READWRITE_PROT,
+            0,
+            16 * 1024 * 1024,
+            wide.as_ptr(),
+        )
+    };
+    if handle.is_null() {
+        eprintln!(
+            "workpen: msys CreateFileMapping {name} skipped (win32 {})",
+            unsafe { GetLastError() }
+        );
+        return None;
+    }
+    Some(CloseOnDrop(handle))
 }
 
 fn sid_to_string(sid: &[u8]) -> Result<String, KernelError> {
@@ -2333,6 +2407,7 @@ fn spawn_prepared_child(
             &program,
             prepared._sid.0,
             prepared._world.0,
+            prepared.token.0,
             &mut prepared.acl_guards,
             &mut prepared.sections,
         );
