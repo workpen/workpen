@@ -684,6 +684,9 @@ struct Prepared {
     token: CloseOnDrop,
     job: CloseOnDrop,
     acl_guards: Vec<AclRestore>,
+    /// Keeps pre-created MSYS sections alive until the child exits.
+    /// Without a held handle, a non-permanent section is deleted on close.
+    sections: Vec<CloseOnDrop>,
     _sid: RestrictedSid,
     _world: WorldSid,
     helper: Option<PathBuf>,
@@ -776,6 +779,7 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
         token,
         job,
         acl_guards,
+        sections: Vec::new(),
         _sid: sid,
         _world: world,
         helper: None,
@@ -1105,6 +1109,7 @@ fn allow_msys_shared_dirs(
     restricted: Handle,
     world: Handle,
     guards: &mut Vec<AclRestore>,
+    sections: &mut Vec<CloseOnDrop>,
 ) {
     let Some(dll) = msys_dll_beside(program) else {
         return;
@@ -1144,7 +1149,7 @@ fn allow_msys_shared_dirs(
             Err(err) => eprintln!("workpen: msys restricted dir skipped: {name}: {err}"),
         }
     }
-    grant_user_shared_section(restricted, world);
+    sections.extend(grant_user_shared_section(restricted, world));
 }
 
 fn restricted_namespace_names() -> Vec<String> {
@@ -1162,12 +1167,12 @@ const MSYS_USER_SHARED_SUFFIX: &str = ".1";
 /// `SECTION_ALL_ACCESS`. `CreateFileMapping` asks for map read and write.
 const SECTION_ALL_ACCESS: Dword = 0x000F_001F;
 
-fn grant_user_shared_section(restricted: Handle, world: Handle) {
+fn grant_user_shared_section(restricted: Handle, world: Handle) -> Vec<CloseOnDrop> {
     let Ok(sid) = current_user_sid() else {
-        return;
+        return Vec::new();
     };
     let Ok(text) = sid_to_string(&sid) else {
-        return;
+        return Vec::new();
     };
     let leaf = format!("{text}{MSYS_USER_SHARED_SUFFIX}");
     let mut names = vec![
@@ -1185,9 +1190,13 @@ fn grant_user_shared_section(restricted: Handle, world: Handle) {
         names.push(format!(r"\Sessions\{session}\BaseNamedObjects\{leaf}"));
         names.push(format!(r"\Sessions\BNOLINKS\{session}\{leaf}"));
     }
+    let mut held = Vec::new();
     for name in names {
-        grant_existing_section(&name, restricted);
+        if let Some(handle) = grant_existing_section(&name, restricted) {
+            held.push(CloseOnDrop(handle));
+        }
     }
+    held
 }
 
 fn sid_to_string(sid: &[u8]) -> Result<String, KernelError> {
@@ -1209,19 +1218,19 @@ fn sid_to_string(sid: &[u8]) -> Result<String, KernelError> {
     Ok(text)
 }
 
-fn grant_existing_section(name: &str, _restricted: Handle) {
+fn grant_existing_section(name: &str, _restricted: Handle) -> Option<Handle> {
     let section = match open_section_status(name, 0x0006_0000) {
         Ok(section) => section,
         Err(status) if status == STATUS_ACCESS_DENIED => {
             if let Err(err) = take_section_ownership(name) {
                 eprintln!("workpen: msys section owner skipped: {name}: {err}");
-                return;
+                return None;
             }
             match open_section_status(name, 0x0006_0000) {
                 Ok(section) => section,
                 Err(status) => {
                     eprintln!("workpen: msys section open skipped: {name} (ntstatus {status:#x})");
-                    return;
+                    return None;
                 }
             }
         }
@@ -1229,20 +1238,22 @@ fn grant_existing_section(name: &str, _restricted: Handle) {
             if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND =>
         {
             match create_user_section(name) {
-                Ok(()) => return,
+                Ok(section) => return Some(section),
                 Err(err) => {
                     eprintln!("workpen: msys section create skipped: {name}: {err}");
-                    return;
+                    return None;
                 }
             }
         }
         Err(status) => {
             eprintln!("workpen: msys section open skipped: {name} (ntstatus {status:#x})");
-            return;
+            return None;
         }
     };
     // A null DACL grants the restricting SID. The inherited directory
     // ACE does not rewrite a section checkout already created.
+    // Keep the handle. A non-permanent section is deleted on close,
+    // and CreateFileMapping then creates a new one the token cannot open.
     let set = unsafe {
         SetSecurityInfo(
             section,
@@ -1254,16 +1265,18 @@ fn grant_existing_section(name: &str, _restricted: Handle) {
             ptr::null_mut(),
         )
     };
-    unsafe { CloseHandle(section) };
     if set != 0 {
         eprintln!(
             "workpen: msys section DACL skipped: {name}: {}",
             win32_error("SetSecurityInfo", set)
         );
+        unsafe { CloseHandle(section) };
+        return None;
     }
+    Some(section)
 }
 
-fn create_user_section(name: &str) -> Result<(), KernelError> {
+fn create_user_section(name: &str) -> Result<Handle, KernelError> {
     // `u8` storage is only 1-aligned. NtCreateSection returns
     // STATUS_DATATYPE_MISALIGNMENT (0x80000002) for that descriptor.
     let mut sd = [0u64; 8];
@@ -1311,8 +1324,7 @@ fn create_user_section(name: &str) -> Result<(), KernelError> {
             "NtCreateSection {name} failed (ntstatus {status:#x})"
         )));
     }
-    unsafe { CloseHandle(handle) };
-    Ok(())
+    Ok(handle)
 }
 
 fn open_section_status(name: &str, access: u32) -> Result<Handle, i32> {
@@ -2322,6 +2334,7 @@ fn spawn_prepared_child(
             prepared._sid.0,
             prepared._world.0,
             &mut prepared.acl_guards,
+            &mut prepared.sections,
         );
     }
     let mut env_block = environment_block(cmd);
