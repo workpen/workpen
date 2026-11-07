@@ -2158,6 +2158,32 @@ fn spawn_prepared(
     }
 }
 
+fn probe_cat_sim(prepared: &mut Prepared, program: &Path) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if msys_dll_beside(program).is_none() || DONE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let Ok(helper) = windows_net::HelperFile::install(&std::env::temp_dir()) else {
+        eprintln!("workpen: cat-sim helper skipped");
+        return;
+    };
+    let mut cmd = std::process::Command::new(helper.path());
+    cmd.arg("--cat-sim");
+    match spawn_prepared_child(
+        prepared,
+        &mut cmd,
+        Some(Duration::from_secs(20)),
+        StdioCapture::Collect,
+    ) {
+        Ok((_, _, Some(output), _)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("workpen: cat-sim {stderr}");
+        }
+        Ok((_, status, _, _)) => eprintln!("workpen: cat-sim status={status}"),
+        Err(err) => eprintln!("workpen: cat-sim failed: {err}"),
+    }
+}
+
 fn spawn_prepared_child(
     prepared: &mut Prepared,
     cmd: &mut Command,
@@ -2176,6 +2202,7 @@ fn spawn_prepared_child(
             prepared.token.0,
             &mut prepared.acl_guards,
         );
+        probe_cat_sim(prepared, &program);
     }
     let mut env_block = environment_block(cmd);
     let std_in = inheritable_std_handle(STD_INPUT_HANDLE, false)?;
