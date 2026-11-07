@@ -1429,7 +1429,7 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "workpen"
-version = "0.7.9"
+version = "0.8.0"
 dependencies = [
  "dunce",
  "libc",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "workpen-cli"
-version = "0.7.9"
+version = "0.8.0"
 dependencies = [
  "tempfile",
  "workpen",
