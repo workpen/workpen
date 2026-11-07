@@ -142,10 +142,11 @@ in one page is [docs/threat-model.md](docs/threat-model.md).
   drops. `strict` and `read-only` can read the workspace
   (`read_only` cannot write it), `SystemRoot`, `System32`, and
   `ProgramFiles`. `spawn_reexec` keeps network open for a host
-  that re-execs into one long-lived jail. Git `usr\bin` tools run:
-  the jail grants the restricted SID on that install's MSYS shared
-  directory, and keeps `S-1-5-12` on the token default DACL so
-  MSYS `sec_none` can create the per-user section. The job
+  that re-execs into one long-lived jail. Git `usr\bin` tools run.
+  The jail grants the restricted SID on that install's MSYS shared
+  directory. MSYS creates the per-user section in that directory
+  without a security descriptor, so the directory gets an inheritable
+  allow for the user and `S-1-5-12`. The job
   blocks clipboard use.
   A session with no window station does not
   enforce that limit. The child still inherits the parent console

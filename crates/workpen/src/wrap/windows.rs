@@ -74,6 +74,12 @@ const SECTION_ALL_ACCESS: Dword = 0x000F_001F;
 /// MSYS mask plus WRITE_DAC, so the parent can edit the leaf it creates
 /// without also granting DELETE to Everyone.
 const MSYS_DIR_WRITE_DAC: Dword = MSYS_DIR_ACCESS | 0x0004_0000;
+/// `SECTION_ALL_ACCESS`. MSYS `NtCreateSection` requests
+/// `STANDARD_RIGHTS_REQUIRED | SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE`
+/// (`0x000F0007`), which is a subset. The per-user section inherits this
+/// mask from the MSYS directory because `sec_none` passes a null descriptor.
+const MSYS_SECTION_ACCESS: Dword = 0x000F_001F;
+const MSYS_INHERIT_ACCESS: Dword = MSYS_DIR_ACCESS | MSYS_SECTION_ACCESS;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const OBJ_OPENIF: u32 = 0x80;
 const OBJECT_INHERIT_ACE: Dword = 0x1;
@@ -430,7 +436,24 @@ unsafe extern "system" {
     fn InitializeSecurityDescriptor(sd: *mut u8, revision: u32) -> Bool;
     fn InitializeAcl(acl: *mut u8, length: Dword, revision: u32) -> Bool;
     fn AddAccessAllowedAce(acl: *mut u8, revision: u32, mask: Dword, sid: Handle) -> Bool;
+    fn AddAccessAllowedAceEx(
+        acl: *mut u8,
+        revision: u32,
+        flags: u32,
+        mask: Dword,
+        sid: Handle,
+    ) -> Bool;
     fn AddAccessDeniedAce(acl: *mut u8, revision: u32, mask: Dword, sid: Handle) -> Bool;
+    fn GetAce(acl: Handle, index: Dword, ace: *mut Handle) -> Bool;
+    fn AddAce(
+        acl: *mut u8,
+        revision: u32,
+        index: Dword,
+        ace_list: *const u8,
+        ace_list_bytes: Dword,
+    ) -> Bool;
+    fn EqualSid(a: Handle, b: Handle) -> Bool;
+    fn ConvertSidToStringSidW(sid: Handle, string_sid: *mut *mut u16) -> Bool;
     fn SetSecurityDescriptorDacl(
         sd: *mut u8,
         present: Bool,
@@ -927,8 +950,8 @@ fn grant_directory_object(
     let mut entry = ExplicitAccessW {
         grf_access_permissions: rights,
         grf_access_mode: GRANT_ACCESS,
-        // `sec_none` creates the per-user section with no explicit DACL,
-        // so the section inherits this ACE. `shared.5` uses a null DACL.
+        // Children created in this directory inherit the ACE. An MSYS
+        // leaf that already exists does not. That leaf is granted below.
         grf_inheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
         trustee: TrusteeW {
             p_multiple_trustee: ptr::null_mut(),
@@ -1046,10 +1069,8 @@ fn relax_child_bno(process: Handle, restricted: Handle, world: Handle) {
     }
 }
 
-/// `sec_none` inherits this directory. An inheritable allow that omits
-/// a right `CreateFileMapping` requests fails the restricted write
-/// check with Win32 5. A null DACL does not inherit that allow.
-/// `shared.5` already opens because MSYS passes an explicit null DACL.
+/// Replace this object directory's DACL with null.
+/// Do not call this on `\BaseNamedObjects` itself.
 fn null_directory_dacl(
     name: &str,
     _restricted: Handle,
@@ -1133,6 +1154,11 @@ unsafe extern "system" {
         desired_access: u32,
         object_attributes: *mut ObjectAttributes,
     ) -> i32;
+    fn NtOpenSection(
+        section_handle: *mut Handle,
+        desired_access: u32,
+        object_attributes: *mut ObjectAttributes,
+    ) -> i32;
 }
 
 fn open_object_directory(name: &str) -> Result<Handle, KernelError> {
@@ -1179,14 +1205,11 @@ fn allow_msys_shared_dirs(
             world,
         );
     }
-    // `shared.5` passes an explicit null DACL and already opens.
-    // `sec_none` inherits the namespace directory, so a pre-created
-    // section is the object cat opens. Leave creation to cat.
+    // `SID.1` is created in the leaf above. `Restricted` is unrelated.
+    // Nulling `\BaseNamedObjects` itself breaks AppContainer tests.
     ensure_msys_shared_dir(r"\BaseNamedObjects\Restricted", restricted, world);
-    // Null the namespace DACL for the child so `sec_none` cannot
-    // inherit an allow that omits the restricting SID. The token
-    // default DACL is null, and MSYS cannot replace it. Restored
-    // after the child exits.
+    // `Restricted` only. Restored after the child exits.
+    // Do not null `\BaseNamedObjects`.
     for name in restricted_namespace_names() {
         match null_directory_dacl(&name, restricted, world) {
             Ok(Some(guard)) => guards.push(guard),
@@ -1349,52 +1372,39 @@ fn upcase_path(name: &[u16]) -> Vec<u16> {
 }
 
 fn ensure_msys_shared_dir(name: &str, restricted: Handle, world: Handle) {
-    match open_directory_status(name, 0x0006_0000) {
-        Ok(dir) => {
-            if let Err(err) = grant_sid_on_directory(dir, restricted, MSYS_DIR_ACCESS) {
-                eprintln!("workpen: msys shared ACE skipped: {name}: {err}");
-            }
-            return;
-        }
+    let dir = match open_directory_status(name, 0x0006_0000) {
+        Ok(dir) => dir,
         Err(status)
             if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND =>
         {
-            // The leaf is missing. Create it below.
+            match create_msys_directory(name, restricted, world) {
+                Ok(dir) => dir,
+                Err(status) => {
+                    eprintln!("workpen: msys shared create skipped: {name} (ntstatus {status:#x})");
+                    return;
+                }
+            }
         }
         Err(status) if status == STATUS_ACCESS_DENIED => {
             // The leaf exists, but its DACL does not grant WRITE_DAC.
-            // Take ownership, then add the restricting SID.
             if let Err(err) = take_directory_ownership(name) {
                 eprintln!("workpen: msys shared owner skipped: {name}: {err}");
                 return;
             }
             match open_directory_status(name, 0x0006_0000) {
-                Ok(dir) => {
-                    if let Err(err) = grant_sid_on_directory(dir, restricted, MSYS_DIR_ACCESS) {
-                        eprintln!("workpen: msys shared ACE skipped: {name}: {err}");
-                    }
-                }
+                Ok(dir) => dir,
                 Err(status) => {
                     eprintln!("workpen: msys shared open skipped: {name} (ntstatus {status:#x})");
+                    return;
                 }
             }
-            return;
         }
         Err(status) => {
             eprintln!("workpen: msys shared open skipped: {name} (ntstatus {status:#x})");
             return;
         }
-    }
-    match create_msys_directory(name, restricted, world) {
-        Ok(dir) => {
-            if let Err(err) = grant_sid_on_directory(dir, restricted, MSYS_DIR_ACCESS) {
-                eprintln!("workpen: msys shared ACE skipped: {name}: {err}");
-            }
-        }
-        Err(status) => {
-            eprintln!("workpen: msys shared create skipped: {name} (ntstatus {status:#x})");
-        }
-    }
+    };
+    secure_msys_directory(dir, name, restricted);
 }
 
 fn take_directory_ownership(name: &str) -> Result<(), KernelError> {
@@ -1597,22 +1607,17 @@ fn grant_sid_on_directory(dir: Handle, sid: Handle, rights: Dword) -> Result<(),
         )
     };
     if got != 0 {
-        unsafe { CloseHandle(dir) };
         return Err(win32_error("GetSecurityInfo", got));
     }
     let _sd = LocalMem(sd);
-    // A null DACL already grants the restricting SID. Replacing it
-    // would leave only the new ACE.
+    // A null DACL already grants every SID. The caller adds an
+    // inheritable section allow when this returns.
     if dacl.is_null() {
-        unsafe { CloseHandle(dir) };
         return Ok(());
     }
     let new_acl = match acl_with_grant(dacl, sid, rights) {
         Ok(acl) => acl,
-        Err(err) => {
-            unsafe { CloseHandle(dir) };
-            return Err(err);
-        }
+        Err(err) => return Err(err),
     };
     // SAFETY: `new_acl` is a LocalAlloc ACL from SetEntriesInAclW.
     let applied = unsafe {
@@ -1626,11 +1631,237 @@ fn grant_sid_on_directory(dir: Handle, sid: Handle, rights: Dword) -> Result<(),
             ptr::null_mut(),
         )
     };
-    unsafe { CloseHandle(dir) };
     if applied != 0 {
         return Err(win32_error("SetSecurityInfo", applied));
     }
     Ok(())
+}
+
+/// `sec_none` passes a null descriptor, so `SID.1` inherits this
+/// directory. The directory-open ACE is not inheritable. Children need
+/// an allow for the user and for `S-1-5-12`.
+fn secure_msys_directory(dir: Handle, name: &str, restricted: Handle) {
+    let granted = grant_sid_on_directory(dir, restricted, MSYS_DIR_ACCESS);
+    let inherited = append_inheritable_section_allows(dir, restricted);
+    // `Restricted` is not the parent of `SID.1`.
+    let existing = if name.contains("msys-") {
+        grant_existing_user_section(name, restricted)
+    } else {
+        Ok(())
+    };
+    unsafe { CloseHandle(dir) };
+    if let Err(err) = granted {
+        eprintln!("workpen: msys shared ACE skipped: {name}: {err}");
+    }
+    match inherited {
+        Ok(()) => eprintln!("workpen: msys inherit ok {name}"),
+        Err(err) => eprintln!("workpen: msys inherit skipped: {name}: {err}"),
+    }
+    if let Err(err) = existing {
+        eprintln!("workpen: msys user section skipped: {name}: {err}");
+    }
+}
+
+fn append_inheritable_section_allows(
+    object: Handle,
+    restricted: Handle,
+) -> Result<(), KernelError> {
+    let user = current_user_sid()?;
+    let user_sid = user.as_ptr().cast_mut().cast();
+    let (dacl, _sd) = object_dacl(object)?;
+    let have_user = acl_has_inherit_allow(dacl, user_sid, MSYS_INHERIT_ACCESS);
+    let have_restricted = acl_has_inherit_allow(dacl, restricted, MSYS_INHERIT_ACCESS);
+    if have_user && have_restricted {
+        return Ok(());
+    }
+    let mut words = vec![0u32; 1024];
+    let acl = words.as_mut_ptr().cast::<u8>();
+    let bytes = (words.len() * 4) as Dword;
+    if unsafe { InitializeAcl(acl, bytes, 2) } == 0 {
+        return Err(last_error("InitializeAcl"));
+    }
+    if !dacl.is_null() {
+        copy_aces(dacl, acl)?;
+    }
+    let flags = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+    if !have_user
+        && unsafe { AddAccessAllowedAceEx(acl, 2, flags, MSYS_INHERIT_ACCESS, user_sid) } == 0
+    {
+        return Err(last_error("AddAccessAllowedAceEx user"));
+    }
+    if !have_restricted
+        && unsafe { AddAccessAllowedAceEx(acl, 2, flags, MSYS_INHERIT_ACCESS, restricted) } == 0
+    {
+        return Err(last_error("AddAccessAllowedAceEx restricted"));
+    }
+    let applied = unsafe {
+        SetSecurityInfo(
+            object,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            acl.cast(),
+            ptr::null_mut(),
+        )
+    };
+    if applied != 0 {
+        return Err(win32_error("SetSecurityInfo", applied));
+    }
+    Ok(())
+}
+
+fn object_dacl(object: Handle) -> Result<(Handle, LocalMem), KernelError> {
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut sacl = ptr::null_mut();
+    let mut sd = ptr::null_mut();
+    let got = unsafe {
+        GetSecurityInfo(
+            object,
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    if got != 0 {
+        return Err(win32_error("GetSecurityInfo", got));
+    }
+    Ok((dacl, LocalMem(sd)))
+}
+
+fn copy_aces(from: Handle, to: *mut u8) -> Result<(), KernelError> {
+    let count = u32::from(ace_count(from));
+    for index in 0..count {
+        let mut ace = ptr::null_mut();
+        if unsafe { GetAce(from, index, &mut ace) } == 0 || ace.is_null() {
+            return Err(last_error("GetAce"));
+        }
+        let bytes = ace.cast::<u8>();
+        let size = unsafe { u16::from_le_bytes([*bytes.add(2), *bytes.add(3)]) };
+        if unsafe { AddAce(to, 2, Dword::MAX, bytes, u32::from(size)) } == 0 {
+            return Err(last_error("AddAce"));
+        }
+    }
+    Ok(())
+}
+
+fn ace_count(acl: Handle) -> u16 {
+    if acl.is_null() {
+        return 0;
+    }
+    let bytes = acl.cast::<u8>();
+    unsafe { u16::from_le_bytes([*bytes.add(4), *bytes.add(5)]) }
+}
+
+fn acl_has_inherit_allow(acl: Handle, sid: Handle, mask: Dword) -> bool {
+    if acl.is_null() || sid.is_null() {
+        return false;
+    }
+    let count = u32::from(ace_count(acl));
+    for index in 0..count {
+        let mut ace = ptr::null_mut();
+        if unsafe { GetAce(acl, index, &mut ace) } == 0 || ace.is_null() {
+            return false;
+        }
+        let bytes = ace.cast::<u8>();
+        let size = unsafe { u16::from_le_bytes([*bytes.add(2), *bytes.add(3)]) };
+        if size < 20 {
+            continue;
+        }
+        let kind = unsafe { *bytes };
+        let flags = unsafe { *bytes.add(1) };
+        let ace_mask = unsafe {
+            u32::from_le_bytes([*bytes.add(4), *bytes.add(5), *bytes.add(6), *bytes.add(7)])
+        };
+        if kind != 0 || flags & (OBJECT_INHERIT_ACE as u8) == 0 {
+            continue;
+        }
+        if ace_mask & mask != mask {
+            continue;
+        }
+        if unsafe { EqualSid(bytes.add(8).cast(), sid) } != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// MSYS `user_info::create` opens `SID.1` with `OBJ_OPENIF`. An existing
+/// section does not inherit a directory ACE added later.
+fn grant_existing_user_section(dir_name: &str, restricted: Handle) -> Result<(), KernelError> {
+    let user = current_user_sid()?;
+    let text = sid_to_string(&user)?;
+    let path = format!(r"{dir_name}\{text}.1");
+    match open_section_status(&path, 0x0006_0000) {
+        Ok(section) => {
+            let result = append_inheritable_section_allows(section, restricted);
+            unsafe { CloseHandle(section) };
+            if result.is_ok() {
+                eprintln!("workpen: msys user section allow {path}");
+            }
+            result
+        }
+        Err(status)
+            if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND =>
+        {
+            eprintln!("workpen: msys user section absent {path}");
+            Ok(())
+        }
+        Err(status) => {
+            eprintln!("workpen: msys user section open {path} ntstatus {status:#x}");
+            Ok(())
+        }
+    }
+}
+
+fn sid_to_string(sid: &[u8]) -> Result<String, KernelError> {
+    let mut wide = ptr::null_mut();
+    let ok = unsafe { ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut wide) };
+    if ok == 0 || wide.is_null() {
+        return Err(last_error("ConvertSidToStringSidW"));
+    }
+    let mut len = 0usize;
+    unsafe {
+        while *wide.add(len) != 0 && len < 200 {
+            len += 1;
+        }
+    }
+    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
+    unsafe { LocalFree(wide.cast()) };
+    if text.is_empty() {
+        return Err(KernelError::Apply("empty SID string".into()));
+    }
+    Ok(text)
+}
+
+fn open_section_status(name: &str, access: u32) -> Result<Handle, i32> {
+    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
+    let mut us = UnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attrs = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: ptr::null_mut(),
+        object_name: &mut us,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: ptr::null_mut(),
+        security_quality_of_service: ptr::null_mut(),
+    };
+    let mut handle = ptr::null_mut();
+    let status = unsafe { NtOpenSection(&mut handle, access, &mut attrs) };
+    if status != 0 || handle.is_null() {
+        return Err(status);
+    }
+    Ok(handle)
 }
 
 fn acl_with_grant(old: Handle, sid: Handle, rights: Dword) -> Result<LocalMem, KernelError> {
@@ -2158,32 +2389,6 @@ fn spawn_prepared(
     }
 }
 
-fn probe_cat_sim(prepared: &mut Prepared, program: &Path) {
-    static DONE: AtomicBool = AtomicBool::new(false);
-    if msys_dll_beside(program).is_none() || DONE.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    let Ok(helper) = windows_net::HelperFile::install(&std::env::temp_dir()) else {
-        eprintln!("workpen: cat-sim helper skipped");
-        return;
-    };
-    let mut cmd = std::process::Command::new(helper.path());
-    cmd.arg("--cat-sim");
-    match spawn_prepared_child(
-        prepared,
-        &mut cmd,
-        Some(Duration::from_secs(20)),
-        StdioCapture::Collect,
-    ) {
-        Ok((_, _, Some(output), _)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("workpen: cat-sim {stderr}");
-        }
-        Ok((_, status, _, _)) => eprintln!("workpen: cat-sim status={status}"),
-        Err(err) => eprintln!("workpen: cat-sim failed: {err}"),
-    }
-}
-
 fn spawn_prepared_child(
     prepared: &mut Prepared,
     cmd: &mut Command,
@@ -2202,7 +2407,6 @@ fn spawn_prepared_child(
             prepared.token.0,
             &mut prepared.acl_guards,
         );
-        probe_cat_sim(prepared, &program);
     }
     let mut env_block = environment_block(cmd);
     let std_in = inheritable_std_handle(STD_INPUT_HANDLE, false)?;

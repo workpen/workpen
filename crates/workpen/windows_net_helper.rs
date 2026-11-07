@@ -20,10 +20,6 @@ fn main() -> ExitCode {
     if rest.first().is_some_and(|arg| arg == "--hold-sid") {
         return hold_sid(rest.get(1));
     }
-    #[cfg(windows)]
-    if rest.first().is_some_and(|arg| arg == "--cat-sim") {
-        return cat_sim(rest.get(1));
-    }
     let Some(dash) = rest.iter().position(|a| a == "--") else {
         eprintln!("workpen-net-helper: missing --");
         return ExitCode::from(2);
@@ -57,73 +53,6 @@ fn sec_probe(sid_name: Option<&OsString>) -> ExitCode {
     map_shape("null-psa-64m", &format!("wp-null-64m-{pid}"), 0, 64 * 1024 * 1024);
     let _ = sid_name;
     ExitCode::from(0)
-}
-
-/// MSYS sets the process DACL, creates `shared.5` with an explicit null
-/// DACL, then creates the per-user section with `sec_none`.
-#[cfg(windows)]
-fn cat_sim(sid_name: Option<&OsString>) -> ExitCode {
-    let pid = std::process::id();
-    map_shape("baseline", &format!("wp-base-{pid}"), 1, 65_536);
-    let dacl = set_process_dacl_world();
-    eprintln!("workpen-net-helper: process-dacl {dacl}");
-    map_shape("after-pdacl", &format!("wp-pdacl-{pid}"), 1, 65_536);
-    let shared = map_open(&format!("wp-shared-{pid}"), 2, 65_536);
-    let shared_err = unsafe { GetLastError() };
-    eprintln!(
-        "workpen-net-helper: shared null={} err={shared_err}",
-        shared.is_null()
-    );
-    let sid = sid_name
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| format!("wp-user-{pid}"));
-    map_shape("after-shared", &sid, 1, 65_536);
-    if !shared.is_null() {
-        unsafe { CloseHandle(shared) };
-    }
-    ExitCode::from(0)
-}
-
-#[cfg(windows)]
-fn set_process_dacl_world() -> String {
-    let mut world_auth = SidAuthority {
-        value: [0, 0, 0, 0, 0, 1],
-    };
-    let mut world = std::ptr::null_mut();
-    if unsafe {
-        AllocateAndInitializeSid(&mut world_auth, 1, 0, 0, 0, 0, 0, 0, 0, 0, &mut world)
-    } == 0
-    {
-        return format!("sid={}", unsafe { GetLastError() });
-    }
-    let mut acl_words = vec![0u32; 32];
-    let acl = acl_words.as_mut_ptr().cast::<u8>();
-    let ready = unsafe {
-        InitializeAcl(acl, (acl_words.len() * 4) as u32, 2) != 0
-            && AddAccessAllowedAce(acl, 2, 0x101F_FFFF, world) != 0
-    };
-    let result = if !ready {
-        format!("acl={}", unsafe { GetLastError() })
-    } else {
-        let set = unsafe {
-            SetSecurityInfo(
-                -1isize as *mut core::ffi::c_void,
-                6,
-                4,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                acl,
-                std::ptr::null_mut(),
-            )
-        };
-        if set == 0 {
-            "ok".to_string()
-        } else {
-            format!("set={set}")
-        }
-    };
-    unsafe { FreeSid(world) };
-    result
 }
 
 /// Keep `NAME` mapped with `sec_none` until stdin closes. `cat` then

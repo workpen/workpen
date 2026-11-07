@@ -59,14 +59,12 @@ The parent is trusted. The child is not.
   `OBJ_OPENIF`. The jail grants the restricted SID on that directory.
   The key is the MSYS hash of `msys-2.0.dll`, not a fixed id. The same
   grant is applied under `\Sessions\BNOLINKS\<session>` when the
-  process is not in session 0. MSYS `sec_none` uses the token default
-  DACL for the per-user section `SID.1`. The jail grants `GENERIC_ALL`
-  to the user, Everyone, and `S-1-5-12` on that DACL and, while the
-  child is suspended, denies `TOKEN_ADJUST_DEFAULT` so MSYS cannot
-  replace it, and denies `WRITE_DAC` on the process so MSYS cannot
-  replace the process DACL. The `Restricted` namespace directory is given a null
-  DACL for the child so inheritance cannot omit `S-1-5-12`. A write
-  outside the ReadWrite grant still fails.
+  process is not in session 0. MSYS creates the per-user section `SID.1`
+  in that directory and passes a null security descriptor
+  (`sec_none`). The section inherits the directory, so the jail
+  adds an inheritable allow for the user and `S-1-5-12`. An
+  existing `SID.1` gets the same allow. A write outside the
+  ReadWrite grant still fails.
 - The workspace jail scanned the user profile. It denies `.ssh`,
   `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`, and `.kube`
   with the restricted SID and restores those ACLs when the jail drops.
