@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.8.0](https://github.com/workpen/workpen/compare/v0.7.9...v0.8.0) (2026-11-07)
+
+
+### Features
+
+* **gc:** age-gc registered worktrees when a host opts in ([#336](https://github.com/workpen/workpen/issues/336)) ([16fc8c3](https://github.com/workpen/workpen/commit/16fc8c3c5a4ce21a7d631971400641e551558408)), closes [#329](https://github.com/workpen/workpen/issues/329)
+* **wrap:** add a Windows re-exec jail with outbound network ([#338](https://github.com/workpen/workpen/issues/338)) ([4f48fd7](https://github.com/workpen/workpen/commit/4f48fd7a956dce6c6ce260f0964dc046cf280f2c))
+* **wrap:** jail Windows reads, console, and re-exec ([#339](https://github.com/workpen/workpen/issues/339)) ([d19d990](https://github.com/workpen/workpen/commit/d19d990681091598e0317078b1f21c664402f2be))
+
 ## [0.7.9](https://github.com/workpen/workpen/compare/v0.7.8...v0.7.9) (2026-11-05)
 
 
