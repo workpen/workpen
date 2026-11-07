@@ -211,6 +211,7 @@ fn grant_held_mapping(handle: *mut core::ffi::c_void) -> String {
     result
 }
 
+#[cfg(windows)]
 fn object_name(handle: *mut core::ffi::c_void) -> String {
     if handle.is_null() {
         return String::new();
