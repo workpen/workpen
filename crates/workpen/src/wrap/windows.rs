@@ -1183,10 +1183,13 @@ fn grant_existing_section(name: &str, _restricted: Handle) {
 }
 
 fn create_user_section(name: &str) -> Result<(), KernelError> {
-    let mut sd = [0u8; 64];
+    // `u8` storage is only 1-aligned. NtCreateSection returns
+    // STATUS_DATATYPE_MISALIGNMENT (0x80000002) for that descriptor.
+    let mut sd = [0u64; 8];
+    let sd_ptr = sd.as_mut_ptr().cast::<u8>();
     let ready = unsafe {
-        InitializeSecurityDescriptor(sd.as_mut_ptr(), 1) != 0
-            && SetSecurityDescriptorDacl(sd.as_mut_ptr(), 1, ptr::null_mut(), 0) != 0
+        InitializeSecurityDescriptor(sd_ptr, 1) != 0
+            && SetSecurityDescriptorDacl(sd_ptr, 1, ptr::null_mut(), 0) != 0
     };
     if !ready {
         return Err(last_error("null DACL for msys section"));
@@ -1587,14 +1590,17 @@ fn open_directory_status(name: &str, access: u32) -> Result<Handle, i32> {
 }
 
 fn create_msys_directory(name: &str, restricted: Handle, world: Handle) -> Result<Handle, i32> {
-    let mut sd = [0u8; 64];
-    let mut acl = vec![0u8; 256];
+    let mut sd = [0u64; 8];
+    let sd_ptr = sd.as_mut_ptr().cast::<u8>();
+    // ACLs must be DWORD-aligned. A `Vec<u8>` is not.
+    let mut acl_words = vec![0u32; 64];
+    let acl = acl_words.as_mut_ptr().cast::<u8>();
     let ready = unsafe {
-        InitializeSecurityDescriptor(sd.as_mut_ptr(), 1) != 0
-            && InitializeAcl(acl.as_mut_ptr(), acl.len() as Dword, 2) != 0
-            && AddAccessAllowedAce(acl.as_mut_ptr(), 2, MSYS_DIR_WRITE_DAC, world) != 0
-            && AddAccessAllowedAce(acl.as_mut_ptr(), 2, MSYS_DIR_ACCESS, restricted) != 0
-            && SetSecurityDescriptorDacl(sd.as_mut_ptr(), 1, acl.as_mut_ptr(), 0) != 0
+        InitializeSecurityDescriptor(sd_ptr, 1) != 0
+            && InitializeAcl(acl, acl_words.len() as Dword * 4, 2) != 0
+            && AddAccessAllowedAce(acl, 2, MSYS_DIR_WRITE_DAC, world) != 0
+            && AddAccessAllowedAce(acl, 2, MSYS_DIR_ACCESS, restricted) != 0
+            && SetSecurityDescriptorDacl(sd_ptr, 1, acl, 0) != 0
     };
     if !ready {
         return Err(STATUS_OBJECT_PATH_NOT_FOUND);
