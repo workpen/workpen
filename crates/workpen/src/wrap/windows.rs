@@ -288,8 +288,6 @@ unsafe extern "system" {
         h_template_file: Handle,
     ) -> Handle;
     fn GetModuleHandleW(lp_module_name: *const u16) -> Handle;
-    fn ImpersonateLoggedOnUser(token: Handle) -> Bool;
-    fn RevertToSelf() -> Bool;
     fn GetProcAddress(h_module: Handle, lp_proc_name: *const u8) -> *mut core::ffi::c_void;
     fn CreatePipe(
         h_read_pipe: *mut Handle,
@@ -1098,7 +1096,6 @@ fn relax_child_bno(process: Handle, restricted: Handle, world: Handle) {
     let prefix = unsafe { buf.as_ptr().cast::<*mut u16>().read() };
     let enabled = unsafe { *buf.as_ptr().add(8) };
     if prefix.is_null() {
-        eprintln!("workpen: msys bno enabled={enabled} prefix=<null>");
         return;
     }
     let mut len = 0usize;
@@ -1106,7 +1103,6 @@ fn relax_child_bno(process: Handle, restricted: Handle, world: Handle) {
         len += 1;
     }
     let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(prefix, len) });
-    eprintln!("workpen: msys bno enabled={enabled} prefix={text}");
     if enabled != 0 && !text.is_empty() {
         let mut session = 0u32;
         let session_ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
@@ -1248,7 +1244,6 @@ fn allow_msys_shared_dirs(
     program: &Path,
     restricted: Handle,
     world: Handle,
-    token: Handle,
     guards: &mut Vec<AclRestore>,
 ) {
     let Some(dll) = msys_dll_beside(program) else {
@@ -1289,7 +1284,6 @@ fn allow_msys_shared_dirs(
             Ok(None) => {}
             Err(err) => eprintln!("workpen: msys restricted dir skipped: {name}: {err}"),
         }
-        probe_directory_create(token, &name);
     }
 }
 
@@ -1302,11 +1296,8 @@ fn allow_signal_pipe(restricted: Handle, guards: &mut Vec<AclRestore>) {
         }
     };
     match grant_npfs_inherit(file, restricted) {
-        Ok(Some(guard)) => {
-            eprintln!("workpen: npfs inherit ok");
-            guards.push(guard);
-        }
-        Ok(None) => eprintln!("workpen: npfs dacl null"),
+        Ok(Some(guard)) => guards.push(guard),
+        Ok(None) => {}
         Err(err) => eprintln!("workpen: npfs inherit skipped: {err}"),
     }
 }
@@ -1478,7 +1469,6 @@ fn install_ntdll_pipe_hook(process: Handle, restricted: Handle) -> Result<(), Ke
     if !write_remote(process, stub.cast(), &patch) {
         return Err(last_error("WriteProcessMemory ntdll stub"));
     }
-    eprintln!("workpen: pipe hook ntdll syscall={syscall}");
     Ok(())
 }
 
@@ -1578,27 +1568,6 @@ fn write_remote(process: Handle, addr: *mut core::ffi::c_void, bytes: &[u8]) -> 
         VirtualProtectEx(process, addr, bytes.len(), old, &mut old);
     }
     ok != 0
-}
-
-fn probe_directory_create(token: Handle, name: &str) {
-    if unsafe { ImpersonateLoggedOnUser(token) } == 0 {
-        eprintln!(
-            "workpen: msys dir probe impersonate failed: {}",
-            last_error("ImpersonateLoggedOnUser")
-        );
-        return;
-    }
-    let opened = open_directory_status(name, MSYS_DIR_ACCESS);
-    unsafe { RevertToSelf() };
-    match opened {
-        Ok(dir) => {
-            unsafe { CloseHandle(dir) };
-            eprintln!("workpen: msys dir probe ok {name}");
-        }
-        Err(status) => {
-            eprintln!("workpen: msys dir probe failed {name} ntstatus {status:#x}");
-        }
-    }
 }
 
 fn restricted_namespace_names() -> Vec<String> {
@@ -2013,9 +1982,8 @@ fn secure_msys_directory(dir: Handle, name: &str, restricted: Handle) {
     if let Err(err) = granted {
         eprintln!("workpen: msys shared ACE skipped: {name}: {err}");
     }
-    match inherited {
-        Ok(()) => eprintln!("workpen: msys inherit ok {name}"),
-        Err(err) => eprintln!("workpen: msys inherit skipped: {name}: {err}"),
+    if let Err(err) = inherited {
+        eprintln!("workpen: msys inherit skipped: {name}: {err}");
     }
     if let Err(err) = existing {
         eprintln!("workpen: msys user section skipped: {name}: {err}");
@@ -2162,15 +2130,11 @@ fn grant_existing_user_section(dir_name: &str, restricted: Handle) -> Result<(),
         Ok(section) => {
             let result = append_inheritable_section_allows(section, restricted);
             unsafe { CloseHandle(section) };
-            if result.is_ok() {
-                eprintln!("workpen: msys user section allow {path}");
-            }
             result
         }
         Err(status)
             if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND =>
         {
-            eprintln!("workpen: msys user section absent {path}");
             Ok(())
         }
         Err(status) => {
@@ -2766,7 +2730,6 @@ fn spawn_prepared_child(
             &program,
             prepared._sid.0,
             prepared._world.0,
-            prepared.token.0,
             &mut prepared.acl_guards,
         );
     }
@@ -3503,38 +3466,7 @@ fn lock_suspended_token(process: Handle, restricted: Handle) -> Result<(), Kerne
     }
     let token = CloseOnDrop(raw);
     grant_token_default_dacl(token.0, restricted)?;
-    let (null_dacl, aces) = token_default_dacl_aces(token.0);
-    eprintln!("workpen: token default dacl null={null_dacl} aces={aces}");
     deny_token_adjust_default(token.0)
-}
-
-fn token_default_dacl_aces(token: Handle) -> (bool, i32) {
-    let mut bytes = 0u32;
-    unsafe {
-        GetTokenInformation(token, TOKEN_DEFAULT_DACL, ptr::null_mut(), 0, &mut bytes);
-    }
-    if bytes < std::mem::size_of::<TokenDefaultDacl>() as u32 {
-        return (true, -1);
-    }
-    let mut buf = vec![0u8; bytes as usize];
-    let ok = unsafe {
-        GetTokenInformation(
-            token,
-            TOKEN_DEFAULT_DACL,
-            buf.as_mut_ptr().cast(),
-            bytes,
-            &mut bytes,
-        )
-    };
-    if ok == 0 {
-        return (false, -2);
-    }
-    let acl = unsafe { buf.as_ptr().cast::<TokenDefaultDacl>().read().default_dacl };
-    if acl.is_null() {
-        return (true, 0);
-    }
-    let count = unsafe { u16::from_le_bytes([*acl.add(4), *acl.add(5)]) };
-    (false, i32::from(count))
 }
 
 fn deny_token_adjust_default(token: Handle) -> Result<(), KernelError> {

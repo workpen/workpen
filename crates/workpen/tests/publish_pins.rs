@@ -311,8 +311,24 @@ fn applied_does_not_mean_omits_promises() {
     assert!(promises.contains("TMP"));
     assert!(promises.contains("platform default"));
     assert!(promises.contains("glued shorts"));
+    assert!(
+        !markdown.contains("lasts after `execve`"),
+        "threat-model.md still says PR_SET_DUMPABLE lasts after execve"
+    );
+    assert!(
+        markdown.contains("does not survive `execve`"),
+        "threat-model.md must say dumpable does not survive execve"
+    );
 
     let rustdoc = read(&root.join("crates/workpen/src/threat_model.rs"));
+    assert!(
+        rustdoc.contains("SUID_DUMP_USER"),
+        "rustdoc must keep the execve dumpable contract"
+    );
+    assert!(
+        !rustdoc.contains("lasts after `execve`"),
+        "rustdoc must not say dumpable lasts after execve"
+    );
     let rust_limits = section_after(&rustdoc, "# What `KernelApply::Applied` does not mean");
     for phrase in ["glued shorts", "stdbuf", "TMPDIR"] {
         assert!(
