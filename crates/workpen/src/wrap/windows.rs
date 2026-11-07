@@ -146,6 +146,7 @@ struct TokenPrivileges {
     attr: LuidAndAttributes,
 }
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 struct TrusteeW {
     p_multiple_trustee: *mut TrusteeW,
@@ -296,6 +297,16 @@ unsafe extern "system" {
         lp_pipe_attributes: *mut SecurityAttributes,
         n_size: Dword,
     ) -> Bool;
+    fn CreateNamedPipeW(
+        lp_name: *const u16,
+        dw_open_mode: Dword,
+        dw_pipe_mode: Dword,
+        n_max_instances: Dword,
+        n_out_buffer_size: Dword,
+        n_in_buffer_size: Dword,
+        n_default_time_out: Dword,
+        lp_security_attributes: *mut SecurityAttributes,
+    ) -> Handle;
     fn ReadFile(
         h_file: Handle,
         lp_buffer: *mut u8,
@@ -1253,7 +1264,7 @@ fn allow_msys_shared_dirs(
     // `sigproc_init` creates the signal pipe with `sec_user`, which
     // does not name `S-1-5-12`. The pipe device allow is restored
     // with the other guards.
-    allow_signal_pipe(restricted, guards);
+    allow_signal_pipe(restricted, token, guards);
     for name in restricted_namespace_names() {
         match null_directory_dacl(&name, restricted, world) {
             Ok(Some(guard)) => guards.push(guard),
@@ -1264,7 +1275,85 @@ fn allow_msys_shared_dirs(
     }
 }
 
-fn allow_signal_pipe(restricted: Handle, guards: &mut Vec<AclRestore>) {
+fn probe_signal_pipe(token: Handle, restricted: Handle) {
+    let user = match current_user_sid() {
+        Ok(user) => user,
+        Err(err) => {
+            eprintln!("workpen: pipe probe user: {err}");
+            return;
+        }
+    };
+    if unsafe { ImpersonateLoggedOnUser(token) } == 0 {
+        eprintln!(
+            "workpen: pipe probe impersonate {}",
+            last_error("ImpersonateLoggedOnUser")
+        );
+        return;
+    }
+    struct Revert;
+    impl Drop for Revert {
+        fn drop(&mut self) {
+            unsafe {
+                RevertToSelf();
+            }
+        }
+    }
+    let _revert = Revert;
+    let user_sid: Handle = user.as_ptr().cast_mut().cast();
+    let null_err = probe_pipe_result(&[], "null");
+    let user_err = probe_pipe_result(&[user_sid], "user");
+    let both_err = probe_pipe_result(&[user_sid, restricted], "both");
+    eprintln!("workpen: pipe probe null={null_err} user={user_err} both={both_err}");
+}
+
+fn probe_pipe_result(sids: &[Handle], label: &str) -> u32 {
+    if sids.is_empty() {
+        return create_probe_pipe(label, ptr::null_mut());
+    }
+    let mut buf = vec![0u64; 48];
+    let sd = buf.as_mut_ptr().cast::<u8>();
+    let acl = unsafe { sd.add(64) };
+    let acl_bytes = (buf.len() * 8 - 64) as Dword;
+    let mut ready = unsafe {
+        InitializeSecurityDescriptor(sd, 1) != 0 && InitializeAcl(acl, acl_bytes, 2) != 0
+    };
+    if ready {
+        for sid in sids {
+            if unsafe { AddAccessAllowedAce(acl, 2, GENERIC_ALL | FILE_ALL_ACCESS, *sid) } == 0 {
+                ready = false;
+                break;
+            }
+        }
+    }
+    if ready && unsafe { SetSecurityDescriptorDacl(sd, 1, acl, 0) } == 0 {
+        ready = false;
+    }
+    if !ready {
+        return unsafe { GetLastError() };
+    }
+    let mut sa = SecurityAttributes {
+        n_length: std::mem::size_of::<SecurityAttributes>() as Dword,
+        lp_security_descriptor: sd.cast(),
+        b_inherit_handle: 0,
+    };
+    create_probe_pipe(label, &mut sa)
+}
+
+fn create_probe_pipe(label: &str, sa: *mut SecurityAttributes) -> u32 {
+    let name = wide_os(OsStr::new(&format!(
+        r"\\.\pipe\wp-probe-{label}-{}",
+        std::process::id()
+    )));
+    let handle = unsafe { CreateNamedPipeW(name.as_ptr(), 1, 4, 1, 4096, 4096, 0, sa) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        unsafe { GetLastError() }
+    } else {
+        unsafe { CloseHandle(handle) };
+        0
+    }
+}
+
+fn allow_signal_pipe(restricted: Handle, token: Handle, guards: &mut Vec<AclRestore>) {
     let file = match open_nt_file(r"\Device\NamedPipe", 0x0006_0000, FILE_DIRECTORY_FILE) {
         Ok(file) => file,
         Err(status) => {
@@ -1280,6 +1369,7 @@ fn allow_signal_pipe(restricted: Handle, guards: &mut Vec<AclRestore>) {
         Ok(None) => eprintln!("workpen: npfs dacl null"),
         Err(err) => eprintln!("workpen: npfs inherit skipped: {err}"),
     }
+    probe_signal_pipe(token, restricted);
 }
 
 fn open_nt_file(name: &str, access: u32, options: u32) -> Result<Handle, i32> {
@@ -1352,22 +1442,33 @@ fn grant_npfs_inherit_inner(file: Handle, sid: Handle) -> Result<Option<AclResto
     if dacl.is_null() {
         return Ok(None);
     }
-    let mut entry = ExplicitAccessW {
-        grf_access_permissions: GENERIC_ALL | FILE_ALL_ACCESS,
-        grf_access_mode: GRANT_ACCESS,
-        // Applies to the device, so pipe create is allowed, and to
-        // new pipes. `sec_user` does not name `S-1-5-12`.
-        grf_inheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-        trustee: TrusteeW {
-            p_multiple_trustee: ptr::null_mut(),
-            multiple_trustee_operation: NO_MULTIPLE_TRUSTEE,
-            trustee_form: TRUSTEE_IS_SID,
-            trustee_type: TRUSTEE_IS_WELL_KNOWN_GROUP,
-            ptstr_name: sid,
-        },
+    let mask = GENERIC_ALL | FILE_ALL_ACCESS;
+    let trustee = TrusteeW {
+        p_multiple_trustee: ptr::null_mut(),
+        multiple_trustee_operation: NO_MULTIPLE_TRUSTEE,
+        trustee_form: TRUSTEE_IS_SID,
+        trustee_type: TRUSTEE_IS_WELL_KNOWN_GROUP,
+        ptstr_name: sid,
     };
+    // A direct ACE covers create-in-directory. NPFS assigns the new
+    // pipe's security with a null parent, so inheritance does not
+    // rewrite `sec_user`. The direct ACE is the create check.
+    let mut entries = [
+        ExplicitAccessW {
+            grf_access_permissions: mask,
+            grf_access_mode: GRANT_ACCESS,
+            grf_inheritance: NO_INHERITANCE,
+            trustee,
+        },
+        ExplicitAccessW {
+            grf_access_permissions: mask,
+            grf_access_mode: GRANT_ACCESS,
+            grf_inheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            trustee,
+        },
+    ];
     let mut new_acl = ptr::null_mut();
-    let set = unsafe { SetEntriesInAclW(1, &mut entry, dacl, &mut new_acl) };
+    let set = unsafe { SetEntriesInAclW(2, entries.as_mut_ptr(), dacl, &mut new_acl) };
     if set != 0 {
         return Err(win32_error("SetEntriesInAclW", set));
     }

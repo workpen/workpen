@@ -76,9 +76,8 @@
 //!   adds an inheritable allow for the user and `S-1-5-12`. An
 //!   existing `SID.1` gets the same allow. MSYS then creates its
 //!   signal pipe with a user security descriptor that does not name
-//!   `S-1-5-12`. The jail adds an inheritable allow for that SID on
-//!   `\Device\NamedPipe` and restores the previous DACL when the child
-//!   exits. A write outside the ReadWrite grant still fails.
+//!   `S-1-5-12`. The jail grants that SID on `\Device\NamedPipe` and
+//!   restores the previous DACL when the child exits. A write outside the ReadWrite grant still fails.
 //! * The workspace jail scanned the user profile. It denies `.ssh`,
 //!   `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`, and `.kube`
 //!   with the restricted SID and restores those ACLs when the jail
