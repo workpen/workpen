@@ -80,6 +80,12 @@ const MSYS_DIR_WRITE_DAC: Dword = MSYS_DIR_ACCESS | 0x0004_0000;
 /// mask from the MSYS directory because `sec_none` passes a null descriptor.
 const MSYS_SECTION_ACCESS: Dword = 0x000F_001F;
 const MSYS_INHERIT_ACCESS: Dword = MSYS_DIR_ACCESS | MSYS_SECTION_ACCESS;
+/// `FILE_ALL_ACCESS`. Named-pipe create needs `FILE_CREATE_PIPE_INSTANCE`.
+const FILE_ALL_ACCESS: Dword = 0x001F_01FF;
+const FILE_SHARE_DELETE: Dword = 0x4;
+const FILE_DIRECTORY_FILE: u32 = 0x1;
+/// Not a Windows `SE_OBJECT_TYPE`. Restore reopens `\Device\NamedPipe`.
+const NPFS_RESTORE: u32 = 0x4E50_4653;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const OBJ_OPENIF: u32 = 0x80;
 const OBJECT_INHERIT_ACE: Dword = 0x1;
@@ -605,7 +611,27 @@ impl AclRestore {
         if self.restored {
             return Ok(());
         }
-        let err = if self.object_type == SE_KERNEL_OBJECT {
+        let err = if self.object_type == NPFS_RESTORE {
+            let Ok(file) = open_nt_file(r"\Device\NamedPipe", 0x0006_0000, FILE_DIRECTORY_FILE)
+            else {
+                return Err(KernelError::Apply(
+                    "restore could not reopen the named pipe device".into(),
+                ));
+            };
+            let err = unsafe {
+                SetSecurityInfo(
+                    file,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    self.dacl,
+                    ptr::null_mut(),
+                )
+            };
+            unsafe { CloseHandle(file) };
+            err
+        } else if self.object_type == SE_KERNEL_OBJECT {
             let name =
                 String::from_utf16_lossy(self.path.split(|c| *c == 0).next().unwrap_or(&self.path));
             let Ok(dir) = open_object_directory(&name) else {
@@ -1142,6 +1168,12 @@ struct ObjectAttributes {
     security_quality_of_service: *mut core::ffi::c_void,
 }
 
+#[repr(C)]
+struct IoStatusBlock {
+    status: usize,
+    information: usize,
+}
+
 #[link(name = "ntdll")]
 unsafe extern "system" {
     fn NtOpenDirectoryObject(
@@ -1158,6 +1190,14 @@ unsafe extern "system" {
         section_handle: *mut Handle,
         desired_access: u32,
         object_attributes: *mut ObjectAttributes,
+    ) -> i32;
+    fn NtOpenFile(
+        file_handle: *mut Handle,
+        desired_access: u32,
+        object_attributes: *mut ObjectAttributes,
+        io_status_block: *mut IoStatusBlock,
+        share_access: u32,
+        open_options: u32,
     ) -> i32;
 }
 
@@ -1210,6 +1250,10 @@ fn allow_msys_shared_dirs(
     ensure_msys_shared_dir(r"\BaseNamedObjects\Restricted", restricted, world);
     // `Restricted` only. Restored after the child exits.
     // Do not null `\BaseNamedObjects`.
+    // `sigproc_init` creates the signal pipe with `sec_user`, which
+    // does not name `S-1-5-12`. The pipe device allow is restored
+    // with the other guards.
+    allow_signal_pipe(restricted, guards);
     for name in restricted_namespace_names() {
         match null_directory_dacl(&name, restricted, world) {
             Ok(Some(guard)) => guards.push(guard),
@@ -1218,6 +1262,137 @@ fn allow_msys_shared_dirs(
         }
         probe_directory_create(token, &name);
     }
+}
+
+fn allow_signal_pipe(restricted: Handle, guards: &mut Vec<AclRestore>) {
+    let file = match open_nt_file(r"\Device\NamedPipe", 0x0006_0000, FILE_DIRECTORY_FILE) {
+        Ok(file) => file,
+        Err(status) => {
+            eprintln!("workpen: npfs open skipped ntstatus {status:#x}");
+            return;
+        }
+    };
+    match grant_npfs_inherit(file, restricted) {
+        Ok(Some(guard)) => {
+            eprintln!("workpen: npfs inherit ok");
+            guards.push(guard);
+        }
+        Ok(None) => eprintln!("workpen: npfs dacl null"),
+        Err(err) => eprintln!("workpen: npfs inherit skipped: {err}"),
+    }
+}
+
+fn open_nt_file(name: &str, access: u32, options: u32) -> Result<Handle, i32> {
+    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
+    let mut us = UnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attrs = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: ptr::null_mut(),
+        object_name: &mut us,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: ptr::null_mut(),
+        security_quality_of_service: ptr::null_mut(),
+    };
+    let mut iosb = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    let mut handle = ptr::null_mut();
+    let status = unsafe {
+        NtOpenFile(
+            &mut handle,
+            access,
+            &mut attrs,
+            &mut iosb,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            options,
+        )
+    };
+    if status != 0 || handle.is_null() {
+        return Err(status);
+    }
+    Ok(handle)
+}
+
+fn grant_npfs_inherit(file: Handle, sid: Handle) -> Result<Option<AclRestore>, KernelError> {
+    let result = grant_npfs_inherit_inner(file, sid);
+    unsafe { CloseHandle(file) };
+    result
+}
+
+fn grant_npfs_inherit_inner(file: Handle, sid: Handle) -> Result<Option<AclRestore>, KernelError> {
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut sacl = ptr::null_mut();
+    let mut sd = ptr::null_mut();
+    let got = unsafe {
+        GetSecurityInfo(
+            file,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    if got != 0 {
+        return Err(win32_error("GetSecurityInfo", got));
+    }
+    let sd = LocalMem(sd);
+    // A null device DACL already lets the restricted token create a
+    // pipe. Replacing it would remove everyone else's access.
+    if dacl.is_null() {
+        return Ok(None);
+    }
+    let mut entry = ExplicitAccessW {
+        grf_access_permissions: GENERIC_ALL | FILE_ALL_ACCESS,
+        grf_access_mode: GRANT_ACCESS,
+        // Applies to the device, so pipe create is allowed, and to
+        // new pipes. `sec_user` does not name `S-1-5-12`.
+        grf_inheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        trustee: TrusteeW {
+            p_multiple_trustee: ptr::null_mut(),
+            multiple_trustee_operation: NO_MULTIPLE_TRUSTEE,
+            trustee_form: TRUSTEE_IS_SID,
+            trustee_type: TRUSTEE_IS_WELL_KNOWN_GROUP,
+            ptstr_name: sid,
+        },
+    };
+    let mut new_acl = ptr::null_mut();
+    let set = unsafe { SetEntriesInAclW(1, &mut entry, dacl, &mut new_acl) };
+    if set != 0 {
+        return Err(win32_error("SetEntriesInAclW", set));
+    }
+    let new_acl = LocalMem(new_acl);
+    let applied = unsafe {
+        SetSecurityInfo(
+            file,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            new_acl.0,
+            ptr::null_mut(),
+        )
+    };
+    if applied != 0 {
+        return Err(win32_error("SetSecurityInfo", applied));
+    }
+    Ok(Some(AclRestore {
+        path: wide_os(OsStr::new(r"\Device\NamedPipe")),
+        object_type: NPFS_RESTORE,
+        _sd: sd,
+        dacl,
+        restored: false,
+    }))
 }
 
 fn probe_directory_create(token: Handle, name: &str) {
