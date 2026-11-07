@@ -59,8 +59,9 @@ The parent is trusted. The child is not.
   `OBJ_OPENIF`. The jail grants the restricted SID on that directory.
   The key is the MSYS hash of `msys-2.0.dll`, not a fixed id. The same
   grant is applied under `\Sessions\BNOLINKS\<session>` when the
-  process is not in session 0. A write outside the ReadWrite grant
-  still fails.
+  process is not in session 0. The per-user section `SID.1` gets
+  the same grant when checkout already created it. A write outside
+  the ReadWrite grant still fails.
 - The workspace jail scanned the user profile. It denies `.ssh`,
   `.aws`, `.gnupg`, `.azure`, `.config\gh`, `.docker`, and `.kube`
   with the restricted SID and restores those ACLs when the jail drops.

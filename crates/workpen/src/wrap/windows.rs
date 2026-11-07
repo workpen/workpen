@@ -445,6 +445,7 @@ unsafe extern "system" {
     ) -> Bool;
     fn GetLengthSid(sid: Handle) -> Dword;
     fn CopySid(len: Dword, dest: *mut u8, src: Handle) -> Bool;
+    fn ConvertSidToStringSidW(sid: Handle, string_sid: *mut *mut u16) -> Bool;
 }
 
 #[link(name = "kernel32")]
@@ -989,6 +990,11 @@ unsafe extern "system" {
         desired_access: u32,
         object_attributes: *mut ObjectAttributes,
     ) -> i32;
+    fn NtOpenSection(
+        section_handle: *mut Handle,
+        desired_access: u32,
+        object_attributes: *mut ObjectAttributes,
+    ) -> i32;
 }
 
 fn open_object_directory(name: &str) -> Result<Handle, KernelError> {
@@ -1029,6 +1035,139 @@ fn allow_msys_shared_dirs(program: &Path, restricted: Handle, world: Handle) {
             world,
         );
     }
+    // Per-user `CreateFileMapping` uses `sec_none` (the token default
+    // DACL). Checkout already created `S-1-5-21-....1` without the
+    // restricting SID. `shared.5` uses a null DACL and already opens.
+    ensure_msys_shared_dir(r"\BaseNamedObjects\Restricted", restricted, world);
+    grant_user_shared_section(restricted);
+}
+
+/// `user_info::create` maps `SID.USER_VERSION`. This MSYS build uses `.1`.
+const MSYS_USER_SHARED_SUFFIX: &str = ".1";
+/// `SECTION_ALL_ACCESS`. `CreateFileMapping` asks for map read and write.
+const SECTION_ALL_ACCESS: Dword = 0x000F_001F;
+
+fn grant_user_shared_section(restricted: Handle) {
+    let Ok(sid) = current_user_sid() else {
+        return;
+    };
+    let Ok(text) = sid_to_string(&sid) else {
+        return;
+    };
+    let leaf = format!("{text}{MSYS_USER_SHARED_SUFFIX}");
+    let mut names = vec![
+        format!(r"\BaseNamedObjects\{leaf}"),
+        format!(r"\BaseNamedObjects\Restricted\{leaf}"),
+    ];
+    let mut session = 0u32;
+    let ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+    if ok != 0 && session != 0 {
+        names.push(format!(r"\Sessions\{session}\BaseNamedObjects\{leaf}"));
+        names.push(format!(r"\Sessions\BNOLINKS\{session}\{leaf}"));
+    }
+    for name in names {
+        grant_existing_section(&name, restricted);
+    }
+}
+
+fn sid_to_string(sid: &[u8]) -> Result<String, KernelError> {
+    let mut wide = ptr::null_mut();
+    // SAFETY: `sid` is a copied SID. The API allocates `wide`.
+    let ok = unsafe { ConvertSidToStringSidW(sid.as_ptr().cast_mut().cast(), &mut wide) };
+    if ok == 0 || wide.is_null() {
+        return Err(last_error("ConvertSidToStringSidW"));
+    }
+    let mut len = 0usize;
+    while unsafe { *wide.add(len) } != 0 {
+        len += 1;
+        if len > 256 {
+            break;
+        }
+    }
+    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, len) });
+    unsafe { LocalFree(wide.cast()) };
+    Ok(text)
+}
+
+fn grant_existing_section(name: &str, restricted: Handle) {
+    match open_section_status(name, 0x0006_0000) {
+        Ok(section) => {
+            if let Err(err) = grant_sid_on_directory(section, restricted, SECTION_ALL_ACCESS) {
+                eprintln!("workpen: msys section ACE skipped: {name}: {err}");
+            }
+        }
+        Err(status) if status == STATUS_ACCESS_DENIED => {
+            if let Err(err) = take_section_ownership(name) {
+                eprintln!("workpen: msys section owner skipped: {name}: {err}");
+                return;
+            }
+            match open_section_status(name, 0x0006_0000) {
+                Ok(section) => {
+                    if let Err(err) =
+                        grant_sid_on_directory(section, restricted, SECTION_ALL_ACCESS)
+                    {
+                        eprintln!("workpen: msys section ACE skipped: {name}: {err}");
+                    }
+                }
+                Err(status) => {
+                    eprintln!("workpen: msys section open skipped: {name} (ntstatus {status:#x})");
+                }
+            }
+        }
+        Err(_) => {}
+    }
+}
+
+fn open_section_status(name: &str, access: u32) -> Result<Handle, i32> {
+    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    let bytes = u16::try_from(wide.len() * 2).unwrap_or(u16::MAX);
+    let mut us = UnicodeString {
+        length: bytes,
+        maximum_length: bytes,
+        buffer: wide.as_mut_ptr(),
+    };
+    let mut attrs = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root_directory: ptr::null_mut(),
+        object_name: &mut us,
+        attributes: OBJ_CASE_INSENSITIVE,
+        security_descriptor: ptr::null_mut(),
+        security_quality_of_service: ptr::null_mut(),
+    };
+    let mut handle = ptr::null_mut();
+    // SAFETY: `us` and `wide` live for the call.
+    let status = unsafe { NtOpenSection(&mut handle, access, &mut attrs) };
+    if status != 0 || handle.is_null() {
+        return Err(status);
+    }
+    Ok(handle)
+}
+
+fn take_section_ownership(name: &str) -> Result<(), KernelError> {
+    enable_privilege("SeTakeOwnershipPrivilege")?;
+    let section = open_section_status(name, WRITE_OWNER | 0x0002_0000).map_err(|status| {
+        KernelError::Apply(format!(
+            "NtOpenSection {name} WRITE_OWNER failed (ntstatus {status:#x})"
+        ))
+    })?;
+    let user = current_user_sid()?;
+    // SAFETY: `section` is open for WRITE_OWNER. `user` is a SID copy.
+    let set = unsafe {
+        SetSecurityInfo(
+            section,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            user.as_ptr().cast_mut().cast(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(section) };
+    if set != 0 {
+        return Err(win32_error("SetSecurityInfo section owner", set));
+    }
+    Ok(())
 }
 
 fn msys_dll_beside(program: &Path) -> Option<PathBuf> {
