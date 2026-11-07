@@ -995,6 +995,66 @@ fn open_directory_for_dacl(name: &str) -> Result<Handle, KernelError> {
     }
 }
 
+fn relax_child_bno(process: Handle, restricted: Handle, world: Handle) {
+    let mut token = ptr::null_mut();
+    let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
+    if opened == 0 {
+        eprintln!(
+            "workpen: msys bno token failed: {}",
+            last_error("OpenProcessToken")
+        );
+        return;
+    }
+    let token = CloseOnDrop(token);
+    let mut bytes = 0u32;
+    unsafe {
+        GetTokenInformation(token.0, 44, ptr::null_mut(), 0, &mut bytes);
+    }
+    if bytes < 16 {
+        eprintln!("workpen: msys bno query size={bytes} win32 {}", unsafe {
+            GetLastError()
+        });
+        return;
+    }
+    let mut buf = vec![0u8; bytes as usize];
+    let ok =
+        unsafe { GetTokenInformation(token.0, 44, buf.as_mut_ptr().cast(), bytes, &mut bytes) };
+    if ok == 0 {
+        eprintln!(
+            "workpen: msys bno query failed: {}",
+            last_error("GetTokenInformation TokenBnoIsolation")
+        );
+        return;
+    }
+    let prefix = unsafe { buf.as_ptr().cast::<*mut u16>().read() };
+    let enabled = unsafe { *buf.as_ptr().add(8) };
+    if prefix.is_null() {
+        eprintln!("workpen: msys bno enabled={enabled} prefix=<null>");
+        return;
+    }
+    let mut len = 0usize;
+    while unsafe { *prefix.add(len) } != 0 && len < 512 {
+        len += 1;
+    }
+    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(prefix, len) });
+    eprintln!("workpen: msys bno enabled={enabled} prefix={text}");
+    if enabled != 0 && !text.is_empty() {
+        let mut session = 0u32;
+        let session_ok = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+        let mut paths = vec![text.clone()];
+        if session_ok != 0 {
+            paths.push(format!(r"\Sessions\{session}\BaseNamedObjects\{text}"));
+        }
+        paths.push(format!(r"\BaseNamedObjects\{text}"));
+        for path in paths {
+            match null_directory_dacl(&path, restricted, world) {
+                Ok(_) => {}
+                Err(err) => eprintln!("workpen: msys bno dacl skipped: {path}: {err}"),
+            }
+        }
+    }
+}
+
 fn directory_ace_count(name: &str) -> i32 {
     let Ok(dir) = open_directory_status(name, 0x0002_0000) else {
         return -1;
@@ -2416,6 +2476,7 @@ fn spawn_prepared_child(
         join_copy(stderr_fwd);
         return Err(last_error("AssignProcessToJobObject"));
     }
+    relax_child_bno(process.0, prepared._sid.0, prepared._world.0);
     // SAFETY: thread is the primary thread of the suspended process.
     let resumed = unsafe { ResumeThread(thread.0) };
     if resumed == Dword::MAX {
