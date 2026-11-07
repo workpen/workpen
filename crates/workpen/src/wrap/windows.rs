@@ -2313,7 +2313,7 @@ fn start_sid_holder(prepared: &mut Prepared, program: &Path) {
     }
     let mut got = Vec::new();
     let mut buf = [0u8; 256];
-    while !got.windows(5).any(|chunk| chunk == b"READY") && got.len() < 8192 {
+    while !got.windows(5).any(|chunk| chunk == b"READY") && got.len() < 16384 {
         let mut n = 0u32;
         let ok = unsafe {
             ReadFile(

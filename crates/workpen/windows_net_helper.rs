@@ -66,13 +66,25 @@ fn hold_sid(name: Option<&OsString>) -> ExitCode {
         return ExitCode::from(2);
     };
     let text = name.to_string_lossy();
-    let handle = map_open(&text, 1, 64 * 1024 * 1024);
-    let err = unsafe { GetLastError() };
-    eprintln!(
-        "workpen-net-helper: sid-hold null={} err={err}",
-        handle.is_null()
-    );
-    if handle.is_null() {
+    let mut held = Vec::new();
+    for candidate in [
+        text.to_string(),
+        format!("Local\\{text}"),
+        format!("Global\\{text}"),
+        format!("Local\\Restricted\\{text}"),
+    ] {
+        let handle = map_open(&candidate, 1, 64 * 1024 * 1024);
+        let err = unsafe { GetLastError() };
+        let path = object_name(handle);
+        eprintln!(
+            "workpen-net-helper: sid-hold name={candidate} null={} err={err} path={path}",
+            handle.is_null()
+        );
+        if !handle.is_null() {
+            held.push(handle);
+        }
+    }
+    if held.is_empty() {
         return ExitCode::from(1);
     }
     let mut out = std::io::stdout();
@@ -80,7 +92,9 @@ fn hold_sid(name: Option<&OsString>) -> ExitCode {
     let _ = out.flush();
     let mut sink = Vec::new();
     let _ = std::io::stdin().read_to_end(&mut sink);
-    unsafe { CloseHandle(handle) };
+    for handle in held {
+        unsafe { CloseHandle(handle) };
+    }
     ExitCode::from(0)
 }
 
@@ -140,6 +154,31 @@ fn map_open(name: &str, mode: u8, size: u32) -> *mut core::ffi::c_void {
             wide.as_mut_ptr(),
         )
     }
+}
+
+#[cfg(windows)]
+fn object_name(handle: *mut core::ffi::c_void) -> String {
+    if handle.is_null() {
+        return String::new();
+    }
+    let mut bytes = 0u32;
+    unsafe { NtQueryObject(handle, 1, std::ptr::null_mut(), 0, &mut bytes) };
+    if bytes < 16 || bytes > 4096 {
+        return String::new();
+    }
+    let mut buf = vec![0u8; bytes as usize];
+    let status = unsafe { NtQueryObject(handle, 1, buf.as_mut_ptr(), bytes, &mut bytes) };
+    if status < 0 || buf.len() < 16 {
+        return format!("status={status:#x}");
+    }
+    let len = u16::from_le_bytes([buf[0], buf[1]]) as usize / 2;
+    let ptr_val = usize::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8]));
+    let start = buf.as_ptr() as usize;
+    if ptr_val < start || len == 0 || ptr_val + len * 2 > start + buf.len() {
+        return String::new();
+    }
+    let chars = unsafe { std::slice::from_raw_parts(ptr_val as *const u16, len) };
+    String::from_utf16_lossy(chars)
 }
 
 /// Create `NAME` with a null DACL in this process's Win32 namespace and
@@ -227,6 +266,18 @@ unsafe extern "system" {
     ) -> *mut core::ffi::c_void;
     fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
     fn GetLastError() -> u32;
+}
+
+#[cfg(windows)]
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQueryObject(
+        handle: *mut core::ffi::c_void,
+        info_class: u32,
+        buffer: *mut u8,
+        length: u32,
+        return_length: *mut u32,
+    ) -> i32;
 }
 
 #[cfg(windows)]
