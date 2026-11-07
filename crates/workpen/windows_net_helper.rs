@@ -181,8 +181,8 @@ fn grant_held_mapping(handle: *mut core::ffi::c_void) -> String {
     let acl = acl_words.as_mut_ptr().cast::<u8>();
     let ready = unsafe {
         InitializeAcl(acl, (acl_words.len() * 4) as u32, 2) != 0
-            && AddAccessAllowedAce(acl, 2, 0x1000_0000, world) != 0
-            && AddAccessAllowedAce(acl, 2, 0x1000_0000, restricted) != 0
+            && AddAccessAllowedAce(acl, 2, 0x101F_FFFF, world) != 0
+            && AddAccessAllowedAce(acl, 2, 0x101F_FFFF, restricted) != 0
     };
     let result = if !ready {
         format!("acl={}", unsafe { GetLastError() })
