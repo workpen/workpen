@@ -105,7 +105,8 @@
 //!   call keeps outbound network open (internet client capability, no
 //!   WFP BLOCK) and reuses one AppContainer in the process.
 //!   [`crate::KernelApply::Applied`] there means the container is up.
-//!   [`crate::KernelPolicy::run_child`] is unchanged.
+//!   A denied open of `\BaseNamedObjects` skips that ACE and is not
+//!   printed. [`crate::KernelPolicy::run_child`] is unchanged.
 //! * Renaming the dest-deny parent is in scope. Parent-rename of a
 //!   dest-deny ancestor (`mv workspace out`) is out of scope. Leaf
 //!   `mv .env leaked` is a Seatbelt last-match contract on macOS.

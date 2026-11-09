@@ -1512,7 +1512,8 @@ impl KernelPolicy {
     /// [`reexec_profile_creates`] counts that create. The profile name is
     /// per Windows user, so a second process derives the same container.
     /// It lives until this process exits. [`KernelApply::Applied`] means the
-    /// container is active. It does not mean WFP ran.
+    /// container is active. It does not mean WFP ran. A denied open of
+    /// `\BaseNamedObjects` skips that ACE and is not printed.
     ///
     /// Unix returns [`KernelError::Apply`] and does not start `cmd`.
     /// Windows does the same when the container cannot be created.

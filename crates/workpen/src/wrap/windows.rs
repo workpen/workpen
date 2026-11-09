@@ -956,14 +956,15 @@ fn cached_blocked_profile(helper: &Path) -> Result<(Handle, bool), KernelError> 
 /// Best-effort grant on the session object directory. MSYS does not
 /// create `\BaseNamedObjects\msys-...` through this ACE when that
 /// leaf already exists. [`allow_msys_shared_dirs`] grants the leaf.
-/// A missed ACE does not fail the spawn.
+/// A missed ACE does not fail the spawn. Do not print it. The error
+/// text says the kernel apply failed, and the caller still returns
+/// [`super::KernelApply::Applied`].
 fn allow_session_object_create(sid: Handle) -> Result<Vec<AclRestore>, KernelError> {
     let rights = DIRECTORY_ALL_ACCESS | SECTION_ALL_ACCESS | GENERIC_ALL;
     let mut guards = Vec::new();
     for name in object_namespace_names() {
-        match grant_directory_object(&name, sid, rights) {
-            Ok(guard) => guards.push(guard),
-            Err(err) => eprintln!("workpen: namespace ACE skipped: {err}"),
+        if let Ok(guard) = grant_directory_object(&name, sid, rights) {
+            guards.push(guard);
         }
     }
     Ok(guards)
