@@ -15,17 +15,36 @@
 //! * **PathGuard** refuses filesystem root and `$HOME` as the workspace
 //!   or extra-root. [`crate::KernelPolicy::with_write_file`] grants one
 //!   regular file. A missing name whose parent directory already exists
-//!   is created empty, mode 0600 on Unix, and then granted. The parent
-//!   is not created. An existing regular file is not truncated. A
-//!   symlink or a directory is refused. It does not walk the parent and
-//!   does not make that parent a read-write root. Windows adds traverse
-//!   on that parent and a write ACE on the file. Linux adds execute on
-//!   each ancestor directory in the same Landlock ruleset. Landlock has
-//!   no access right that walks a directory without that execute. A
-//!   path-beneath rule with that right also allows executing other files
-//!   beneath the directory. It does not grant listing or reading
-//!   children. A deny glob that names that file is not applied to it.
-//!   Siblings stay outside the grant.
+//!   is created empty, mode 0600 on Unix, and then granted.
+//!   [`crate::KernelPolicy::with_write_file_create`] with `create` false
+//!   grants an existing file and does not create a missing one. The
+//!   parent is not created. An existing regular file is not truncated
+//!   and keeps its mode and ACL. A new Windows file gets an owner-only
+//!   DACL before the call returns. A symlink or a directory is refused,
+//!   as is a Windows reserved device name including `NUL.txt`. Hosts
+//!   match [`crate::FileGrantReason`], not the sentence.
+//!   [`crate::KernelPolicy::try_write_file`] keeps the policy when the
+//!   host should skip that path. A hard failure removes files that
+//!   builder created. A symlink or junction parent is followed, and only
+//!   the canonical file is granted. It does not walk the parent and does
+//!   not make that parent a read-write root.
+//!   [`crate::KernelPolicy::with_read_file`] is the read-only form and
+//!   does not create. [`crate::KernelPolicy::with_create_files`] lets
+//!   the child create regular files in one directory without a dest-deny
+//!   walk and without granting existing siblings or subdirectories.
+//!   Linux returns [`crate::FileGrantReason::Unsupported`] for that
+//!   directory grant. On macOS a prefix limits the new name. Windows
+//!   records a prefix and cannot enforce it: the child may create any
+//!   new file in that directory, and a file that already exists does
+//!   not receive the ACE. Subdirectories are not granted. Windows adds
+//!   traverse on the file parent and a write ACE on the file. Linux
+//!   adds execute on each ancestor
+//!   directory in the same Landlock ruleset. Landlock has no access
+//!   right that walks a directory without that execute. A path-beneath
+//!   rule with that right also allows executing other files beneath the
+//!   directory. It does not grant listing or reading children. A deny
+//!   glob that names that file is not applied to it. Siblings stay
+//!   outside the one-file grant.
 //! * **Userspace dest-deny** refuses secret dests in argv and
 //!   [`crate::check_dest`] before spawn.
 //! * **Kernel dest-deny** hides existing dests after spawn: Linux

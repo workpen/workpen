@@ -108,11 +108,16 @@ pub struct KernelPolicy {
     /// Read by [`Self::require_spawn`] on Unix. Windows has no remount.
     #[cfg_attr(not(unix), allow(dead_code))]
     require_dest_hide: bool,
-    /// Parent directories of [`Self::with_write_file`] grants.
-    /// The bool is true for the file's parent (the ACE is required)
-    /// and false for higher ancestors (access denied is skipped).
+    /// Parent directories of one-file grants and create-files directories.
+    /// The bool is true for that parent (the ACE is required) and false
+    /// for higher ancestors (access denied is skipped).
     #[cfg(windows)]
     traverse_dirs: Vec<(PathBuf, bool)>,
+    /// Files this builder created. Removed on a hard grant failure.
+    created: Vec<CreatedGrant>,
+    /// Directories where the child may create regular files. Not a
+    /// read-write root and not a dest-deny walk.
+    create_files: Vec<CreateFiles>,
 }
 
 /// Result of applying the jail. Hosts match the variant, not English.
@@ -171,6 +176,120 @@ pub enum KernelError {
     /// it from [`PreExecReport::finish`]. The CLI exits 4.
     #[error("kernel wrap did not track every descendant")]
     Descendants,
+    /// One-file grant failed. Hosts match [`FileGrantReason`], not the sentence.
+    #[error("kernel wrap file grant failed for {path}: {reason}")]
+    FileGrant {
+        path: PathBuf,
+        reason: FileGrantReason,
+    },
+}
+
+/// Why a one-file grant did not add that path.
+///
+/// Hosts match this. The `Display` text is for logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileGrantReason {
+    /// `create` was false, or the read grant's file is not there.
+    Missing,
+    /// The path exists and is not a regular file.
+    NotRegular,
+    /// The final component is a symlink. The parent may still be a junction.
+    Symlink,
+    /// Windows reserved device, including `NUL.txt`. `notes.NUL` is not one.
+    ReservedDevice,
+    /// The immediate parent does not exist. The grant does not create it.
+    ParentMissing,
+    /// The immediate parent exists and is not a directory.
+    ParentNotDirectory,
+    /// This kernel cannot grant new names in one directory without also
+    /// granting the files beneath it. Linux Landlock is that kernel.
+    Unsupported,
+}
+
+impl std::fmt::Display for FileGrantReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Missing => "file does not exist",
+            Self::NotRegular => "is not a regular file",
+            Self::Symlink => "is a symlink",
+            Self::ReservedDevice => "is a reserved device name",
+            Self::ParentMissing => "parent directory does not exist",
+            Self::ParentNotDirectory => "parent is not a directory",
+            Self::Unsupported => {
+                "this kernel cannot create new files in one directory without granting the files beneath it"
+            }
+        })
+    }
+}
+
+/// Result of [`KernelPolicy::try_write_file`] or [`KernelPolicy::try_read_file`].
+///
+/// [`FileGrantAttempt::Skipped`] keeps files this builder already created.
+/// [`FileGrantAttempt::Failed`] has removed them. Dropping a [`Granted`](Self::Granted)
+/// policy does not remove them: a failed spawn still leaves the new lock,
+/// with mode 0600 on Unix and an owner-only DACL on Windows.
+#[derive(Debug)]
+pub enum FileGrantAttempt {
+    Granted(KernelPolicy),
+    Skipped {
+        policy: KernelPolicy,
+        path: PathBuf,
+        reason: FileGrantReason,
+    },
+    Failed(KernelError),
+}
+
+/// One directory the child may create regular files in.
+///
+/// Not a read-write root. [`KernelPolicy::grants`] does not list it.
+/// Dest-deny does not walk it. `prefix` limits names on macOS.
+/// Windows allows any new file name in the directory and does not
+/// open files that were already there. Linux returns
+/// [`FileGrantReason::Unsupported`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateFiles {
+    pub directory: PathBuf,
+    pub prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreatedGrant {
+    path: PathBuf,
+    id: FileId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(windows)]
+    volume: u32,
+    #[cfg(windows)]
+    index_high: u32,
+    #[cfg(windows)]
+    index_low: u32,
+}
+
+impl FileGrantAttempt {
+    /// Turn a skip or a failure into [`KernelError::FileGrant`].
+    ///
+    /// A skip removes files this builder created. A failure already did.
+    pub fn strict(self) -> Result<KernelPolicy, KernelError> {
+        match self {
+            Self::Granted(policy) => Ok(policy),
+            Self::Skipped {
+                mut policy,
+                path,
+                reason,
+            } => {
+                policy.rollback_created();
+                Err(KernelError::FileGrant { path, reason })
+            }
+            Self::Failed(err) => Err(err),
+        }
+    }
 }
 
 /// Owns the reaper report for one [`KernelPolicy::apply_pre_exec_report`].
@@ -1098,6 +1217,8 @@ pub fn process_jail_with_policy(
         require_dest_hide: false,
         #[cfg(windows)]
         traverse_dirs: Vec::new(),
+        created: Vec::new(),
+        create_files: Vec::new(),
     })
 }
 
@@ -1115,87 +1236,176 @@ fn null_device_grant() -> Option<PathBuf> {
     None
 }
 
-/// `true` when this call created `path`.
-///
-/// Landlock and a Windows DACL can only name an existing object.
-/// A later grant failure removes that new file.
-fn prepare_missing_grant_file(path: &Path) -> Result<bool, KernelError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(false),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => create_empty_grant_file(path),
-        Err(err) => Err(KernelError::Root(format!("{}: {err}", path.display()))),
+fn file_grant(path: &Path, reason: FileGrantReason) -> KernelError {
+    KernelError::FileGrant {
+        path: path.to_path_buf(),
+        reason,
     }
-}
-
-fn create_empty_grant_file(path: &Path) -> Result<bool, KernelError> {
-    require_grant_file_name(path)?;
-    require_grant_parent_dir(path)?;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    match opts.open(path) {
-        Ok(file) => drop(file),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-        Err(err) => {
-            return Err(KernelError::Root(format!("{}: {err}", path.display())));
-        }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
-            let _ = std::fs::remove_file(path);
-            return Err(KernelError::Root(format!("{}: {err}", path.display())));
-        }
-    }
-    Ok(true)
 }
 
 fn require_grant_file_name(path: &Path) -> Result<(), KernelError> {
     match path.file_name() {
         Some(name) if !name.is_empty() && name != "." && name != ".." => Ok(()),
-        _ => Err(KernelError::Root(format!(
-            "{} is not a regular file",
-            path.display()
-        ))),
+        _ => Err(file_grant(path, FileGrantReason::NotRegular)),
     }
 }
 
+/// The immediate parent must be a directory. A symlink or junction is
+/// followed. A missing parent is not created.
 fn require_grant_parent_dir(path: &Path) -> Result<(), KernelError> {
     let parent = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
         Some(_) => PathBuf::from("."),
-        None => {
-            return Err(KernelError::Root(format!(
-                "{}: parent directory does not exist",
-                path.display()
-            )));
+        None => return Err(file_grant(path, FileGrantReason::ParentMissing)),
+    };
+    match std::fs::symlink_metadata(&parent) {
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::metadata(&parent) {
+            Ok(followed) if followed.is_dir() => Ok(()),
+            Ok(_) => Err(file_grant(path, FileGrantReason::ParentNotDirectory)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Err(file_grant(path, FileGrantReason::ParentMissing))
+            }
+            Err(_) => Err(file_grant(path, FileGrantReason::ParentNotDirectory)),
+        },
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(file_grant(path, FileGrantReason::ParentNotDirectory)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(file_grant(path, FileGrantReason::ParentMissing))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => {
+            Err(file_grant(path, FileGrantReason::ParentNotDirectory))
+        }
+        Err(err) => Err(KernelError::Root(format!("{}: {err}", path.display()))),
+    }
+}
+
+enum GrantAdd {
+    Added,
+    Skip(FileGrantReason),
+}
+
+enum FileMode {
+    Write { create: bool },
+    Read,
+}
+
+impl FileMode {
+    fn access(self) -> KernelAccess {
+        match self {
+            Self::Write { .. } => KernelAccess::ReadWrite,
+            Self::Read => KernelAccess::Read,
+        }
+    }
+}
+
+fn create_empty_grant_file(path: &Path) -> Result<Option<CreatedGrant>, KernelError> {
+    #[cfg(unix)]
+    {
+        create_empty_grant_file_unix(path)
+    }
+    #[cfg(windows)]
+    {
+        windows::create_owner_file(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(KernelError::Apply(
+            "file grants are not available on this platform".into(),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn create_empty_grant_file_unix(path: &Path) -> Result<Option<CreatedGrant>, KernelError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).read(true).create_new(true).mode(0o600);
+    let file = match opts.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(err) => {
+            return Err(KernelError::Root(format!("{}: {err}", path.display())));
         }
     };
-    match std::fs::metadata(&parent) {
-        Ok(meta) if meta.is_dir() => Ok(()),
-        Ok(_) => Err(KernelError::Root(format!(
-            "{}: parent is not a directory",
-            path.display()
-        ))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(KernelError::Root(format!(
-            "{}: parent directory does not exist",
-            path.display()
-        ))),
-        Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => Err(KernelError::Root(
-            format!("{}: parent is not a directory", path.display()),
-        )),
-        Err(err) => Err(KernelError::Root(format!("{}: {err}", path.display()))),
+    let rc = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if let Ok(id) = unix_file_id(&file) {
+            remove_created(&CreatedGrant {
+                path: path.to_path_buf(),
+                id,
+            });
+        }
+        return Err(KernelError::Root(format!("{}: {err}", path.display())));
+    }
+    let id = unix_file_id(&file)?;
+    if path_file_id(path) != Some(id) {
+        return Err(file_grant(path, FileGrantReason::NotRegular));
+    }
+    Ok(Some(CreatedGrant {
+        path: path.to_path_buf(),
+        id,
+    }))
+}
+
+#[cfg(unix)]
+fn unix_file_id(file: &std::fs::File) -> Result<FileId, KernelError> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file
+        .metadata()
+        .map_err(|err| KernelError::Root(format!("grant file: {err}")))?;
+    Ok(FileId {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+fn path_file_id(path: &Path) -> Option<FileId> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return None;
+        }
+        Some(FileId {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        windows::path_grant_file_id(path).ok().flatten()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn remove_created(created: &CreatedGrant) {
+    if path_file_id(&created.path) == Some(created.id) {
+        let _ = std::fs::remove_file(&created.path);
     }
 }
 
 impl KernelPolicy {
     pub fn grants(&self) -> &[KernelGrant] {
         &self.grants
+    }
+
+    /// Directories the child may create regular files in.
+    ///
+    /// These are not [`Self::grants`] and they are not dest-deny walks.
+    pub fn create_files(&self) -> &[CreateFiles] {
+        &self.create_files
+    }
+
+    /// Remove files this builder created and keep files that were already there.
+    pub fn discard_created_files(mut self) {
+        self.rollback_created();
     }
 
     /// Dest-deny paths collected under the workspace and extra-roots.
@@ -1217,7 +1427,9 @@ impl KernelPolicy {
     /// On Windows this is the read-only jail: no write ACE is added, so
     /// the restricting SID denies creates in the workspace. Network is
     /// unchanged. Call [`Self::with_network`] when the profile should
-    /// also block sockets.
+    /// also block sockets. This does not remove [`Self::with_create_files`]
+    /// entries. A status check starts a new policy and calls
+    /// [`Self::with_read_file`].
     #[must_use]
     pub fn read_only(mut self) -> Self {
         for grant in &mut self.grants {
@@ -1251,66 +1463,284 @@ impl KernelPolicy {
     ///
     /// A missing name whose parent directory already exists is created
     /// empty, mode 0600 on Unix, and then granted. The parent is not
-    /// created. An existing regular file is not truncated. A symlink
-    /// or a directory is refused, as is a Windows reserved device name.
+    /// created. An existing regular file is not truncated and keeps its
+    /// mode and ACL. A symlink or a directory is refused, as is a
+    /// Windows reserved device name, including `NUL.txt`.
+    ///
+    /// Same as [`Self::with_write_file_create`] with `create` true.
+    /// Pass `create` false to grant a file that must already exist.
+    /// [`Self::try_write_file`] returns the policy when the host should
+    /// skip that path and keep going. A hard failure removes every file
+    /// this builder created and leaves files that were already there.
     ///
     /// Does not walk the parent, so a sibling tree such as
     /// `~/.grok/sessions` is not charged against the dest-deny
-    /// entry cap. The parent is not a read-write root. Windows
-    /// adds traverse on that parent and a write ACE on the file.
-    /// Linux adds execute on each ancestor directory in the same
-    /// Landlock ruleset. Landlock has no access right that walks a
-    /// directory without that execute. A path-beneath rule with that
-    /// right also allows executing other files beneath the directory.
-    /// That does not grant listing or reading children. Siblings stay
-    /// outside the grant.
+    /// entry cap. The parent is not a read-write root. A symlink or
+    /// junction parent is followed, and only the canonical file is
+    /// granted. Windows adds traverse on that parent and a write ACE
+    /// on the file. A file this call created gets an owner-only DACL
+    /// before the call returns, so a failed spawn does not leave the
+    /// parent directory's ACL on it. Linux adds execute on each
+    /// ancestor directory in the same Landlock ruleset. Landlock has
+    /// no access right that walks a directory without that execute. A
+    /// path-beneath rule with that right also allows executing other
+    /// files beneath the directory. That does not grant listing or
+    /// reading children. Siblings stay outside the grant.
     ///
     /// A deny glob that matches this file (`**/auth.json`) is not
     /// applied to it. The host asked for this file.
-    pub fn with_write_file(mut self, path: &Path) -> Result<Self, KernelError> {
-        if crate::deny::is_reserved_windows_device(path) {
-            return Err(KernelError::Root(format!(
-                "{} is not a regular file",
-                path.display()
-            )));
-        }
-        let created = prepare_missing_grant_file(path)?;
-        let granted = self.grant_existing_write_file(path);
-        if granted.is_err() && created {
-            let _ = std::fs::remove_file(path);
-        }
-        granted?;
-        Ok(self)
+    pub fn with_write_file(self, path: &Path) -> Result<Self, KernelError> {
+        self.with_write_file_create(path, true)
     }
 
-    fn grant_existing_write_file(&mut self, path: &Path) -> Result<(), KernelError> {
-        let meta = std::fs::symlink_metadata(path)
-            .map_err(|err| KernelError::Root(format!("{}: {err}", path.display())))?;
-        if meta.file_type().is_symlink() || !meta.is_file() {
-            return Err(KernelError::Root(format!(
-                "{} is not a regular file",
-                path.display()
-            )));
+    /// [`Self::with_write_file`] when `create` is true.
+    ///
+    /// When `create` is false, a missing file is
+    /// [`FileGrantReason::Missing`] and nothing is created.
+    pub fn with_write_file_create(self, path: &Path, create: bool) -> Result<Self, KernelError> {
+        self.try_write_file(path, create).strict()
+    }
+
+    /// Grant one file, or skip a path the host can ignore.
+    ///
+    /// [`FileGrantReason::Symlink`], [`FileGrantReason::ReservedDevice`],
+    /// and [`FileGrantReason::Missing`] (when `create` is false) keep the
+    /// policy and the files already created. [`FileGrantReason::ParentMissing`]
+    /// does too, so the host can create that one directory and retry.
+    /// [`FileGrantReason::ParentNotDirectory`] and other errors remove
+    /// files this builder created.
+    pub fn try_write_file(self, path: &Path, create: bool) -> FileGrantAttempt {
+        self.try_one_file(path, FileMode::Write { create })
+    }
+
+    /// Read-only grant for one existing regular file.
+    ///
+    /// Does not create a missing file. Does not walk the parent and does
+    /// not grant it. The same ancestor execute rule as
+    /// [`Self::with_write_file`] applies on Linux. Landlock has no access
+    /// right that walks a directory without that execute.
+    pub fn with_read_file(self, path: &Path) -> Result<Self, KernelError> {
+        self.try_read_file(path).strict()
+    }
+
+    /// [`Self::with_read_file`] that keeps the policy when the file is
+    /// missing, a symlink, or a reserved device name.
+    pub fn try_read_file(self, path: &Path) -> FileGrantAttempt {
+        self.try_one_file(path, FileMode::Read)
+    }
+
+    /// Let the child create regular files directly in `dir`.
+    ///
+    /// The directory is not a read-write root and is not dest-deny
+    /// walked. Subdirectories are not granted, so `sessions` cannot be
+    /// created and files already inside it are not opened. Existing
+    /// siblings such as `notes.txt` are not granted. `prefix` limits
+    /// the name on macOS (`auth` allows `auth.json` and not
+    /// `notes.txt`). Windows allows any new file name in that directory
+    /// and still does not open files that were already there. Linux
+    /// returns [`FileGrantReason::Unsupported`].
+    ///
+    /// A missing directory is [`FileGrantReason::ParentMissing`]. This
+    /// call does not create it.
+    pub fn with_create_files(self, dir: &Path, prefix: Option<&str>) -> Result<Self, KernelError> {
+        self.try_create_files(dir, prefix).strict()
+    }
+
+    /// [`Self::with_create_files`] that keeps earlier files when the
+    /// directory is missing or this kernel cannot express the grant.
+    pub fn try_create_files(self, dir: &Path, prefix: Option<&str>) -> FileGrantAttempt {
+        self.try_add_create_files(dir, prefix)
+    }
+
+    fn try_one_file(mut self, path: &Path, mode: FileMode) -> FileGrantAttempt {
+        match self.grant_one_file(path, mode) {
+            Ok(GrantAdd::Added) => FileGrantAttempt::Granted(self),
+            Ok(GrantAdd::Skip(reason)) => FileGrantAttempt::Skipped {
+                policy: self,
+                path: path.to_path_buf(),
+                reason,
+            },
+            Err(err) => {
+                self.rollback_created();
+                FileGrantAttempt::Failed(err)
+            }
         }
+    }
+
+    fn try_add_create_files(self, dir: &Path, prefix: Option<&str>) -> FileGrantAttempt {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = prefix;
+            FileGrantAttempt::Skipped {
+                policy: self,
+                path: dir.to_path_buf(),
+                reason: FileGrantReason::Unsupported,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut policy = self;
+            match policy.add_create_files(dir, prefix) {
+                Ok(()) => FileGrantAttempt::Granted(policy),
+                Err(err) => match err {
+                    KernelError::FileGrant {
+                        reason: FileGrantReason::ParentMissing,
+                        path,
+                    } => FileGrantAttempt::Skipped {
+                        policy,
+                        path,
+                        reason: FileGrantReason::ParentMissing,
+                    },
+                    err => {
+                        policy.rollback_created();
+                        FileGrantAttempt::Failed(err)
+                    }
+                },
+            }
+        }
+    }
+
+    fn grant_one_file(&mut self, path: &Path, mode: FileMode) -> Result<GrantAdd, KernelError> {
+        if crate::deny::is_reserved_grant_device(path) {
+            return Ok(GrantAdd::Skip(FileGrantReason::ReservedDevice));
+        }
+        require_grant_file_name(path)?;
+        if let Err(err) = require_grant_parent_dir(path) {
+            if let KernelError::FileGrant {
+                reason: FileGrantReason::ParentMissing,
+                ..
+            } = err
+            {
+                return Ok(GrantAdd::Skip(FileGrantReason::ParentMissing));
+            }
+            return Err(err);
+        }
+        let create = match mode {
+            FileMode::Write { create } => create,
+            FileMode::Read => false,
+        };
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                Ok(GrantAdd::Skip(FileGrantReason::Symlink))
+            }
+            Ok(meta) if !meta.is_file() => Err(file_grant(path, FileGrantReason::NotRegular)),
+            Ok(_) => {
+                self.push_file_grant(path, mode.access())?;
+                Ok(GrantAdd::Added)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && !create => {
+                Ok(GrantAdd::Skip(FileGrantReason::Missing))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match create_empty_grant_file(path)? {
+                    Some(created) => {
+                        let granted = self.push_file_grant(path, mode.access());
+                        if granted.is_err() {
+                            remove_created(&created);
+                            return granted.map(|_| GrantAdd::Added);
+                        }
+                        self.created.push(created);
+                        Ok(GrantAdd::Added)
+                    }
+                    None => match std::fs::symlink_metadata(path) {
+                        Ok(meta) if meta.file_type().is_symlink() => {
+                            Ok(GrantAdd::Skip(FileGrantReason::Symlink))
+                        }
+                        Ok(meta) if meta.is_file() => {
+                            self.push_file_grant(path, mode.access())?;
+                            Ok(GrantAdd::Added)
+                        }
+                        _ => Err(file_grant(path, FileGrantReason::NotRegular)),
+                    },
+                }
+            }
+            Err(err) => Err(KernelError::Root(format!("{}: {err}", path.display()))),
+        }
+    }
+
+    fn push_file_grant(&mut self, path: &Path, access: KernelAccess) -> Result<(), KernelError> {
         let resolved = std::fs::canonicalize(path)
             .map_err(|err| KernelError::Root(format!("{}: {err}", path.display())))?;
         if is_fs_root(&resolved) || is_drive_root(&resolved) {
             return Err(KernelError::FsRoot(resolved));
         }
+        let resolved_meta = std::fs::symlink_metadata(&resolved)
+            .map_err(|err| KernelError::Root(format!("{}: {err}", resolved.display())))?;
+        if resolved_meta.file_type().is_symlink() || !resolved_meta.is_file() {
+            return Err(file_grant(path, FileGrantReason::NotRegular));
+        }
         self.dest_denies.retain(|deny| {
             !same_existing_path(&deny.path, path) && !same_existing_path(&deny.path, &resolved)
         });
-        if !is_fs_root(path) && path != resolved.as_path() {
-            push_grant(
-                &mut self.grants,
-                path.to_path_buf(),
-                KernelAccess::ReadWrite,
-            );
+        #[cfg(windows)]
+        {
+            record_file_traverse(&mut self.traverse_dirs, &resolved);
+            if path != resolved.as_path() {
+                record_file_traverse(&mut self.traverse_dirs, path);
+            }
+        }
+        push_grant(&mut self.grants, resolved, access);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn add_create_files(&mut self, dir: &Path, prefix: Option<&str>) -> Result<(), KernelError> {
+        if let Some(prefix) = prefix {
+            if prefix.is_empty()
+                || prefix.contains('/')
+                || prefix.contains('\\')
+                || prefix.contains('\0')
+                || prefix == "."
+                || prefix == ".."
+            {
+                return Err(KernelError::Apply(format!(
+                    "create-files prefix is not a single name: {prefix}"
+                )));
+            }
+        }
+        // The reported path is the directory. A synthetic child would
+        // make the host create `dir/name` when it retries.
+        if let Err(err) = require_grant_parent_dir(&dir.join("name")) {
+            return Err(match err {
+                KernelError::FileGrant { reason, .. } => file_grant(dir, reason),
+                other => other,
+            });
+        }
+        let resolved = std::fs::canonicalize(dir)
+            .map_err(|err| KernelError::Root(format!("{}: {err}", dir.display())))?;
+        if is_fs_root(&resolved) || is_drive_root(&resolved) {
+            return Err(KernelError::FsRoot(resolved));
+        }
+        let meta = std::fs::symlink_metadata(&resolved)
+            .map_err(|err| KernelError::Root(format!("{}: {err}", resolved.display())))?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(file_grant(dir, FileGrantReason::ParentNotDirectory));
+        }
+        if self
+            .create_files
+            .iter()
+            .any(|grant| grant.directory == resolved)
+        {
+            return Ok(());
         }
         #[cfg(windows)]
-        record_file_traverse(&mut self.traverse_dirs, &resolved);
-        push_grant(&mut self.grants, resolved, KernelAccess::ReadWrite);
+        {
+            record_file_traverse(&mut self.traverse_dirs, &resolved.join("name"));
+            if dir != resolved.as_path() {
+                record_file_traverse(&mut self.traverse_dirs, &dir.join("name"));
+            }
+        }
+        self.create_files.push(CreateFiles {
+            directory: resolved,
+            prefix: prefix.map(str::to_string),
+        });
         Ok(())
+    }
+
+    fn rollback_created(&mut self) {
+        for created in self.created.drain(..) {
+            remove_created(&created);
+        }
     }
 
     /// Fail closed when Linux dest-deny remount is skipped.
@@ -2152,6 +2582,9 @@ impl KernelPolicy {
                 .map(|g| g.path.as_path())
                 .collect();
             add_macos_dest_deny_rules(&mut caps, &self.dest_denies, &rw, self.deny_policy.globs())?;
+            for grant in &self.create_files {
+                add_macos_create_file_rules(&mut caps, grant)?;
+            }
         }
         let caps = if self.network_blocked {
             caps.block_network()
@@ -3061,6 +3494,47 @@ fn push_dest_deny(out: &mut Vec<DestDeny>, deny: DestDeny) {
         return;
     }
     out.push(deny);
+}
+
+/// New files directly in `dir`. A prefix limits the name. No subpath.
+#[cfg(target_os = "macos")]
+fn add_macos_create_file_rules(
+    caps: &mut nono::CapabilitySet,
+    grant: &CreateFiles,
+) -> Result<(), KernelError> {
+    let Some(raw) = grant.directory.to_str() else {
+        return Err(KernelError::Apply(format!(
+            "create-files path is not UTF-8: {}",
+            grant.directory.display()
+        )));
+    };
+    let escaped_dir = escape_sbpl_literal(raw);
+    for action in ["file-read-metadata", "file-write-create"] {
+        let rule = format!("(allow {action} (literal \"{escaped_dir}\"))");
+        caps.add_platform_rule(&rule)
+            .map_err(|err| KernelError::Apply(err.to_string()))?;
+    }
+    let dir = escape_regex_literal(raw);
+    let name = match grant.prefix.as_deref() {
+        Some(prefix) => format!("{}[^/]*", escape_regex_literal(prefix)),
+        None => "[^/]+".to_string(),
+    };
+    let regex = escape_sbpl_literal(&format!("^{dir}/{name}$"));
+    // The dest-deny list allows `file-write*` and `file-write-create`
+    // separately, so creation is its own allow. Without a prefix the
+    // regex is every direct child, including `notes.txt`.
+    let mut actions = vec!["file-write*", "file-write-create", "file-write-data"];
+    if grant.prefix.is_some() {
+        actions.push("file-read*");
+    } else {
+        actions.push("file-read-metadata");
+    }
+    for action in actions {
+        let rule = format!("(allow {action} (regex \"{regex}\"))");
+        caps.add_platform_rule(&rule)
+            .map_err(|err| KernelError::Apply(err.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Seatbelt dest-deny of workspace secrets. Platform rules emit last so
@@ -3979,10 +4453,33 @@ mod write_file_grant_tests {
     use super::{KernelAccess, process_jail};
 
     fn grant_is_file(policy: &super::KernelPolicy, file: &Path) -> bool {
-        let want = std::fs::canonicalize(file).expect("canon");
+        grant_has(policy, file, KernelAccess::ReadWrite)
+    }
+
+    fn grant_has(policy: &super::KernelPolicy, file: &Path, access: KernelAccess) -> bool {
+        let want = std::fs::canonicalize(file).ok();
         policy.grants().iter().any(|grant| {
-            grant.access == KernelAccess::ReadWrite && (grant.path == file || grant.path == want)
+            grant.access == access
+                && (grant.path == file || want.as_ref().is_some_and(|p| grant.path == *p))
         })
+    }
+
+    fn file_grant_reason(err: super::KernelError) -> super::FileGrantReason {
+        match err {
+            super::KernelError::FileGrant { reason, .. } => reason,
+            other => panic!("expected FileGrant, got {other}"),
+        }
+    }
+
+    fn only_canonical(policy: &super::KernelPolicy, spelled: &Path) -> bool {
+        let canon = std::fs::canonicalize(spelled).expect("canon");
+        let hits: Vec<_> = policy
+            .grants()
+            .iter()
+            .filter(|grant| grant.path == spelled || grant.path == canon)
+            .map(|grant| grant.path.clone())
+            .collect();
+        hits == vec![canon]
     }
 
     #[test]
@@ -4032,10 +4529,11 @@ mod write_file_grant_tests {
             .expect("jail")
             .with_write_file(&grok)
             .expect_err("a directory is not a file grant");
-        let super::KernelError::Root(msg) = err else {
-            panic!("expected Root, got {err}");
-        };
-        assert!(msg.contains("not a regular file"), "{msg}");
+        assert_eq!(
+            file_grant_reason(err),
+            super::FileGrantReason::NotRegular,
+            "a directory is not a regular file"
+        );
     }
 
     #[test]
@@ -4083,10 +4581,7 @@ mod write_file_grant_tests {
             .expect("jail")
             .with_write_file(&link)
             .expect_err("symlink");
-        let super::KernelError::Root(msg) = err else {
-            panic!("expected Root, got {err}");
-        };
-        assert!(msg.contains("not a regular file"), "{msg}");
+        assert_eq!(file_grant_reason(err), super::FileGrantReason::Symlink);
     }
 
     #[cfg(unix)]
@@ -4184,10 +4679,10 @@ mod write_file_grant_tests {
             .expect("jail")
             .with_write_file(&auth)
             .expect_err("missing parent");
-        let super::KernelError::Root(msg) = err else {
-            panic!("expected Root, got {err}");
-        };
-        assert!(msg.contains("parent directory does not exist"), "{msg}");
+        assert_eq!(
+            file_grant_reason(err),
+            super::FileGrantReason::ParentMissing
+        );
         assert!(!parent.exists(), "the parent directory must not be created");
         assert!(!auth.exists(), "the file must not be created");
     }
@@ -4206,10 +4701,11 @@ mod write_file_grant_tests {
                 .expect("jail")
                 .with_write_file(&path)
                 .expect_err(name);
-            let super::KernelError::Root(msg) = err else {
-                panic!("expected Root, got {err}");
-            };
-            assert!(msg.contains("not a regular file"), "{name}: {msg}");
+            assert_eq!(
+                file_grant_reason(err),
+                super::FileGrantReason::ReservedDevice,
+                "{name}"
+            );
         }
         let listed: Vec<_> = std::fs::read_dir(&grok)
             .expect("list")
@@ -4219,5 +4715,524 @@ mod write_file_grant_tests {
             listed.is_empty(),
             "device names must not create files: {listed:?}"
         );
+    }
+
+    #[test]
+    fn write_file_create_false_does_not_plant_a_missing_login() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = grok.join("auth.json");
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file_create(&auth, false)
+            .expect_err("missing login");
+        assert_eq!(file_grant_reason(err), super::FileGrantReason::Missing);
+        assert!(!auth.exists(), "a missing login file must not be created");
+        std::fs::write(&auth, b"{token}\n").expect("auth");
+        let policy = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file_create(&auth, false)
+            .expect("existing login");
+        assert!(grant_is_file(&policy, &auth));
+        assert_eq!(std::fs::read(&auth).expect("bytes"), b"{token}\n");
+    }
+
+    #[test]
+    fn write_file_failure_removes_only_files_this_builder_created() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = grok.join("auth.json");
+        std::fs::write(&auth, b"{token}\n").expect("auth");
+        let lock = grok.join("auth.lock");
+        let link = grok.join("auth-work.lock");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&auth, &link).expect("symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&auth, &link).expect("symlink");
+        #[cfg(not(any(unix, windows)))]
+        return;
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock")
+            .with_write_file(&link)
+            .expect_err("symlink lock");
+        assert_eq!(file_grant_reason(err), super::FileGrantReason::Symlink);
+        assert!(!lock.exists(), "the new lock must be removed");
+        assert_eq!(std::fs::read(&auth).expect("auth"), b"{token}\n");
+        assert!(
+            link.symlink_metadata()
+                .expect("link")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn try_write_file_skips_a_symlink_and_keeps_the_new_lock() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = grok.join("auth.json");
+        std::fs::write(&auth, b"{token}\n").expect("auth");
+        let lock = grok.join("auth.lock");
+        let link = grok.join("auth-work.lock");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&auth, &link).expect("symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&auth, &link).expect("symlink");
+        #[cfg(not(any(unix, windows)))]
+        return;
+        let started = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock");
+        let skipped = started.try_write_file(&link, true);
+        let super::FileGrantAttempt::Skipped { policy, reason, .. } = skipped else {
+            panic!("symlink lock should be skipped");
+        };
+        assert_eq!(reason, super::FileGrantReason::Symlink);
+        assert!(lock.exists(), "a skipped path must not remove the new lock");
+        assert!(grant_is_file(&policy, &lock));
+    }
+
+    #[test]
+    fn try_write_file_reports_a_missing_parent_without_creating_it() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let grok = root.path().join("grok");
+        let auth = grok.join("auth.json");
+        let attempt = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .try_write_file(&auth, true);
+        let super::FileGrantAttempt::Skipped { reason, .. } = attempt else {
+            panic!("missing parent should be skipped so the host can retry");
+        };
+        assert_eq!(reason, super::FileGrantReason::ParentMissing);
+        assert!(!grok.exists());
+        assert!(!auth.exists());
+    }
+
+    #[test]
+    fn write_file_follows_a_directory_link_and_grants_one_file() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let real = root.path().join("real");
+        let link = root.path().join("link");
+        std::fs::create_dir_all(&real).expect("real");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).expect("symlink dir");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&real, &link).expect("junction");
+        #[cfg(not(any(unix, windows)))]
+        return;
+        let spelled = link.join("auth.lock");
+        let policy = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&spelled)
+            .expect("grant through the directory link");
+        assert!(only_canonical(&policy, &spelled));
+        assert_eq!(std::fs::read(real.join("auth.lock")).expect("bytes"), b"");
+    }
+
+    #[test]
+    fn read_file_does_not_create_or_walk_or_grant_write() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        let sessions = grok.join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        std::fs::write(sessions.join("one.log"), b"log\n").expect("log");
+        std::fs::write(grok.join("notes.txt"), b"notes\n").expect("notes");
+        let missing = grok.join("auth.json");
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_read_file(&missing)
+            .expect_err("missing");
+        assert_eq!(file_grant_reason(err), super::FileGrantReason::Missing);
+        assert!(!missing.exists());
+        let dir_err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_read_file(&grok)
+            .expect_err("directory");
+        assert_eq!(
+            file_grant_reason(dir_err),
+            super::FileGrantReason::NotRegular
+        );
+        std::fs::write(&missing, b"{exp}\n").expect("auth");
+        let policy = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_read_file(&missing)
+            .expect("read");
+        assert!(grant_has(&policy, &missing, KernelAccess::Read));
+        assert!(
+            !grant_is_file(&policy, &missing),
+            "read must not grant write"
+        );
+        assert_eq!(std::fs::read(&missing).expect("bytes"), b"{exp}\n");
+        let link = grok.join("link.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&missing, &link).expect("symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&missing, &link).expect("symlink");
+        #[cfg(any(unix, windows))]
+        {
+            let link_err = process_jail(&workspace, std::iter::empty::<&Path>())
+                .expect("jail")
+                .with_read_file(&link)
+                .expect_err("symlink");
+            assert_eq!(file_grant_reason(link_err), super::FileGrantReason::Symlink);
+        }
+        let grok_canon = std::fs::canonicalize(&grok).expect("grok");
+        assert!(policy.grants().iter().all(|grant| {
+            grant.path != grok
+                && grant.path != grok_canon
+                && grant.path != grok.join("notes.txt")
+                && !grant.path.starts_with(&sessions)
+        }));
+        assert!(policy.dest_denies().iter().all(|deny| {
+            !deny.path.starts_with(&sessions) && !deny.path.ends_with("notes.txt")
+        }));
+    }
+
+    #[test]
+    fn create_files_does_not_walk_or_grant_the_directory() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        let sessions = grok.join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        std::fs::write(grok.join("notes.txt"), b"notes\n").expect("notes");
+        for index in 0..8 {
+            std::fs::write(sessions.join(format!("f{index}.log")), b"x").expect("log");
+        }
+        let missing = root.path().join("absent");
+        let missing_err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_create_files(&missing, Some("auth"))
+            .expect_err("missing dir");
+        let super::KernelError::FileGrant { path, reason } = &missing_err else {
+            panic!("expected FileGrant, got {missing_err}");
+        };
+        assert_eq!(path, &missing, "the error path is the directory");
+        #[cfg(target_os = "linux")]
+        assert_eq!(*reason, super::FileGrantReason::Unsupported);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(*reason, super::FileGrantReason::ParentMissing);
+        assert!(!missing.exists());
+        let result = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_create_files(&grok, Some("auth"));
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                file_grant_reason(result.expect_err("landlock")),
+                super::FileGrantReason::Unsupported
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let policy = result.expect("create files");
+            let grok_canon = std::fs::canonicalize(&grok).expect("grok");
+            assert!(policy.grants().iter().all(|grant| {
+                grant.path != grok
+                    && grant.path != grok_canon
+                    && grant.path != grok.join("notes.txt")
+            }));
+            assert!(policy.dest_denies().iter().all(|deny| {
+                !deny.path.starts_with(&sessions) && !deny.path.ends_with("notes.txt")
+            }));
+            assert_eq!(policy.create_files().len(), 1);
+            assert_eq!(policy.create_files()[0].directory, grok_canon);
+            assert_eq!(policy.create_files()[0].prefix.as_deref(), Some("auth"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_file_refuses_a_reserved_device_name_with_an_extension() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        for name in ["NUL.txt", "AUX.json", "COM1.txt"] {
+            let path = grok.join(name);
+            let err = process_jail(&workspace, std::iter::empty::<&Path>())
+                .expect("jail")
+                .with_write_file(&path)
+                .expect_err(name);
+            assert_eq!(
+                file_grant_reason(err),
+                super::FileGrantReason::ReservedDevice,
+                "{name}"
+            );
+        }
+        let notes = grok.join("notes.NUL");
+        process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&notes)
+            .expect("notes.NUL is not a device");
+        assert!(notes.is_file());
+        let _ = std::fs::remove_file(&notes);
+        let listed: Vec<_> = std::fs::read_dir(&grok)
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert!(
+            listed.is_empty(),
+            "extended device names must not create files: {listed:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_file_sets_an_owner_only_dacl_on_a_new_file() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let lock = grok.join("auth.lock");
+        process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("lock");
+        assert!(
+            super::windows::dacl_is_protected(&lock).expect("dacl"),
+            "a new lock must not keep the parent ACL"
+        );
+        assert_eq!(std::fs::read(&lock).expect("lock bytes"), b"");
+        std::fs::write(grok.join("auth.json"), b"{token}\n").expect("auth");
+        let auth = grok.join("auth.json");
+        process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file_create(&auth, false)
+            .expect("existing");
+        assert_eq!(std::fs::read(&auth).expect("bytes"), b"{token}\n");
+        assert!(
+            !super::windows::dacl_is_protected(&auth).expect("existing dacl"),
+            "an existing login file must keep its ACL"
+        );
+    }
+
+    #[test]
+    fn first_login_creates_the_file_after_the_host_creates_the_directory() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let grok = root.path().join("grok");
+        let auth = grok.join("auth.json");
+        let sessions = grok.join("sessions");
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&auth)
+            .expect_err("no directory yet");
+        assert_eq!(
+            file_grant_reason(err),
+            super::FileGrantReason::ParentMissing
+        );
+        assert!(!grok.exists());
+        std::fs::create_dir(&grok).expect("host creates the directory");
+        let policy = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&auth)
+            .expect("login file");
+        assert!(grant_is_file(&policy, &auth));
+        assert_eq!(std::fs::read(&auth).expect("bytes"), b"");
+        assert!(!sessions.exists(), "sessions must not be created");
+        assert!(policy.grants().iter().all(|grant| {
+            let canon = std::fs::canonicalize(&grok).expect("grok");
+            grant.path != grok && grant.path != canon
+        }));
+    }
+
+    #[test]
+    fn later_missing_parent_removes_only_the_new_lock() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = grok.join("auth.json");
+        std::fs::write(&auth, b"{token}\n").expect("auth");
+        let lock = grok.join("auth.lock");
+        let other = root.path().join("missing").join("auth.lock");
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock")
+            .with_write_file(&other)
+            .expect_err("missing parent");
+        assert_eq!(
+            file_grant_reason(err),
+            super::FileGrantReason::ParentMissing
+        );
+        assert!(!lock.exists(), "the new lock must be removed");
+        assert!(!other.parent().expect("parent").exists());
+        assert_eq!(std::fs::read(&auth).expect("auth"), b"{token}\n");
+    }
+
+    #[test]
+    fn try_write_file_keeps_the_lock_when_the_next_parent_is_missing() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let lock = grok.join("auth.lock");
+        let other = root.path().join("missing").join("auth.lock");
+        let started = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock");
+        let skipped = started.try_write_file(&other, true);
+        let super::FileGrantAttempt::Skipped { policy, reason, .. } = skipped else {
+            panic!("missing parent should be skipped");
+        };
+        assert_eq!(reason, super::FileGrantReason::ParentMissing);
+        assert!(lock.exists(), "a skipped path must not remove the new lock");
+        assert!(grant_is_file(&policy, &lock));
+        assert!(!other.parent().expect("parent").exists());
+    }
+
+    #[test]
+    fn write_file_refuses_a_parent_that_is_a_file() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let parent = grok.join("not-a-dir");
+        std::fs::write(&parent, b"x").expect("file");
+        let auth = parent.join("auth.json");
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&auth)
+            .expect_err("parent file");
+        assert_eq!(
+            file_grant_reason(err),
+            super::FileGrantReason::ParentNotDirectory
+        );
+        assert!(!auth.exists());
+        assert_eq!(std::fs::read(&parent).expect("bytes"), b"x");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn create_files_rejects_a_file_and_an_empty_prefix() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let notes = grok.join("notes.txt");
+        std::fs::write(&notes, b"notes\n").expect("notes");
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_create_files(&notes, Some("auth"))
+            .expect_err("file");
+        assert!(
+            matches!(
+                &err,
+                super::KernelError::FileGrant { path, reason }
+                    if path == &notes && *reason == super::FileGrantReason::ParentNotDirectory
+            ),
+            "{err}"
+        );
+        let bad = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_create_files(&grok, Some(""))
+            .expect_err("prefix");
+        assert!(
+            matches!(bad, super::KernelError::Apply(ref msg) if msg.contains("prefix")),
+            "{bad}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_file_follows_a_junction_and_grants_one_file() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let real = root.path().join("real");
+        let link = root.path().join("link");
+        std::fs::create_dir_all(&real).expect("real");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .status()
+            .expect("mklink");
+        assert!(status.success(), "mklink /J");
+        let spelled = link.join("auth.lock");
+        let policy = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&spelled)
+            .expect("grant through the junction");
+        assert!(only_canonical(&policy, &spelled));
+        assert_eq!(std::fs::read(real.join("auth.lock")).expect("bytes"), b"");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_file_creates_a_verbatim_nul_as_a_literal_file() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        assert!(crate::deny::is_reserved_grant_device(std::path::Path::new(
+            r"\\?\NUL"
+        )));
+        let grok_abs = std::fs::canonicalize(&grok).expect("canon");
+        let text = grok_abs.display().to_string();
+        let verbatim_dir = if text.starts_with(r"\\?\") {
+            grok_abs
+        } else {
+            std::path::PathBuf::from(format!(r"\\?\{text}"))
+        };
+        let literal = verbatim_dir.join("NUL");
+        assert!(!crate::deny::is_reserved_grant_device(&literal));
+        let policy = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&literal)
+            .expect("literal NUL");
+        assert!(only_canonical(&policy, &literal));
+        assert!(std::fs::metadata(&literal).expect("meta").is_file());
+        std::fs::remove_file(&literal).expect("remove literal");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_file_refuses_an_extended_device_name() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let path = grok.join("NUL.txt");
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_read_file(&path)
+            .expect_err("NUL.txt");
+        assert_eq!(
+            file_grant_reason(err),
+            super::FileGrantReason::ReservedDevice
+        );
+        assert!(!path.exists());
     }
 }

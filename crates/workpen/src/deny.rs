@@ -530,10 +530,38 @@ enum WinDev {
 /// `true` when opening `path` would hit a Windows reserved device
 /// (`NUL`, `CON`, `PRN`, `AUX`, `COM1` through `COM9`, `LPT1` through
 /// `LPT9`, `CONIN$`, `CONOUT$`) instead of a regular file.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn is_reserved_windows_device(path: &Path) -> bool {
     #[cfg(windows)]
     {
         windows_device_kind(&path.to_string_lossy()).is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// File grants also refuse `NUL.txt`. Dest-deny still treats that name
+/// as an ordinary path. The stem is the final component before the
+/// first `.`, after trailing spaces and dots. `notes.NUL` is not a
+/// device. `\\?\C:\dir\NUL` stays a literal file.
+pub(crate) fn is_reserved_grant_device(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        if is_reserved_windows_device(path) {
+            return true;
+        }
+        let text = path.to_string_lossy();
+        if device_namespace_body(&text).is_some() {
+            return false;
+        }
+        let component = text.rsplit(['\\', '/']).next().unwrap_or(text.as_ref());
+        let trimmed = component.trim_end_matches([' ', '.']);
+        let stem = trimmed.split('.').next().unwrap_or(trimmed);
+        let stem = stem.trim_end_matches([' ', '.']);
+        classify_reserved(stem).is_some()
     }
     #[cfg(not(windows))]
     {
