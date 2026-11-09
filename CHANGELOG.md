@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/workpen/workpen/compare/v0.9.0...v0.10.0) (2026-11-09)
+
+
+### Features
+
+* **wrap:** grant a one-file name that does not exist yet ([#351](https://github.com/workpen/workpen/issues/351)) ([ef830bd](https://github.com/workpen/workpen/commit/ef830bde1ddb97a0ef5ce7efa9c3fee1a2667572))
+
 ## [0.9.0](https://github.com/workpen/workpen/compare/v0.8.0...v0.9.0) (2026-11-09)
 
 
