@@ -299,6 +299,190 @@ fn windows_write_file() -> Result<(), String> {
     Ok(())
 }
 
+/// The child creates `auth-new.json` after spawn and writes the lock
+/// this builder created. It cannot read `notes.txt`, cannot read
+/// `sessions`, and cannot create a subdirectory. Windows ACEs cannot
+/// filter the prefix, so a different new file name is created too.
+#[cfg(windows)]
+#[test]
+fn reexec_create_files_grant() {
+    windows_create_files().unwrap_or_else(|err| panic!("FAIL: {err}"));
+}
+
+#[cfg(windows)]
+fn windows_create_files() -> Result<(), String> {
+    let base = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is unset")?;
+    let root = PathBuf::from(base).join(format!("workpen-create-files-{}", std::process::id()));
+    let _cleanup = RemoveDir(root.clone());
+    let grok = root.join("grok");
+    let sessions = grok.join("sessions");
+    std::fs::create_dir_all(&sessions).map_err(|err| err.to_string())?;
+    std::fs::write(sessions.join("one.log"), b"log\n").map_err(|err| err.to_string())?;
+    let secret = grok.join("notes.txt");
+    std::fs::write(&secret, b"sibling-secret\n").map_err(|err| err.to_string())?;
+    let lock = grok.join("auth.lock");
+    let new_file = grok.join("auth-new.json");
+    let other = grok.join("notes-new.txt");
+    let extra = grok.join("extra-dir");
+    let workspace = tempfile::tempdir().map_err(|err| err.to_string())?;
+    let policy = jail(workspace.path())?
+        .with_write_file(&lock)
+        .map_err(|err| err.to_string())?
+        .with_create_files(&grok, Some("auth"))
+        .map_err(|err| err.to_string())?;
+    if policy.grants().iter().any(|grant| {
+        grant.path == grok || grant.path.ends_with("notes.txt") || grant.path.starts_with(&sessions)
+    }) {
+        return Err(format!(
+            "create-files granted an existing path: {:?}",
+            policy.grants()
+        ));
+    }
+    if policy.create_files().len() != 1 {
+        return Err(format!("create-files: {:?}", policy.create_files()));
+    }
+    let mut cmd = Command::new(std::env::current_exe().map_err(|err| err.to_string())?);
+    cmd.args(["--exact", "reexec_create_probe_child", "--nocapture"])
+        .env("WORKPEN_REEXEC_CREATE_PROBE", "1")
+        .env("WORKPEN_REEXEC_LOCK", &lock)
+        .env("WORKPEN_REEXEC_NEW", &new_file)
+        .env("WORKPEN_REEXEC_OTHER", &other)
+        .env("WORKPEN_REEXEC_SECRET", &secret)
+        .env("WORKPEN_REEXEC_LOG", sessions.join("one.log"))
+        .env("WORKPEN_REEXEC_EXTRA", &extra)
+        .env("WORKPEN_REEXEC_NEST", sessions.join("nested"))
+        .env("WORKPEN_REEXEC_DIR", &grok)
+        .current_dir(workspace.path());
+    let (applied, output) = policy
+        .spawn_reexec_output(cmd)
+        .map_err(|err| format!("spawn_reexec: {err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!(
+            "create probe status {:?} applied {applied:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        ));
+    }
+    for line in [
+        "LOCK=wrote",
+        "NEW=wrote",
+        "SECRET=denied",
+        "LOG=denied",
+        "EXTRA=denied",
+        "NEST=denied",
+        "LIST=denied",
+        "OTHER=wrote",
+    ] {
+        if !has_line(&stdout, line) {
+            return Err(format!(
+                "missing {line}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            ));
+        }
+    }
+    let lock_body = std::fs::read_to_string(&lock).map_err(|err| err.to_string())?;
+    if lock_body != "held\n" {
+        return Err(format!("lock body {lock_body:?}"));
+    }
+    let new_body = std::fs::read_to_string(&new_file).map_err(|err| err.to_string())?;
+    if new_body != "token\n" {
+        return Err(format!("new login body {new_body:?}"));
+    }
+    let secret_body = std::fs::read_to_string(&secret).map_err(|err| err.to_string())?;
+    if secret_body != "sibling-secret\n" {
+        return Err(format!("sibling changed {secret_body:?}"));
+    }
+    if extra.exists() || sessions.join("nested").exists() {
+        return Err("a subdirectory was created".into());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn reexec_create_probe_child() {
+    if std::env::var_os("WORKPEN_REEXEC_CREATE_PROBE").is_none() {
+        return;
+    }
+    std::process::exit(create_probe());
+}
+
+#[cfg(windows)]
+fn create_probe() -> i32 {
+    let (
+        Some(lock),
+        Some(new_file),
+        Some(other),
+        Some(secret),
+        Some(log),
+        Some(extra),
+        Some(nest),
+        Some(dir),
+    ) = (
+        env_path("WORKPEN_REEXEC_LOCK"),
+        env_path("WORKPEN_REEXEC_NEW"),
+        env_path("WORKPEN_REEXEC_OTHER"),
+        env_path("WORKPEN_REEXEC_SECRET"),
+        env_path("WORKPEN_REEXEC_LOG"),
+        env_path("WORKPEN_REEXEC_EXTRA"),
+        env_path("WORKPEN_REEXEC_NEST"),
+        env_path("WORKPEN_REEXEC_DIR"),
+    )
+    else {
+        println!("PROBE=bad-env");
+        return 2;
+    };
+    match std::fs::write(&lock, b"held\n") {
+        Ok(()) => println!("LOCK=wrote"),
+        Err(err) => {
+            println!("LOCK=fail {err}");
+            return 1;
+        }
+    }
+    match std::fs::write(&new_file, b"token\n") {
+        Ok(()) => match std::fs::read(&new_file) {
+            Ok(body) if body == b"token\n" => println!("NEW=wrote"),
+            Ok(_) => {
+                println!("NEW=changed");
+                return 1;
+            }
+            Err(err) => {
+                println!("NEW=noread {err}");
+                return 1;
+            }
+        },
+        Err(err) => {
+            println!("NEW=fail {err}");
+            return 1;
+        }
+    }
+    match std::fs::read(&secret) {
+        Ok(_) => println!("SECRET=read"),
+        Err(_) => println!("SECRET=denied"),
+    }
+    match std::fs::read(&log) {
+        Ok(_) => println!("LOG=read"),
+        Err(_) => println!("LOG=denied"),
+    }
+    match std::fs::create_dir(&extra) {
+        Ok(()) => println!("EXTRA=created"),
+        Err(_) => println!("EXTRA=denied"),
+    }
+    match std::fs::create_dir(&nest) {
+        Ok(()) => println!("NEST=created"),
+        Err(_) => println!("NEST=denied"),
+    }
+    match std::fs::read_dir(&dir) {
+        Ok(_) => println!("LIST=read"),
+        Err(_) => println!("LIST=denied"),
+    }
+    match std::fs::write(&other, b"x") {
+        Ok(()) => println!("OTHER=wrote"),
+        Err(_) => println!("OTHER=denied"),
+    }
+    0
+}
+
 #[cfg(windows)]
 struct RemoveDir(PathBuf);
 

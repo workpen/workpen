@@ -91,10 +91,29 @@ const FILE_SHARE_DELETE: Dword = 0x4;
 const FILE_DIRECTORY_FILE: u32 = 0x1;
 /// Not a Windows `SE_OBJECT_TYPE`. Restore reopens `\Device\NamedPipe`.
 const NPFS_RESTORE: u32 = 0x4E50_4653;
+/// Not a Windows `SE_OBJECT_TYPE`. Restore sets the DACL on the open
+/// directory. `SetNamedSecurityInfo` would propagate inheritable ACEs
+/// through every child, including `sessions`.
+const FILE_NO_PROPAGATE: u32 = 0x4E50_4631;
+const FILE_FLAG_BACKUP_SEMANTICS: Dword = 0x0200_0000;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const OBJ_OPENIF: u32 = 0x80;
 const OBJECT_INHERIT_ACE: Dword = 0x1;
 const CONTAINER_INHERIT_ACE: Dword = 0x2;
+const INHERIT_ONLY_ACE: Dword = 0x8;
+const FILE_ADD_FILE: Dword = 0x0002;
+const FILE_WRITE_ATTRIBUTES: Dword = 0x0100;
+const DELETE_ACCESS: Dword = 0x0001_0000;
+const WRITE_DAC: Dword = 0x0004_0000;
+const READ_CONTROL: Dword = 0x0002_0000;
+const CREATE_NEW: Dword = 1;
+const FILE_SHARE_ALL: Dword = 0x7;
+const FILE_ATTRIBUTE_NORMAL: Dword = 0x80;
+const FILE_FLAG_OPEN_REPARSE_POINT: Dword = 0x0020_0000;
+const PROTECTED_DACL_SECURITY_INFORMATION: Dword = 0x8000_0000;
+const CREATE_IN_DIR: Dword =
+    FILE_ADD_FILE | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE;
+const NEW_FILE_RIGHTS: Dword = GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS;
 const STATUS_OBJECT_NAME_NOT_FOUND: i32 = 0xC000_0034_u32 as i32;
 const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003A_u32 as i32;
 const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
@@ -292,6 +311,10 @@ unsafe extern "system" {
         dw_flags_and_attributes: Dword,
         h_template_file: Handle,
     ) -> Handle;
+    fn GetFileInformationByHandle(
+        h_file: Handle,
+        lp_file_information: *mut ByHandleFileInformation,
+    ) -> Bool;
     fn GetModuleHandleW(lp_module_name: *const u16) -> Handle;
     fn GetProcAddress(h_module: Handle, lp_proc_name: *const u8) -> *mut core::ffi::c_void;
     fn CreatePipe(
@@ -452,6 +475,11 @@ unsafe extern "system" {
         p_dacl: Handle,
         p_sacl: Handle,
     ) -> Dword;
+    fn SetKernelObjectSecurity(
+        handle: Handle,
+        security_info: Dword,
+        sd: *mut core::ffi::c_void,
+    ) -> Bool;
     fn SetEntriesInAclW(
         c_count_of_explicit_entries: u32,
         p_list_of_explicit_entries: *mut ExplicitAccessW,
@@ -663,6 +691,13 @@ impl AclRestore {
             };
             unsafe { CloseHandle(file) };
             err
+        } else if self.object_type == FILE_NO_PROPAGATE {
+            let dir = open_create_files_dir(&self.path).map_err(|_| {
+                KernelError::Apply("restore could not reopen the create-files directory".into())
+            })?;
+            set_kernel_dacl(dir.0, self.dacl)?;
+            self.restored = true;
+            return Ok(());
         } else if self.object_type == SE_KERNEL_OBJECT {
             let name =
                 String::from_utf16_lossy(self.path.split(|c| *c == 0).next().unwrap_or(&self.path));
@@ -728,6 +763,322 @@ pub(super) unsafe fn free_sid(sid: Handle) {
     unsafe {
         FreeSid(sid);
     }
+}
+
+#[repr(C)]
+struct ByHandleFileInformation {
+    file_attributes: u32,
+    creation_low: u32,
+    creation_high: u32,
+    access_low: u32,
+    access_high: u32,
+    write_low: u32,
+    write_high: u32,
+    volume_serial: u32,
+    size_high: u32,
+    size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+pub(super) fn create_owner_file(path: &Path) -> Result<Option<super::CreatedGrant>, KernelError> {
+    use std::os::windows::io::FromRawHandle;
+    let wide = wide_path(path);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE | WRITE_DAC | READ_CONTROL,
+            FILE_SHARE_ALL,
+            ptr::null_mut(),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        let err = unsafe { GetLastError() };
+        if err == 80 || err == 183 {
+            return Ok(None);
+        }
+        return Err(KernelError::Root(format!(
+            "{}: win32 {err}",
+            path.display()
+        )));
+    }
+    // SAFETY: `CreateFileW` returned an owned handle. `File` closes it.
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    if let Err(err) = protect_new_file(&file) {
+        let id = grant_file_id(&file).ok();
+        drop(file);
+        if id.is_some() && path_grant_file_id(path).ok().flatten() == id {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(err);
+    }
+    let id = grant_file_id(&file)?;
+    drop(file);
+    if path_grant_file_id(path)? != Some(id) {
+        return Err(super::file_grant(path, super::FileGrantReason::NotRegular));
+    }
+    Ok(Some(super::CreatedGrant {
+        path: path.to_path_buf(),
+        id,
+    }))
+}
+
+pub(super) fn path_grant_file_id(path: &Path) -> Result<Option<super::FileId>, KernelError> {
+    use std::os::windows::io::FromRawHandle;
+    let wide = wide_path(path);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_ALL,
+            ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL,
+            ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        let err = unsafe { GetLastError() };
+        if err == 2 || err == 3 {
+            return Ok(None);
+        }
+        return Err(KernelError::Root(format!(
+            "{}: win32 {err}",
+            path.display()
+        )));
+    }
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    grant_file_id(&file).map(Some)
+}
+
+fn grant_file_id(file: &std::fs::File) -> Result<super::FileId, KernelError> {
+    use std::os::windows::io::AsRawHandle;
+    let mut info = ByHandleFileInformation {
+        file_attributes: 0,
+        creation_low: 0,
+        creation_high: 0,
+        access_low: 0,
+        access_high: 0,
+        write_low: 0,
+        write_high: 0,
+        volume_serial: 0,
+        size_high: 0,
+        size_low: 0,
+        number_of_links: 0,
+        file_index_high: 0,
+        file_index_low: 0,
+    };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+    if ok == 0 {
+        return Err(last_error("GetFileInformationByHandle"));
+    }
+    Ok(super::FileId {
+        volume: info.volume_serial,
+        index_high: info.file_index_high,
+        index_low: info.file_index_low,
+    })
+}
+
+fn protect_new_file(file: &std::fs::File) -> Result<(), KernelError> {
+    use std::os::windows::io::AsRawHandle;
+    let user = current_user_sid()?;
+    let mut acl_words = vec![0u32; 64];
+    let acl = acl_words.as_mut_ptr().cast::<u8>();
+    let ready = unsafe {
+        InitializeAcl(acl, acl_words.len() as Dword * 4, 2) != 0
+            && AddAccessAllowedAce(
+                acl,
+                2,
+                GENERIC_ALL | FILE_ALL_ACCESS,
+                user.as_ptr().cast_mut().cast(),
+            ) != 0
+    };
+    if !ready {
+        return Err(last_error("owner file DACL"));
+    }
+    let set = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            acl.cast(),
+            ptr::null_mut(),
+        )
+    };
+    if set != 0 {
+        return Err(win32_error("SetSecurityInfo owner file", set));
+    }
+    Ok(())
+}
+
+fn grant_create_dirs(
+    policy: &super::KernelPolicy,
+    sid: Handle,
+    guards: &mut Vec<AclRestore>,
+) -> Result<(), KernelError> {
+    for grant in policy.create_files() {
+        guards.push(set_create_dir_aces(&grant.directory, sid)?);
+    }
+    Ok(())
+}
+
+/// Create rights on `dir`, and read-write on files created later.
+///
+/// `SetNamedSecurityInfo` propagates an inheritable ACE into files that
+/// already exist, which would open `notes.txt` and walk `sessions`.
+/// `SetKernelObjectSecurity` changes this directory only. A file created
+/// afterwards still inherits the ACE.
+fn set_create_dir_aces(dir: &Path, sid: Handle) -> Result<AclRestore, KernelError> {
+    let wide = wide_path(dir);
+    let file = open_create_files_dir(&wide)?;
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut sacl = ptr::null_mut();
+    let mut sd = ptr::null_mut();
+    let got = unsafe {
+        GetSecurityInfo(
+            file.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    if got != 0 {
+        return Err(win32_error("GetSecurityInfo create-files", got));
+    }
+    let sd = LocalMem(sd);
+    let trustee = TrusteeW {
+        p_multiple_trustee: ptr::null_mut(),
+        multiple_trustee_operation: NO_MULTIPLE_TRUSTEE,
+        trustee_form: TRUSTEE_IS_SID,
+        trustee_type: TRUSTEE_IS_WELL_KNOWN_GROUP,
+        ptstr_name: sid,
+    };
+    let mut entries = [
+        ExplicitAccessW {
+            grf_access_permissions: CREATE_IN_DIR,
+            grf_access_mode: GRANT_ACCESS,
+            grf_inheritance: NO_INHERITANCE,
+            trustee,
+        },
+        ExplicitAccessW {
+            grf_access_permissions: NEW_FILE_RIGHTS,
+            grf_access_mode: GRANT_ACCESS,
+            grf_inheritance: OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE,
+            trustee,
+        },
+    ];
+    let mut new_acl = ptr::null_mut();
+    let set = unsafe { SetEntriesInAclW(2, entries.as_mut_ptr(), dacl, &mut new_acl) };
+    if set != 0 {
+        return Err(win32_error("SetEntriesInAclW create-files", set));
+    }
+    let new_acl = LocalMem(new_acl);
+    set_kernel_dacl(file.0, new_acl.0)?;
+    Ok(AclRestore {
+        path: wide,
+        object_type: FILE_NO_PROPAGATE,
+        _sd: sd,
+        dacl,
+        restored: false,
+    })
+}
+
+fn open_create_files_dir(wide: &[u16]) -> Result<CloseOnDrop, KernelError> {
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            READ_CONTROL | WRITE_DAC,
+            FILE_SHARE_ALL,
+            ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(last_error("open create-files directory"));
+    }
+    Ok(CloseOnDrop(handle))
+}
+
+fn set_kernel_dacl(handle: Handle, dacl: Handle) -> Result<(), KernelError> {
+    let mut sd = [0u64; 8];
+    let header = sd.as_mut_ptr().cast::<u8>();
+    let ok = unsafe { InitializeSecurityDescriptor(header, 1) };
+    if ok == 0 {
+        return Err(last_error("InitializeSecurityDescriptor"));
+    }
+    let ok = unsafe { SetSecurityDescriptorDacl(header, 1, dacl.cast(), 0) };
+    if ok == 0 {
+        return Err(last_error("SetSecurityDescriptorDacl"));
+    }
+    let ok = unsafe { SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, header.cast()) };
+    if ok == 0 {
+        return Err(last_error("SetKernelObjectSecurity"));
+    }
+    Ok(())
+}
+
+/// Test aid: a new grant file's DACL is protected and does not allow Everyone.
+#[cfg(test)]
+pub(super) fn dacl_is_owner_only(path: &Path) -> Result<bool, KernelError> {
+    let wide = wide_path(path);
+    let mut owner = ptr::null_mut();
+    let mut group = ptr::null_mut();
+    let mut dacl = ptr::null_mut();
+    let mut sacl = ptr::null_mut();
+    let mut sd = ptr::null_mut();
+    let got = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            &mut owner,
+            &mut group,
+            &mut dacl,
+            &mut sacl,
+            &mut sd,
+        )
+    };
+    if got != 0 {
+        return Err(win32_error("GetNamedSecurityInfoW owner check", got));
+    }
+    let control = unsafe { sd.cast::<u8>().add(2).cast::<u16>().read_unaligned() };
+    let _sd = LocalMem(sd);
+    if dacl.is_null() {
+        return Ok(false);
+    }
+    let world = WorldSid::new()?;
+    let count = u32::from(ace_count(dacl));
+    let mut world_allow = false;
+    for index in 0..count {
+        let mut ace = ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+            continue;
+        }
+        let bytes = ace.cast::<u8>();
+        let size = unsafe { u16::from_le_bytes([*bytes.add(2), *bytes.add(3)]) };
+        if size < 20 {
+            continue;
+        }
+        let kind = unsafe { *bytes };
+        if kind == 0 && unsafe { EqualSid(bytes.add(8).cast(), world.0) } != 0 {
+            world_allow = true;
+        }
+    }
+    Ok(control & 0x1000 != 0 && !world_allow)
 }
 
 fn last_error(op: &str) -> KernelError {
@@ -851,6 +1202,7 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
     let world = WorldSid::new()?;
     let mut acl_guards = grant_write_aces(&rw_paths, sid.0)?;
     grant_traverse_dirs(policy, sid.0, &mut acl_guards)?;
+    grant_create_dirs(policy, sid.0, &mut acl_guards)?;
     acl_guards.extend(deny_dest_aces(&dest_deny_paths(policy), world.0)?);
     acl_guards.extend(deny_dest_aces(&profile_secret_dirs(), sid.0)?);
     acl_guards.extend(allow_session_object_create(sid.0)?);
@@ -878,6 +1230,7 @@ fn prepare_network_blocked(policy: &KernelPolicy) -> Result<Prepared, KernelErro
         grant_package_root(&path, package_sid, &mut prepared.acl_guards)?;
     }
     grant_traverse_dirs(policy, package_sid, &mut prepared.acl_guards)?;
+    grant_create_dirs(policy, package_sid, &mut prepared.acl_guards)?;
     for path in read_grant_paths(policy) {
         grant_package_read(&path, package_sid, &mut prepared.acl_guards)?;
     }
@@ -2392,6 +2745,7 @@ fn prepare_reexec(policy: &super::KernelPolicy, program: &Path) -> Result<Prepar
             .map_err(|err| annotate_path(&path, err))?;
     }
     grant_traverse_dirs(policy, package_sid, &mut prepared.acl_guards)?;
+    grant_create_dirs(policy, package_sid, &mut prepared.acl_guards)?;
     for path in read_grant_paths(policy) {
         grant_package_read(&path, package_sid, &mut prepared.acl_guards)
             .map_err(|err| annotate_path(&path, err))?;
