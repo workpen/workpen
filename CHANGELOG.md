@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.9.0](https://github.com/workpen/workpen/compare/v0.8.0...v0.9.0) (2026-11-09)
+
+
+### Features
+
+* **wrap:** grant one file without walking its parent ([#344](https://github.com/workpen/workpen/issues/344)) ([66f7e19](https://github.com/workpen/workpen/commit/66f7e19ce4030901abc7611cb8e86a4bf0904efc))
+
+
+### Bug Fixes
+
+* quiet skipped namespace ACE and keep Windows live cwd ([#346](https://github.com/workpen/workpen/issues/346)) ([a1ab407](https://github.com/workpen/workpen/commit/a1ab40707a271336ca153a4b4595055c7ecc9407))
+* **wrap:** open a one-file grant through Linux parents ([#348](https://github.com/workpen/workpen/issues/348)) ([8b258a5](https://github.com/workpen/workpen/commit/8b258a597d34933a8e6a051ff3383250ccf811fc)), closes [#347](https://github.com/workpen/workpen/issues/347)
+
 ## [0.8.0](https://github.com/workpen/workpen/compare/v0.7.9...v0.8.0) (2026-11-07)
 
 
