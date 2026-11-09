@@ -298,6 +298,8 @@ fn classify_worktree_with_index(
 /// `leftover_dir` are Keep(UntrackedWorktree) and never removed.
 /// Untracked directories outside `leftover_dir` are not candidates.
 /// Dry-run uses the same live-cwd probe and does not delete.
+/// On Windows the probe reads other processes' working directories.
+/// If that list cannot be read, the tree stays.
 ///
 /// Uses [`DenyPolicy::default()`]. Hosts with extras should call
 /// [`run_gc_with_policy`].
@@ -482,9 +484,14 @@ fn paths_eq(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
     }
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+    let a = legacy_windows_path(a);
+    let b = legacy_windows_path(b);
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(&a), std::fs::canonicalize(&b)) {
         (Ok(ca), Ok(cb)) => ca == cb,
-        _ => a == b,
+        _ => false,
     }
 }
 
@@ -492,10 +499,26 @@ fn path_is_same_or_parent(root: &Path, inner: &Path) -> bool {
     if paths_eq(root, inner) {
         return true;
     }
-    match (std::fs::canonicalize(root), std::fs::canonicalize(inner)) {
+    let root = legacy_windows_path(root);
+    let inner = legacy_windows_path(inner);
+    match (std::fs::canonicalize(&root), std::fs::canonicalize(&inner)) {
         (Ok(r), Ok(i)) => i.starts_with(&r),
-        _ => inner.starts_with(root),
+        _ => inner.starts_with(&root),
     }
+}
+
+/// `\\?\C:\...` and `\\?\UNC\server\...` are the same paths as `C:\...`
+/// and `\\server\...`. Canonicalize cannot open the legacy form once it
+/// is past MAX_PATH, so the lexical check has to see one spelling.
+fn legacy_windows_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
 }
 
 fn worktree_has_live_cwd(path: &Path) -> bool {
@@ -529,7 +552,10 @@ fn worktree_has_live_cwd_from(
 }
 
 /// Other-process cwds. `Err` when an expected probe failed.
-/// Windows has no `/proc` and no `lsof`; that is not a probe failure.
+///
+/// On Windows, `Err` means this process's cwd could not be read or the
+/// process snapshot failed. A process that denies the read is omitted.
+/// An empty `Ok` is not a Windows result.
 fn other_process_cwds() -> Result<Vec<PathBuf>, ()> {
     #[cfg(test)]
     CWD_PROBE_COUNT.with(|slot| slot.set(slot.get().saturating_add(1)));
@@ -543,9 +569,13 @@ fn other_process_cwds() -> Result<Vec<PathBuf>, ()> {
     {
         lsof_process_cwds()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        Ok(Vec::new())
+        windows_process_cwds()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(())
     }
 }
 
@@ -585,6 +615,322 @@ fn lsof_process_cwds() -> Result<Vec<PathBuf>, ()> {
         return Err(());
     }
     Ok(paths)
+}
+
+#[cfg(windows)]
+const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+#[cfg(windows)]
+const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+#[cfg(windows)]
+const PROCESS_VM_READ: u32 = 0x0010;
+#[cfg(windows)]
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+#[cfg(windows)]
+fn windows_process_cwds() -> Result<Vec<PathBuf>, ()> {
+    // SAFETY: pseudo-handle for this process. Do not close it.
+    let self_cwd = process_cwd(unsafe { GetCurrentProcess() }).ok_or(())?;
+    // SAFETY: a process snapshot needs no extra privilege. Failure is
+    // INVALID_HANDLE, checked below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot.is_null() || snapshot == INVALID_HANDLE {
+        return Err(());
+    }
+    let snapshot = CloseHandleOnDrop(snapshot);
+    // SAFETY: the entry is plain integers. Zero is a valid start value.
+    let mut entry: ProcessEntry32W = unsafe { std::mem::zeroed() };
+    entry.size = u32::try_from(std::mem::size_of::<ProcessEntry32W>()).map_err(|_| ())?;
+    // SAFETY: `snapshot` owns the toolhelp handle and `entry.size` is set.
+    if unsafe { Process32FirstW(snapshot.0, &mut entry) } == 0 {
+        return Err(());
+    }
+    let self_pid = unsafe { GetCurrentProcessId() };
+    let mut cwds = vec![self_cwd];
+    loop {
+        if entry.process_id != 0 && entry.process_id != self_pid {
+            // Same-user processes are readable. System and other protected
+            // processes deny this open. Skipping those is not an empty list.
+            let access =
+                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION;
+            // SAFETY: pid came from the snapshot. A denied open returns null.
+            let handle = unsafe { OpenProcess(access, 0, entry.process_id) };
+            if !handle.is_null() && handle != INVALID_HANDLE {
+                let handle = CloseHandleOnDrop(handle);
+                if let Some(cwd) = process_cwd(handle.0) {
+                    cwds.push(cwd);
+                }
+            }
+        }
+        // SAFETY: same snapshot and entry as Process32FirstW.
+        if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
+            break;
+        }
+    }
+    Ok(cwds)
+}
+
+#[cfg(windows)]
+const INVALID_HANDLE: *mut core::ffi::c_void = -1isize as *mut core::ffi::c_void;
+
+#[cfg(windows)]
+struct CloseHandleOnDrop(*mut core::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for CloseHandleOnDrop {
+    fn drop(&mut self) {
+        if !self.0.is_null() && self.0 != INVALID_HANDLE {
+            // SAFETY: this value came from CreateToolhelp32Snapshot or OpenProcess.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum ProcBits {
+    W32,
+    W64,
+}
+
+#[cfg(windows)]
+fn process_cwd(process: *mut core::ffi::c_void) -> Option<PathBuf> {
+    if let Some(peb) = wow64_peb(process) {
+        return cwd_at(process, peb, ProcBits::W32);
+    }
+    let peb = native_peb(process)?;
+    let bits = if cfg!(target_pointer_width = "64") {
+        ProcBits::W64
+    } else {
+        ProcBits::W32
+    };
+    cwd_at(process, peb, bits)
+}
+
+#[cfg(windows)]
+fn native_peb(process: *mut core::ffi::c_void) -> Option<usize> {
+    let wide = cfg!(target_pointer_width = "64");
+    let pbi_len: u32 = if wide { 48 } else { 24 };
+    let mut pbi = [0u8; 48];
+    let mut ret = 0u32;
+    // SAFETY: class 0 is ProcessBasicInformation. `pbi` is our buffer.
+    let status = unsafe {
+        NtQueryInformationProcess(process, 0, pbi.as_mut_ptr().cast(), pbi_len, &mut ret)
+    };
+    if status < 0 {
+        return None;
+    }
+    let peb_off = if wide { 8 } else { 4 };
+    let width = if wide { 8 } else { 4 };
+    read_addr(&pbi, peb_off, width)
+}
+
+/// 32-bit PEB of a WOW64 process. Null when the process is native.
+#[cfg(windows)]
+fn wow64_peb(process: *mut core::ffi::c_void) -> Option<usize> {
+    if cfg!(not(target_pointer_width = "64")) {
+        return None;
+    }
+    let mut raw = [0u8; 8];
+    let mut ret = 0u32;
+    // SAFETY: class 26 is ProcessWow64Information. A native process
+    // stores a null pointer. `raw` is ours.
+    let status =
+        unsafe { NtQueryInformationProcess(process, 26, raw.as_mut_ptr().cast(), 8, &mut ret) };
+    if status < 0 {
+        return None;
+    }
+    read_addr(&raw, 0, 8)
+}
+
+#[cfg(windows)]
+fn cwd_at(process: *mut core::ffi::c_void, peb: usize, bits: ProcBits) -> Option<PathBuf> {
+    let (params_off, header_len, len_off, buf_off, ptr_width) = match bits {
+        ProcBits::W64 => (0x20, 0x50, 0x38, 0x40, 8),
+        ProcBits::W32 => (0x10, 0x30, 0x24, 0x28, 4),
+    };
+    let mut params_buf = [0u8; 8];
+    let slot = peb.checked_add(params_off)?;
+    if !read_remote(process, slot, &mut params_buf[..ptr_width]) {
+        return None;
+    }
+    let params = read_addr(&params_buf, 0, ptr_width)?;
+    let mut header = vec![0u8; header_len];
+    if !read_remote(process, params, &mut header) {
+        return None;
+    }
+    cwd_from_params(process, params, &header, len_off, buf_off, ptr_width)
+}
+
+#[cfg(windows)]
+fn cwd_from_params(
+    process: *mut core::ffi::c_void,
+    params: usize,
+    header: &[u8],
+    len_off: usize,
+    buf_off: usize,
+    ptr_width: usize,
+) -> Option<PathBuf> {
+    let flags = u32::from_ne_bytes(header.get(8..12)?.try_into().ok()?);
+    let normalized = flags & 1 != 0;
+    let nbytes = usize::from(u16::from_ne_bytes(
+        header.get(len_off..len_off + 2)?.try_into().ok()?,
+    ));
+    let raw = read_addr(header, buf_off, ptr_width)?;
+    let absolute = if normalized {
+        raw
+    } else {
+        params.checked_add(raw)?
+    };
+    let relative = if normalized {
+        params.checked_add(raw).unwrap_or(0)
+    } else {
+        raw
+    };
+    read_dos_path(process, absolute, nbytes).or_else(|| read_dos_path(process, relative, nbytes))
+}
+
+#[cfg(windows)]
+fn read_dos_path(process: *mut core::ffi::c_void, addr: usize, nbytes: usize) -> Option<PathBuf> {
+    if addr == 0 || nbytes == 0 || nbytes > 65_536 || !nbytes.is_multiple_of(2) {
+        return None;
+    }
+    let mut raw = vec![0u8; nbytes];
+    if !read_remote(process, addr, &mut raw) {
+        return None;
+    }
+    let mut units = Vec::with_capacity(nbytes / 2);
+    for chunk in raw.chunks_exact(2) {
+        units.push(u16::from_ne_bytes([chunk[0], chunk[1]]));
+    }
+    normalize_dos_cwd(&String::from_utf16_lossy(&units))
+}
+
+#[cfg(any(windows, test))]
+fn verbatim_if_long(legacy: &str, unc: bool) -> String {
+    let trimmed = if legacy.ends_with(":\\") || legacy.ends_with(":/") {
+        legacy.to_string()
+    } else {
+        legacy.trim_end_matches(['\\', '/']).to_string()
+    };
+    if trimmed.encode_utf16().count() <= 259 {
+        return trimmed;
+    }
+    if unc {
+        let body = trimmed.trim_start_matches('\\');
+        format!(r"\\?\UNC\{body}")
+    } else {
+        format!(r"\\?\{trimmed}")
+    }
+}
+
+#[cfg(any(windows, test))]
+fn normalize_dos_cwd(raw: &str) -> Option<PathBuf> {
+    let text = raw.trim_end_matches('\0').trim();
+    let rewritten = if let Some(rest) = text
+        .strip_prefix(r"\??\UNC\")
+        .or_else(|| text.strip_prefix(r"\\?\UNC\"))
+    {
+        verbatim_if_long(&format!(r"\\{rest}"), true)
+    } else if let Some(rest) = text
+        .strip_prefix(r"\??\")
+        .or_else(|| text.strip_prefix(r"\\?\"))
+    {
+        verbatim_if_long(rest, false)
+    } else {
+        text.to_string()
+    };
+    let trimmed = if rewritten.ends_with(":\\") || rewritten.ends_with(":/") {
+        rewritten
+    } else {
+        rewritten.trim_end_matches(['\\', '/']).to_string()
+    };
+    if trimmed.len() < 2
+        || !(trimmed.contains('\\')
+            || trimmed.contains('/')
+            || trimmed.as_bytes().get(1) == Some(&b':'))
+    {
+        return None;
+    }
+    Some(dunce::simplified(Path::new(&trimmed)).to_path_buf())
+}
+
+#[cfg(windows)]
+fn read_addr(buf: &[u8], offset: usize, width: usize) -> Option<usize> {
+    let bytes = buf.get(offset..offset.checked_add(width)?)?;
+    let mut addr = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        addr |= usize::from(*byte) << (index * 8);
+    }
+    if addr == 0 { None } else { Some(addr) }
+}
+
+#[cfg(windows)]
+fn read_remote(process: *mut core::ffi::c_void, addr: usize, buf: &mut [u8]) -> bool {
+    if addr == 0 || buf.is_empty() {
+        return false;
+    }
+    let mut got = 0usize;
+    // SAFETY: `process` is a process handle and `addr` is an address in
+    // that process. A bad address makes the call return false.
+    let ok = unsafe {
+        ReadProcessMemory(
+            process,
+            std::ptr::with_exposed_provenance(addr),
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut got,
+        )
+    };
+    ok != 0 && got == buf.len()
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct ProcessEntry32W {
+    size: u32,
+    cnt_usage: u32,
+    process_id: u32,
+    default_heap_id: usize,
+    module_id: u32,
+    threads: u32,
+    parent_process_id: u32,
+    pri_class_base: i32,
+    flags: u32,
+    exe_file: [u16; 260],
+}
+
+#[cfg(all(windows, target_pointer_width = "64"))]
+const _: () = assert!(std::mem::size_of::<ProcessEntry32W>() == 568);
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentProcess() -> *mut core::ffi::c_void;
+    fn GetCurrentProcessId() -> u32;
+    fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+    fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut core::ffi::c_void;
+    fn Process32FirstW(snapshot: *mut core::ffi::c_void, entry: *mut ProcessEntry32W) -> i32;
+    fn Process32NextW(snapshot: *mut core::ffi::c_void, entry: *mut ProcessEntry32W) -> i32;
+    fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> *mut core::ffi::c_void;
+    fn ReadProcessMemory(
+        process: *mut core::ffi::c_void,
+        base: *const core::ffi::c_void,
+        buffer: *mut u8,
+        size: usize,
+        read: *mut usize,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQueryInformationProcess(
+        process: *mut core::ffi::c_void,
+        class: u32,
+        info: *mut core::ffi::c_void,
+        len: u32,
+        ret_len: *mut u32,
+    ) -> i32;
 }
 
 /// Newest of HEAD committer time (`git log -1 --format=%ct`), index
@@ -1836,6 +2182,129 @@ mod parse_tests {
             !worktree_has_live_cwd_from(tree.path(), Some(elsewhere.path()), Ok(&[])),
             "successful empty scan is not live"
         );
+    }
+
+    struct StopChild(std::process::Child);
+
+    impl Drop for StopChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn idle_in(dir: &Path) -> std::process::Command {
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut program = PathBuf::from("ping");
+            if let Some(root) = std::env::var_os("SystemRoot") {
+                let wow = Path::new(&root).join("SysWOW64").join("ping.exe");
+                if wow.is_file() {
+                    program = wow;
+                }
+            }
+            let mut cmd = std::process::Command::new(program);
+            cmd.args(["-n", "30", "127.0.0.1"]);
+            cmd
+        };
+        #[cfg(not(windows))]
+        let mut cmd = {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("30");
+            cmd
+        };
+        cmd.current_dir(dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd
+    }
+
+    #[test]
+    fn dos_cwd_keeps_unc_and_a_long_verbatim_prefix() {
+        let cases = [
+            (r"\??\C:\work\", r"C:\work"),
+            (r"\??\UNC\server\share\wt", r"\\server\share\wt"),
+            (r"\\?\UNC\server\share\wt\", r"\\server\share\wt"),
+            (r"C:\work\", r"C:\work"),
+            (r"\\server\share\wt", r"\\server\share\wt"),
+            (r"C:\", r"C:\"),
+        ];
+        for (raw, want) in cases {
+            let got = super::normalize_dos_cwd(raw).unwrap_or_else(|| panic!("cwd {raw}"));
+            assert_eq!(got, PathBuf::from(want), "{raw}");
+        }
+        let long_rest = format!(r"C:\{}", "a".repeat(300));
+        let long = format!(r"\??\{long_rest}");
+        let got = super::normalize_dos_cwd(&long).expect("long cwd");
+        let text = got.to_string_lossy();
+        assert!(
+            text.starts_with(r"\\?\"),
+            "a path past MAX_PATH must keep the verbatim prefix: {text}"
+        );
+        let unc_prefix = r"\\server\share\";
+        let extra = 260usize.saturating_sub(unc_prefix.encode_utf16().count());
+        let unc_rest = format!(r"server\share\{}", "c".repeat(extra));
+        let unc_raw = format!(r"\??\UNC\{unc_rest}");
+        let unc = super::normalize_dos_cwd(&unc_raw).expect("unc 260");
+        let unc_text = unc.to_string_lossy();
+        assert!(
+            unc_text.starts_with(r"\\?\UNC\"),
+            "a 260-character UNC cwd must keep the verbatim prefix: {unc_text}"
+        );
+        assert!(
+            super::path_is_same_or_parent(Path::new(&long_rest), got.as_path()),
+            "verbatim cwd must match the legacy worktree path"
+        );
+        let unc_legacy = format!(r"\\{unc_rest}");
+        assert!(
+            super::path_is_same_or_parent(Path::new(&unc_legacy), unc.as_path()),
+            "verbatim UNC cwd must match the legacy worktree path"
+        );
+    }
+
+    #[test]
+    fn age_gc_keeps_another_process_cwd_then_reclaims_after_it_exits() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let repo = sample_repo(dir.path());
+        let sibling = dir.path().join("feature");
+        link_worktree(&repo, &sibling, "feature");
+        let mine = std::env::current_dir().expect("cwd");
+        let seen = super::other_process_cwds().expect("cwd probe");
+        assert!(
+            seen.iter().any(|cwd| super::paths_eq(cwd, &mine)),
+            "the probe must see this process, not an empty success: {seen:?} mine {mine:?}"
+        );
+        let mut held = StopChild(idle_in(&sibling).spawn().expect("idle child"));
+        let during = super::other_process_cwds().expect("cwd probe while child runs");
+        assert!(
+            during
+                .iter()
+                .any(|cwd| super::path_is_same_or_parent(&sibling, cwd)),
+            "another process cwd must be visible: {sibling:?} in {during:?}"
+        );
+        let cfg = opted_in(&repo, false);
+        let rows = run_gc(&repo, &cfg).expect("gc while the child is inside the tree");
+        let decision = rows
+            .iter()
+            .find(|(path, _)| super::paths_eq(path, &sibling))
+            .map(|(_, decision)| decision);
+        match decision {
+            Some(GcDecision::Keep {
+                reason: KeepReason::LiveCwd,
+            }) => {}
+            other => panic!("a live cwd must stay, got {other:?} rows {rows:?}"),
+        }
+        assert!(sibling.exists(), "live cwd must not be removed");
+        let _ = held.0.kill();
+        let _ = held.0.wait();
+        let rows = run_gc(&repo, &cfg).expect("gc after the child exits");
+        assert!(
+            rows.iter()
+                .any(|(_, decision)| matches!(decision, GcDecision::Reclaim { .. })),
+            "the tree must be reclaimed once its cwd is gone: {rows:?}"
+        );
+        assert!(!sibling.exists(), "exited cwd must be removed");
     }
 
     #[test]
