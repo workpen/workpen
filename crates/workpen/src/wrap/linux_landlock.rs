@@ -192,12 +192,13 @@ fn path_access(
 
 #[cfg(test)]
 mod tests {
-    use landlock::AccessFs;
+    use landlock::{AccessFs, BitFlags};
 
     use super::ancestor_walk_access;
 
     #[test]
     fn ancestor_walk_is_execute_only() {
-        assert_eq!(ancestor_walk_access(), AccessFs::Execute.into());
+        let execute: BitFlags<AccessFs> = AccessFs::Execute.into();
+        assert_eq!(ancestor_walk_access(), execute);
     }
 }
