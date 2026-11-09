@@ -13,7 +13,11 @@
 //! # Layers
 //!
 //! * **PathGuard** refuses filesystem root and `$HOME` as the workspace
-//!   or extra-root.
+//!   or extra-root. [`crate::KernelPolicy::with_write_file`] grants one
+//!   existing regular file. It does not walk the parent and does not
+//!   make that parent a read-write root. Windows adds traverse on that
+//!   parent and a write ACE on the file. A deny glob that names that
+//!   file is not applied to it. Siblings stay outside the grant.
 //! * **Userspace dest-deny** refuses secret dests in argv and
 //!   [`crate::check_dest`] before spawn.
 //! * **Kernel dest-deny** hides existing dests after spawn: Linux

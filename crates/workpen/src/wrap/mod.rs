@@ -106,6 +106,11 @@ pub struct KernelPolicy {
     /// Read by [`Self::require_spawn`] on Unix. Windows has no remount.
     #[cfg_attr(not(unix), allow(dead_code))]
     require_dest_hide: bool,
+    /// Parent directories of [`Self::with_write_file`] grants.
+    /// The bool is true for the file's parent (the ACE is required)
+    /// and false for higher ancestors (access denied is skipped).
+    #[cfg(windows)]
+    traverse_dirs: Vec<(PathBuf, bool)>,
 }
 
 /// Result of applying the jail. Hosts match the variant, not English.
@@ -1089,6 +1094,8 @@ pub fn process_jail_with_policy(
         deny_policy: policy.clone(),
         network_blocked: true,
         require_dest_hide: false,
+        #[cfg(windows)]
+        traverse_dirs: Vec::new(),
     })
 }
 
@@ -1157,6 +1164,47 @@ impl KernelPolicy {
             &mut self.dest_denies,
             &mut remaining,
         )?;
+        Ok(self)
+    }
+
+    /// Read-write grant for one existing regular file.
+    ///
+    /// Does not walk the parent, so a sibling tree such as
+    /// `~/.grok/sessions` is not charged against the dest-deny
+    /// entry cap. The parent is not a read-write root. Windows
+    /// adds traverse on that parent and a write ACE on the file.
+    /// Siblings stay outside the grant.
+    ///
+    /// A deny glob that matches this file (`**/auth.json`) is not
+    /// applied to it. The host asked for this file. A symlink is
+    /// refused. A missing path is refused.
+    pub fn with_write_file(mut self, path: &Path) -> Result<Self, KernelError> {
+        let meta = std::fs::symlink_metadata(path)
+            .map_err(|err| KernelError::Root(format!("{}: {err}", path.display())))?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(KernelError::Root(format!(
+                "{} is not a regular file",
+                path.display()
+            )));
+        }
+        let resolved = std::fs::canonicalize(path)
+            .map_err(|err| KernelError::Root(format!("{}: {err}", path.display())))?;
+        if is_fs_root(&resolved) || is_drive_root(&resolved) {
+            return Err(KernelError::FsRoot(resolved));
+        }
+        self.dest_denies.retain(|deny| {
+            !same_existing_path(&deny.path, path) && !same_existing_path(&deny.path, &resolved)
+        });
+        if !is_fs_root(path) && path != resolved.as_path() {
+            push_grant(
+                &mut self.grants,
+                path.to_path_buf(),
+                KernelAccess::ReadWrite,
+            );
+        }
+        #[cfg(windows)]
+        record_file_traverse(&mut self.traverse_dirs, &resolved);
+        push_grant(&mut self.grants, resolved, KernelAccess::ReadWrite);
         Ok(self)
     }
 
@@ -3280,6 +3328,56 @@ fn is_fs_root(path: &Path) -> bool {
     }
 }
 
+/// `C:\` and `\\?\C:\`. Those are not file parents we can jail.
+fn is_drive_root(path: &Path) -> bool {
+    let text = path.to_string_lossy().replace('/', "\\");
+    let text = text
+        .strip_prefix("\\\\?\\")
+        .unwrap_or(text.as_str())
+        .trim_end_matches('\\');
+    text.len() == 2 && text.as_bytes().get(1) == Some(&b':')
+}
+
+fn same_existing_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// The file's parent only.
+///
+/// Higher directories such as the user profile are not rewritten.
+/// `SetNamedSecurityInfo` on those trees is slow, and a jail that can
+/// already open a temp workspace can traverse them.
+#[cfg(windows)]
+fn file_ancestor_dirs(file: &Path) -> Vec<PathBuf> {
+    match file.parent() {
+        Some(dir) if !is_fs_root(dir) && !is_drive_root(dir) && !dir.as_os_str().is_empty() => {
+            vec![dir.to_path_buf()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(windows)]
+fn record_file_traverse(dirs: &mut Vec<(PathBuf, bool)>, file: &Path) {
+    let mut required = true;
+    for dir in file_ancestor_dirs(file) {
+        if let Some(existing) = dirs.iter_mut().find(|(path, _)| path == &dir) {
+            if required {
+                existing.1 = true;
+            }
+        } else {
+            dirs.push((dir, required));
+        }
+        required = false;
+    }
+}
+
 #[cfg(all(test, unix))]
 mod timeout_deadline_tests {
     use std::time::Duration;
@@ -3690,5 +3788,123 @@ mod doctor_facts_tests {
     #[test]
     fn setup_failure_fails() {
         assert!(doctor_fails(facts(true, None, None, true)));
+    }
+}
+
+#[cfg(test)]
+mod write_file_grant_tests {
+    use std::path::Path;
+
+    use super::{KernelAccess, process_jail};
+
+    fn grant_is_file(policy: &super::KernelPolicy, file: &Path) -> bool {
+        let want = std::fs::canonicalize(file).expect("canon");
+        policy.grants().iter().any(|grant| {
+            grant.access == KernelAccess::ReadWrite && (grant.path == file || grant.path == want)
+        })
+    }
+
+    #[test]
+    fn write_file_does_not_grant_or_walk_the_parent() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        let sessions = grok.join("sessions");
+        std::fs::create_dir_all(&sessions).expect("sessions");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = grok.join("auth.json");
+        std::fs::write(&auth, b"{}\n").expect("auth");
+        std::fs::write(sessions.join("one.log"), b"log\n").expect("log");
+        let policy = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&auth)
+            .expect("file grant");
+        assert!(grant_is_file(&policy, &auth), "auth.json must be writable");
+        let grok_canon = std::fs::canonicalize(&grok).expect("grok");
+        assert!(
+            policy
+                .grants()
+                .iter()
+                .all(|grant| grant.path != grok && grant.path != grok_canon),
+            "the parent directory must not be a grant: {:?}",
+            policy.grants()
+        );
+        assert!(
+            policy
+                .dest_denies()
+                .iter()
+                .all(|deny| !deny.path.starts_with(&sessions) && !deny.path.ends_with("auth.json")),
+            "sessions and auth.json must not be dest-deny walked: {:?}",
+            policy.dest_denies()
+        );
+        #[cfg(windows)]
+        {
+            assert!(
+                policy
+                    .traverse_dirs
+                    .iter()
+                    .any(|(dir, required)| dir == &grok_canon && *required),
+                "the parent needs traverse, not a write root"
+            );
+        }
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&grok)
+            .expect_err("a directory is not a file grant");
+        let super::KernelError::Root(msg) = err else {
+            panic!("expected Root, got {err}");
+        };
+        assert!(msg.contains("not a regular file"), "{msg}");
+    }
+
+    #[test]
+    fn write_file_clears_a_deny_glob_on_that_file() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = workspace.join("auth.json");
+        std::fs::write(&auth, b"{}\n").expect("auth");
+        let walked = process_jail(&workspace, std::iter::empty::<&Path>()).expect("jail");
+        assert!(
+            walked
+                .dest_denies()
+                .iter()
+                .any(|deny| deny.path.ends_with("auth.json")),
+            "workspace walk must still dest-deny auth.json before the file grant"
+        );
+        let granted = walked.with_write_file(&auth).expect("file grant");
+        assert!(
+            granted
+                .dest_denies()
+                .iter()
+                .all(|deny| !deny.path.ends_with("auth.json")),
+            "the explicit file grant must drop the auth.json deny: {:?}",
+            granted.dest_denies()
+        );
+        assert!(grant_is_file(&granted, &auth));
+    }
+
+    #[test]
+    fn write_file_refuses_a_symlink() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = workspace.join("auth.json");
+        std::fs::write(&auth, b"{}\n").expect("auth");
+        let link = workspace.join("link.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&auth, &link).expect("symlink");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&auth, &link).expect("symlink");
+        #[cfg(not(any(unix, windows)))]
+        return;
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&link)
+            .expect_err("symlink");
+        let super::KernelError::Root(msg) = err else {
+            panic!("expected Root, got {err}");
+        };
+        assert!(msg.contains("not a regular file"), "{msg}");
     }
 }

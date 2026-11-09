@@ -37,6 +37,11 @@ const SECURITY_WORLD_SID_AUTHORITY: [u8; 6] = [0, 0, 0, 0, 0, 1];
 const SECURITY_RESTRICTED_CODE_RID: Dword = 12;
 const SECURITY_WORLD_RID: Dword = 0;
 const GENERIC_ALL: Dword = 0x1000_0000;
+const FILE_TRAVERSE: Dword = 0x0020;
+const FILE_READ_ATTRIBUTES: Dword = 0x0080;
+const SYNCHRONIZE: Dword = 0x0010_0000;
+/// Open a known child by name. Not list, not create, not write.
+const TRAVERSE_ONLY: Dword = FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const GRANT_ACCESS: u32 = 1;
 const DENY_ACCESS: u32 = 3;
 const NO_INHERITANCE: Dword = 0;
@@ -845,6 +850,7 @@ fn prepare_write_restricted(policy: &KernelPolicy) -> Result<Prepared, KernelErr
     let sid = RestrictedSid::new()?;
     let world = WorldSid::new()?;
     let mut acl_guards = grant_write_aces(&rw_paths, sid.0)?;
+    grant_traverse_dirs(policy, sid.0, &mut acl_guards)?;
     acl_guards.extend(deny_dest_aces(&dest_deny_paths(policy), world.0)?);
     acl_guards.extend(deny_dest_aces(&profile_secret_dirs(), sid.0)?);
     acl_guards.extend(allow_session_object_create(sid.0)?);
@@ -871,6 +877,7 @@ fn prepare_network_blocked(policy: &KernelPolicy) -> Result<Prepared, KernelErro
     for path in rw_grant_paths(policy) {
         grant_package_root(&path, package_sid, &mut prepared.acl_guards)?;
     }
+    grant_traverse_dirs(policy, package_sid, &mut prepared.acl_guards)?;
     for path in read_grant_paths(policy) {
         grant_package_read(&path, package_sid, &mut prepared.acl_guards)?;
     }
@@ -2383,6 +2390,7 @@ fn prepare_reexec(policy: &super::KernelPolicy, program: &Path) -> Result<Prepar
         grant_package_root(&path, package_sid, &mut prepared.acl_guards)
             .map_err(|err| annotate_path(&path, err))?;
     }
+    grant_traverse_dirs(policy, package_sid, &mut prepared.acl_guards)?;
     for path in read_grant_paths(policy) {
         grant_package_read(&path, package_sid, &mut prepared.acl_guards)
             .map_err(|err| annotate_path(&path, err))?;
@@ -3286,13 +3294,30 @@ fn grant_write_aces(paths: &[PathBuf], sid: Handle) -> Result<Vec<AclRestore>, K
 }
 
 fn grant_write_ace(path: &Path, sid: Handle) -> Result<AclRestore, KernelError> {
-    set_acl_entry(
-        path,
-        sid,
-        GENERIC_ALL,
-        GRANT_ACCESS,
-        SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-    )
+    let inherit = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => NO_INHERITANCE,
+        _ => SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    };
+    set_acl_entry(path, sid, GENERIC_ALL, GRANT_ACCESS, inherit)
+}
+
+/// Traverse-only ACE. A required directory (the file's parent) fails
+/// the spawn when the ACE cannot be set. A higher ancestor that
+/// refuses the write is skipped. The user profile often already
+/// allows traverse, and `C:\Users` may not be writable.
+fn grant_traverse_dirs(
+    policy: &super::KernelPolicy,
+    sid: Handle,
+    guards: &mut Vec<AclRestore>,
+) -> Result<(), KernelError> {
+    for (dir, required) in &policy.traverse_dirs {
+        match set_acl_entry(dir, sid, TRAVERSE_ONLY, GRANT_ACCESS, NO_INHERITANCE) {
+            Ok(guard) => guards.push(guard),
+            Err(err) if !required && acl_is_access_denied(&err) => {}
+            Err(err) => return Err(annotate_path(dir, err)),
+        }
+    }
+    Ok(())
 }
 
 fn set_acl_entry(

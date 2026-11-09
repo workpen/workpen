@@ -232,6 +232,128 @@ fn jail(path: &Path) -> Result<KernelPolicy, String> {
     process_jail(path, std::iter::empty::<&Path>()).map_err(|err| err.to_string())
 }
 
+/// One file outside the workspace is readable and writable. A sibling
+/// in that directory is not. The parent directory is not a write root,
+/// so this does not walk `sessions`.
+#[cfg(windows)]
+#[test]
+fn reexec_write_file_grant() {
+    windows_write_file().unwrap_or_else(|err| panic!("FAIL: {err}"));
+}
+
+#[cfg(windows)]
+fn windows_write_file() -> Result<(), String> {
+    let base = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is unset")?;
+    let root = PathBuf::from(base).join(format!("workpen-write-file-{}", std::process::id()));
+    let _cleanup = RemoveDir(root.clone());
+    let grok = root.join("grok");
+    let sessions = grok.join("sessions");
+    std::fs::create_dir_all(&sessions).map_err(|err| err.to_string())?;
+    let auth = grok.join("auth.json");
+    std::fs::write(&auth, b"old-token\n").map_err(|err| err.to_string())?;
+    let secret = grok.join("secret.txt");
+    std::fs::write(&secret, b"sibling-secret\n").map_err(|err| err.to_string())?;
+    std::fs::write(sessions.join("one.log"), b"log\n").map_err(|err| err.to_string())?;
+    let workspace = tempfile::tempdir().map_err(|err| err.to_string())?;
+    let policy = jail(workspace.path())?
+        .with_write_file(&auth)
+        .map_err(|err| err.to_string())?;
+    let grok_canon = std::fs::canonicalize(&grok).map_err(|err| err.to_string())?;
+    if policy.grants().iter().any(|grant| grant.path == grok_canon) {
+        return Err("parent directory was granted".into());
+    }
+    let mut cmd = Command::new(std::env::current_exe().map_err(|err| err.to_string())?);
+    cmd.args(["--exact", "reexec_file_probe_child", "--nocapture"])
+        .env("WORKPEN_REEXEC_FILE_PROBE", "1")
+        .env("WORKPEN_REEXEC_AUTH", &auth)
+        .env("WORKPEN_REEXEC_SECRET", &secret)
+        .env("WORKPEN_REEXEC_LOG", sessions.join("one.log"))
+        .current_dir(workspace.path());
+    let (applied, output) = policy
+        .spawn_reexec_output(cmd)
+        .map_err(|err| format!("spawn_reexec: {err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!(
+            "file probe status {:?} applied {applied:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        ));
+    }
+    if !has_line(&stdout, "AUTH=wrote")
+        || !has_line(&stdout, "SECRET=denied")
+        || !has_line(&stdout, "LOG=denied")
+    {
+        return Err(format!(
+            "file probe lines\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        ));
+    }
+    let body = std::fs::read_to_string(&auth).map_err(|err| err.to_string())?;
+    if body != "new-token\n" {
+        return Err(format!("auth body {body:?}"));
+    }
+    let secret_body = std::fs::read_to_string(&secret).map_err(|err| err.to_string())?;
+    if secret_body != "sibling-secret\n" {
+        return Err(format!("sibling changed {secret_body:?}"));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+struct RemoveDir(PathBuf);
+
+#[cfg(windows)]
+impl Drop for RemoveDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn reexec_file_probe_child() {
+    if std::env::var_os("WORKPEN_REEXEC_FILE_PROBE").is_none() {
+        return;
+    }
+    std::process::exit(file_probe());
+}
+
+#[cfg(windows)]
+fn file_probe() -> i32 {
+    let (Some(auth), Some(secret), Some(log)) = (
+        env_path("WORKPEN_REEXEC_AUTH"),
+        env_path("WORKPEN_REEXEC_SECRET"),
+        env_path("WORKPEN_REEXEC_LOG"),
+    ) else {
+        println!("PROBE=bad-env");
+        return 2;
+    };
+    let Ok(text) = std::fs::read_to_string(&auth) else {
+        println!("AUTH=denied");
+        return 1;
+    };
+    if text != "old-token\n" {
+        println!("AUTH=changed");
+        return 1;
+    }
+    match std::fs::write(&auth, b"new-token\n") {
+        Ok(()) => println!("AUTH=wrote"),
+        Err(err) => {
+            println!("AUTH=fail {err}");
+            return 1;
+        }
+    }
+    match std::fs::read(&secret) {
+        Ok(_) => println!("SECRET=read"),
+        Err(_) => println!("SECRET=denied"),
+    }
+    match std::fs::read(&log) {
+        Ok(_) => println!("LOG=read"),
+        Err(_) => println!("LOG=denied"),
+    }
+    0
+}
+
 fn probe() -> i32 {
     let (Some(rw), Some(outside), Some(hidden), Some(sys)) = (
         env_path("WORKPEN_REEXEC_RW"),
