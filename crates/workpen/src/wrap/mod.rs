@@ -5011,9 +5011,10 @@ mod write_file_grant_tests {
             .with_write_file(&lock)
             .expect("lock");
         assert!(
-            super::windows::dacl_is_owner_only(&lock).expect("dacl"),
+            super::windows::dacl_is_protected(&lock).expect("dacl"),
             "a new lock must not keep the parent ACL"
         );
+        assert_eq!(std::fs::read(&lock).expect("lock bytes"), b"");
         std::fs::write(grok.join("auth.json"), b"{token}\n").expect("auth");
         let auth = grok.join("auth.json");
         process_jail(&workspace, std::iter::empty::<&Path>())
@@ -5022,7 +5023,7 @@ mod write_file_grant_tests {
             .expect("existing");
         assert_eq!(std::fs::read(&auth).expect("bytes"), b"{token}\n");
         assert!(
-            !super::windows::dacl_is_owner_only(&auth).expect("existing dacl"),
+            !super::windows::dacl_is_protected(&auth).expect("existing dacl"),
             "an existing login file must keep its ACL"
         );
     }

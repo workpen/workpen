@@ -1031,9 +1031,12 @@ fn set_kernel_dacl(handle: Handle, dacl: Handle) -> Result<(), KernelError> {
     Ok(())
 }
 
-/// Test aid: a new grant file's DACL is protected and does not allow Everyone.
+/// Test aid: the DACL is present and `SE_DACL_PROTECTED` is set.
+///
+/// A protected DACL does not inherit the parent directory's ACL.
+/// A null DACL would allow everyone, so that is not protected.
 #[cfg(test)]
-pub(super) fn dacl_is_owner_only(path: &Path) -> Result<bool, KernelError> {
+pub(super) fn dacl_is_protected(path: &Path) -> Result<bool, KernelError> {
     let wide = wide_path(path);
     let mut owner = ptr::null_mut();
     let mut group = ptr::null_mut();
@@ -1055,30 +1058,10 @@ pub(super) fn dacl_is_owner_only(path: &Path) -> Result<bool, KernelError> {
     if got != 0 {
         return Err(win32_error("GetNamedSecurityInfoW owner check", got));
     }
+    // SECURITY_DESCRIPTOR.Control is the u16 at offset 2.
     let control = unsafe { sd.cast::<u8>().add(2).cast::<u16>().read_unaligned() };
     let _sd = LocalMem(sd);
-    if dacl.is_null() {
-        return Ok(false);
-    }
-    let world = WorldSid::new()?;
-    let count = u32::from(ace_count(dacl));
-    let mut world_allow = false;
-    for index in 0..count {
-        let mut ace = ptr::null_mut();
-        if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
-            continue;
-        }
-        let bytes = ace.cast::<u8>();
-        let size = unsafe { u16::from_le_bytes([*bytes.add(2), *bytes.add(3)]) };
-        if size < 20 {
-            continue;
-        }
-        let kind = unsafe { *bytes };
-        if kind == 0 && unsafe { EqualSid(bytes.add(8).cast(), world.0) } != 0 {
-            world_allow = true;
-        }
-    }
-    Ok(control & 0x1000 != 0 && !world_allow)
+    Ok(!dacl.is_null() && control & 0x1000 != 0)
 }
 
 fn last_error(op: &str) -> KernelError {
