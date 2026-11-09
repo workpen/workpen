@@ -14,6 +14,22 @@ fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
 }
 
+/// Doc comments and wrapped markdown, as one line of words.
+fn prose(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("///")
+                .or_else(|| trimmed.strip_prefix("//!"))
+                .unwrap_or(trimmed)
+                .trim()
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// First `version = "..."` under `[package]`.
 fn package_version(manifest: &str) -> String {
     let mut in_package = false;
@@ -264,6 +280,22 @@ fn cli_lock_omits_reqwest_and_keeps_nono_defaults_off() {
     assert!(rustdoc.contains("does not depend on `reqwest`"));
     assert!(rustdoc.contains("does not link `aws-lc-sys`"));
     assert!(rustdoc.contains("no nono feature"));
+}
+
+#[test]
+fn one_file_grant_contract_is_pinned() {
+    let root = repo_root();
+    let sentence = "Landlock has no access right that walks a directory without that execute";
+    let created = "created empty, mode 0600 on Unix";
+    for rel in [
+        "docs/threat-model.md",
+        "crates/workpen/src/threat_model.rs",
+        "crates/workpen/src/wrap/mod.rs",
+    ] {
+        let text = prose(&read(&root.join(rel)));
+        assert!(text.contains(sentence), "{rel} missing the Landlock limit");
+        assert!(text.contains(created), "{rel} missing the empty-file grant");
+    }
 }
 
 #[test]
