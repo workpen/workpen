@@ -37,6 +37,8 @@ use crate::deny::{
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod linux_landlock;
 #[cfg(unix)]
 mod pty;
 #[cfg(unix)]
@@ -1173,6 +1175,10 @@ impl KernelPolicy {
     /// `~/.grok/sessions` is not charged against the dest-deny
     /// entry cap. The parent is not a read-write root. Windows
     /// adds traverse on that parent and a write ACE on the file.
+    /// Linux adds execute (traverse) on each ancestor directory in
+    /// the same Landlock ruleset. That does not grant listing or
+    /// reading children. Landlock's execute right on a directory
+    /// also allows executing other files beneath that directory.
     /// Siblings stay outside the grant.
     ///
     /// A deny glob that matches this file (`**/auth.json`) is not
@@ -1270,7 +1276,7 @@ impl KernelPolicy {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let caps = self.to_capability_set(nono::SignalMode::AllowAll)?;
-            nono::Sandbox::apply_auto(&caps).map_err(|e| KernelError::Apply(e.to_string()))?;
+            apply_kernel_caps(&caps)?;
             Ok(KernelApply::Applied)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1384,6 +1390,8 @@ impl KernelPolicy {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let caps = self.to_capability_set(nono::SignalMode::Isolated)?;
+            #[cfg(target_os = "linux")]
+            let file_ancestors = uncovered_file_ancestors(&caps);
             let mut dests: Vec<PathBuf> = self.dest_denies.iter().map(|d| d.path.clone()).collect();
             dests.extend(extra_dests);
             let workspace = self
@@ -1417,8 +1425,21 @@ impl KernelPolicy {
                     #[cfg(not(target_os = "linux"))]
                     let _ = (&dests, &workspace);
                     apply_child_hardening()?;
-                    nono::Sandbox::apply_auto(&caps)
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    #[cfg(target_os = "linux")]
+                    {
+                        if file_ancestors.is_empty() {
+                            let _ = nono::Sandbox::apply_auto(&caps)
+                                .map_err(|err| std::io::Error::other(err.to_string()))?;
+                        } else {
+                            linux_landlock::apply_landlock_with_ancestors(&caps, &file_ancestors)
+                                .map_err(|err| std::io::Error::other(err.to_string()))?;
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        nono::Sandbox::apply_auto(&caps)
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    }
                     Ok(())
                 });
             }
@@ -2040,7 +2061,66 @@ impl KernelPolicy {
         };
         Ok(caps.set_signal_mode(signal))
     }
+}
 
+#[cfg(unix)]
+fn apply_kernel_caps(caps: &nono::CapabilitySet) -> Result<(), KernelError> {
+    #[cfg(target_os = "linux")]
+    {
+        let ancestors = uncovered_file_ancestors(caps);
+        if ancestors.is_empty() {
+            match nono::Sandbox::apply_auto(caps) {
+                Ok(_) => Ok(()),
+                Err(err) => Err(KernelError::Apply(err.to_string())),
+            }
+        } else {
+            linux_landlock::apply_landlock_with_ancestors(caps, &ancestors)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        nono::Sandbox::apply_auto(caps).map_err(|err| KernelError::Apply(err.to_string()))
+    }
+}
+
+/// Ancestor directories of file grants that no directory grant already covers.
+///
+/// A directory grant includes execute for that directory and everything
+/// beneath it. Higher directories still need their own execute right, or
+/// an absolute open stops there. `/` is omitted: executing `/bin/sh`
+/// already works without a rule on the filesystem root.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn uncovered_file_ancestors(caps: &nono::CapabilitySet) -> Vec<PathBuf> {
+    let dirs: Vec<&Path> = caps
+        .fs_capabilities()
+        .iter()
+        .filter(|cap| !cap.is_file)
+        .map(|cap| cap.resolved.as_path())
+        .collect();
+    let mut out = Vec::new();
+    for cap in caps.fs_capabilities() {
+        if !cap.is_file {
+            continue;
+        }
+        let mut cursor = cap.resolved.parent();
+        while let Some(dir) = cursor {
+            if is_fs_root(dir) {
+                break;
+            }
+            let covered = dirs
+                .iter()
+                .any(|root| dir == *root || dir.starts_with(root));
+            if !covered && !out.iter().any(|got| got == dir) {
+                out.push(dir.to_path_buf());
+            }
+            cursor = dir.parent();
+        }
+    }
+    out
+}
+
+impl KernelPolicy {
     /// Dest-deny `cmd` argv with the jail [`DenyPolicy`] before spawn.
     ///
     /// Relative dests resolve against `cmd.current_dir()` when set, else
@@ -3907,5 +3987,37 @@ mod write_file_grant_tests {
             panic!("expected Root, got {err}");
         };
         assert!(msg.contains("not a regular file"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_traverse_dirs_are_not_grants() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = grok.join("auth.json");
+        std::fs::write(&auth, b"{}\n").expect("auth");
+        let policy = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&auth)
+            .expect("file grant");
+        let caps = policy
+            .to_capability_set(nono::SignalMode::Isolated)
+            .expect("caps");
+        let extra = super::uncovered_file_ancestors(&caps);
+        let grok_canon = std::fs::canonicalize(&grok).expect("grok");
+        assert!(
+            extra.iter().any(|dir| dir == &grok_canon),
+            "the parent directory needs traverse: {extra:?}"
+        );
+        assert!(
+            extra
+                .iter()
+                .all(|dir| policy.grants().iter().all(|grant| grant.path != *dir)),
+            "traverse directories must not be grants: {extra:?} {:?}",
+            policy.grants()
+        );
     }
 }
