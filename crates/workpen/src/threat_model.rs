@@ -16,7 +16,10 @@
 //!   or extra-root. [`crate::KernelPolicy::with_write_file`] grants one
 //!   existing regular file. It does not walk the parent and does not
 //!   make that parent a read-write root. Windows adds traverse on that
-//!   parent and a write ACE on the file. A deny glob that names that
+//!   parent and a write ACE on the file. Linux adds execute (traverse)
+//!   on each ancestor directory in the same Landlock ruleset. That does
+//!   not grant listing or reading children. Execute on a directory also
+//!   allows executing other files beneath it. A deny glob that names that
 //!   file is not applied to it. Siblings stay outside the grant.
 //! * **Userspace dest-deny** refuses secret dests in argv and
 //!   [`crate::check_dest`] before spawn.

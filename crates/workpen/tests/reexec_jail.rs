@@ -417,6 +417,111 @@ fn stage(msg: &str) {
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
+/// Absolute path outside the workspace. `/bin/sh` rewrites that file.
+/// A sibling stays unreadable, and the parent directory cannot be listed.
+/// The parent is not a read-write grant. The child is not this test
+/// binary: that binary lives outside the read grant, so Landlock would
+/// refuse to execute it.
+#[cfg(unix)]
+#[test]
+fn unix_write_file_grant() {
+    unix_write_file().unwrap_or_else(|err| panic!("FAIL: {err}"));
+}
+
+/// Paths stay in the environment. The script must not name `auth.json`.
+#[cfg(unix)]
+const UNIX_WRITE_FILE_SCRIPT: &str = r#"
+printf 'new-token\n' > "$WORKPEN_WRITE_FILE_AUTH" || { echo WRITE=fail; exit 1; }
+echo WRITE=ok
+if /bin/cat "$WORKPEN_WRITE_FILE_SIBLING" >/dev/null 2>&1; then
+  echo SECRET=read
+else
+  echo SECRET=denied
+fi
+if /bin/ls "$WORKPEN_WRITE_FILE_DIR" >/dev/null 2>&1; then
+  echo LIST=read
+else
+  echo LIST=denied
+fi
+if /bin/bash -c 'echo >/dev/tcp/127.0.0.1/1' >/dev/null 2>net.err; then
+  echo NET=open
+else
+  if /usr/bin/grep -E -q 'refused' net.err; then
+    echo NET=refused
+  elif /usr/bin/grep -E -q 'denied|not permitted' net.err; then
+    echo NET=denied
+  else
+    echo NET=other
+    /bin/cat net.err
+  fi
+fi
+"#;
+
+#[cfg(unix)]
+fn unix_write_file() -> Result<(), String> {
+    if !workpen::kernel_supported() {
+        return Ok(());
+    }
+    let root = tempfile::tempdir().map_err(|err| err.to_string())?;
+    let workspace = root.path().join("ws");
+    let grok = root.path().join("grok");
+    let sessions = grok.join("sessions");
+    std::fs::create_dir_all(&sessions).map_err(|err| err.to_string())?;
+    std::fs::create_dir_all(&workspace).map_err(|err| err.to_string())?;
+    let auth = grok.join("auth.json");
+    std::fs::write(&auth, b"old-token\n").map_err(|err| err.to_string())?;
+    let secret = grok.join("secret.txt");
+    std::fs::write(&secret, b"sibling-secret\n").map_err(|err| err.to_string())?;
+    std::fs::write(sessions.join("one.log"), b"log\n").map_err(|err| err.to_string())?;
+    let policy = jail(&workspace)?
+        .with_write_file(&auth)
+        .map_err(|err| err.to_string())?;
+    let grok_canon = std::fs::canonicalize(&grok).map_err(|err| err.to_string())?;
+    if policy
+        .grants()
+        .iter()
+        .any(|grant| grant.path == grok || grant.path == grok_canon)
+    {
+        return Err(format!(
+            "parent directory was granted: {:?}",
+            policy.grants()
+        ));
+    }
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", UNIX_WRITE_FILE_SCRIPT])
+        .env("WORKPEN_WRITE_FILE_AUTH", &auth)
+        .env("WORKPEN_WRITE_FILE_SIBLING", &secret)
+        .env("WORKPEN_WRITE_FILE_DIR", &grok)
+        .current_dir(&workspace);
+    let (applied, output) = policy
+        .run_child_output(cmd)
+        .map_err(|err| format!("run_child: {err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!(
+            "file probe status {:?} applied {applied:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        ));
+    }
+    for line in ["WRITE=ok", "SECRET=denied", "LIST=denied", "NET=denied"] {
+        if !stdout.lines().any(|got| got == line) {
+            return Err(format!(
+                "missing {line}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            ));
+        }
+    }
+    let body = std::fs::read_to_string(&auth).map_err(|err| err.to_string())?;
+    if body != "new-token\n" {
+        return Err(format!("auth body {body:?}"));
+    }
+    let secret_body = std::fs::read_to_string(&secret).map_err(|err| err.to_string())?;
+    if secret_body != "sibling-secret\n" {
+        return Err(format!("sibling changed {secret_body:?}"));
+    }
+    Ok(())
+}
+
 fn tcp_ok(addr: &str, secs: u64) -> bool {
     let Ok(addr) = addr.parse::<std::net::SocketAddr>() else {
         return false;
