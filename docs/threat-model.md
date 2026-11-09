@@ -14,6 +14,11 @@ The parent is trusted. The child is not.
 ## Layers
 
 1. PathGuard refuses `/` and `$HOME` as the workspace or extra-root.
+   `with_write_file` grants one existing regular file. It does not
+   walk the parent and does not make that parent a read-write root.
+   Windows adds traverse on that parent and a write ACE on the file.
+   A deny glob that names that file is not applied to it. Siblings
+   stay outside the grant.
 2. Userspace dest-deny refuses secret dests in argv and `check_dest`
    before spawn.
 3. Kernel dest-deny hides dests that exist at spawn: Linux remount,

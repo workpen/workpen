@@ -25,7 +25,7 @@ The parent is trusted. This is not a VM.
 Library:
 
 ```toml
-workpen = { version = "0.7", features = ["gc", "nono"] }
+workpen = { version = "0.8", features = ["gc", "nono"] }
 ```
 
 CLI:
