@@ -6,6 +6,10 @@
 //! This path builds one ruleset: the same file and directory rights
 //! nono would install, plus execute on ancestor directories that are
 //! not already covered by a directory grant.
+//!
+//! Landlock has no access right that walks a directory without that
+//! execute. A path-beneath rule with that right also allows executing
+//! other files beneath the directory. The ancestor rule stays execute.
 
 use std::os::fd::{AsFd, OwnedFd};
 
@@ -72,7 +76,7 @@ pub(super) fn apply_landlock_with_ancestors(
             .add_rule(PathBeneath::new(fd, access))
             .map_err(|err| KernelError::Apply(format!("{}: {err}", cap.resolved.display())))?;
     }
-    let traverse = AccessFs::Execute;
+    let traverse = ancestor_walk_access();
     for dir in ancestors {
         let fd = PathFd::new(dir)
             .map_err(|err| KernelError::Apply(format!("{}: {err}", dir.display())))?;
@@ -89,6 +93,14 @@ pub(super) fn apply_landlock_with_ancestors(
         ));
     }
     Ok(())
+}
+
+/// Walk right for an ancestor of a one-file grant.
+///
+/// Landlock has no access right that walks a directory without that
+/// execute.
+fn ancestor_walk_access() -> BitFlags<AccessFs> {
+    AccessFs::Execute.into()
 }
 
 fn landlock_scopes(
@@ -176,4 +188,16 @@ fn path_access(
         )));
     }
     Ok(access)
+}
+
+#[cfg(test)]
+mod tests {
+    use landlock::AccessFs;
+
+    use super::ancestor_walk_access;
+
+    #[test]
+    fn ancestor_walk_is_execute_only() {
+        assert_eq!(ancestor_walk_access(), AccessFs::Execute.into());
+    }
 }

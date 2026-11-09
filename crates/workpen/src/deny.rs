@@ -527,6 +527,21 @@ enum WinDev {
     Other,
 }
 
+/// `true` when opening `path` would hit a Windows reserved device
+/// (`NUL`, `CON`, `PRN`, `AUX`, `COM1` through `COM9`, `LPT1` through
+/// `LPT9`, `CONIN$`, `CONOUT$`) instead of a regular file.
+pub(crate) fn is_reserved_windows_device(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        windows_device_kind(&path.to_string_lossy()).is_some()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 #[cfg(windows)]
 fn windows_device_kind(text: &str) -> Option<WinDev> {
     if let Some(rest) = device_namespace_body(text) {

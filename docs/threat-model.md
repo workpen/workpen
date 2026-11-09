@@ -14,14 +14,19 @@ The parent is trusted. The child is not.
 ## Layers
 
 1. PathGuard refuses `/` and `$HOME` as the workspace or extra-root.
-   `with_write_file` grants one existing regular file. It does not
-   walk the parent and does not make that parent a read-write root.
-   Windows adds traverse on that parent and a write ACE on the file.
-   Linux adds execute (traverse) on each ancestor directory in the
-   same Landlock ruleset. That does not grant listing or reading
-   children. Execute on a directory also allows executing other files
-   beneath it. A deny glob that names that file is not applied to it.
-   Siblings stay outside the grant.
+   `with_write_file` grants one regular file. A missing name whose
+   parent directory already exists is created empty, mode 0600 on
+   Unix, and then granted. The parent is not created. An existing
+   regular file is not truncated. A symlink or a directory is refused.
+   It does not walk the parent and does not make that parent a
+   read-write root. Windows adds traverse on that parent and a write
+   ACE on the file. Linux adds execute on each ancestor directory in
+   the same Landlock ruleset. Landlock has no access right that walks
+   a directory without that execute. A path-beneath rule with that
+   right also allows executing other files beneath the directory.
+   It does not grant listing or reading children. A deny glob that
+   names that file is not applied to it. Siblings stay outside the
+   grant.
 2. Userspace dest-deny refuses secret dests in argv and `check_dest`
    before spawn.
 3. Kernel dest-deny hides dests that exist at spawn: Linux remount,
