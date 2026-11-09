@@ -106,7 +106,7 @@ Commands: `why`, `run`, `policy`, `gc`, `init`, `doctor`. `workpen --help` print
 
 `workpen gc --max-age 7d` looks under `.workpen-worktrees`. A registered worktree from `git worktree add` that lives outside that directory is left alone. `--dry-run` prints what it would remove and does not delete. It does not clean `target/`.
 
-Library hosts that still want those registered worktrees set `GcConfig.age_gc_registered`. The same run skips the primary checkout, a locked worktree, and a directory a process is using, and it reads status again before delete. Dry-run uses that same probe. Untracked directories outside `leftover_dir` are not candidates. `workpen gc` does not turn the flag on.
+Library hosts that still want those registered worktrees set `GcConfig.age_gc_registered`. The same run skips the primary checkout, a locked worktree, and a directory any process is using as its working directory. On Windows that list is the processes this user can read. If the list cannot be read, the tree stays. It reads status again before delete. Dry-run uses that same probe. Untracked directories outside `leftover_dir` are not candidates. `workpen gc` does not turn the flag on.
 
 ## Library
 
@@ -142,7 +142,8 @@ in one page is [docs/threat-model.md](docs/threat-model.md).
   drops. `strict` and `read-only` can read the workspace
   (`read_only` cannot write it), `SystemRoot`, `System32`, and
   `ProgramFiles`. `spawn_reexec` keeps network open for a host
-  that re-execs into one long-lived jail. Git `usr\bin` tools run.
+  that re-execs into one long-lived jail. A denied open of
+  `\BaseNamedObjects` skips that ACE and is not printed. Git `usr\bin` tools run.
   The jail grants the restricted SID on that install's MSYS shared
   directory. MSYS creates the per-user section in that directory
   without a security descriptor, so the directory gets an inheritable
