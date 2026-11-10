@@ -849,8 +849,35 @@ fn check_dest_json(code: u8, err: &CheckDestError) -> String {
         CheckDestError::SpecialFile { path, kind } => {
             json_line("denied", code, Some(path), Some(kind), Some("special_file"))
         }
-        CheckDestError::DestDeny(_) | CheckDestError::PathGuard(_) => {
-            json_line("denied", code, None, None, Some("path_guard"))
+        CheckDestError::DestDeny(DestDenyError::CommandToken { token }) => {
+            json_line("denied", code, Some(token), None, Some("command_token"))
+        }
+        CheckDestError::DestDeny(DestDenyError::EncodedCommand) => {
+            json_line("denied", code, None, None, Some("encoded_command"))
+        }
+        CheckDestError::DestDeny(DestDenyError::StdinScript) => {
+            json_line("denied", code, None, None, Some("stdin_script"))
+        }
+        CheckDestError::DestDeny(DestDenyError::LateHardlink { path }) => {
+            json_line("denied", code, Some(path), None, Some("late_hardlink"))
+        }
+        CheckDestError::DestDeny(DestDenyError::Toctou { path }) => {
+            json_line("denied", code, Some(path), None, Some("toctou"))
+        }
+        CheckDestError::DestDeny(DestDenyError::ToctouStat(message)) => {
+            json_line("denied", code, Some(message), None, Some("toctou_stat"))
+        }
+        CheckDestError::PathGuard(PathGuardError::EmptyPath) => {
+            json_line("denied", code, None, None, Some("empty_path"))
+        }
+        CheckDestError::PathGuard(PathGuardError::AbsolutePath(path)) => {
+            json_line("denied", code, Some(path), None, Some("absolute_path"))
+        }
+        CheckDestError::PathGuard(PathGuardError::Root(path)) => {
+            json_line("denied", code, Some(path), None, Some("guard_root"))
+        }
+        CheckDestError::PathGuard(PathGuardError::Canonicalize { path, .. }) => {
+            json_line("denied", code, Some(path), None, Some("canonicalize"))
         }
         CheckDestError::Nul
         | CheckDestError::Directory { .. }

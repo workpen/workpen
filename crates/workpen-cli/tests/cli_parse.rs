@@ -1786,6 +1786,32 @@ fn policy_json_formats_a_dest_deny() {
 }
 
 #[test]
+fn policy_json_names_an_invalid_encoded_command() {
+    let dir = TempDir::new().expect("workspace");
+    let out = workpen()
+        .args(["policy", "--json", "--root"])
+        .arg(dir.path())
+        .args(["--", "pwsh", "-EncodedCommand", "!!!not-base64!!!"])
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().last().expect("refusal line");
+    assert!(
+        line.contains("\"result\":\"denied\"")
+            && line.contains("\"exit\":3")
+            && line.contains("\"kind\":\"encoded_command\"")
+            && !line.contains("\"kind\":\"path_guard\""),
+        "{line}"
+    );
+}
+
+#[test]
 fn why_json_names_an_outside_path() {
     let dir = TempDir::new().expect("workspace");
     let outside = TempDir::new().expect("outside");
