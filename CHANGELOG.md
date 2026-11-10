@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.11.0](https://github.com/workpen/workpen/compare/v0.10.0...v0.11.0) (2026-11-10)
+
+
+### Features
+
+* **wrap:** split file grants for create, skip, and read ([#365](https://github.com/workpen/workpen/issues/365)) ([d50bf85](https://github.com/workpen/workpen/commit/d50bf85ef264f813893ed86a566a25b6401b9cfd))
+
+
+### Bug Fixes
+
+* **cli:** name each dest-deny JSON kind ([#366](https://github.com/workpen/workpen/issues/366)) ([d0c3472](https://github.com/workpen/workpen/commit/d0c34723ffc194a9648ffbb844816bdf1cb4f6ee))
+* pin the crates.io example at 0.10 ([#353](https://github.com/workpen/workpen/issues/353)) ([520e8af](https://github.com/workpen/workpen/commit/520e8afc1c1d872cfd5486ec3427dd3e9ae35af1))
+
 ## [0.10.0](https://github.com/workpen/workpen/compare/v0.9.0...v0.10.0) (2026-11-09)
 
 
