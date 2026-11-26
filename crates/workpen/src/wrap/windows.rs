@@ -1016,6 +1016,29 @@ fn open_create_files_dir(wide: &[u16]) -> Result<CloseOnDrop, KernelError> {
     Ok(CloseOnDrop(handle))
 }
 
+#[cfg(test)]
+#[test]
+fn create_files_restore_names_the_path_when_reopen_fails() {
+    let path = wide_path(Path::new(r"C:\missing-workpen-create-files"));
+    let mut restore = AclRestore {
+        path,
+        object_type: FILE_NO_PROPAGATE,
+        _sd: LocalMem(ptr::null_mut()),
+        dacl: ptr::null_mut(),
+        restored: false,
+    };
+    let err = restore.restore().expect_err("missing directory");
+    match err {
+        KernelError::Restore(message) => {
+            assert!(
+                message.contains("missing-workpen-create-files"),
+                "{message}"
+            );
+        }
+        other => panic!("reopen failure must be Restore, got {other}"),
+    }
+}
+
 fn set_kernel_dacl(handle: Handle, dacl: Handle) -> Result<(), KernelError> {
     let mut sd = [0u64; 8];
     let header = sd.as_mut_ptr().cast::<u8>();

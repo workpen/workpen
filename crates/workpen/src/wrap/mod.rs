@@ -5502,6 +5502,33 @@ mod write_file_grant_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_only_remount_probe_uses_the_workspace() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        std::fs::write(workspace.join(".env"), "SECRET=1\n").expect("env");
+        let policy = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .read_only();
+        assert!(
+            policy
+                .dest_denies()
+                .iter()
+                .any(|deny| deny.path.ends_with(".env")),
+            "the probe needs a workspace dest: {:?}",
+            policy.dest_denies()
+        );
+        let _guard = super::linux::RemountEnterGuard::deny();
+        let mut cmd = std::process::Command::new("true");
+        let (apply, report) = policy
+            .apply_pre_exec_dests(&mut cmd, Vec::new())
+            .expect("a /dev/null remount root treats the workspace secret as extra-root");
+        assert_eq!(apply, super::KernelApply::RemountSkipped);
+        report.discard();
+    }
+
     #[cfg(windows)]
     #[test]
     fn write_file_follows_a_junction_and_grants_one_file() {
