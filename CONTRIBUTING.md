@@ -19,7 +19,14 @@ make check
 ```
 
 That runs fmt, clippy (`-D warnings`), rustdoc, tests with features
-`gc,nono`, `cargo deny`, and the workflow-trigger lock.
+`gc,nono`, `cargo deny`, and the workflow-trigger lock. CI installs
+`cargo-deny` 0.20.2. Install that pin before `make check`:
+
+```bash
+cargo install cargo-deny --version 0.20.2 --locked
+```
+
+`make check` stops immediately when `cargo-deny` is not on `PATH`.
 
 ## DCO
 

@@ -5,6 +5,10 @@ help: ## Show this help
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
 
 check: ## fmt, clippy, test, deny, trigger lock
+	@command -v cargo-deny >/dev/null || { \
+		printf '%s\n' 'cargo-deny 0.20.2 is required, same as CI: cargo install cargo-deny --version 0.20.2 --locked'; \
+		exit 1; \
+	}
 	cargo fmt --check
 	RUSTFLAGS="-D warnings" cargo clippy --locked --workspace --all-targets --features gc,nono -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace --features gc,nono
