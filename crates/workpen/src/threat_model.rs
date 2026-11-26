@@ -146,9 +146,9 @@
 //!   returns `EAGAIN`. A pipe with a few free bytes does not spin.
 //!   A reader that stops still fills the pipe, and `--timeout` ends
 //!   that forward.
-//! * Windows `Stdio::piped` on `run_child` captures stdout. The child
-//!   inherits the handle or gets NUL. Hosts that need captured stdout
-//!   call [`crate::KernelPolicy::run_child_output`].
+//! * Windows `Stdio::piped` on `run_child` does not capture stdout.
+//!   The child inherits the parent handle or gets `NUL`. Hosts that
+//!   need captured stdout call [`crate::KernelPolicy::run_child_output`].
 //!
 //! # Promises
 //!
