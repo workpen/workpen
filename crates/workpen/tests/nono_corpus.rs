@@ -3380,6 +3380,27 @@ fn dest_deny_command_uses_command_current_dir_not_rw_grant() {
 }
 
 #[test]
+fn read_only_dest_deny_uses_the_workspace_not_the_null_device() {
+    let root = workspace();
+    let ws = root.path().join("ws");
+    fs::create_dir_all(&ws).expect("ws");
+    fs::write(ws.join(".env"), "SECRET=1\n").expect("env");
+    fs::hard_link(ws.join(".env"), ws.join("notes.txt")).expect("hardlink");
+    let policy = process_jail(&ws, std::iter::empty::<&Path>())
+        .expect("jail")
+        .read_only();
+    let mut cmd = Command::new("cat");
+    cmd.arg("notes.txt");
+    let err = policy
+        .dest_deny_command(&cmd)
+        .expect_err("hardlink must dest-deny against the workspace");
+    assert!(
+        matches!(err, KernelError::DestDeny(_)),
+        "read-only dest-deny must use the workspace, not the null device: {err}"
+    );
+}
+
+#[test]
 fn run_child_scrubs_tmpdir() {
     if !kernel_supported() {
         return;

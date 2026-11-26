@@ -1423,6 +1423,7 @@ impl KernelPolicy {
     }
 
     /// Downgrade read-write grants to read. The null device stays writable.
+    /// Dest-deny still uses the workspace directory, not that device.
     ///
     /// On Windows this is the read-only jail: no write ACE is added, so
     /// the restricting SID denies creates in the workspace. Network is
@@ -1720,12 +1721,18 @@ impl KernelPolicy {
         if meta.file_type().is_symlink() || !meta.is_dir() {
             return Err(file_grant(dir, FileGrantReason::ParentNotDirectory));
         }
-        if self
+        if let Some(existing) = self
             .create_files
             .iter()
-            .any(|grant| grant.directory == resolved)
+            .find(|grant| grant.directory == resolved)
         {
-            return Ok(());
+            if existing.prefix.as_deref() == prefix {
+                return Ok(());
+            }
+            return Err(KernelError::Apply(format!(
+                "create-files prefix does not match the prefix already set for {}",
+                resolved.display()
+            )));
         }
         #[cfg(windows)]
         {
@@ -1928,10 +1935,8 @@ impl KernelPolicy {
             let mut dests: Vec<PathBuf> = self.dest_denies.iter().map(|d| d.path.clone()).collect();
             dests.extend(extra_dests);
             let workspace = self
-                .grants
-                .iter()
-                .find(|g| g.access == KernelAccess::ReadWrite)
-                .map(|g| g.path.clone())
+                .grant_workspace()
+                .map(Path::to_path_buf)
                 .unwrap_or_default();
             #[cfg(target_os = "linux")]
             let remount = linux::remount_status(&dests, &workspace)?;
@@ -2661,7 +2666,9 @@ impl KernelPolicy {
     /// Dest-deny `cmd` argv with the jail [`DenyPolicy`] before spawn.
     ///
     /// Relative dests resolve against `cmd.current_dir()` when set, else
-    /// the first ReadWrite grant. Same rules as
+    /// the jail workspace. That directory stays the root after
+    /// [`Self::read_only`]. The null device stays writable and is not
+    /// the root. Same rules as
     /// [`crate::check_command_argv`] on program plus args. A program or
     /// argument that is not valid UTF-8 is [`KernelError::DestDeny`]
     /// of [`CheckDestError::NonUtf8`] before spawn. Hosts that
@@ -2672,17 +2679,39 @@ impl KernelPolicy {
     /// [`KernelError::DestDeny`], not English.
     pub fn dest_deny_command(&self, cmd: &Command) -> Result<(), KernelError> {
         let from_cwd = cmd.get_current_dir();
-        let from_grant = self
-            .grants
-            .iter()
-            .find(|g| g.access == KernelAccess::ReadWrite)
-            .map(|g| g.path.as_path());
-        let workspace = from_cwd.or(from_grant).ok_or_else(|| {
+        let workspace = from_cwd.or_else(|| self.grant_workspace()).ok_or_else(|| {
             KernelError::Apply("dest-deny argv needs a current_dir or ReadWrite grant".into())
         })?;
         let argv = command_argv(cmd)?;
         crate::check_command_argv(&argv, workspace, &self.deny_policy)?;
         Ok(())
+    }
+
+    /// Directory this jail was built on.
+    ///
+    /// [`Self::read_only`] turns that directory into a read grant and
+    /// leaves the null device writable. Dest-deny and the Linux remount
+    /// probe still need the directory, not the device.
+    fn grant_workspace(&self) -> Option<&Path> {
+        self.grants.iter().find_map(|grant| {
+            if is_null_grant(&grant.path) {
+                None
+            } else {
+                Some(grant.path.as_path())
+            }
+        })
+    }
+}
+
+fn is_null_grant(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        crate::deny::is_null_device(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
     }
 }
 
@@ -5034,6 +5063,17 @@ mod write_file_grant_tests {
             assert_eq!(policy.create_files().len(), 1);
             assert_eq!(policy.create_files()[0].directory, grok_canon);
             assert_eq!(policy.create_files()[0].prefix.as_deref(), Some("auth"));
+            let again = policy
+                .with_create_files(&grok, Some("auth"))
+                .expect("same prefix");
+            assert_eq!(again.create_files()[0].prefix.as_deref(), Some("auth"));
+            let err = again
+                .with_create_files(&grok, None)
+                .expect_err("wider prefix");
+            assert!(
+                matches!(err, super::KernelError::Apply(ref msg) if msg.contains("prefix")),
+                "{err}"
+            );
         }
     }
 

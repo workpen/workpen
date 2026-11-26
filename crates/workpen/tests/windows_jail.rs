@@ -505,10 +505,12 @@ fn windows_readonly_jail_cannot_create_in_workspace() {
             .expect("jail")
             .read_only();
         let created = ws.path().join("created.txt");
-        let _ = policy.run_child(com(|command| {
-            let script = format!("echo x 1>{}", created.display());
-            command.args(["/C", &script]);
-        }));
+        policy
+            .run_child(com(|command| {
+                let script = format!("echo x 1>{}", created.display());
+                command.args(["/C", &script]);
+            }))
+            .expect("read-only spawn");
         assert!(
             !created.exists(),
             "read-only child must not create in the workspace"

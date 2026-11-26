@@ -71,7 +71,9 @@ The parent is trusted. The child is not.
 - `apply_pre_exec` skipped argv dest-deny. It dest-denies the same way
   `run_child` does. Hosts that spawn themselves can also call
   `dest_deny_command`. Relative dests resolve against
-  `Command::current_dir` when set, else the first ReadWrite grant.
+  `Command::current_dir` when set, else the jail workspace.
+  `read_only` still uses that directory. The null device stays
+  writable and is not the root.
 - Extra-root `/tmp` remounts every hardlink. `/tmp` is one dest-deny
   name level. A hardlink under a deeper ordinary dir is not remounted.
   `check_dest` still dest-denies hardlink siblings when the host calls
