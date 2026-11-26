@@ -126,8 +126,9 @@ The parent is trusted. The child is not.
   printed. `run_child` is unchanged.
 - Renaming the dest-deny parent is in scope. Parent-rename is out of
   scope. Leaf `mv .env leaked` is a macOS last-match contract.
-- Windows `Stdio::piped` on `run_child` captures stdout for the host.
-  It is a host-readable pipe. Use `run_child_output`.
+- Windows `Stdio::piped` on `run_child` does not capture stdout.
+  The child inherits the parent handle or gets `NUL`. Hosts that
+  need captured stdout call `run_child_output`.
 - Linux stdout forwarding writes one byte when a larger write returns
   `EAGAIN`. A pipe with a few free bytes does not spin. A reader that
   stops still fills the pipe, and `--timeout` ends that forward.
