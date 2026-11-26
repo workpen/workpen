@@ -78,8 +78,10 @@
 //!   installs the hook. Hosts that cannot use `run_child` still call
 //!   [`crate::KernelPolicy::dest_deny_command`]. That check resolves
 //!   relative dests against `Command::current_dir` when set, else the
-//!   first ReadWrite grant (a capture-dir jail still dest-denies the
-//!   user cwd when the host sets `current_dir`).
+//!   jail workspace. [`crate::KernelPolicy::read_only`] still uses that
+//!   directory. The null device stays writable and is not the root.
+//!   A capture-dir jail still dest-denies the
+//!   user cwd when the host sets `current_dir`.
 //! * Extra-root `/tmp` remounts every hardlink. `/tmp` is one extra
 //!   dest-deny name level. A hardlink under a deeper ordinary dir is
 //!   not remounted. Path remount does not hide other hardlinks to the

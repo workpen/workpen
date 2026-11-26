@@ -539,6 +539,24 @@ pub(super) fn occupy_missing(roots: &[PathBuf], globs: &[String]) -> io::Result<
 }
 
 #[cfg(test)]
+pub(super) struct RemountEnterGuard;
+
+#[cfg(test)]
+impl RemountEnterGuard {
+    pub(super) fn deny() -> Self {
+        TEST_ENTER.with(|cell| cell.set(Some(false)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for RemountEnterGuard {
+    fn drop(&mut self) {
+        TEST_ENTER.with(|cell| cell.set(None));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         TEST_BIND_FAIL, TEST_ENTER, TEST_HIDE_FAIL, apply_dest_deny_remounts, remount_status,

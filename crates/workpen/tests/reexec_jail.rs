@@ -294,7 +294,7 @@ fn windows_write_file() -> Result<(), String> {
     }
     let secret_body = std::fs::read_to_string(&secret).map_err(|err| err.to_string())?;
     if secret_body != "sibling-secret\n" {
-        return Err(format!("sibling changed {secret_body:?}"));
+        return Err("sibling file changed".to_string());
     }
     Ok(())
 }
@@ -390,7 +390,7 @@ fn windows_create_files() -> Result<(), String> {
     }
     let secret_body = std::fs::read_to_string(&secret).map_err(|err| err.to_string())?;
     if secret_body != "sibling-secret\n" {
-        return Err(format!("sibling changed {secret_body:?}"));
+        return Err("sibling file changed".to_string());
     }
     if extra.exists() || sessions.join("nested").exists() {
         return Err("a subdirectory was created".into());
@@ -701,7 +701,7 @@ fn unix_write_file() -> Result<(), String> {
     }
     let secret_body = std::fs::read_to_string(&secret).map_err(|err| err.to_string())?;
     if secret_body != "sibling-secret\n" {
-        return Err(format!("sibling changed {secret_body:?}"));
+        return Err("sibling file changed".to_string());
     }
     Ok(())
 }

@@ -1423,6 +1423,7 @@ impl KernelPolicy {
     }
 
     /// Downgrade read-write grants to read. The null device stays writable.
+    /// Dest-deny still uses the workspace directory, not that device.
     ///
     /// On Windows this is the read-only jail: no write ACE is added, so
     /// the restricting SID denies creates in the workspace. Network is
@@ -1698,7 +1699,8 @@ impl KernelPolicy {
                 || prefix == ".."
             {
                 return Err(KernelError::Apply(format!(
-                    "create-files prefix is not a single name: {prefix}"
+                    "create-files prefix is not a single name: {prefix} ({})",
+                    dir.display()
                 )));
             }
         }
@@ -1720,12 +1722,18 @@ impl KernelPolicy {
         if meta.file_type().is_symlink() || !meta.is_dir() {
             return Err(file_grant(dir, FileGrantReason::ParentNotDirectory));
         }
-        if self
+        if let Some(existing) = self
             .create_files
             .iter()
-            .any(|grant| grant.directory == resolved)
+            .find(|grant| grant.directory == resolved)
         {
-            return Ok(());
+            if existing.prefix.as_deref() == prefix {
+                return Ok(());
+            }
+            return Err(KernelError::Apply(format!(
+                "create-files prefix does not match the prefix already set for {}",
+                resolved.display()
+            )));
         }
         #[cfg(windows)]
         {
@@ -1928,10 +1936,8 @@ impl KernelPolicy {
             let mut dests: Vec<PathBuf> = self.dest_denies.iter().map(|d| d.path.clone()).collect();
             dests.extend(extra_dests);
             let workspace = self
-                .grants
-                .iter()
-                .find(|g| g.access == KernelAccess::ReadWrite)
-                .map(|g| g.path.clone())
+                .grant_workspace()
+                .map(Path::to_path_buf)
                 .unwrap_or_default();
             #[cfg(target_os = "linux")]
             let remount = linux::remount_status(&dests, &workspace)?;
@@ -2661,7 +2667,9 @@ impl KernelPolicy {
     /// Dest-deny `cmd` argv with the jail [`DenyPolicy`] before spawn.
     ///
     /// Relative dests resolve against `cmd.current_dir()` when set, else
-    /// the first ReadWrite grant. Same rules as
+    /// the jail workspace. That directory stays the root after
+    /// [`Self::read_only`]. The null device stays writable and is not
+    /// the root. Same rules as
     /// [`crate::check_command_argv`] on program plus args. A program or
     /// argument that is not valid UTF-8 is [`KernelError::DestDeny`]
     /// of [`CheckDestError::NonUtf8`] before spawn. Hosts that
@@ -2672,17 +2680,39 @@ impl KernelPolicy {
     /// [`KernelError::DestDeny`], not English.
     pub fn dest_deny_command(&self, cmd: &Command) -> Result<(), KernelError> {
         let from_cwd = cmd.get_current_dir();
-        let from_grant = self
-            .grants
-            .iter()
-            .find(|g| g.access == KernelAccess::ReadWrite)
-            .map(|g| g.path.as_path());
-        let workspace = from_cwd.or(from_grant).ok_or_else(|| {
+        let workspace = from_cwd.or_else(|| self.grant_workspace()).ok_or_else(|| {
             KernelError::Apply("dest-deny argv needs a current_dir or ReadWrite grant".into())
         })?;
         let argv = command_argv(cmd)?;
         crate::check_command_argv(&argv, workspace, &self.deny_policy)?;
         Ok(())
+    }
+
+    /// Directory this jail was built on.
+    ///
+    /// [`Self::read_only`] turns that directory into a read grant and
+    /// leaves the null device writable. Dest-deny and the Linux remount
+    /// probe still need the directory, not the device.
+    fn grant_workspace(&self) -> Option<&Path> {
+        self.grants.iter().find_map(|grant| {
+            if is_null_grant(&grant.path) {
+                None
+            } else {
+                Some(grant.path.as_path())
+            }
+        })
+    }
+}
+
+fn is_null_grant(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        crate::deny::is_null_device(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
     }
 }
 
@@ -3525,8 +3555,9 @@ fn add_macos_create_file_rules(
     };
     let regex = escape_sbpl_literal(&format!("^{dir}/{name}$"));
     // The dest-deny list allows `file-write*` and `file-write-create`
-    // separately, so creation is its own allow. Without a prefix the
-    // regex is every direct child, including `notes.txt`.
+    // separately, so creation is its own allow. The regex also matches
+    // names that already exist. Deny those literals after the allow so
+    // an existing sibling stays closed.
     let mut actions = vec!["file-write*", "file-write-create", "file-write-data"];
     if grant.prefix.is_some() {
         actions.push("file-read*");
@@ -3537,6 +3568,61 @@ fn add_macos_create_file_rules(
         let rule = format!("(allow {action} (regex \"{regex}\"))");
         caps.add_platform_rule(&rule)
             .map_err(|err| KernelError::Apply(err.to_string()))?;
+    }
+    deny_existing_create_file_names(caps, grant)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn deny_existing_create_file_names(
+    caps: &mut nono::CapabilitySet,
+    grant: &CreateFiles,
+) -> Result<(), KernelError> {
+    let entries = std::fs::read_dir(&grant.directory).map_err(|err| {
+        KernelError::Apply(format!(
+            "create-files directory {}: {err}",
+            grant.directory.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            KernelError::Apply(format!(
+                "create-files directory {}: {err}",
+                grant.directory.display()
+            ))
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(KernelError::Apply(format!(
+                "create-files name is not UTF-8 in {}",
+                grant.directory.display()
+            )));
+        };
+        if grant
+            .prefix
+            .as_deref()
+            .is_some_and(|prefix| !name.starts_with(prefix))
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Some(raw) = path.to_str() else {
+            return Err(KernelError::Apply(format!(
+                "create-files path is not UTF-8: {}",
+                path.display()
+            )));
+        };
+        let escaped = escape_sbpl_literal(raw);
+        for action in [
+            "file-write*",
+            "file-write-data",
+            "file-read*",
+            "file-read-metadata",
+        ] {
+            let rule = format!("(deny {action} (literal \"{escaped}\"))");
+            caps.add_platform_rule(&rule)
+                .map_err(|err| KernelError::Apply(err.to_string()))?;
+        }
     }
     Ok(())
 }
@@ -5034,7 +5120,56 @@ mod write_file_grant_tests {
             assert_eq!(policy.create_files().len(), 1);
             assert_eq!(policy.create_files()[0].directory, grok_canon);
             assert_eq!(policy.create_files()[0].prefix.as_deref(), Some("auth"));
+            let again = policy
+                .with_create_files(&grok, Some("auth"))
+                .expect("same prefix");
+            assert_eq!(again.create_files()[0].prefix.as_deref(), Some("auth"));
+            let err = again
+                .with_create_files(&grok, None)
+                .expect_err("wider prefix");
+            assert!(
+                matches!(err, super::KernelError::Apply(ref msg) if msg.contains("prefix")),
+                "{err}"
+            );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_create_files_denies_an_existing_prefixed_sibling() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        std::fs::write(grok.join("notes.txt"), b"keep\n").expect("notes");
+        std::fs::write(grok.join("auth.json"), b"{}\n").expect("auth");
+        let policy = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_create_files(&grok, Some("auth"))
+            .expect("create files");
+        let caps = policy
+            .to_capability_set(nono::SignalMode::Isolated)
+            .expect("caps");
+        let rules = caps.platform_rules();
+        let allow = rules
+            .iter()
+            .position(|rule| rule.contains("(allow file-write*") && rule.contains("auth"))
+            .expect("allow regex");
+        let deny = rules
+            .iter()
+            .position(|rule| rule.contains("(deny file-write*") && rule.contains("auth.json"))
+            .expect("existing auth.json stays closed");
+        assert!(
+            deny > allow,
+            "the existing-file deny must follow the create allow"
+        );
+        assert!(
+            rules
+                .iter()
+                .all(|rule| !(rule.contains("notes.txt") && rule.contains("(deny file-write*"))),
+            "a name outside the prefix is not granted, so it is not denied here"
+        );
     }
 
     #[cfg(windows)]
@@ -5211,6 +5346,130 @@ mod write_file_grant_tests {
         assert_eq!(std::fs::read(&parent).expect("bytes"), b"x");
     }
 
+    #[test]
+    fn write_file_parent_not_directory_removes_the_new_lock() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = grok.join("auth.json");
+        std::fs::write(&auth, b"{token}\n").expect("auth");
+        let lock = grok.join("auth.lock");
+        let parent = grok.join("not-a-dir");
+        std::fs::write(&parent, b"x").expect("file");
+        let child = parent.join("auth.json");
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock")
+            .with_write_file(&child)
+            .expect_err("parent file");
+        assert_eq!(
+            file_grant_reason(err),
+            super::FileGrantReason::ParentNotDirectory
+        );
+        assert!(!lock.exists(), "a hard failure removes the new lock");
+        assert!(!child.exists());
+        assert_eq!(std::fs::read(&parent).expect("bytes"), b"x");
+        assert_eq!(std::fs::read(&auth).expect("auth"), b"{token}\n");
+    }
+
+    #[test]
+    fn create_files_skip_keeps_the_lock_this_builder_created() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = grok.join("auth.json");
+        std::fs::write(&auth, b"{token}\n").expect("auth");
+        let lock = grok.join("auth.lock");
+        let missing = root.path().join("absent");
+        let started = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock");
+        let skipped = started.try_create_files(&missing, Some("auth"));
+        let super::FileGrantAttempt::Skipped {
+            policy,
+            reason,
+            path,
+        } = skipped
+        else {
+            panic!("a missing create-files directory should be skipped");
+        };
+        #[cfg(target_os = "linux")]
+        assert_eq!(reason, super::FileGrantReason::Unsupported);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(reason, super::FileGrantReason::ParentMissing);
+        assert_eq!(path, missing);
+        assert!(
+            lock.exists(),
+            "a skipped create-files grant must keep the lock"
+        );
+        assert_eq!(std::fs::read(&lock).expect("lock"), b"");
+        assert!(grant_is_file(&policy, &lock));
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read(&auth).expect("auth"), b"{token}\n");
+        #[cfg(target_os = "linux")]
+        {
+            let again = policy.try_create_files(&grok, Some("auth"));
+            let super::FileGrantAttempt::Skipped { reason, .. } = again else {
+                panic!("linux create-files should stay unsupported");
+            };
+            assert_eq!(reason, super::FileGrantReason::Unsupported);
+            assert!(lock.exists(), "an unsupported grant must keep the lock");
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn create_files_hard_failure_removes_the_new_lock() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = grok.join("auth.json");
+        std::fs::write(&auth, b"{token}\n").expect("auth");
+        let notes = grok.join("notes.txt");
+        std::fs::write(&notes, b"notes\n").expect("notes");
+        let lock = grok.join("auth.lock");
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock")
+            .with_create_files(&notes, Some("auth"))
+            .expect_err("file");
+        assert_eq!(
+            file_grant_reason(err),
+            super::FileGrantReason::ParentNotDirectory
+        );
+        assert!(
+            !lock.exists(),
+            "a hard create-files failure removes the new lock"
+        );
+        assert_eq!(std::fs::read(&notes).expect("notes"), b"notes\n");
+        assert_eq!(std::fs::read(&auth).expect("auth"), b"{token}\n");
+        let lock = grok.join("auth.lock");
+        let bad = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock")
+            .with_create_files(&grok, Some(""))
+            .expect_err("prefix");
+        assert!(
+            matches!(bad, super::KernelError::Apply(ref msg) if msg.contains("prefix")),
+            "{bad}"
+        );
+        assert!(
+            !lock.exists(),
+            "a rejected create-files prefix removes the new lock"
+        );
+        assert_eq!(std::fs::read(&auth).expect("auth"), b"{token}\n");
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn create_files_rejects_a_file_and_an_empty_prefix() {
@@ -5241,6 +5500,33 @@ mod write_file_grant_tests {
             matches!(bad, super::KernelError::Apply(ref msg) if msg.contains("prefix")),
             "{bad}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_only_remount_probe_uses_the_workspace() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        std::fs::write(workspace.join(".env"), "SECRET=1\n").expect("env");
+        let policy = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .read_only();
+        assert!(
+            policy
+                .dest_denies()
+                .iter()
+                .any(|deny| deny.path.ends_with(".env")),
+            "the probe needs a workspace dest: {:?}",
+            policy.dest_denies()
+        );
+        let _guard = super::linux::RemountEnterGuard::deny();
+        let mut cmd = std::process::Command::new("true");
+        let (apply, report) = policy
+            .apply_pre_exec_dests(&mut cmd, Vec::new())
+            .expect("a /dev/null remount root treats the workspace secret as extra-root");
+        assert_eq!(apply, super::KernelApply::RemountSkipped);
+        report.discard();
     }
 
     #[cfg(windows)]

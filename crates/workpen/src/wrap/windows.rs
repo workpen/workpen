@@ -692,8 +692,11 @@ impl AclRestore {
             unsafe { CloseHandle(file) };
             err
         } else if self.object_type == FILE_NO_PROPAGATE {
-            let dir = open_create_files_dir(&self.path).map_err(|_| {
-                KernelError::Apply("restore could not reopen the create-files directory".into())
+            let dir = open_create_files_dir(&self.path).map_err(|err| {
+                let shown = String::from_utf16_lossy(
+                    self.path.split(|c| *c == 0).next().unwrap_or(&self.path),
+                );
+                KernelError::Restore(format!("{shown}: {err}"))
             })?;
             set_kernel_dacl(dir.0, self.dacl)?;
             self.restored = true;
@@ -1011,6 +1014,29 @@ fn open_create_files_dir(wide: &[u16]) -> Result<CloseOnDrop, KernelError> {
         return Err(last_error("open create-files directory"));
     }
     Ok(CloseOnDrop(handle))
+}
+
+#[cfg(test)]
+#[test]
+fn create_files_restore_names_the_path_when_reopen_fails() {
+    let path = wide_path(Path::new(r"C:\missing-workpen-create-files"));
+    let mut restore = AclRestore {
+        path,
+        object_type: FILE_NO_PROPAGATE,
+        _sd: LocalMem(ptr::null_mut()),
+        dacl: ptr::null_mut(),
+        restored: false,
+    };
+    let err = restore.restore().expect_err("missing directory");
+    match err {
+        KernelError::Restore(message) => {
+            assert!(
+                message.contains("missing-workpen-create-files"),
+                "{message}"
+            );
+        }
+        other => panic!("reopen failure must be Restore, got {other}"),
+    }
 }
 
 fn set_kernel_dacl(handle: Handle, dacl: Handle) -> Result<(), KernelError> {
