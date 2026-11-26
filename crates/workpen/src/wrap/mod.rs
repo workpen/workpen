@@ -5211,6 +5211,130 @@ mod write_file_grant_tests {
         assert_eq!(std::fs::read(&parent).expect("bytes"), b"x");
     }
 
+    #[test]
+    fn write_file_parent_not_directory_removes_the_new_lock() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = grok.join("auth.json");
+        std::fs::write(&auth, b"{token}\n").expect("auth");
+        let lock = grok.join("auth.lock");
+        let parent = grok.join("not-a-dir");
+        std::fs::write(&parent, b"x").expect("file");
+        let child = parent.join("auth.json");
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock")
+            .with_write_file(&child)
+            .expect_err("parent file");
+        assert_eq!(
+            file_grant_reason(err),
+            super::FileGrantReason::ParentNotDirectory
+        );
+        assert!(!lock.exists(), "a hard failure removes the new lock");
+        assert!(!child.exists());
+        assert_eq!(std::fs::read(&parent).expect("bytes"), b"x");
+        assert_eq!(std::fs::read(&auth).expect("auth"), b"{token}\n");
+    }
+
+    #[test]
+    fn create_files_skip_keeps_the_lock_this_builder_created() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = grok.join("auth.json");
+        std::fs::write(&auth, b"{token}\n").expect("auth");
+        let lock = grok.join("auth.lock");
+        let missing = root.path().join("absent");
+        let started = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock");
+        let skipped = started.try_create_files(&missing, Some("auth"));
+        let super::FileGrantAttempt::Skipped {
+            policy,
+            reason,
+            path,
+        } = skipped
+        else {
+            panic!("a missing create-files directory should be skipped");
+        };
+        #[cfg(target_os = "linux")]
+        assert_eq!(reason, super::FileGrantReason::Unsupported);
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(reason, super::FileGrantReason::ParentMissing);
+        assert_eq!(path, missing);
+        assert!(
+            lock.exists(),
+            "a skipped create-files grant must keep the lock"
+        );
+        assert_eq!(std::fs::read(&lock).expect("lock"), b"");
+        assert!(grant_is_file(&policy, &lock));
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read(&auth).expect("auth"), b"{token}\n");
+        #[cfg(target_os = "linux")]
+        {
+            let again = policy.try_create_files(&grok, Some("auth"));
+            let super::FileGrantAttempt::Skipped { reason, .. } = again else {
+                panic!("linux create-files should stay unsupported");
+            };
+            assert_eq!(reason, super::FileGrantReason::Unsupported);
+            assert!(lock.exists(), "an unsupported grant must keep the lock");
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn create_files_hard_failure_removes_the_new_lock() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = grok.join("auth.json");
+        std::fs::write(&auth, b"{token}\n").expect("auth");
+        let notes = grok.join("notes.txt");
+        std::fs::write(&notes, b"notes\n").expect("notes");
+        let lock = grok.join("auth.lock");
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock")
+            .with_create_files(&notes, Some("auth"))
+            .expect_err("file");
+        assert_eq!(
+            file_grant_reason(err),
+            super::FileGrantReason::ParentNotDirectory
+        );
+        assert!(
+            !lock.exists(),
+            "a hard create-files failure removes the new lock"
+        );
+        assert_eq!(std::fs::read(&notes).expect("notes"), b"notes\n");
+        assert_eq!(std::fs::read(&auth).expect("auth"), b"{token}\n");
+        let lock = grok.join("auth.lock");
+        let bad = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock")
+            .with_create_files(&grok, Some(""))
+            .expect_err("prefix");
+        assert!(
+            matches!(bad, super::KernelError::Apply(ref msg) if msg.contains("prefix")),
+            "{bad}"
+        );
+        assert!(
+            !lock.exists(),
+            "a rejected create-files prefix removes the new lock"
+        );
+        assert_eq!(std::fs::read(&auth).expect("auth"), b"{token}\n");
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn create_files_rejects_a_file_and_an_empty_prefix() {
