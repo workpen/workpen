@@ -24,7 +24,9 @@ The parent is trusted. The child is not.
    is refused, as is a Windows reserved device name including
    `NUL.txt`. Hosts match `FileGrantReason`, not the sentence.
    `try_write_file` keeps the policy when the host should skip that
-   path. A hard failure removes files that builder created. A symlink
+   path. A hard failure removes files that builder created. A skip
+   from the `Result` methods returns `FileGrant` and leaves those
+   files. `discard_created_files` removes only the new ones. A symlink
    or junction parent is followed, and only the canonical file is
    granted. It does not walk the parent and does not make that parent
    a read-write root. `with_read_file` is the read-only form and does

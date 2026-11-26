@@ -275,18 +275,18 @@ struct FileId {
 impl FileGrantAttempt {
     /// Turn a skip or a failure into [`KernelError::FileGrant`].
     ///
-    /// A skip removes files this builder created. A failure already did.
+    /// A skip leaves files this builder created. Call
+    /// [`KernelPolicy::discard_created_files`] on the skipped policy
+    /// when the host wants those files removed. A failure already
+    /// removed them.
     pub fn strict(self) -> Result<KernelPolicy, KernelError> {
         match self {
             Self::Granted(policy) => Ok(policy),
             Self::Skipped {
-                mut policy,
+                policy: _,
                 path,
                 reason,
-            } => {
-                policy.rollback_created();
-                Err(KernelError::FileGrant { path, reason })
-            }
+            } => Err(KernelError::FileGrant { path, reason }),
             Self::Failed(err) => Err(err),
         }
     }
@@ -1470,8 +1470,11 @@ impl KernelPolicy {
     /// Same as [`Self::with_write_file_create`] with `create` true.
     /// Pass `create` false to grant a file that must already exist.
     /// [`Self::try_write_file`] returns the policy when the host should
-    /// skip that path and keep going. A hard failure removes every file
+    /// skip that path and keep going. The `Result` methods return
+    /// [`KernelError::FileGrant`] for that skip and leave files this
+    /// builder already created. A hard failure removes every file
     /// this builder created and leaves files that were already there.
+    /// [`Self::discard_created_files`] removes only the new files.
     ///
     /// Does not walk the parent, so a sibling tree such as
     /// `~/.grok/sessions` is not charged against the dest-deny
@@ -1496,7 +1499,8 @@ impl KernelPolicy {
     /// [`Self::with_write_file`] when `create` is true.
     ///
     /// When `create` is false, a missing file is
-    /// [`FileGrantReason::Missing`] and nothing is created.
+    /// [`FileGrantReason::Missing`] and nothing is created. Files this
+    /// builder already created stay.
     pub fn with_write_file_create(self, path: &Path, create: bool) -> Result<Self, KernelError> {
         self.try_write_file(path, create).strict()
     }
@@ -4741,7 +4745,7 @@ mod write_file_grant_tests {
     }
 
     #[test]
-    fn write_file_failure_removes_only_files_this_builder_created() {
+    fn write_file_symlink_keeps_files_this_builder_created() {
         let root = tempfile::tempdir().expect("temp");
         let workspace = root.path().join("ws");
         let grok = root.path().join("grok");
@@ -4764,7 +4768,11 @@ mod write_file_grant_tests {
             .with_write_file(&link)
             .expect_err("symlink lock");
         assert_eq!(file_grant_reason(err), super::FileGrantReason::Symlink);
-        assert!(!lock.exists(), "the new lock must be removed");
+        assert!(
+            lock.exists(),
+            "a skipped symlink must not remove the new lock"
+        );
+        assert_eq!(std::fs::read(&lock).expect("lock"), b"");
         assert_eq!(std::fs::read(&auth).expect("auth"), b"{token}\n");
         assert!(
             link.symlink_metadata()
@@ -4772,6 +4780,75 @@ mod write_file_grant_tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[test]
+    fn write_file_not_regular_removes_only_files_this_builder_created() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = grok.join("auth.json");
+        std::fs::write(&auth, b"{token}\n").expect("auth");
+        let lock = grok.join("auth.lock");
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock")
+            .with_write_file(&grok)
+            .expect_err("directory");
+        assert_eq!(file_grant_reason(err), super::FileGrantReason::NotRegular);
+        assert!(!lock.exists(), "a hard failure removes the new lock");
+        assert_eq!(std::fs::read(&auth).expect("auth"), b"{token}\n");
+    }
+
+    #[test]
+    fn strict_missing_login_keeps_the_lock_this_builder_created() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        std::fs::write(grok.join("notes.txt"), b"sibling\n").expect("notes");
+        let lock = grok.join("auth.lock");
+        let auth = grok.join("auth.json");
+        let err = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock")
+            .with_write_file_create(&auth, false)
+            .expect_err("missing login");
+        assert_eq!(file_grant_reason(err), super::FileGrantReason::Missing);
+        assert!(
+            lock.exists(),
+            "a missing login must not delete the lock from this builder"
+        );
+        assert_eq!(std::fs::read(&lock).expect("lock"), b"");
+        assert!(!auth.exists(), "a missing login file must not be created");
+        assert_eq!(
+            std::fs::read(grok.join("notes.txt")).expect("notes"),
+            b"sibling\n"
+        );
+    }
+
+    #[test]
+    fn discard_created_files_removes_only_the_new_lock() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        let auth = grok.join("auth.json");
+        std::fs::write(&auth, b"{token}\n").expect("auth");
+        let lock = grok.join("auth.lock");
+        process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_write_file(&lock)
+            .expect("create lock")
+            .discard_created_files();
+        assert!(!lock.exists(), "the host asked to remove the new lock");
+        assert_eq!(std::fs::read(&auth).expect("auth"), b"{token}\n");
     }
 
     #[test]
@@ -5060,7 +5137,7 @@ mod write_file_grant_tests {
     }
 
     #[test]
-    fn later_missing_parent_removes_only_the_new_lock() {
+    fn later_missing_parent_keeps_the_new_lock() {
         let root = tempfile::tempdir().expect("temp");
         let workspace = root.path().join("ws");
         let grok = root.path().join("grok");
@@ -5080,7 +5157,11 @@ mod write_file_grant_tests {
             file_grant_reason(err),
             super::FileGrantReason::ParentMissing
         );
-        assert!(!lock.exists(), "the new lock must be removed");
+        assert!(
+            lock.exists(),
+            "a skipped missing parent must not remove the new lock"
+        );
+        assert_eq!(std::fs::read(&lock).expect("lock"), b"");
         assert!(!other.parent().expect("parent").exists());
         assert_eq!(std::fs::read(&auth).expect("auth"), b"{token}\n");
     }
