@@ -25,7 +25,10 @@
 //!   match [`crate::FileGrantReason`], not the sentence.
 //!   [`crate::KernelPolicy::try_write_file`] keeps the policy when the
 //!   host should skip that path. A hard failure removes files that
-//!   builder created. A symlink or junction parent is followed, and only
+//!   builder created. A skip from the `Result` methods returns
+//!   [`crate::KernelError::FileGrant`] and leaves those files.
+//!   [`crate::KernelPolicy::discard_created_files`] removes only the
+//!   new ones. A symlink or junction parent is followed, and only
 //!   the canonical file is granted. It does not walk the parent and does
 //!   not make that parent a read-write root.
 //!   [`crate::KernelPolicy::with_read_file`] is the read-only form and
