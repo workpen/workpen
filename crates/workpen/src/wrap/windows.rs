@@ -692,8 +692,11 @@ impl AclRestore {
             unsafe { CloseHandle(file) };
             err
         } else if self.object_type == FILE_NO_PROPAGATE {
-            let dir = open_create_files_dir(&self.path).map_err(|_| {
-                KernelError::Apply("restore could not reopen the create-files directory".into())
+            let dir = open_create_files_dir(&self.path).map_err(|err| {
+                let shown = String::from_utf16_lossy(
+                    self.path.split(|c| *c == 0).next().unwrap_or(&self.path),
+                );
+                KernelError::Restore(format!("{shown}: {err}"))
             })?;
             set_kernel_dacl(dir.0, self.dacl)?;
             self.restored = true;

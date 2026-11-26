@@ -1699,7 +1699,8 @@ impl KernelPolicy {
                 || prefix == ".."
             {
                 return Err(KernelError::Apply(format!(
-                    "create-files prefix is not a single name: {prefix}"
+                    "create-files prefix is not a single name: {prefix} ({})",
+                    dir.display()
                 )));
             }
         }
@@ -3554,8 +3555,9 @@ fn add_macos_create_file_rules(
     };
     let regex = escape_sbpl_literal(&format!("^{dir}/{name}$"));
     // The dest-deny list allows `file-write*` and `file-write-create`
-    // separately, so creation is its own allow. Without a prefix the
-    // regex is every direct child, including `notes.txt`.
+    // separately, so creation is its own allow. The regex also matches
+    // names that already exist. Deny those literals after the allow so
+    // an existing sibling stays closed.
     let mut actions = vec!["file-write*", "file-write-create", "file-write-data"];
     if grant.prefix.is_some() {
         actions.push("file-read*");
@@ -3566,6 +3568,61 @@ fn add_macos_create_file_rules(
         let rule = format!("(allow {action} (regex \"{regex}\"))");
         caps.add_platform_rule(&rule)
             .map_err(|err| KernelError::Apply(err.to_string()))?;
+    }
+    deny_existing_create_file_names(caps, grant)?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn deny_existing_create_file_names(
+    caps: &mut nono::CapabilitySet,
+    grant: &CreateFiles,
+) -> Result<(), KernelError> {
+    let entries = std::fs::read_dir(&grant.directory).map_err(|err| {
+        KernelError::Apply(format!(
+            "create-files directory {}: {err}",
+            grant.directory.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            KernelError::Apply(format!(
+                "create-files directory {}: {err}",
+                grant.directory.display()
+            ))
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(KernelError::Apply(format!(
+                "create-files name is not UTF-8 in {}",
+                grant.directory.display()
+            )));
+        };
+        if grant
+            .prefix
+            .as_deref()
+            .is_some_and(|prefix| !name.starts_with(prefix))
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Some(raw) = path.to_str() else {
+            return Err(KernelError::Apply(format!(
+                "create-files path is not UTF-8: {}",
+                path.display()
+            )));
+        };
+        let escaped = escape_sbpl_literal(raw);
+        for action in [
+            "file-write*",
+            "file-write-data",
+            "file-read*",
+            "file-read-metadata",
+        ] {
+            let rule = format!("(deny {action} (literal \"{escaped}\"))");
+            caps.add_platform_rule(&rule)
+                .map_err(|err| KernelError::Apply(err.to_string()))?;
+        }
     }
     Ok(())
 }
@@ -5075,6 +5132,44 @@ mod write_file_grant_tests {
                 "{err}"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_create_files_denies_an_existing_prefixed_sibling() {
+        let root = tempfile::tempdir().expect("temp");
+        let workspace = root.path().join("ws");
+        let grok = root.path().join("grok");
+        std::fs::create_dir_all(&grok).expect("grok");
+        std::fs::create_dir_all(&workspace).expect("ws");
+        std::fs::write(grok.join("notes.txt"), b"keep\n").expect("notes");
+        std::fs::write(grok.join("auth.json"), b"{}\n").expect("auth");
+        let policy = process_jail(&workspace, std::iter::empty::<&Path>())
+            .expect("jail")
+            .with_create_files(&grok, Some("auth"))
+            .expect("create files");
+        let caps = policy
+            .to_capability_set(nono::SignalMode::Isolated)
+            .expect("caps");
+        let rules = caps.platform_rules();
+        let allow = rules
+            .iter()
+            .position(|rule| rule.contains("(allow file-write*") && rule.contains("auth"))
+            .expect("allow regex");
+        let deny = rules
+            .iter()
+            .position(|rule| rule.contains("(deny file-write*") && rule.contains("auth.json"))
+            .expect("existing auth.json stays closed");
+        assert!(
+            deny > allow,
+            "the existing-file deny must follow the create allow"
+        );
+        assert!(
+            rules
+                .iter()
+                .all(|rule| !(rule.contains("notes.txt") && rule.contains("(deny file-write*"))),
+            "a name outside the prefix is not granted, so it is not denied here"
+        );
     }
 
     #[cfg(windows)]
