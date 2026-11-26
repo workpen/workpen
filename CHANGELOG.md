@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.1](https://github.com/workpen/workpen/compare/v0.11.0...v0.11.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* **wrap:** keep created files when a file grant is skipped ([#374](https://github.com/workpen/workpen/issues/374)) ([88eb1be](https://github.com/workpen/workpen/commit/88eb1beb7243639fbdce99acaab66bb3a1f17f35)), closes [#368](https://github.com/workpen/workpen/issues/368)
+* **wrap:** keep dest-deny on the workspace after read_only ([#376](https://github.com/workpen/workpen/issues/376)) ([de84771](https://github.com/workpen/workpen/commit/de847712855eab51a9c47411fab388873aa6386b))
+
 ## [0.11.0](https://github.com/workpen/workpen/compare/v0.10.0...v0.11.0) (2026-11-10)
 
 
