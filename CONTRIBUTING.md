@@ -78,4 +78,8 @@ and
 ## Pull requests
 
 Use a Conventional Commits title (`feat:`, `fix:`, `docs:`, `chore:`).
-One logical change per commit. Squash-merge is the default.
+One logical change per commit. Squash-merge is the default. The squash
+commit is that title and an empty body. Release Please parses the whole
+commit, and a pull request body with nested parentheses makes it skip
+the commit and still exit 0. Put `Closes #N` in the pull request
+description. GitHub closes the issue from the description.

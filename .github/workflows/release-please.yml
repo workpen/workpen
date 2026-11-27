@@ -46,6 +46,41 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+  reject-unparsed-commits:
+    name: Release commit parse
+    needs: release-please
+    if: >-
+      always() && !cancelled() &&
+      needs.release-please.result == 'success' &&
+      needs.release-please.outputs.release_created != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2
+        with:
+          egress-policy: audit
+      - uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        id: app-token
+        with:
+          client-id: ${{ vars.AUTO_APPROVE_CLIENT_ID }}
+          private-key: ${{ secrets.AUTO_APPROVE_PRIVATE_KEY }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Reject commits Release Please drops
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          NODE_PATH: ${{ runner.temp }}/rp-parse/node_modules
+        run: |
+          set -euo pipefail
+          npm install --prefix "${RUNNER_TEMP}/rp-parse" @conventional-commits/parser@0.4.1
+          tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
+          gh api "repos/${GITHUB_REPOSITORY}/compare/${tag}...${GITHUB_SHA}" \
+            --jq '[.commits[] | {sha: .sha, message: .commit.message}]' \
+            > "${RUNNER_TEMP}/commits.json"
+          node scripts/release_please_commit_parse.mjs --commits "${RUNNER_TEMP}/commits.json"
+
   sync-release-pr-versions:
     name: Sync release PR lock
     needs: release-please

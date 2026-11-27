@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -99,14 +103,14 @@ class WorkflowTriggerTests(unittest.TestCase):
         text = (WORKFLOWS / "release-please.yml").read_text(encoding="utf-8")
         pin = "actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc"
         token = "token: ${{ steps.app-token.outputs.token }}"
-        self.assertEqual(text.count(pin), 2)
-        self.assertEqual(text.count("id: app-token"), 2)
+        self.assertEqual(text.count(pin), 3)
+        self.assertEqual(text.count("id: app-token"), 3)
         self.assertEqual(
-            text.count("client-id: ${{ vars.AUTO_APPROVE_CLIENT_ID }}"), 2
+            text.count("client-id: ${{ vars.AUTO_APPROVE_CLIENT_ID }}"), 3
         )
         self.assertEqual(
             text.count("private-key: ${{ secrets.AUTO_APPROVE_PRIVATE_KEY }}"),
-            2,
+            3,
         )
         self.assertEqual(text.count(token), 2)
         release, sync = text.split("sync-release-pr-versions:", 1)
@@ -154,6 +158,44 @@ class WorkflowTriggerTests(unittest.TestCase):
         self.assertIn("hmarr/auto-approve-action@", approve_block)
         merge_block = text[merge_idx:]
         self.assertIn("!startsWith(github.head_ref, 'release-please')", merge_block)
+
+    def test_squash_commit_is_the_validated_title(self) -> None:
+        text = (WORKFLOWS / "pr-title.yml").read_text(encoding="utf-8")
+        self.assertIn("name: Squash commit", text)
+        self.assertIn("squash_merge_commit_message", text)
+        self.assertIn('"$msg" != "BLANK"', text)
+        self.assertIn('"$title" != "PR_TITLE"', text)
+        release = (WORKFLOWS / "release-please.yml").read_text(encoding="utf-8")
+        self.assertIn("scripts/release_please_commit_parse.mjs", release)
+        self.assertIn("@conventional-commits/parser@0.4.1", release)
+
+    def test_release_please_parser_rejects_nested_parentheses(self) -> None:
+        node = shutil.which("node")
+        npm = shutil.which("npm")
+        if node is None or npm is None:
+            self.fail("node and npm are required to parse release commits")
+        prefix = Path(tempfile.gettempdir()) / "workpen-rp-parse"
+        module = prefix / "node_modules" / "@conventional-commits" / "parser"
+        if not module.exists():
+            subprocess.check_call(
+                [
+                    npm,
+                    "install",
+                    "--prefix",
+                    str(prefix),
+                    "@conventional-commits/parser@0.4.1",
+                ],
+            )
+        env = os.environ.copy()
+        env["NODE_PATH"] = str(prefix / "node_modules")
+        subprocess.check_call(
+            [
+                node,
+                str(ROOT / "scripts" / "release_please_commit_parse.mjs"),
+                "--self-test",
+            ],
+            env=env,
+        )
 
     def test_cheap_pr_status_checks_do_not_cancel(self) -> None:
         for name in ("pr-title.yml", "dco.yml"):
