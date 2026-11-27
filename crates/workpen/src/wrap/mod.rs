@@ -3554,11 +3554,11 @@ fn add_macos_create_file_rules(
         None => "[^/]+".to_string(),
     };
     let regex = escape_sbpl_literal(&format!("^{dir}/{name}$"));
-    // The dest-deny list allows `file-write*` and `file-write-create`
-    // separately, so creation is its own allow. The regex also matches
-    // names that already exist. Deny those literals after the allow so
-    // an existing sibling stays closed.
-    let mut actions = vec!["file-write*", "file-write-create", "file-write-data"];
+    // Seatbelt does not treat `file-write*` as `file-write-create`.
+    // The regex also matches names that already exist. The deny below
+    // is emitted later and has to name each of these write actions, or
+    // that allow stays the last match.
+    let mut actions = macos_create_name_write_actions().to_vec();
     if grant.prefix.is_some() {
         actions.push("file-read*");
     } else {
@@ -3571,6 +3571,27 @@ fn add_macos_create_file_rules(
     }
     deny_existing_create_file_names(caps, grant)?;
     Ok(())
+}
+
+/// Write actions the create-files allow opens on a matching name.
+/// Seatbelt's `file-write*` does not cover `file-write-create`.
+#[cfg(any(test, target_os = "macos"))]
+fn macos_create_name_write_actions() -> &'static [&'static str] {
+    &["file-write*", "file-write-create", "file-write-data"]
+}
+
+/// Denies for a name that already exists in a create-files directory.
+/// Emitted after the allow. Each [`macos_create_name_write_actions`]
+/// entry has to appear here, or that allow stays the last match.
+#[cfg(any(test, target_os = "macos"))]
+fn macos_existing_create_deny_actions() -> &'static [&'static str] {
+    &[
+        "file-write*",
+        "file-write-data",
+        "file-write-create",
+        "file-read*",
+        "file-read-metadata",
+    ]
 }
 
 #[cfg(target_os = "macos")]
@@ -3613,12 +3634,7 @@ fn deny_existing_create_file_names(
             )));
         };
         let escaped = escape_sbpl_literal(raw);
-        for action in [
-            "file-write*",
-            "file-write-data",
-            "file-read*",
-            "file-read-metadata",
-        ] {
+        for action in macos_existing_create_deny_actions() {
             let rule = format!("(deny {action} (literal \"{escaped}\"))");
             caps.add_platform_rule(&rule)
                 .map_err(|err| KernelError::Apply(err.to_string()))?;
@@ -5134,6 +5150,17 @@ mod write_file_grant_tests {
         }
     }
 
+    #[test]
+    fn existing_create_deny_names_every_create_write_action() {
+        let deny = super::macos_existing_create_deny_actions();
+        for action in super::macos_create_name_write_actions() {
+            assert!(
+                deny.contains(action),
+                "existing-name deny omits {action}, so the create allow stays last"
+            );
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_create_files_denies_an_existing_prefixed_sibling() {
@@ -5164,10 +5191,26 @@ mod write_file_grant_tests {
             deny > allow,
             "the existing-file deny must follow the create allow"
         );
+        let allow_create = rules
+            .iter()
+            .position(|rule| rule.contains("(allow file-write-create") && rule.contains("auth"))
+            .expect("allow file-write-create");
+        let deny_create = rules
+            .iter()
+            .position(|rule| {
+                rule.contains("(deny file-write-create (literal") && rule.contains("auth.json")
+            })
+            .expect("existing auth.json denies file-write-create");
         assert!(
-            rules
-                .iter()
-                .all(|rule| !(rule.contains("notes.txt") && rule.contains("(deny file-write*"))),
+            deny_create > allow_create,
+            "the file-write-create deny must follow the create allow"
+        );
+        assert!(
+            rules.iter().all(|rule| {
+                !(rule.contains("notes.txt")
+                    && (rule.contains("(deny file-write*")
+                        || rule.contains("(deny file-write-create")))
+            }),
             "a name outside the prefix is not granted, so it is not denied here"
         );
     }
