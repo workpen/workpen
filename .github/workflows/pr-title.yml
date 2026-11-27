@@ -41,28 +41,3 @@ jobs:
             chore
             revert
           requireScope: false
-
-  squash-commit:
-    name: Squash commit
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: step-security/harden-runner@aebdcf6156ab6691adf63218240e476564a1ed4c # v2
-        with:
-          egress-policy: audit
-      # Release Please parses the whole squash commit. The semantic
-      # title check does not see the pull request body. Nested
-      # parentheses in that body drop the commit, and the release
-      # job still exits 0. Keep the squash body empty.
-      - name: Title is the whole squash commit
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          msg=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .squash_merge_commit_message)
-          title=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .squash_merge_commit_title)
-          if [ "$msg" != "BLANK" ] || [ "$title" != "PR_TITLE" ]; then
-            printf 'squash_merge_commit_message=%s squash_merge_commit_title=%s\n' "$msg" "$title"
-            echo "Keep the squash message BLANK and the squash title PR_TITLE."
-            exit 1
-          fi

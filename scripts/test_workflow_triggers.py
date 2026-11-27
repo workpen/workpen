@@ -159,15 +159,14 @@ class WorkflowTriggerTests(unittest.TestCase):
         merge_block = text[merge_idx:]
         self.assertIn("!startsWith(github.head_ref, 'release-please')", merge_block)
 
-    def test_squash_commit_is_the_validated_title(self) -> None:
-        text = (WORKFLOWS / "pr-title.yml").read_text(encoding="utf-8")
-        self.assertIn("name: Squash commit", text)
-        self.assertIn("squash_merge_commit_message", text)
-        self.assertIn('"$msg" != "BLANK"', text)
-        self.assertIn('"$title" != "PR_TITLE"', text)
+    def test_release_please_parses_commits_since_latest_release(self) -> None:
+        # The pull request token cannot read squash_merge_commit_message.
+        # A job that requires that field stays red. The main parse job
+        # reads commits, which contents:read can see.
         release = (WORKFLOWS / "release-please.yml").read_text(encoding="utf-8")
         self.assertIn("scripts/release_please_commit_parse.mjs", release)
         self.assertIn("@conventional-commits/parser@0.4.1", release)
+        self.assertNotIn("squash_merge_commit_message", (WORKFLOWS / "pr-title.yml").read_text(encoding="utf-8"))
 
     def test_release_please_parser_rejects_nested_parentheses(self) -> None:
         node = shutil.which("node")
