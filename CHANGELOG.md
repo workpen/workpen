@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.2](https://github.com/workpen/workpen/compare/v0.11.1...v0.11.2) (2026-11-27)
+
+
+### Bug Fixes
+
+* **wrap:** deny file-write-create on an existing create-files name ([#380](https://github.com/workpen/workpen/issues/380)) ([77e0765](https://github.com/workpen/workpen/commit/77e07651c59cd34c008a5769f2f586a8666d04d8))
+
 ## [0.11.1](https://github.com/workpen/workpen/compare/v0.11.0...v0.11.1) (2026-11-26)
 
 
